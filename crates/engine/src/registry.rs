@@ -213,8 +213,8 @@ pub fn default_registry() -> HarnessRegistry {
     // Hermes (NousResearch/hermes-agent) over ACP, same lazy pattern. The
     // static descriptor mirrors HermesHarness exactly: "Hermes", StepBoundary
     // steering (a mid-turn prompt is redirected into the running turn), and an
-    // EMPTY reasoning ladder — effort is a property of the provider/model
-    // picked in `hermes model`, not a per-turn ACP knob.
+    // empty HARNESS-WIDE reasoning ladder. Hermes's live Codex/Claude model
+    // rows receive those underlying harnesses' model-specific traits instead.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Hermes,

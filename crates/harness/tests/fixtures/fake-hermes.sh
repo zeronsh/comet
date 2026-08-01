@@ -60,6 +60,8 @@ fi
 # ---- set_model / set_mode preamble, then the turn --------------------------
 SAW_SET_MODEL=no
 SAW_MODE=''
+SAW_REASONING=''
+SAW_SERVICE_TIER=''
 promptline=''
 while read -r line; do
   case "$line" in
@@ -71,6 +73,14 @@ while read -r line; do
   *'"method":"session/set_mode"'*)
     SAW_MODE=$(printf '%s' "$line" | sed 's/.*"modeId":"\([a-z_]*\)".*/\1/')
     emit "{\"id\":$(rid "$line"),\"result\":{}}"
+    ;;
+  *'"method":"session/set_config_option"'*'"configId":"reasoning_effort"'*)
+    SAW_REASONING=$(printf '%s' "$line" | sed 's/.*"value":"\([a-z]*\)".*/\1/')
+    emit "{\"id\":$(rid "$line"),\"result\":{\"configOptions\":[]}}"
+    ;;
+  *'"method":"session/set_config_option"'*'"configId":"service_tier"'*)
+    SAW_SERVICE_TIER=$(printf '%s' "$line" | sed 's/.*"value":"\([a-z]*\)".*/\1/')
+    emit "{\"id\":$(rid "$line"),\"result\":{\"configOptions\":[]}}"
     ;;
   *'"method":"session/prompt"'*)
     promptline="$line"
@@ -109,6 +119,12 @@ case "$promptline" in
   upd '{"sessionUpdate":"tool_call","toolCallId":"tc-4","kind":"other","title":"mcp__linear__create_issue","rawInput":{"team":"eng"}}'
   upd '{"sessionUpdate":"plan","entries":[{"content":"Read the code","status":"completed"},{"content":"Write the fix","status":"pending"}]}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\",$USAGE}}"
+  ;;
+
+*scenario:traits*)
+  [ "$SAW_REASONING" = high ] || exit 1
+  [ "$SAW_SERVICE_TIER" = priority ] || exit 1
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
 *scenario:resumed*)

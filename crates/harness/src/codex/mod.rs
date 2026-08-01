@@ -24,7 +24,7 @@
 //!   escalating to SIGTERM → SIGKILL if the child is unresponsive; the stream
 //!   always ends with `Done { status: Interrupted }`.
 
-mod catalog;
+pub(crate) mod catalog;
 mod normalize;
 
 use std::collections::{HashSet, VecDeque};

@@ -9,8 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use comet_harness::{CancellationToken, Harness, HermesHarness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, TodoItem, ToolCall,
-    UserInputAnswer,
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
+    ToolCall, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -211,6 +211,25 @@ async fn happy_path_maps_chunks_tool_calls_plan_usage_and_done() {
             ..
         }) if id == "s-live"
     ));
+}
+
+#[tokio::test]
+async fn reasoning_and_service_tier_are_set_before_the_turn() {
+    let mut req = request("scenario:traits");
+    req.reasoning = Some(ReasoningLevel::High);
+    req.model_options
+        .insert("serviceTier".into(), "fast".into());
+    let events = run_once(&harness(), req).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
 }
 
 /// `session/load` replays the whole prior transcript before responding. Comet's
@@ -512,8 +531,10 @@ async fn models_are_discovered_live_and_cached() {
     assert_eq!(models[0].id, "xai-oauth:grok-4.5");
     assert_eq!(models[0].label, "xAI · grok-4.5");
     assert_eq!(models[0].description.as_deref(), Some("Provider: xAI"));
-    // Hermes exposes no per-turn effort knob.
+    // Non-Claude/Codex providers retain the raw ACP catalog traits.
     assert!(models[0].reasoning_levels.is_empty());
+    assert!(models[1].reasoning_levels.contains(&ReasoningLevel::XHigh));
+    assert!(models[1].options.iter().any(|o| o.id == "serviceTier"));
     assert!(models[1].description.is_none());
 
     let again = harness.models().await.expect("cached models");

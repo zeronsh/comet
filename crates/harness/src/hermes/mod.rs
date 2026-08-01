@@ -53,7 +53,8 @@ use comet_proto::{
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{
-    REASONING_LEVELS, current_model, models_from_session, session_mode, stop_reason_interrupted,
+    REASONING_LEVELS, current_model, models_from_session, reasoning_effort, service_tier,
+    session_mode, stop_reason_interrupted,
 };
 
 /// How long a discovered model catalog stays fresh. Discovery costs a full
@@ -525,7 +526,8 @@ async fn run_session(session: Session) {
             ));
         }
 
-        // Model + edit-approval mode. A rejected set is logged, not fatal:
+        // Model + per-session traits + edit-approval mode. A rejected set is
+        // logged, not fatal:
         // the session still runs on Hermes's configured defaults.
         if let Some(model) = request.model.as_ref().filter(|m| !m.is_empty())
             && current_model(&result).as_ref() != Some(model)
@@ -539,6 +541,42 @@ async fn run_session(session: Session) {
             tracing::warn!(
                 target: "comet_harness::hermes",
                 "session/set_model({model}) rejected; using the session default: {e}"
+            );
+        }
+        if let Some(reasoning) = request.reasoning {
+            let effort = reasoning_effort(reasoning);
+            if let Err(e) = client
+                .request(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": session_id,
+                        "configId": "reasoning_effort",
+                        "value": effort,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "comet_harness::hermes",
+                    "session reasoning effort {effort} rejected; using the session default: {e}"
+                );
+            }
+        }
+        if let Some(tier) = service_tier(request.model.as_deref(), &request.model_options)
+            && let Err(e) = client
+                .request(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": session_id,
+                        "configId": "service_tier",
+                        "value": tier,
+                    }),
+                )
+                .await
+        {
+            tracing::warn!(
+                target: "comet_harness::hermes",
+                "session service tier {tier} rejected; using the session default: {e}"
             );
         }
         let mode = session_mode(request.sandbox, request.auto_approve);
