@@ -116,6 +116,11 @@ icon_assets![
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
+    // Hermes has no vector mark to port — its app icon is a full raster
+    // illustration that doesn't reduce to a 16px monochrome glyph. This is a
+    // hand-drawn winged helmet (Hermes, the messenger) in the Solar Linear
+    // style, like the terminal/git-branch/return ports.
+    (HERMES_MARK, "hermes-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — comet keeps it even on the

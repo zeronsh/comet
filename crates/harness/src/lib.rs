@@ -66,6 +66,8 @@ pub trait Harness: Send + Sync {
 
 pub mod claude;
 pub mod codex;
+pub mod hermes;
+pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod shell_env;
 
@@ -208,3 +210,4 @@ pub(crate) fn crash_message(
 
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
+pub use hermes::HermesHarness;

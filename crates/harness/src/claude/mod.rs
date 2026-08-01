@@ -329,12 +329,13 @@ enum StdinMsg {
 
 /// Anthropic's API caps inline images at 5MB of raw bytes; larger files stay
 /// path refs only.
-const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Media type for an inline image block — extension first, magic bytes as the
 /// fallback (pasted screenshots may carry odd names). Only the API-supported
 /// inline types map; anything else (svg/bmp/tiff/…) returns `None`.
-fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
+/// Shared with the Hermes ACP adapter, which inlines the same staged uploads.
+pub(crate) fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
     let by_ext = match path
         .extension()
         .and_then(|e| e.to_str())

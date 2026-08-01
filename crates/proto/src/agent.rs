@@ -8,6 +8,8 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Cursor,
+    /// Hermes Agent (NousResearch/hermes-agent), driven over ACP.
+    Hermes,
     /// Test harness; never shown in production pickers.
     Mock,
 }

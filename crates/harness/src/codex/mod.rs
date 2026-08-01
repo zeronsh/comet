@@ -26,7 +26,6 @@
 
 mod catalog;
 mod normalize;
-mod rpc;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -47,12 +46,12 @@ use comet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     Phase, delta_text, item_id, item_type, map_item, turn_error_message, turn_id, usage_event,
 };
-use rpc::{Incoming, RpcClient};
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
 /// PATH, then the login-shell PATH snapshot (the user's shell init shapes

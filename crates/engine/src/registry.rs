@@ -210,6 +210,21 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
+    // Hermes (NousResearch/hermes-agent) over ACP, same lazy pattern. The
+    // static descriptor mirrors HermesHarness exactly: "Hermes", StepBoundary
+    // steering (a mid-turn prompt is redirected into the running turn), and an
+    // EMPTY reasoning ladder — effort is a property of the provider/model
+    // picked in `hermes model`, not a per-turn ACP knob.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Hermes,
+            name: "Hermes".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![],
+        },
+        Box::new(|| Ok(Arc::new(comet_harness::HermesHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -249,12 +264,17 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_and_codex_slots() {
+    fn default_registry_lists_mock_claude_codex_and_hermes_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
             ids,
-            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![
+                HarnessId::Mock,
+                HarnessId::ClaudeCode,
+                HarnessId::Codex,
+                HarnessId::Hermes
+            ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
@@ -262,6 +282,8 @@ mod tests {
         // cheap; CLI discovery is deferred to models()/run()).
         let codex = registry.resolve(HarnessId::Codex).unwrap();
         assert_eq!(codex.id(), HarnessId::Codex);
+        let hermes = registry.resolve(HarnessId::Hermes).unwrap();
+        assert_eq!(hermes.id(), HarnessId::Hermes);
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`
@@ -271,22 +293,23 @@ mod tests {
     /// `[Ultrathink]` while the resolved adapter reports `[Low..Max]` — left
     /// as-is here; flagged for its own pass.)
     #[test]
-    fn codex_lazy_descriptor_matches_resolved_harness() {
-        let registry = default_registry();
-        let before = registry
-            .descriptors()
-            .into_iter()
-            .find(|d| d.id == HarnessId::Codex)
-            .unwrap();
-        registry.resolve(HarnessId::Codex).unwrap();
-        let after = registry
-            .descriptors()
-            .into_iter()
-            .find(|d| d.id == HarnessId::Codex)
-            .unwrap();
-        assert_eq!(before.name, after.name);
-        assert_eq!(before.supports_steering, after.supports_steering);
-        assert_eq!(before.steering_mode, after.steering_mode);
-        assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    fn codex_and_hermes_lazy_descriptors_match_resolved_harnesses() {
+        for id in [HarnessId::Codex, HarnessId::Hermes] {
+            let registry = default_registry();
+            let find = |registry: &HarnessRegistry| {
+                registry
+                    .descriptors()
+                    .into_iter()
+                    .find(|d| d.id == id)
+                    .unwrap()
+            };
+            let before = find(&registry);
+            registry.resolve(id).unwrap();
+            let after = find(&registry);
+            assert_eq!(before.name, after.name, "{id:?}");
+            assert_eq!(before.supports_steering, after.supports_steering, "{id:?}");
+            assert_eq!(before.steering_mode, after.steering_mode, "{id:?}");
+            assert_eq!(before.reasoning_levels, after.reasoning_levels, "{id:?}");
+        }
     }
 }

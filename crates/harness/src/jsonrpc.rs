@@ -1,11 +1,13 @@
-//! Minimal JSON-RPC 2.0 client over the app server's stdio (newline-delimited
-//! frames, id-multiplexed), ported from codex.ts's `startAppServer`.
+//! Minimal JSON-RPC 2.0 client over a child's stdio (newline-delimited frames,
+//! id-multiplexed). Shared by every stdio-JSON-RPC harness: Codex's
+//! `codex app-server` (where it was first ported from codex.ts's
+//! `startAppServer`) and Hermes's `hermes acp`.
 //!
 //! - Responses are matched to callers by numeric id (a shared pending map the
 //!   reader task resolves directly, so requests can be awaited from anywhere —
 //!   including inside the session loop — without starving notifications).
-//! - Notifications and server→client requests (approvals) are pumped into an
-//!   [`Incoming`] channel the session loop drains.
+//! - Notifications and server→client requests (approvals, permission prompts)
+//!   are pumped into an [`Incoming`] channel the session loop drains.
 //! - Writes to a dead child's stdin (EPIPE) are tolerated and logged, matching
 //!   the TS harness's swallowed-EPIPE behavior.
 
@@ -20,21 +22,21 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::HarnessError;
 
-/// A non-response line from the app server, in stdout order.
+/// A non-response line from the child, in stdout order.
 #[derive(Debug)]
 pub(crate) enum Incoming {
     Notification {
         method: String,
         params: Value,
     },
-    /// Server→client request (approvals); must be answered via
+    /// Server→client request (approvals / permission prompts); must be answered via
     /// [`RpcClient::respond`] / [`RpcClient::respond_error`].
     Request {
         id: Value,
         method: String,
         params: Value,
     },
-    /// stdout EOF: the app server exited. All pending requests fail.
+    /// stdout EOF: the child exited. All pending requests fail.
     Eof,
 }
 
@@ -75,7 +77,7 @@ impl RpcClient {
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
             return Err(HarnessError::Protocol(format!(
-                "{method}: app-server stdin closed"
+                "{method}: child stdin closed"
             )));
         }
         match rx.await {
@@ -83,7 +85,7 @@ impl RpcClient {
             Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
             // Sender dropped: the reader hit EOF and failed all pending.
             Err(_) => Err(HarnessError::Protocol(format!(
-                "{method}: app-server exited before responding"
+                "{method}: child exited before responding"
             ))),
         }
     }
@@ -124,7 +126,7 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
             stdin.flush().await
         };
         if let Err(e) = write.await {
-            tracing::debug!(target: "comet_harness::codex", "stdin write failed (tolerated): {e}");
+            tracing::debug!(target: "comet_harness::jsonrpc", "stdin write failed (tolerated): {e}");
             return;
         }
     }
@@ -143,7 +145,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            tracing::debug!(target: "comet_harness::codex", "non-JSON stdout line (skipped)");
+            tracing::debug!(target: "comet_harness::jsonrpc", "non-JSON stdout line (skipped)");
             continue;
         };
         let method = msg.get("method").and_then(Value::as_str);
