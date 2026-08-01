@@ -13,12 +13,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PaintQuad, PathPromptOptions, Pixels, Point, SharedString, Style, StyledImage as _,
-    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, img, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
+    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
+    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
+    prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -66,6 +67,8 @@ pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
+/// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
+pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
@@ -131,6 +134,56 @@ pub fn composer_total_height(content_height: f32) -> f32 {
     (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN, TEXTAREA_MAX)
         + ACTIONS_ROW_HEIGHT
         + PILL_BORDER_V
+}
+
+fn input_max_scroll(content_height: f32, viewport_height: f32) -> f32 {
+    (content_height - viewport_height).max(0.0)
+}
+
+/// Apply GPUI's wheel delta to a top-origin input offset. Positive deltas mean
+/// scrolling toward the start, matching gpui's built-in list/div behavior.
+fn input_scroll_offset(
+    current: f32,
+    delta_y: f32,
+    content_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    (current - delta_y).clamp(0.0, input_max_scroll(content_height, viewport_height))
+}
+
+/// Minimally adjust the viewport so the caret row is fully visible.
+fn input_scroll_offset_for_cursor(
+    current: f32,
+    cursor_top: f32,
+    cursor_height: f32,
+    content_height: f32,
+    viewport_height: f32,
+) -> f32 {
+    let mut next = current;
+    if cursor_top < next {
+        next = cursor_top;
+    } else if cursor_top + cursor_height > next + viewport_height {
+        next = cursor_top + cursor_height - viewport_height;
+    }
+    next.clamp(0.0, input_max_scroll(content_height, viewport_height))
+}
+
+/// Per-frame drag-selection scroll. Distance increases speed, capped at one
+/// text row per frame so crossing the input boundary never causes a jump.
+fn input_drag_scroll_delta(
+    pointer_y: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    line_height: f32,
+) -> f32 {
+    let distance = if pointer_y < viewport_top {
+        pointer_y - viewport_top
+    } else if pointer_y > viewport_bottom {
+        pointer_y - viewport_bottom
+    } else {
+        return 0.0;
+    };
+    distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
 }
 
 /// Staged-attachment strip metrics (comet attachment-ui.tsx AttachmentStrip:
@@ -621,8 +674,14 @@ pub struct ComposerInput {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
+    drag_position: Option<Point<Pixels>>,
+    drag_generation: u64,
+    drag_autoscroll_active: bool,
     /// Vertical scroll inside the input once content exceeds the max height.
     scroll_top: f32,
+    /// Normally keeps the caret visible through edits and rewraps. Manual
+    /// wheel scrolling pauses it until the next caret move or edit.
+    follow_cursor: bool,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
@@ -665,7 +724,11 @@ impl ComposerInput {
             selection_reversed: false,
             marked_range: None,
             is_selecting: false,
+            drag_position: None,
+            drag_generation: 0,
+            drag_autoscroll_active: false,
             scroll_top: 0.0,
+            follow_cursor: true,
             last_lines: Vec::new(),
             line_starts: vec![0],
             last_bounds: None,
@@ -747,6 +810,7 @@ impl ComposerInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_top = 0.0;
+        self.follow_cursor = true;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -764,6 +828,7 @@ impl ComposerInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.follow_cursor = true;
         self.reset_blink();
         cx.notify();
     }
@@ -778,6 +843,7 @@ impl ComposerInput {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.follow_cursor = true;
         self.reset_blink();
         cx.notify();
     }
@@ -1054,6 +1120,9 @@ impl ComposerInput {
     ) {
         window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
+        self.drag_position = Some(event.position);
+        self.drag_generation = self.drag_generation.wrapping_add(1);
+        self.drag_autoscroll_active = false;
         let index = self.index_for_mouse_position(event.position);
         if event.modifiers.shift {
             self.select_to(index, cx);
@@ -1064,12 +1133,116 @@ impl ComposerInput {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.drag_position = None;
+        self.drag_generation = self.drag_generation.wrapping_add(1);
+        self.drag_autoscroll_active = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.drag_position = Some(event.position);
+            let position = self.drag_selection_position(event.position);
+            self.select_to(self.index_for_mouse_position(position), cx);
+            if self.drag_scroll_delta(event.position) != 0.0 && !self.drag_autoscroll_active {
+                self.start_drag_autoscroll(cx);
+            }
         }
+    }
+
+    fn start_drag_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self.drag_autoscroll_active = true;
+        let generation = self.drag_generation;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(DRAG_SCROLL_FRAME_MS))
+                    .await;
+                let keep_running = this
+                    .update(cx, |input, cx| input.drag_autoscroll_tick(generation, cx))
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn drag_selection_position(&self, position: Point<Pixels>) -> Point<Pixels> {
+        let Some(bounds) = self.last_bounds else {
+            return position;
+        };
+        point(
+            position.x.clamp(bounds.left(), bounds.right() - px(0.5)),
+            position.y.clamp(bounds.top(), bounds.bottom() - px(0.5)),
+        )
+    }
+
+    fn drag_scroll_delta(&self, position: Point<Pixels>) -> f32 {
+        let Some(bounds) = self.last_bounds else {
+            return 0.0;
+        };
+        input_drag_scroll_delta(
+            f32::from(position.y),
+            f32::from(bounds.top()),
+            f32::from(bounds.bottom()),
+            f32::from(self.line_height),
+        )
+    }
+
+    fn drag_autoscroll_tick(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        if !self.is_selecting || self.drag_generation != generation {
+            return false;
+        }
+        let (Some(position), Some(bounds)) = (self.drag_position, self.last_bounds) else {
+            self.drag_autoscroll_active = false;
+            return false;
+        };
+        let delta = self.drag_scroll_delta(position);
+        if delta == 0.0 {
+            self.drag_autoscroll_active = false;
+            return false;
+        }
+        let next = (self.scroll_top + delta).clamp(
+            0.0,
+            input_max_scroll(self.content_height, f32::from(bounds.size.height)),
+        );
+        if next == self.scroll_top {
+            self.drag_autoscroll_active = false;
+            return false;
+        }
+        self.scroll_top = next;
+        let edge_position = self.drag_selection_position(position);
+        self.select_to(self.index_for_mouse_position(edge_position), cx);
+        // Selection motion normally resumes caret following. During an edge
+        // drag the autoscroll loop owns the viewport instead.
+        self.follow_cursor = false;
+        true
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bounds) = self.last_bounds else {
+            return;
+        };
+        let delta_y = f32::from(event.delta.pixel_delta(self.line_height).y);
+        let next = input_scroll_offset(
+            self.scroll_top,
+            delta_y,
+            self.content_height,
+            f32::from(bounds.size.height),
+        );
+        if next == self.scroll_top {
+            return;
+        }
+        self.scroll_top = next;
+        self.follow_cursor = false;
+        cx.stop_propagation();
+        cx.notify();
     }
 
     // ---- utf16 mapping (IME) ----
@@ -1181,17 +1354,20 @@ impl ComposerInput {
 
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) {
-        let max_scroll = (self.content_height - element_height).max(0.0);
-        if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
-            let cursor_top = f32::from(cursor.y);
-            let cursor_bottom = cursor_top + f32::from(self.line_height);
-            if cursor_top < self.scroll_top {
-                self.scroll_top = cursor_top;
-            } else if cursor_bottom > self.scroll_top + element_height {
-                self.scroll_top = cursor_bottom - element_height;
+        if self.follow_cursor {
+            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
+                self.scroll_top = input_scroll_offset_for_cursor(
+                    self.scroll_top,
+                    f32::from(cursor.y),
+                    f32::from(self.line_height),
+                    self.content_height,
+                    element_height,
+                );
             }
         }
-        self.scroll_top = self.scroll_top.clamp(0.0, max_scroll);
+        self.scroll_top = self
+            .scroll_top
+            .clamp(0.0, input_max_scroll(self.content_height, element_height));
     }
 }
 
@@ -1255,6 +1431,7 @@ impl EntityInputHandler for ComposerInput {
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range.take();
+        self.follow_cursor = true;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -1285,6 +1462,7 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.follow_cursor = true;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -1470,6 +1648,12 @@ impl gpui::Element for ComposerTextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble && event.pressed_button == Some(MouseButton::Left) {
+                input.update(cx, |input, cx| input.on_mouse_move(event, cx));
+            }
+        });
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
@@ -1548,7 +1732,7 @@ impl Render for ComposerInput {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
             .text_size(px(INPUT_TEXT_SIZE))
             .line_height(px(INPUT_LINE_HEIGHT))
@@ -3260,6 +3444,53 @@ mod tests {
         );
         // Zero lines still measures one.
         assert_eq!(input_content_height(0), INPUT_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn input_wheel_scroll_uses_gpui_direction_and_clamps() {
+        // Positive wheel delta moves toward the start; negative moves down.
+        assert_eq!(input_scroll_offset(40.0, 20.0, 200.0, 100.0), 20.0);
+        assert_eq!(input_scroll_offset(40.0, -30.0, 200.0, 100.0), 70.0);
+        // Neither edge can be overscrolled.
+        assert_eq!(input_scroll_offset(10.0, 50.0, 200.0, 100.0), 0.0);
+        assert_eq!(input_scroll_offset(90.0, -50.0, 200.0, 100.0), 100.0);
+        // Short content has no internal scroll range.
+        assert_eq!(input_scroll_offset(20.0, -50.0, 80.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn input_scroll_reveals_only_when_caret_leaves_viewport() {
+        // A visible caret preserves the user's viewport.
+        assert_eq!(
+            input_scroll_offset_for_cursor(40.0, 60.0, 20.0, 300.0, 100.0),
+            40.0
+        );
+        // Moving above or below reveals the row with the smallest adjustment.
+        assert_eq!(
+            input_scroll_offset_for_cursor(80.0, 30.0, 20.0, 300.0, 100.0),
+            30.0
+        );
+        assert_eq!(
+            input_scroll_offset_for_cursor(20.0, 130.0, 20.0, 300.0, 100.0),
+            50.0
+        );
+        // Revealing the final row clamps exactly to the content end.
+        assert_eq!(
+            input_scroll_offset_for_cursor(0.0, 290.0, 20.0, 300.0, 100.0),
+            200.0
+        );
+    }
+
+    #[test]
+    fn input_drag_autoscroll_is_edge_proportional_and_capped() {
+        let top = 100.0;
+        let bottom = 300.0;
+        let line = INPUT_LINE_HEIGHT;
+        assert_eq!(input_drag_scroll_delta(200.0, top, bottom, line), 0.0);
+        assert_eq!(input_drag_scroll_delta(90.0, top, bottom, line), -2.0);
+        assert_eq!(input_drag_scroll_delta(315.0, top, bottom, line), 3.0);
+        assert_eq!(input_drag_scroll_delta(-100.0, top, bottom, line), -line);
+        assert_eq!(input_drag_scroll_delta(500.0, top, bottom, line), line);
     }
 
     /// One frame short of the full morph timeline (never rounds up to done).
