@@ -52,8 +52,8 @@ use futures::stream::BoxStream;
 use serde::Deserialize;
 use tokio::sync::watch;
 
-use comet_doc::SessionCommandPayload;
-use comet_proto::{ChatConfig, HarnessId};
+use comet_doc::{MessagePart, SessionCommandPayload};
+use comet_proto::{ChatConfig, HarnessId, ToolCall};
 use comet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -124,6 +124,36 @@ struct DeleteWorktreeParams {
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileSearchParams {
+    query: String,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    space_id: Option<String>,
+    /// Existing linked worktree selected for a new chat. The engine accepts it
+    /// only after verifying it against the space repository's worktree list.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+fn tool_file_path(call: &ToolCall) -> Option<&str> {
+    match call {
+        ToolCall::ReadFile { path }
+        | ToolCall::WriteFile { path, .. }
+        | ToolCall::EditFile { path, .. } => Some(path),
+        ToolCall::ApplyPatch { path } | ToolCall::Search { path, .. } => path.as_deref(),
+        ToolCall::Exec { .. }
+        | ToolCall::Glob { .. }
+        | ToolCall::WebFetch { .. }
+        | ToolCall::WebSearch { .. }
+        | ToolCall::Todo { .. }
+        | ToolCall::Mcp { .. }
+        | ToolCall::Unknown { .. } => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,6 +416,103 @@ impl EngineRpc {
             .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
     }
 
+    /// Resolve a mention-search root from synced workspace rows. A client may
+    /// name an existing linked worktree for a new chat, but it is verified
+    /// against the space repository before any filesystem walk begins.
+    async fn file_search_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
+        let local_device = self.doc_host.device_id();
+        match (&p.chat_id, &p.space_id) {
+            (Some(_), Some(_)) | (None, None) => Err(RpcError::BadParams(
+                "SearchFiles needs exactly one of chatId or spaceId".into(),
+            )),
+            (Some(chat_id), None) => {
+                if p.path.is_some() {
+                    return Err(RpcError::BadParams(
+                        "SearchFiles path applies only to a space".into(),
+                    ));
+                }
+                let chat = self
+                    .workspace
+                    .doc()
+                    .chat(chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                if chat.device_id != local_device {
+                    return Err(RpcError::Failed("chat belongs to another device".into()));
+                }
+                chat.cwd
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))
+            }
+            (None, Some(space_id)) => {
+                let space = self
+                    .workspace
+                    .doc()
+                    .space(space_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("space not found".into()))?;
+                if space.device_id != local_device {
+                    return Err(RpcError::Failed("space belongs to another device".into()));
+                }
+                let space_path = std::path::PathBuf::from(&space.path);
+                let Some(requested) = p.path.as_deref() else {
+                    return Ok(space_path);
+                };
+                let requested = std::path::PathBuf::from(requested);
+                let same_as_space = std::fs::canonicalize(&space_path)
+                    .ok()
+                    .zip(std::fs::canonicalize(&requested).ok())
+                    .is_some_and(|(space, requested)| space == requested);
+                if same_as_space || self.repos.is_linked_worktree(&space_path, &requested).await {
+                    Ok(requested)
+                } else {
+                    Err(RpcError::BadParams(
+                        "SearchFiles path is not a workspace checkout".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Most-recent-first paths the current chat actually touched, followed by
+    /// files still changed in its checkout. The search worker validates and
+    /// normalizes them against the resolved root before using them as ranking
+    /// hints, so stale or out-of-workspace tool paths simply disappear.
+    fn featured_file_paths(&self, chat_id: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        if let Ok(handle) = self.doc_host.open(chat_id)
+            && let Ok(entries) = handle.doc().read_entries()
+        {
+            for entry in entries.into_iter().rev() {
+                for part in entry.parts.into_iter().rev() {
+                    if let MessagePart::Tool { call, .. } = part
+                        && let Some(path) = tool_file_path(&call)
+                        && !path.trim().is_empty()
+                    {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+
+        if let Ok(Some(chat)) = self.workspace.doc().chat(chat_id) {
+            let diffs = self.diff_sync.watch_diffs().borrow().clone();
+            let diff = chat
+                .checkout_id
+                .as_deref()
+                .and_then(|id| diffs.iter().find(|diff| diff.checkout_id == id))
+                .or_else(|| {
+                    chat.cwd
+                        .as_deref()
+                        .and_then(|cwd| diffs.iter().find(|diff| diff.cwd == cwd))
+                });
+            if let Some(diff) = diff {
+                paths.extend(diff.files.iter().map(|file| file.path.clone()));
+            }
+        }
+        paths
+    }
+
     /// Forward a device-addressed call over the target device's relay. On transport
     /// failure the cached link is invalidated so the next call re-dials.
     async fn forward(
@@ -559,6 +686,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_REFS
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::SEARCH_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -877,6 +1005,27 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
+            methods::SEARCH_FILES => {
+                let p: FileSearchParams = parse_params(params)?;
+                if p.query.chars().count() > 256 {
+                    return Err(RpcError::BadParams(
+                        "SearchFiles query must not exceed 256 characters".into(),
+                    ));
+                }
+                let root = self.file_search_root(&p).await?;
+                let featured_paths = p
+                    .chat_id
+                    .as_deref()
+                    .filter(|_| p.query.is_empty())
+                    .map(|chat_id| self.featured_file_paths(chat_id))
+                    .unwrap_or_default();
+                let matches = self
+                    .repos
+                    .search_files(root, p.query, featured_paths)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&matches)
+            }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
                 let worktree = self
@@ -1069,5 +1218,24 @@ mod tests {
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        assert!(forwardable(methods::SEARCH_FILES));
+    }
+
+    #[test]
+    fn tool_file_paths_keep_workspace_activity_only() {
+        assert_eq!(
+            tool_file_path(&ToolCall::EditFile {
+                path: "src/main.rs".into(),
+                old_string: None,
+                new_string: None,
+            }),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            tool_file_path(&ToolCall::Exec {
+                command: "cargo test".into(),
+            }),
+            None
+        );
     }
 }

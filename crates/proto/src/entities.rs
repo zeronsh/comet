@@ -236,6 +236,16 @@ pub struct FolderListing {
     pub truncated: bool,
 }
 
+/// A workspace-relative file or directory returned by `SearchFiles`.
+/// Contents deliberately never cross this boundary: mentioning a path leaves
+/// the harness to read it through its normal workspace tools when needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSearchMatch {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffFileSummary {

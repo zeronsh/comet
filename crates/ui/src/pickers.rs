@@ -317,7 +317,12 @@ impl Pickers {
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
             // Pasted images/files don't apply to a search box.
-            ComposerInputEvent::PastedImages(_) | ComposerInputEvent::PastedPaths(_) => {}
+            ComposerInputEvent::PastedImages(_)
+            | ComposerInputEvent::PastedPaths(_)
+            | ComposerInputEvent::CursorMoved
+            | ComposerInputEvent::MentionNavigate(_)
+            | ComposerInputEvent::MentionAccept
+            | ComposerInputEvent::MentionDismiss => {}
         });
         // Chat selection / config changes must re-render the chips (child views
         // only re-render on their own notify). A selection change also drops
