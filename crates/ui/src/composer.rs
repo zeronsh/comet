@@ -666,9 +666,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-cmd-right", SelectEnd, ctx),
         KeyBinding::new("shift-cmd-up", SelectDocStart, ctx),
         KeyBinding::new("shift-cmd-down", SelectDocEnd, ctx),
-        // Deletion by word / to the line edge (Opt+Delete, Cmd+Delete).
-        KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
-        KeyBinding::new("alt-delete", DeleteWordRight, ctx),
+        // Line-edge deletion (Cmd+Delete on macOS).
         KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
         KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
     ];
@@ -676,22 +674,42 @@ pub fn init(cx: &mut App) {
         bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, ctx));
         bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, ctx));
     }
-    // Word navigation and clipboard: bind both modifier conventions so the same
-    // map works across platforms.
-    for prefix in ["ctrl", "alt"] {
-        bindings.push(KeyBinding::new(&format!("{prefix}-left"), WordLeft, ctx));
-        bindings.push(KeyBinding::new(&format!("{prefix}-right"), WordRight, ctx));
-        bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-left"),
-            SelectWordLeft,
-            ctx,
-        ));
-        bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-right"),
-            SelectWordRight,
-            ctx,
-        ));
-    }
+    // Word-level editing: Option on macOS, Ctrl on Windows/Linux.
+    let word_edit_prefix = if cfg!(target_os = "macos") {
+        "alt"
+    } else {
+        "ctrl"
+    };
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-backspace"),
+        DeleteWordLeft,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-delete"),
+        DeleteWordRight,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-left"),
+        WordLeft,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-right"),
+        WordRight,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-left"),
+        SelectWordLeft,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-right"),
+        SelectWordRight,
+        ctx,
+    ));
     for prefix in ["cmd", "ctrl"] {
         bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, ctx));
@@ -717,31 +735,38 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-right", End, palette),
         KeyBinding::new("shift-cmd-left", SelectHome, palette),
         KeyBinding::new("shift-cmd-right", SelectEnd, palette),
-        KeyBinding::new("alt-backspace", DeleteWordLeft, palette),
         KeyBinding::new("cmd-backspace", DeleteToLineStart, palette),
     ];
-    for prefix in ["ctrl", "alt"] {
-        palette_bindings.push(KeyBinding::new(
-            &format!("{prefix}-left"),
-            WordLeft,
-            palette,
-        ));
-        palette_bindings.push(KeyBinding::new(
-            &format!("{prefix}-right"),
-            WordRight,
-            palette,
-        ));
-        palette_bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-left"),
-            SelectWordLeft,
-            palette,
-        ));
-        palette_bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-right"),
-            SelectWordRight,
-            palette,
-        ));
-    }
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-backspace"),
+        DeleteWordLeft,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-delete"),
+        DeleteWordRight,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-left"),
+        WordLeft,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-right"),
+        WordRight,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-left"),
+        SelectWordLeft,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-right"),
+        SelectWordRight,
+        palette,
+    ));
     for prefix in ["cmd", "ctrl"] {
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, palette));
