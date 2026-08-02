@@ -10,12 +10,13 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, DispatchPhase,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
+    DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
     ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
@@ -622,6 +623,12 @@ const UNDO_COALESCE: Duration = Duration::from_millis(700);
 /// Cap on retained undo steps — a long-lived composer must not grow forever.
 const UNDO_LIMIT: usize = 200;
 
+/// Invisible but shaped em-space reserved for the SVG painted beside every
+/// mention label. Keeping this in the projection makes the icon participate in
+/// wrapping, hit testing, and selection without changing the raw Markdown.
+const MENTION_ICON_SLOT: &str = "\u{2003}";
+const MENTION_SIDE_PAD: &str = "\u{00A0}";
+
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
 #[derive(Clone)]
@@ -639,6 +646,7 @@ struct FileMentionLink {
     range: Range<usize>,
     basename: String,
     path: String,
+    is_dir: bool,
 }
 
 fn percent_encode_path(path: &str) -> String {
@@ -678,7 +686,8 @@ fn escape_mention_label(label: &str) -> String {
         .replace(']', "\\]")
 }
 
-fn local_file_link(path: &str) -> String {
+fn local_file_link(path: &str, is_dir: bool) -> String {
+    let path = path.trim_end_matches('/');
     let basename = path
         .rsplit('/')
         .next()
@@ -687,7 +696,7 @@ fn local_file_link(path: &str) -> String {
     format!(
         "[{}]({})",
         escape_mention_label(basename),
-        percent_encode_path(path)
+        percent_encode_path(&format!("{path}{}", if is_dir { "/" } else { "" }))
     )
 }
 
@@ -732,20 +741,24 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         let end = target_start + relative_end + 1;
         let label = &text[start + 1..label_end];
         let encoded = &text[target_start..end - 1];
-        let parsed = percent_decode_path(encoded).filter(|path| {
-            local_path_is_safe(path)
-                && percent_encode_path(path) == encoded
+        let parsed = percent_decode_path(encoded).and_then(|target| {
+            let is_dir = target.ends_with('/');
+            let path = target.strip_suffix('/').unwrap_or(&target);
+            (local_path_is_safe(path)
+                && percent_encode_path(&target) == encoded
                 && path
                     .rsplit('/')
                     .next()
-                    .is_some_and(|basename| escape_mention_label(basename) == label)
+                    .is_some_and(|basename| escape_mention_label(basename) == label))
+            .then(|| (path.to_string(), is_dir))
         });
-        if let Some(path) = parsed {
+        if let Some((path, is_dir)) = parsed {
             let basename = path.rsplit('/').next().unwrap_or_default().to_string();
             links.push(FileMentionLink {
                 range: start..end,
                 basename,
                 path,
+                is_dir,
             });
         }
         search = end;
@@ -767,10 +780,12 @@ impl TextProjection {
         for link in links {
             projection.display.push_str(&raw[raw_at..link.range.start]);
             let display_start = projection.display.len();
-            // Text runs cannot host a rounded inline element, but non-breaking
-            // side bearings give the tinted run the compact padding of a chip
-            // and keep names containing spaces together when the line wraps.
-            projection.display.push('\u{00A0}');
+            // Text runs cannot host an inline element. Reserve a stable
+            // em-space for the SVG which `ComposerTextElement::paint`
+            // draws into, then retain non-breaking side bearings around it.
+            projection.display.push_str(MENTION_SIDE_PAD);
+            projection.display.push_str(MENTION_ICON_SLOT);
+            projection.display.push('\u{202F}');
             for ch in link.basename.chars() {
                 projection
                     .display
@@ -1150,8 +1165,14 @@ impl ComposerInput {
     }
 
     /// Replace a completed `@query` token as one non-coalescing undo step.
-    pub fn replace_mention(&mut self, range: Range<usize>, path: &str, cx: &mut Context<Self>) {
-        let path = local_file_link(path);
+    pub fn replace_mention(
+        &mut self,
+        range: Range<usize>,
+        path: &str,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let path = local_file_link(path, is_dir);
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
         let inserted = if existing_separator.is_some() {
@@ -1682,7 +1703,13 @@ impl ComposerInput {
 
     /// Content-local point for a byte index (y grows down from content top).
     fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
-        let index = self.projection.raw_to_display(index);
+        self.point_for_display_index(self.projection.raw_to_display(index))
+    }
+
+    /// Content-local point for a shaped projection byte index. The icon layer
+    /// uses this to occupy its explicit projection slot without inventing a
+    /// second coordinate system beside the custom text editor.
+    fn point_for_display_index(&self, index: usize) -> Option<Point<Pixels>> {
         for (line_ix, line) in self.last_lines.iter().enumerate() {
             let line_start = *self.line_starts.get(line_ix)?;
             let line_len = line.len();
@@ -2178,9 +2205,31 @@ struct ComposerTextElement {
     max_content_height: f32,
 }
 
+struct MentionPathTooltip {
+    path: SharedString,
+}
+
+impl Render for MentionPathTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(self.path.clone())
+    }
+}
+
 struct ComposerTextPrepaint {
     cursor: Option<PaintQuad>,
     mention_quads: Vec<PaintQuad>,
+    mention_icons: Vec<(Bounds<Pixels>, &'static str)>,
     selection_quads: Vec<PaintQuad>,
 }
 
@@ -2234,7 +2283,7 @@ impl gpui::Element for ComposerTextElement {
         _inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _state: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.input.update(cx, |input, _| {
@@ -2248,7 +2297,9 @@ impl gpui::Element for ComposerTextElement {
         let mention_color = Theme::of(cx).accent.opacity(0.22);
 
         let mut mention_quads = Vec::new();
-        for (mention, _) in &input.projection.mentions {
+        let mut mention_icons = Vec::new();
+        let mut hovered_mention = None;
+        for (mention, display) in &input.projection.mentions {
             let (Some(start), Some(end)) = (
                 input.point_for_index(mention.range.start),
                 input.point_for_index(mention.range.end),
@@ -2258,19 +2309,59 @@ impl gpui::Element for ComposerTextElement {
             if start.y != end.y {
                 continue;
             }
-            mention_quads.push(quad(
-                Bounds::from_corners(
-                    point(origin.x + start.x, origin.y + start.y + px(2.0)),
-                    point(
-                        origin.x + end.x,
-                        origin.y + start.y + input.line_height - px(2.0),
-                    ),
+            let chip_bounds = Bounds::from_corners(
+                point(origin.x + start.x, origin.y + start.y + px(2.0)),
+                point(
+                    origin.x + end.x,
+                    origin.y + start.y + input.line_height - px(2.0),
                 ),
+            );
+            mention_quads.push(quad(
+                chip_bounds,
                 px(5.0),
                 mention_color,
                 px(0.0),
                 gpui::transparent_black(),
                 BorderStyle::default(),
+            ));
+            if bounds.contains(&window.mouse_position())
+                && chip_bounds.contains(&window.mouse_position())
+            {
+                hovered_mention = Some((
+                    chip_bounds,
+                    SharedString::from(format!(
+                        "{}{}",
+                        mention.path,
+                        if mention.is_dir { "/" } else { "" }
+                    )),
+                ));
+            }
+            let slot_start = display.start + MENTION_SIDE_PAD.len();
+            let slot_end = slot_start + MENTION_ICON_SLOT.len();
+            let (Some(slot_start), Some(slot_end)) = (
+                input.point_for_display_index(slot_start),
+                input.point_for_display_index(slot_end),
+            ) else {
+                continue;
+            };
+            if slot_start.y != slot_end.y {
+                continue;
+            }
+            let slot_width = (slot_end.x - slot_start.x).max(px(8.0));
+            let icon_size = slot_width.min(px(12.0));
+            mention_icons.push((
+                Bounds::new(
+                    point(
+                        origin.x + slot_start.x + (slot_width - icon_size) / 2.0,
+                        origin.y + slot_start.y + (input.line_height - icon_size) / 2.0,
+                    ),
+                    size(icon_size, icon_size),
+                ),
+                if mention.is_dir {
+                    crate::icons::FOLDER
+                } else {
+                    crate::icons::DOCUMENT
+                },
             ));
         }
         let mut selection_quads = Vec::new();
@@ -2330,9 +2421,20 @@ impl gpui::Element for ComposerTextElement {
                 ));
             }
         }
+        if let Some((chip_bounds, path)) = hovered_mention {
+            let view = cx.new(|_| MentionPathTooltip { path }).into();
+            window.set_tooltip(AnyTooltip {
+                view,
+                mouse_position: window.mouse_position(),
+                check_visible_and_update: Rc::new(move |_, window, _| {
+                    chip_bounds.contains(&window.mouse_position())
+                }),
+            });
+        }
         ComposerTextPrepaint {
             cursor,
             mention_quads,
+            mention_icons,
             selection_quads,
         }
     }
@@ -2354,9 +2456,15 @@ impl gpui::Element for ComposerTextElement {
             cx,
         );
         let input = self.input.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-            if phase == DispatchPhase::Bubble && event.pressed_button == Some(MouseButton::Left) {
-                input.update(cx, |input, cx| input.on_mouse_move(event, cx));
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    input.update(cx, |input, cx| input.on_mouse_move(event, cx));
+                } else {
+                    // Hover-only movement does not mutate the input entity, so
+                    // explicitly refresh to update mention tooltip hit testing.
+                    window.refresh();
+                }
             }
         });
 
@@ -2389,6 +2497,18 @@ impl gpui::Element for ComposerTextElement {
                     cx,
                 );
                 y += height;
+            }
+            // The icon paints after the filename text so selection washes and
+            // glyphs cannot cover it; its em-space slot is blank text.
+            for (bounds, icon) in prepaint.mention_icons.drain(..) {
+                let _ = window.paint_svg(
+                    bounds,
+                    SharedString::from(icon),
+                    None,
+                    gpui::TransformationMatrix::default(),
+                    Theme::of(cx).text_muted,
+                    cx,
+                );
             }
             // Caret only when this input is actually focused in an active
             // window (Electron hides it on window deactivation too), and only
@@ -2991,16 +3111,16 @@ impl Composer {
         let Some(token) = self.mention.token.clone() else {
             return;
         };
-        let Some(path) = self
+        let Some((path, is_dir)) = self
             .mention
             .active
             .and_then(|active| self.mention.results.get(active))
-            .map(|result| result.path.clone())
+            .map(|result| (result.path.clone(), result.is_dir))
         else {
             return;
         };
         self.input.update(cx, |input, cx| {
-            input.replace_mention(token.range, &path, cx)
+            input.replace_mention(token.range, &path, is_dir, cx)
         });
         self.mention = FileMentionState::default();
         self.sync_mention_controls(cx);
@@ -4409,12 +4529,19 @@ mod tests {
 
     #[test]
     fn file_mentions_serialize_to_strict_local_markdown() {
-        let raw = local_file_link("src/a file#[x].rs");
+        let raw = local_file_link("src/a file#[x].rs", false);
         assert_eq!(raw, "[a file#\\[x\\].rs](src/a%20file%23%5Bx%5D.rs)");
         let links = file_mention_links(&raw);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].path, "src/a file#[x].rs");
         assert_eq!(links[0].basename, "a file#[x].rs");
+        assert!(!links[0].is_dir);
+
+        let folder = local_file_link("src/components", true);
+        assert_eq!(folder, "[components](src/components/)");
+        let links = file_mention_links(&folder);
+        assert_eq!(links[0].path, "src/components");
+        assert!(links[0].is_dir);
     }
 
     #[test]
@@ -4429,12 +4556,17 @@ mod tests {
 
     #[test]
     fn projection_maps_and_expands_atomic_chip_ranges() {
-        let raw = format!("open {} now", local_file_link("src/composer.rs"));
+        let raw = format!("open {} now", local_file_link("src/composer.rs", false));
         let projection = TextProjection::new(&raw);
         let (link, chip) = &projection.mentions[0];
         assert_eq!(
             &projection.display[chip.clone()],
-            "\u{00A0}composer.rs\u{00A0}"
+            "\u{00A0}\u{2003}\u{202F}composer.rs\u{00A0}"
+        );
+        assert_eq!(
+            &projection.display[chip.start + MENTION_SIDE_PAD.len()
+                ..chip.start + MENTION_SIDE_PAD.len() + MENTION_ICON_SLOT.len()],
+            MENTION_ICON_SLOT
         );
         assert_eq!(projection.display_to_raw(chip.start + 1), link.range.start);
         assert_eq!(projection.display_to_raw(chip.end - 1), link.range.end);
