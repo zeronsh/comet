@@ -881,7 +881,7 @@ fn register_selection_listeners(
 /// text's own geometry. `pad_x` overhangs the box horizontally (inline code);
 /// `inset_y` shrinks it vertically — both 0 for a selection wash, which wants
 /// full-line-height boxes that tile seamlessly across wrapped rows.
-fn range_rects(
+pub(crate) fn range_rects(
     layout: &gpui::TextLayout,
     range: &Range<usize>,
     pad_x: f32,

@@ -1021,6 +1021,51 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
         .collect()
 }
 
+/// One chip in a *sent* message: its byte range over the projected display
+/// string, the em-space slot the icon paints into, and which icon. The
+/// transcript renders these read-only — no editing state, no tooltip machinery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMentionSpan {
+    pub range: Range<usize>,
+    pub icon_slot: Range<usize>,
+    /// Full workspace-relative path (labels can be shortened to basenames).
+    pub path: SharedString,
+    pub is_dir: bool,
+}
+
+/// Project a sent message's raw Markdown for transcript display: mention links
+/// collapse to the same chip labels the composer shows, everything else passes
+/// through untouched. `None` when the text has no valid mention — the
+/// substring probe keeps ordinary prompts on the zero-allocation path, so this
+/// is safe to call for every user row.
+pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)> {
+    if !raw.contains(FILE_MENTION_SCHEME) {
+        return None;
+    }
+    let projection = TextProjection::new(raw);
+    if projection.mentions.is_empty() {
+        return None;
+    }
+    let spans = projection
+        .mentions
+        .iter()
+        .map(|(link, display)| {
+            let icon_start = display.start + MENTION_SIDE_PAD.len();
+            SentMentionSpan {
+                range: display.clone(),
+                icon_slot: icon_start..icon_start + MENTION_ICON_SLOT.len(),
+                path: SharedString::from(format!(
+                    "{}{}",
+                    link.path,
+                    if link.is_dir { "/" } else { "" }
+                )),
+                is_dir: link.is_dir,
+            }
+        })
+        .collect();
+    Some((projection.display, spans))
+}
+
 /// Direction of the last edit — a run only merges with edits of its own kind.
 #[derive(Clone, Copy, PartialEq)]
 enum EditKind {
@@ -5175,6 +5220,46 @@ mod tests {
         assert_eq!(
             projection.normalize_range(link.range.start + 2..link.range.end - 2),
             link.range
+        );
+    }
+
+    #[test]
+    fn sent_mention_display_projects_chips_for_the_transcript() {
+        let raw = format!(
+            "check {} and {}",
+            local_file_link("src/composer.rs", false),
+            local_file_link("src/components", true)
+        );
+        let (display, spans) = sent_mention_display(&raw).expect("mentions project");
+        assert!(!display.contains(FILE_MENTION_SCHEME));
+        assert!(display.contains("composer.rs"));
+        assert!(display.contains("components"));
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            &display[spans[0].range.clone()],
+            "\u{00A0}\u{2003}\u{202F}composer.rs\u{00A0}"
+        );
+        assert_eq!(&display[spans[0].icon_slot.clone()], MENTION_ICON_SLOT);
+        assert!(!spans[0].is_dir);
+        assert_eq!(spans[0].path.as_ref(), "src/composer.rs");
+        assert!(spans[1].is_dir);
+        assert_eq!(spans[1].path.as_ref(), "src/components/");
+    }
+
+    /// Ordinary prompts must stay on the zero-cost path, including ones that
+    /// merely *talk about* the scheme without containing a valid mention.
+    #[test]
+    fn sent_mention_display_leaves_plain_prompts_untouched() {
+        assert_eq!(sent_mention_display("fix the composer"), None);
+        assert_eq!(
+            sent_mention_display("what is a comet-file: link?"),
+            None,
+            "scheme substring without a valid mention link"
+        );
+        assert_eq!(
+            sent_mention_display("[a.rs](comet-file:../a.rs)"),
+            None,
+            "a hostile path never becomes a chip in the transcript either"
         );
     }
 
