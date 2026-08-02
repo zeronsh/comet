@@ -627,6 +627,8 @@ const UNDO_LIMIT: usize = 200;
 /// mention label. Keeping this in the projection makes the icon participate in
 /// wrapping, hit testing, and selection without changing the raw Markdown.
 const MENTION_ICON_SLOT: &str = "\u{2003}";
+const MENTION_TOOLTIP_DELAY: Duration = Duration::from_millis(420);
+const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
 
 /// A restorable point in the input's history: text plus where the caret and
@@ -770,6 +772,110 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
 struct TextProjection {
     display: String,
     mentions: Vec<(FileMentionLink, Range<usize>)>,
+}
+
+/// A path alone is not enough: two identical relative paths can appear in a
+/// draft, so the raw range remains part of the hover identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionTooltipTarget {
+    range: Range<usize>,
+    path: SharedString,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MentionTooltipPhase {
+    Hidden,
+    Waiting {
+        target: MentionTooltipTarget,
+        generation: u64,
+    },
+    Visible {
+        target: MentionTooltipTarget,
+        generation: u64,
+    },
+}
+
+impl MentionTooltipPhase {
+    fn target(&self) -> Option<&MentionTooltipTarget> {
+        match self {
+            Self::Hidden => None,
+            Self::Waiting { target, .. } | Self::Visible { target, .. } => Some(target),
+        }
+    }
+}
+
+/// Pure tooltip lifecycle reducer. Pointer motion restarts a waiting timer;
+/// after promotion, ordinary motion inside the same chip keeps the tooltip
+/// stable so the popup does not flicker while it is visible.
+fn mention_tooltip_reduce(
+    phase: MentionTooltipPhase,
+    pointer_target: Option<MentionTooltipTarget>,
+    pointer_in_popup: bool,
+    generation: u64,
+) -> MentionTooltipPhase {
+    match pointer_target {
+        Some(target)
+            if phase.target() == Some(&target)
+                && matches!(phase, MentionTooltipPhase::Visible { .. }) =>
+        {
+            phase
+        }
+        Some(target) => MentionTooltipPhase::Waiting { target, generation },
+        None if pointer_in_popup && matches!(phase, MentionTooltipPhase::Visible { .. }) => phase,
+        None => MentionTooltipPhase::Hidden,
+    }
+}
+
+fn mention_tooltip_promote(
+    phase: MentionTooltipPhase,
+    generation: u64,
+    target_is_live: bool,
+) -> MentionTooltipPhase {
+    match phase {
+        MentionTooltipPhase::Waiting {
+            target,
+            generation: current,
+        } if current == generation && target_is_live => MentionTooltipPhase::Visible {
+            target,
+            generation: current,
+        },
+        MentionTooltipPhase::Waiting {
+            generation: current,
+            ..
+        } if current == generation => MentionTooltipPhase::Hidden,
+        phase => phase,
+    }
+}
+
+fn mention_tooltip_contains(in_chip: bool, in_popup: bool) -> bool {
+    in_chip || in_popup
+}
+
+fn display_row_segments(
+    range: Range<usize>,
+    row_ends: impl IntoIterator<Item = usize>,
+) -> Vec<(usize, usize, Range<usize>)> {
+    let mut segments = Vec::new();
+    let mut row_start = 0usize;
+    for (row_ix, row_end) in row_ends.into_iter().enumerate() {
+        let start = range.start.max(row_start);
+        let end = range.end.min(row_end);
+        if start < end {
+            segments.push((row_ix, row_start, start..end));
+        }
+        row_start = row_end;
+        if row_start >= range.end {
+            break;
+        }
+    }
+    segments
+}
+
+#[derive(Debug, Clone)]
+struct MentionHit {
+    target: MentionTooltipTarget,
+    bounds: Bounds<Pixels>,
+    anchor: Point<Pixels>,
 }
 
 impl TextProjection {
@@ -1070,6 +1176,16 @@ pub struct ComposerInput {
     /// mention token is active, keeping input focus and native text editing.
     mention_open: bool,
     mention_has_selection: bool,
+    /// Last prepainted chip bounds; the paint-phase pointer listener uses
+    /// these instead of attempting to infer text geometry from the cursor.
+    mention_hits: Vec<MentionHit>,
+    mention_tooltip: MentionTooltipPhase,
+    mention_tooltip_generation: u64,
+    mention_tooltip_popup: Option<Bounds<Pixels>>,
+    mention_tooltip_task: Option<Task<()>>,
+    /// Created once when Waiting promotes; retaining this entity preserves
+    /// GPUI's global animation state across prepaint frames.
+    mention_tooltip_view: Option<Entity<MentionPathTooltip>>,
 }
 
 impl ComposerInput {
@@ -1116,6 +1232,12 @@ impl ComposerInput {
             last_edit: None,
             mention_open: false,
             mention_has_selection: false,
+            mention_hits: Vec::new(),
+            mention_tooltip: MentionTooltipPhase::Hidden,
+            mention_tooltip_generation: 0,
+            mention_tooltip_popup: None,
+            mention_tooltip_task: None,
+            mention_tooltip_view: None,
         }
     }
 
@@ -1172,6 +1294,7 @@ impl ComposerInput {
         is_dir: bool,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_mention_tooltip();
         let path = local_file_link(path, is_dir);
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
@@ -1220,6 +1343,7 @@ impl ComposerInput {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.invalidate_mention_tooltip();
         self.content = text.into();
         let end = self.content.len();
         self.selected_range = end..end;
@@ -1235,6 +1359,131 @@ impl ComposerInput {
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
+    }
+
+    fn invalidate_mention_tooltip(&mut self) {
+        self.mention_tooltip_generation = self.mention_tooltip_generation.wrapping_add(1);
+        self.mention_tooltip = MentionTooltipPhase::Hidden;
+        self.mention_tooltip_popup = None;
+        self.mention_tooltip_task = None;
+        self.mention_tooltip_view = None;
+    }
+
+    fn set_mention_hits(&mut self, hits: Vec<MentionHit>) {
+        self.mention_hits = hits;
+        let live = self
+            .mention_tooltip
+            .target()
+            .is_none_or(|target| self.mention_hits.iter().any(|hit| &hit.target == target));
+        if !live {
+            self.invalidate_mention_tooltip();
+        }
+    }
+
+    fn start_mention_tooltip_wait(&mut self, target: MentionTooltipTarget, cx: &mut Context<Self>) {
+        self.mention_tooltip_generation = self.mention_tooltip_generation.wrapping_add(1);
+        let generation = self.mention_tooltip_generation;
+        self.mention_tooltip = MentionTooltipPhase::Waiting { target, generation };
+        self.mention_tooltip_popup = None;
+        self.mention_tooltip_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MENTION_TOOLTIP_DELAY).await;
+            this.update(cx, |input, cx| {
+                let live = input.mention_tooltip.target().is_some_and(|target| {
+                    input.mention_hits.iter().any(|hit| &hit.target == target)
+                });
+                let next = mention_tooltip_promote(input.mention_tooltip.clone(), generation, live);
+                if next != input.mention_tooltip {
+                    input.mention_tooltip = next;
+                    input.mention_tooltip_task = None;
+                    if let MentionTooltipPhase::Visible { target, generation } =
+                        &input.mention_tooltip
+                    {
+                        input.mention_tooltip_view = Some(cx.new(|_| MentionPathTooltip {
+                            path: target.path.clone(),
+                            activation: *generation,
+                        }));
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn on_mention_pointer_move(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.is_selecting {
+            self.invalidate_mention_tooltip();
+            return;
+        }
+        let target = self
+            .mention_hits
+            .iter()
+            .find(|hit| hit.bounds.contains(&position))
+            .map(|hit| hit.target.clone());
+        let in_popup = self
+            .mention_tooltip_popup
+            .is_some_and(|popup| popup.contains(&position));
+        let next_generation = self.mention_tooltip_generation.wrapping_add(1);
+        let next = mention_tooltip_reduce(
+            self.mention_tooltip.clone(),
+            target.clone(),
+            in_popup,
+            next_generation,
+        );
+        if next == self.mention_tooltip {
+            return;
+        }
+        match next {
+            MentionTooltipPhase::Waiting { target, .. } => {
+                self.start_mention_tooltip_wait(target, cx)
+            }
+            _ => {
+                self.invalidate_mention_tooltip();
+                self.mention_tooltip = next;
+                cx.notify();
+            }
+        }
+    }
+
+    fn visible_mention_tooltip(
+        &self,
+    ) -> Option<(
+        MentionTooltipTarget,
+        Point<Pixels>,
+        u64,
+        Entity<MentionPathTooltip>,
+    )> {
+        let MentionTooltipPhase::Visible { target, generation } = &self.mention_tooltip else {
+            return None;
+        };
+        self.mention_hits
+            .iter()
+            .find(|hit| hit.target == *target)
+            .and_then(|hit| {
+                let view = self.mention_tooltip_view.clone()?;
+                Some((target.clone(), hit.anchor, *generation, view))
+            })
+    }
+
+    fn check_mention_tooltip_visibility(
+        &mut self,
+        popup: Bounds<Pixels>,
+        pointer: Point<Pixels>,
+    ) -> bool {
+        let Some((target, _, _, _)) = self.visible_mention_tooltip() else {
+            return false;
+        };
+        let in_chip = self
+            .mention_hits
+            .iter()
+            .any(|hit| hit.target == target && hit.bounds.contains(&pointer));
+        if mention_tooltip_contains(in_chip, popup.contains(&pointer)) {
+            self.mention_tooltip_popup = Some(popup);
+            true
+        } else {
+            self.invalidate_mention_tooltip();
+            false
+        }
     }
 
     // ---- undo history ----
@@ -1288,6 +1537,7 @@ impl ComposerInput {
     }
 
     fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+        self.invalidate_mention_tooltip();
         self.content = snapshot.content;
         self.selected_range = snapshot.selected_range;
         self.selection_reversed = snapshot.selection_reversed;
@@ -1730,6 +1980,56 @@ impl ComposerInput {
         None
     }
 
+    /// Content-local boxes occupied by a projected byte range, split at every
+    /// soft wrap. A caret exactly at a wrap boundary belongs visually to both
+    /// rows in GPUI; using the explicit wrap indices lets the range's first
+    /// glyph start at x=0 on the new row instead of inheriting the old row's
+    /// end caret (which previously caused mention washes to be discarded).
+    fn bounds_for_display_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
+        let mut bounds = Vec::new();
+        let mut y_offset = px(0.0);
+        for (line_ix, line) in self.last_lines.iter().enumerate() {
+            let line_start = self.line_starts.get(line_ix).copied().unwrap_or(0);
+            let local_start = range.start.saturating_sub(line_start).min(line.len());
+            let local_end = range.end.saturating_sub(line_start).min(line.len());
+            if local_start >= local_end
+                || range.end <= line_start
+                || range.start >= line_start + line.len()
+            {
+                y_offset += line.size(self.line_height).height;
+                continue;
+            }
+
+            let row_ends = line
+                .wrap_boundaries()
+                .iter()
+                .map(|boundary| line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index)
+                .chain(std::iter::once(line.len()));
+            for (row_ix, row_start, segment) in
+                display_row_segments(local_start..local_end, row_ends)
+            {
+                let row_y = y_offset + self.line_height * row_ix;
+                let start_x = if segment.start == row_start {
+                    px(0.0)
+                } else {
+                    line.position_for_index(segment.start, self.line_height)
+                        .map(|point| point.x)
+                        .unwrap_or(px(0.0))
+                };
+                if let Some(end_point) = line.position_for_index(segment.end, self.line_height)
+                    && end_point.x > start_x
+                {
+                    bounds.push(Bounds::new(
+                        point(start_x, row_y),
+                        size(end_point.x - start_x, self.line_height),
+                    ));
+                }
+            }
+            y_offset += line.size(self.line_height).height;
+        }
+        bounds
+    }
+
     /// Byte index closest to a content-local point.
     fn index_for_point(&self, position: Point<Pixels>) -> usize {
         if self.display_is_placeholder {
@@ -1773,6 +2073,7 @@ impl ComposerInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_mention_tooltip();
         window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
         self.drag_position = Some(event.position);
@@ -1794,6 +2095,7 @@ impl ComposerInput {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        self.on_mention_pointer_move(event.position, cx);
         if self.is_selecting {
             self.drag_position = Some(event.position);
             let position = self.drag_selection_position(event.position);
@@ -1894,6 +2196,7 @@ impl ComposerInput {
         if next == self.scroll_top {
             return;
         }
+        self.invalidate_mention_tooltip();
         self.scroll_top = next;
         self.follow_cursor = false;
         cx.stop_propagation();
@@ -2111,6 +2414,7 @@ impl EntityInputHandler for ComposerInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = TextProjection::new(&self.content).normalize_range(range);
+        self.invalidate_mention_tooltip();
         // An IME commit is the tail of a composition whose pre-composition
         // snapshot was already taken (`replace_and_mark_text_in_range`);
         // recording here would pin undo to the half-composed text instead.
@@ -2142,6 +2446,7 @@ impl EntityInputHandler for ComposerInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = TextProjection::new(&self.content).normalize_range(range);
+        self.invalidate_mention_tooltip();
         // First keystroke of a composition: snapshot the text as it stood
         // before any of it existed, so one undo drops the whole composition.
         if self.marked_range.is_none() {
@@ -2207,22 +2512,30 @@ struct ComposerTextElement {
 
 struct MentionPathTooltip {
     path: SharedString,
+    /// Stable for one `Waiting → Visible` promotion; a later activation gets
+    /// a new key and therefore exactly one fresh fade-in.
+    activation: u64,
 }
 
 impl Render for MentionPathTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .font_family(theme.font_mono.clone())
-            .text_size(px(11.0))
-            .text_color(theme.text_muted)
-            .child(self.path.clone())
+        motion::fade_quick(
+            ("file-mention-path-tooltip", self.activation),
+            div()
+                .h(px(MENTION_TOOLTIP_HEIGHT))
+                .flex()
+                .items_center()
+                .px(px(8.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(theme.border_strong)
+                .bg(theme.surface_raised)
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(self.path.clone()),
+        )
     }
 }
 
@@ -2230,6 +2543,7 @@ struct ComposerTextPrepaint {
     cursor: Option<PaintQuad>,
     mention_quads: Vec<PaintQuad>,
     mention_icons: Vec<(Bounds<Pixels>, &'static str)>,
+    mention_hits: Vec<MentionHit>,
     selection_quads: Vec<PaintQuad>,
 }
 
@@ -2298,62 +2612,65 @@ impl gpui::Element for ComposerTextElement {
 
         let mut mention_quads = Vec::new();
         let mut mention_icons = Vec::new();
-        let mut hovered_mention = None;
+        let mut mention_hits = Vec::new();
         for (mention, display) in &input.projection.mentions {
-            let (Some(start), Some(end)) = (
-                input.point_for_index(mention.range.start),
-                input.point_for_index(mention.range.end),
-            ) else {
-                continue;
+            let target = MentionTooltipTarget {
+                range: mention.range.clone(),
+                path: SharedString::from(format!(
+                    "{}{}",
+                    mention.path,
+                    if mention.is_dir { "/" } else { "" }
+                )),
             };
-            if start.y != end.y {
-                continue;
-            }
-            let chip_bounds = Bounds::from_corners(
-                point(origin.x + start.x, origin.y + start.y + px(2.0)),
-                point(
-                    origin.x + end.x,
-                    origin.y + start.y + input.line_height - px(2.0),
-                ),
-            );
-            mention_quads.push(quad(
-                chip_bounds,
-                px(5.0),
-                mention_color,
-                px(0.0),
-                gpui::transparent_black(),
-                BorderStyle::default(),
-            ));
-            if bounds.contains(&window.mouse_position())
-                && chip_bounds.contains(&window.mouse_position())
-            {
-                hovered_mention = Some((
+            for local_bounds in input.bounds_for_display_range(display.clone()) {
+                let chip_bounds = Bounds::new(
+                    point(
+                        origin.x + local_bounds.origin.x,
+                        origin.y + local_bounds.origin.y + px(2.0),
+                    ),
+                    size(local_bounds.size.width, local_bounds.size.height - px(4.0)),
+                );
+                mention_quads.push(quad(
                     chip_bounds,
-                    SharedString::from(format!(
-                        "{}{}",
-                        mention.path,
-                        if mention.is_dir { "/" } else { "" }
-                    )),
+                    px(5.0),
+                    mention_color,
+                    px(0.0),
+                    gpui::transparent_black(),
+                    BorderStyle::default(),
                 ));
+                let above_anchor = chip_bounds.top() - px(MENTION_TOOLTIP_HEIGHT) - px(1.0);
+                let anchor_y = if above_anchor >= px(0.0) {
+                    above_anchor
+                } else {
+                    // GPUI positions at anchor + 1px; subtracting one keeps the
+                    // below fallback flush so the pointer can enter the popup.
+                    chip_bounds.bottom() - px(1.0)
+                };
+                mention_hits.push(MentionHit {
+                    target: target.clone(),
+                    bounds: chip_bounds,
+                    // The fixed-height popup starts at anchor + 1px. Moving
+                    // the anchor above the chip therefore yields conventional
+                    // above-target placement without cursor tracking.
+                    anchor: point(chip_bounds.left(), anchor_y),
+                });
             }
             let slot_start = display.start + MENTION_SIDE_PAD.len();
             let slot_end = slot_start + MENTION_ICON_SLOT.len();
-            let (Some(slot_start), Some(slot_end)) = (
-                input.point_for_display_index(slot_start),
-                input.point_for_display_index(slot_end),
-            ) else {
+            let Some(slot_bounds) = input
+                .bounds_for_display_range(slot_start..slot_end)
+                .into_iter()
+                .next()
+            else {
                 continue;
             };
-            if slot_start.y != slot_end.y {
-                continue;
-            }
-            let slot_width = (slot_end.x - slot_start.x).max(px(8.0));
+            let slot_width = slot_bounds.size.width.max(px(8.0));
             let icon_size = slot_width.min(px(12.0));
             mention_icons.push((
                 Bounds::new(
                     point(
-                        origin.x + slot_start.x + (slot_width - icon_size) / 2.0,
-                        origin.y + slot_start.y + (input.line_height - icon_size) / 2.0,
+                        origin.x + slot_bounds.origin.x + (slot_width - icon_size) / 2.0,
+                        origin.y + slot_bounds.origin.y + (input.line_height - icon_size) / 2.0,
                     ),
                     size(icon_size, icon_size),
                 ),
@@ -2421,13 +2738,17 @@ impl gpui::Element for ComposerTextElement {
                 ));
             }
         }
-        if let Some((chip_bounds, path)) = hovered_mention {
-            let view = cx.new(|_| MentionPathTooltip { path }).into();
+        let tooltip = input.visible_mention_tooltip();
+        if let Some((_target, anchor, _activation, view)) = tooltip {
+            let view = view.into();
+            let input = self.input.clone();
             window.set_tooltip(AnyTooltip {
                 view,
-                mouse_position: window.mouse_position(),
-                check_visible_and_update: Rc::new(move |_, window, _| {
-                    chip_bounds.contains(&window.mouse_position())
+                mouse_position: anchor,
+                check_visible_and_update: Rc::new(move |popup, window, cx| {
+                    input.update(cx, |input, _| {
+                        input.check_mention_tooltip_visibility(popup, window.mouse_position())
+                    })
                 }),
             });
         }
@@ -2435,6 +2756,7 @@ impl gpui::Element for ComposerTextElement {
             cursor,
             mention_quads,
             mention_icons,
+            mention_hits,
             selection_quads,
         }
     }
@@ -2450,21 +2772,18 @@ impl gpui::Element for ComposerTextElement {
         cx: &mut App,
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
+        self.input.update(cx, |input, _| {
+            input.set_mention_hits(prepaint.mention_hits.clone())
+        });
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
         let input = self.input.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
             if phase == DispatchPhase::Bubble {
-                if event.pressed_button == Some(MouseButton::Left) {
-                    input.update(cx, |input, cx| input.on_mouse_move(event, cx));
-                } else {
-                    // Hover-only movement does not mutate the input entity, so
-                    // explicitly refresh to update mention tooltip hit testing.
-                    window.refresh();
-                }
+                input.update(cx, |input, cx| input.on_mouse_move(event, cx));
             }
         });
 
@@ -4508,6 +4827,86 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
+        MentionTooltipTarget {
+            range,
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn mention_tooltip_wait_restarts_and_promotes_only_the_current_generation() {
+        let target = tooltip_target(3..20, "src/composer.rs");
+        let waiting = MentionTooltipPhase::Waiting {
+            target: target.clone(),
+            generation: 1,
+        };
+        let restarted = mention_tooltip_reduce(waiting, Some(target.clone()), false, 2);
+        assert!(matches!(
+            restarted,
+            MentionTooltipPhase::Waiting { generation: 2, .. }
+        ));
+        assert_eq!(
+            mention_tooltip_promote(restarted.clone(), 1, true),
+            restarted,
+            "a stale timer must not reveal the tooltip"
+        );
+        let visible = mention_tooltip_promote(restarted, 2, true);
+        assert!(matches!(
+            visible,
+            MentionTooltipPhase::Visible { generation: 2, .. }
+        ));
+        assert_eq!(
+            mention_tooltip_reduce(visible.clone(), Some(target), false, 3),
+            visible,
+            "one visible activation keeps its presentation generation stable"
+        );
+    }
+
+    #[test]
+    fn mention_tooltip_changes_target_and_cancels_disappeared_target() {
+        let first = tooltip_target(0..10, "src/a.rs");
+        let second = tooltip_target(20..30, "src/a.rs");
+        let visible = MentionTooltipPhase::Visible {
+            target: first,
+            generation: 4,
+        };
+        assert!(matches!(
+            mention_tooltip_reduce(visible, Some(second), false, 5),
+            MentionTooltipPhase::Waiting { generation: 5, .. }
+        ));
+        assert_eq!(
+            mention_tooltip_promote(
+                MentionTooltipPhase::Waiting {
+                    target: tooltip_target(20..30, "src/a.rs"),
+                    generation: 5,
+                },
+                5,
+                false,
+            ),
+            MentionTooltipPhase::Hidden
+        );
+    }
+
+    #[test]
+    fn mention_tooltip_stays_visible_over_chip_or_popup_only() {
+        assert!(mention_tooltip_contains(true, false));
+        assert!(mention_tooltip_contains(false, true));
+        assert!(!mention_tooltip_contains(false, false));
+    }
+
+    #[test]
+    fn mention_wash_moves_wholly_to_the_next_visual_row_at_a_wrap() {
+        assert_eq!(
+            display_row_segments(12..24, [12, 40]),
+            vec![(1, 12, 12..24)]
+        );
+        assert_eq!(
+            display_row_segments(8..24, [12, 40]),
+            vec![(0, 0, 8..12), (1, 12, 12..24)]
+        );
+    }
 
     #[test]
     fn mention_token_requires_a_token_boundary_and_tracks_full_token() {
