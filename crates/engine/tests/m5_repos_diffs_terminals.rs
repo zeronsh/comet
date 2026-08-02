@@ -707,6 +707,65 @@ async fn rpc_dispatch_for_m5_methods() {
     git(&repo_dir, &["add", "."]).await;
     git(&repo_dir, &["commit", "-m", "seed"]).await;
 
+    // SearchFiles resolves both space and chat roots, while rejecting a chat
+    // whose cwd was retargeted outside the owning repository.
+    core.workspace
+        .create_space("space-term", &core.device_id, &repo_path, None, true)
+        .expect("search space");
+    core.workspace
+        .create_chat("search-chat", "space-term", None, None)
+        .expect("search chat");
+    let space_matches = client
+        .call(
+            methods::SEARCH_FILES,
+            serde_json::json!({ "spaceId": "space-term", "query": "file" }),
+        )
+        .await
+        .expect("SearchFiles by space");
+    assert_eq!(space_matches[0]["path"], "file.txt");
+    let chat_matches = client
+        .call(
+            methods::SEARCH_FILES,
+            serde_json::json!({ "chatId": "search-chat", "query": "file" }),
+        )
+        .await
+        .expect("SearchFiles by chat");
+    assert_eq!(chat_matches[0]["path"], "file.txt");
+    assert!(
+        client
+            .call(
+                methods::SEARCH_FILES,
+                serde_json::json!({
+                    "chatId": "search-chat",
+                    "spaceId": "space-term",
+                    "query": "file"
+                }),
+            )
+            .await
+            .is_err(),
+        "exactly one root id is required"
+    );
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).expect("outside directory");
+    core.workspace
+        .create_chat(
+            "outside-chat",
+            "space-term",
+            None,
+            Some(outside.to_string_lossy().into_owned()),
+        )
+        .expect("outside chat row");
+    assert!(
+        client
+            .call(
+                methods::SEARCH_FILES,
+                serde_json::json!({ "chatId": "outside-chat", "query": "file" }),
+            )
+            .await
+            .is_err(),
+        "chat cwd must stay inside its workspace checkout"
+    );
+
     // ListBranches: default (checked-out) branch first.
     let branches = client
         .call(

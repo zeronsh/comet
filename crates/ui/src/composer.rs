@@ -630,6 +630,9 @@ const MENTION_ICON_SLOT: &str = "\u{2003}";
 const MENTION_TOOLTIP_DELAY: Duration = Duration::from_millis(420);
 const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
+/// A private URI scheme keeps file mentions distinguishable from ordinary
+/// Markdown links pasted into the composer.
+const FILE_MENTION_SCHEME: &str = "comet-file:";
 
 /// A restorable point in the input's history: text plus where the caret and
 /// selection sat when the edit landed.
@@ -696,8 +699,9 @@ fn local_file_link(path: &str, is_dir: bool) -> String {
         .filter(|part| !part.is_empty())
         .unwrap_or(path);
     format!(
-        "[{}]({})",
+        "[{}]({}{})",
         escape_mention_label(basename),
+        FILE_MENTION_SCHEME,
         percent_encode_path(&format!("{path}{}", if is_dir { "/" } else { "" }))
     )
 }
@@ -742,7 +746,10 @@ fn file_mention_links(text: &str) -> Vec<FileMentionLink> {
         };
         let end = target_start + relative_end + 1;
         let label = &text[start + 1..label_end];
-        let encoded = &text[target_start..end - 1];
+        let Some(encoded) = text[target_start..end - 1].strip_prefix(FILE_MENTION_SCHEME) else {
+            search = end;
+            continue;
+        };
         let parsed = percent_decode_path(encoded).and_then(|target| {
             let is_dir = target.ends_with('/');
             let path = target.strip_suffix('/').unwrap_or(&target);
@@ -804,9 +811,9 @@ impl MentionTooltipPhase {
     }
 }
 
-/// Pure tooltip lifecycle reducer. Pointer motion restarts a waiting timer;
-/// after promotion, ordinary motion inside the same chip keeps the tooltip
-/// stable so the popup does not flicker while it is visible.
+/// Pure tooltip lifecycle reducer. Motion within the same chip preserves both
+/// waiting and visible phases, so normal pointer jitter cannot starve the
+/// delay or flicker an already-visible tooltip.
 fn mention_tooltip_reduce(
     phase: MentionTooltipPhase,
     pointer_target: Option<MentionTooltipTarget>,
@@ -814,12 +821,7 @@ fn mention_tooltip_reduce(
     generation: u64,
 ) -> MentionTooltipPhase {
     match pointer_target {
-        Some(target)
-            if phase.target() == Some(&target)
-                && matches!(phase, MentionTooltipPhase::Visible { .. }) =>
-        {
-            phase
-        }
+        Some(target) if phase.target() == Some(&target) => phase,
         Some(target) => MentionTooltipPhase::Waiting { target, generation },
         None if pointer_in_popup && matches!(phase, MentionTooltipPhase::Visible { .. }) => phase,
         None => MentionTooltipPhase::Hidden,
@@ -881,9 +883,10 @@ struct MentionHit {
 impl TextProjection {
     fn new(raw: &str) -> Self {
         let links = file_mention_links(raw);
+        let labels = mention_display_labels(&links);
         let mut projection = Self::default();
         let mut raw_at = 0;
-        for link in links {
+        for (link, label) in links.into_iter().zip(labels) {
             projection.display.push_str(&raw[raw_at..link.range.start]);
             let display_start = projection.display.len();
             // Text runs cannot host an inline element. Reserve a stable
@@ -892,7 +895,7 @@ impl TextProjection {
             projection.display.push_str(MENTION_SIDE_PAD);
             projection.display.push_str(MENTION_ICON_SLOT);
             projection.display.push('\u{202F}');
-            for ch in link.basename.chars() {
+            for ch in label.chars() {
                 projection
                     .display
                     .push(if ch == ' ' { '\u{00A0}' } else { ch });
@@ -980,6 +983,42 @@ impl TextProjection {
             .iter()
             .find_map(|(link, _)| (raw == link.range.start).then_some(link.range.end))
     }
+}
+
+/// Basenames are compact in the common case. When the same basename appears
+/// more than once, use the shortest unique path suffix so chips remain
+/// distinguishable without always expanding to full paths.
+fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
+    links
+        .iter()
+        .enumerate()
+        .map(|(ix, link)| {
+            if links
+                .iter()
+                .filter(|other| other.basename == link.basename)
+                .count()
+                == 1
+            {
+                return link.basename.clone();
+            }
+            let parts: Vec<_> = link.path.split('/').collect();
+            (1..=parts.len())
+                .map(|count| parts[parts.len() - count..].join("/"))
+                .find(|suffix| {
+                    let suffix: Vec<_> = suffix.split('/').collect();
+                    links.iter().enumerate().all(|(other_ix, other)| {
+                        other_ix == ix
+                            || !other
+                                .path
+                                .split('/')
+                                .rev()
+                                .take(suffix.len())
+                                .eq(suffix.iter().rev().copied())
+                    })
+                })
+                .unwrap_or_else(|| link.path.clone())
+        })
+        .collect()
 }
 
 /// Direction of the last edit — a run only merges with edits of its own kind.
@@ -1115,6 +1154,7 @@ pub enum ComposerInputEvent {
     Submitted,
     Edited,
     CursorMoved,
+    ViewportChanged,
     MentionNavigate(isize),
     MentionAccept,
     MentionDismiss,
@@ -1156,6 +1196,9 @@ pub struct ComposerInput {
     last_width: f32,
     /// Raw Markdown → chip display projection from the last layout pass.
     projection: TextProjection,
+    /// File mentions are a composer feature, not a behavior of generic inputs
+    /// (picker searches and rename fields also use this type).
+    mentions_enabled: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -1223,6 +1266,7 @@ impl ComposerInput {
             max_line_width: 0.0,
             last_width: 0.0,
             projection: TextProjection::default(),
+            mentions_enabled: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -1281,9 +1325,28 @@ impl ComposerInput {
         has_selection: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.mention_open == open && self.mention_has_selection == has_selection {
+            return;
+        }
         self.mention_open = open;
         self.mention_has_selection = has_selection;
         cx.notify();
+    }
+
+    fn enable_mentions(&mut self) {
+        self.mentions_enabled = true;
+        self.refresh_projection();
+    }
+
+    fn refresh_projection(&mut self) {
+        self.projection = if self.mentions_enabled {
+            TextProjection::new(&self.content)
+        } else {
+            TextProjection {
+                display: self.content.clone(),
+                mentions: Vec::new(),
+            }
+        };
     }
 
     /// Replace a completed `@query` token as one non-coalescing undo step.
@@ -1306,6 +1369,7 @@ impl ComposerInput {
         self.record_edit(&range, &inserted);
         self.content =
             self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.refresh_projection();
         let cursor =
             range.start + inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
         self.selected_range = cursor..cursor;
@@ -1345,6 +1409,7 @@ impl ComposerInput {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.invalidate_mention_tooltip();
         self.content = text.into();
+        self.refresh_projection();
         let end = self.content.len();
         self.selected_range = end..end;
         self.selection_reversed = false;
@@ -1539,6 +1604,7 @@ impl ComposerInput {
     fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
         self.invalidate_mention_tooltip();
         self.content = snapshot.content;
+        self.refresh_projection();
         self.selected_range = snapshot.selected_range;
         self.selection_reversed = snapshot.selection_reversed;
         self.marked_range = None;
@@ -1577,9 +1643,7 @@ impl ComposerInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = TextProjection::new(&self.content)
-            .normalize_range(offset..offset)
-            .start;
+        let offset = self.projection.normalize_range(offset..offset).start;
         self.selected_range = offset..offset;
         self.follow_cursor = true;
         self.reset_blink();
@@ -1588,9 +1652,7 @@ impl ComposerInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = TextProjection::new(&self.content)
-            .normalize_range(offset..offset)
-            .start;
+        let offset = self.projection.normalize_range(offset..offset).start;
         if self.selection_reversed {
             self.selected_range.start = offset;
         } else {
@@ -1607,7 +1669,7 @@ impl ComposerInput {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
-        if let Some(boundary) = TextProjection::new(&self.content).previous_boundary(offset) {
+        if let Some(boundary) = self.projection.previous_boundary(offset) {
             return boundary;
         }
         self.content
@@ -1618,7 +1680,7 @@ impl ComposerInput {
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
-        if let Some(boundary) = TextProjection::new(&self.content).next_boundary(offset) {
+        if let Some(boundary) = self.projection.next_boundary(offset) {
             return boundary;
         }
         self.content
@@ -1628,7 +1690,7 @@ impl ComposerInput {
     }
 
     fn previous_word_boundary(&self, offset: usize) -> usize {
-        if let Some(boundary) = TextProjection::new(&self.content).previous_boundary(offset) {
+        if let Some(boundary) = self.projection.previous_boundary(offset) {
             return boundary;
         }
         self.content
@@ -1639,7 +1701,7 @@ impl ComposerInput {
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
-        if let Some(boundary) = TextProjection::new(&self.content).next_boundary(offset) {
+        if let Some(boundary) = self.projection.next_boundary(offset) {
             return boundary;
         }
         self.content
@@ -1705,7 +1767,7 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mention_open {
+        if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionNavigate(-1));
             return;
         }
@@ -1715,7 +1777,7 @@ impl ComposerInput {
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mention_open {
+        if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionNavigate(1));
             return;
         }
@@ -1940,12 +2002,16 @@ impl ComposerInput {
     fn mention_tab(&mut self, _: &MentionTab, _: &mut Window, cx: &mut Context<Self>) {
         if self.mention_has_selection {
             cx.emit(ComposerInputEvent::MentionAccept);
+        } else {
+            cx.propagate();
         }
     }
 
     fn mention_escape(&mut self, _: &MentionEscape, _: &mut Window, cx: &mut Context<Self>) {
         if self.mention_open {
             cx.emit(ComposerInputEvent::MentionDismiss);
+        } else {
+            cx.propagate();
         }
     }
 
@@ -1954,6 +2020,13 @@ impl ComposerInput {
     /// Content-local point for a byte index (y grows down from content top).
     fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         self.point_for_display_index(self.projection.raw_to_display(index))
+    }
+
+    fn visible_point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let point = self.point_for_index(index)?;
+        let height = self.last_bounds?.size.height;
+        let y = point.y - px(self.scroll_top);
+        (y >= px(0.0) && y + self.line_height <= height).then_some(gpui::point(point.x, y))
     }
 
     /// Content-local point for a shaped projection byte index. The icon layer
@@ -2200,6 +2273,7 @@ impl ComposerInput {
         self.scroll_top = next;
         self.follow_cursor = false;
         cx.stop_propagation();
+        cx.emit(ComposerInputEvent::ViewportChanged);
         cx.notify();
     }
 
@@ -2246,7 +2320,7 @@ impl ComposerInput {
         // mention can leave its previous paint geometry alive while the
         // placeholder is already being shaped, tinting "Do anything" for a
         // frame (or longer when no subsequent layout is requested).
-        self.projection = TextProjection::new(&self.content);
+        self.refresh_projection();
         let (display, is_placeholder) = if self.content.is_empty() {
             (self.placeholder.clone(), true)
         } else {
@@ -2337,7 +2411,8 @@ impl ComposerInput {
     }
 
     /// Keep the cursor visible when content exceeds the element height.
-    fn clamp_scroll(&mut self, element_height: f32) {
+    fn clamp_scroll(&mut self, element_height: f32) -> bool {
+        let previous = self.scroll_top;
         if self.follow_cursor {
             if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
                 self.scroll_top = input_scroll_offset_for_cursor(
@@ -2352,6 +2427,7 @@ impl ComposerInput {
         self.scroll_top = self
             .scroll_top
             .clamp(0.0, input_max_scroll(self.content_height, element_height));
+        self.scroll_top != previous
     }
 }
 
@@ -2371,8 +2447,9 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range =
-            TextProjection::new(&self.content).normalize_range(self.range_from_utf16(&range_utf16));
+        let range = self
+            .projection
+            .normalize_range(self.range_from_utf16(&range_utf16));
         actual_range.replace(self.range_to_utf16(&range));
         Some(self.content.get(range)?.to_string())
     }
@@ -2383,8 +2460,7 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        self.selected_range =
-            TextProjection::new(&self.content).normalize_range(self.selected_range.clone());
+        self.selected_range = self.projection.normalize_range(self.selected_range.clone());
         Some(UTF16Selection {
             range: self.range_to_utf16(&self.selected_range),
             reversed: self.selection_reversed,
@@ -2413,7 +2489,7 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        let range = TextProjection::new(&self.content).normalize_range(range);
+        let range = self.projection.normalize_range(range);
         self.invalidate_mention_tooltip();
         // An IME commit is the tail of a composition whose pre-composition
         // snapshot was already taken (`replace_and_mark_text_in_range`);
@@ -2423,6 +2499,7 @@ impl EntityInputHandler for ComposerInput {
         }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.refresh_projection();
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range.take();
@@ -2445,7 +2522,7 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        let range = TextProjection::new(&self.content).normalize_range(range);
+        let range = self.projection.normalize_range(range);
         self.invalidate_mention_tooltip();
         // First keystroke of a composition: snapshot the text as it stood
         // before any of it existed, so one undo drops the whole composition.
@@ -2459,6 +2536,7 @@ impl EntityInputHandler for ComposerInput {
         }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.refresh_projection();
         if new_text.is_empty() {
             self.marked_range = None;
         } else {
@@ -2482,8 +2560,9 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let range =
-            TextProjection::new(&self.content).normalize_range(self.range_from_utf16(&range_utf16));
+        let range = self
+            .projection
+            .normalize_range(self.range_from_utf16(&range_utf16));
         let start = self.point_for_index(range.start)?;
         let origin = point(
             bounds.left() + start.x,
@@ -2524,6 +2603,7 @@ impl Render for MentionPathTooltip {
             ("file-mention-path-tooltip", self.activation),
             div()
                 .h(px(MENTION_TOOLTIP_HEIGHT))
+                .max_w(px(480.0))
                 .flex()
                 .items_center()
                 .px(px(8.0))
@@ -2600,9 +2680,12 @@ impl gpui::Element for ComposerTextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.input.update(cx, |input, _| {
-            input.clamp_scroll(f32::from(bounds.size.height));
+        self.input.update(cx, |input, cx| {
+            let scrolled = input.clamp_scroll(f32::from(bounds.size.height));
             input.last_bounds = Some(bounds);
+            if scrolled {
+                cx.emit(ComposerInputEvent::ViewportChanged);
+            }
         });
         let input = self.input.read(cx);
         let scroll = px(input.scroll_top);
@@ -2646,9 +2729,13 @@ impl gpui::Element for ComposerTextElement {
                     // below fallback flush so the pointer can enter the popup.
                     chip_bounds.bottom() - px(1.0)
                 };
+                let visible_bounds = chip_bounds.intersect(&bounds);
+                if visible_bounds.size.width == px(0.0) || visible_bounds.size.height == px(0.0) {
+                    continue;
+                }
                 mention_hits.push(MentionHit {
                     target: target.clone(),
-                    bounds: chip_bounds,
+                    bounds: visible_bounds,
                     // The fixed-height popup starts at anchor + 1px. Moving
                     // the anchor above the chip therefore yields conventional
                     // above-target placement without cursor tracking.
@@ -2974,6 +3061,10 @@ struct FileMentionState {
     dismissed: Option<(Range<usize>, String)>,
 }
 
+fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
+    state.request == request && state.token.is_some()
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
@@ -3038,7 +3129,11 @@ impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| ComposerInput::new("Do anything…", cx));
+        let input = cx.new(|cx| {
+            let mut input = ComposerInput::new("Do anything…", cx);
+            input.enable_mentions();
+            input
+        });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
@@ -3050,6 +3145,7 @@ impl Composer {
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
                 this.on_input_edited(cx)
             }
+            ComposerInputEvent::ViewportChanged => cx.notify(),
             ComposerInputEvent::MentionNavigate(delta) => this.move_mention(*delta, cx),
             ComposerInputEvent::MentionAccept => this.accept_mention(cx),
             ComposerInputEvent::MentionDismiss => this.dismiss_mention(cx),
@@ -3294,7 +3390,27 @@ impl Composer {
         });
     }
 
+    /// Tear down the entire completion lifecycle. Advancing the generation is
+    /// important even when the spawned task is dropped: an RPC response may
+    /// already be queued for delivery on the UI executor.
+    fn reset_mention(&mut self, dismissed: Option<(Range<usize>, String)>, cx: &mut Context<Self>) {
+        let request = self.mention.request.wrapping_add(1);
+        self.mention_task = None;
+        self.mention = FileMentionState {
+            request,
+            dismissed,
+            ..FileMentionState::default()
+        };
+        self.sync_mention_controls(cx);
+    }
+
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_some() {
+            if self.mention.token.is_some() || self.mention_task.is_some() {
+                self.reset_mention(None, cx);
+            }
+            return;
+        }
         let (text, cursor) = {
             let input = self.input.read(cx);
             (input.text().to_string(), input.cursor_offset())
@@ -3310,6 +3426,7 @@ impl Composer {
         });
         if still_dismissed {
             self.mention.token = None;
+            self.mention_task = None;
             self.sync_mention_controls(cx);
             cx.notify();
             return;
@@ -3321,6 +3438,7 @@ impl Composer {
             return;
         }
         self.mention.request = self.mention.request.wrapping_add(1);
+        self.mention_task = None;
         self.mention.token = token.clone();
         self.mention.results.clear();
         self.mention.active = None;
@@ -3375,7 +3493,7 @@ impl Composer {
                 .await;
             let result = engine.client().call(methods::SEARCH_FILES, params).await;
             this.update(cx, |composer, cx| {
-                if composer.mention.request != request {
+                if !mention_response_is_current(&composer.mention, request) {
                     return;
                 }
                 composer.mention.loading = false;
@@ -3398,13 +3516,8 @@ impl Composer {
     }
 
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.mention.results.len();
-        if count > 0 {
-            self.mention.active = Some(
-                (self.mention.active.unwrap_or(0) as isize + delta).rem_euclid(count as isize)
-                    as usize,
-            );
-        }
+        self.mention.active =
+            crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -3417,12 +3530,7 @@ impl Composer {
                 .get(token.range.clone())
                 .map(|text| (token.range.clone(), text.to_string()))
         });
-        self.mention.dismissed = dismissed;
-        self.mention.token = None;
-        self.mention.results.clear();
-        self.mention.active = None;
-        self.mention.loading = false;
-        self.sync_mention_controls(cx);
+        self.reset_mention(dismissed, cx);
         cx.notify();
     }
 
@@ -3441,8 +3549,7 @@ impl Composer {
         self.input.update(cx, |input, cx| {
             input.replace_mention(token.range, &path, is_dir, cx)
         });
-        self.mention = FileMentionState::default();
-        self.sync_mention_controls(cx);
+        self.reset_mention(None, cx);
         cx.notify();
     }
 
@@ -3455,7 +3562,8 @@ impl Composer {
         let mut card = crate::popover::popover_card(theme)
             .w(px(380.0))
             .max_h(px(280.0))
-            .overflow_hidden();
+            .overflow_hidden()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if self.mention.loading {
             card = card.child(crate::popover::skeleton_rows(
                 "file-mention-loading",
@@ -3479,17 +3587,16 @@ impl Composer {
             for (ix, result) in self.mention.results.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
                 let path = result.path.clone();
+                let tooltip_path: SharedString = path.clone().into();
                 card = card.child(
-                    div()
+                    crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
-                        .px(px(10.0))
-                        .py(px(7.0))
-                        .rounded(px(8.0))
-                        .cursor_pointer()
-                        .bg(if selected {
-                            crate::theme::white_alpha(0.10)
-                        } else {
-                            gpui::transparent_black()
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| MentionPathTooltip {
+                                path: tooltip_path.clone(),
+                                activation: ix as u64,
+                            })
+                            .into()
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.mention.active = Some(ix);
@@ -3514,6 +3621,8 @@ impl Composer {
                                     div()
                                         .min_w_0()
                                         .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
                                         .text_size(px(12.5))
                                         .text_color(theme.text)
                                         .child(path),
@@ -3522,10 +3631,22 @@ impl Composer {
                 );
             }
         }
-        Some(crate::popover::anchored_menu_above(
+        let anchor = self
+            .input
+            .read(cx)
+            .visible_point_for_index(token.range.start)?;
+        Some(crate::popover::anchored_menu_above_at(
             "file-mention-popup",
+            anchor,
             card.into_any_element(),
         ))
+    }
+
+    fn render_input_with_completion(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .relative()
+            .child(self.input.clone())
+            .children(self.render_file_mention_popup(theme, cx))
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -3552,8 +3673,7 @@ impl Composer {
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
-            self.mention = FileMentionState::default();
-            self.sync_mention_controls(cx);
+            self.reset_mention(None, cx);
             // Route changes snap (round 5/6): a mode difference between the
             // old and new session's composer must not glide across
             // navigation. Killing the in-flight morph here isn't enough —
@@ -3574,6 +3694,7 @@ impl Composer {
                     .as_ref()
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
+                    self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
@@ -4419,6 +4540,11 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
+        if self.mention.token.is_some()
+            && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
+        {
+            self.reset_mention(None, cx);
+        }
         let mode = self.button_mode(cx);
         let (text_width, has_newline, content_height, last_width, epoch) = {
             let input = self.input.read(cx);
@@ -4700,12 +4826,7 @@ impl Render for Composer {
                         .px(px(16.0))
                         .pt(px(text_pt))
                         .pb(px(4.0))
-                        .child(
-                            div()
-                                .relative()
-                                .child(self.input.clone())
-                                .children(self.render_file_mention_popup(&theme, cx)),
-                        ),
+                        .child(self.render_input_with_completion(&theme, cx)),
                 )
                 .child(
                     div()
@@ -4763,12 +4884,7 @@ impl Render for Composer {
                                 .pr(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .child(self.input.clone())
-                                        .children(self.render_file_mention_popup(&theme, cx)),
-                                ),
+                                .child(self.render_input_with_completion(&theme, cx)),
                         )
                         .child(
                             div()
@@ -4836,26 +4952,27 @@ mod tests {
     }
 
     #[test]
-    fn mention_tooltip_wait_restarts_and_promotes_only_the_current_generation() {
+    fn mention_tooltip_wait_survives_pointer_jitter_and_promotes_once() {
         let target = tooltip_target(3..20, "src/composer.rs");
         let waiting = MentionTooltipPhase::Waiting {
             target: target.clone(),
             generation: 1,
         };
-        let restarted = mention_tooltip_reduce(waiting, Some(target.clone()), false, 2);
+        let restarted = mention_tooltip_reduce(waiting.clone(), Some(target.clone()), false, 2);
+        assert_eq!(restarted, waiting);
         assert!(matches!(
             restarted,
-            MentionTooltipPhase::Waiting { generation: 2, .. }
+            MentionTooltipPhase::Waiting { generation: 1, .. }
         ));
         assert_eq!(
-            mention_tooltip_promote(restarted.clone(), 1, true),
+            mention_tooltip_promote(restarted.clone(), 2, true),
             restarted,
             "a stale timer must not reveal the tooltip"
         );
-        let visible = mention_tooltip_promote(restarted, 2, true);
+        let visible = mention_tooltip_promote(restarted, 1, true);
         assert!(matches!(
             visible,
-            MentionTooltipPhase::Visible { generation: 2, .. }
+            MentionTooltipPhase::Visible { generation: 1, .. }
         ));
         assert_eq!(
             mention_tooltip_reduce(visible.clone(), Some(target), false, 3),
@@ -4927,9 +5044,26 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_mentions_reject_stale_responses() {
+        let mut state = FileMentionState {
+            token: mention_token("@src", 4),
+            request: 7,
+            ..FileMentionState::default()
+        };
+        assert!(mention_response_is_current(&state, 7));
+        state.request += 1;
+        state.token = None;
+        assert!(!mention_response_is_current(&state, 7));
+        assert!(!mention_response_is_current(&state, 8));
+    }
+
+    #[test]
     fn file_mentions_serialize_to_strict_local_markdown() {
         let raw = local_file_link("src/a file#[x].rs", false);
-        assert_eq!(raw, "[a file#\\[x\\].rs](src/a%20file%23%5Bx%5D.rs)");
+        assert_eq!(
+            raw,
+            "[a file#\\[x\\].rs](comet-file:src/a%20file%23%5Bx%5D.rs)"
+        );
         let links = file_mention_links(&raw);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].path, "src/a file#[x].rs");
@@ -4937,7 +5071,7 @@ mod tests {
         assert!(!links[0].is_dir);
 
         let folder = local_file_link("src/components", true);
-        assert_eq!(folder, "[components](src/components/)");
+        assert_eq!(folder, "[components](comet-file:src/components/)");
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
@@ -4949,8 +5083,43 @@ mod tests {
         assert!(file_mention_links("[a.rs](../a.rs)").is_empty());
         assert!(file_mention_links("[a.rs](src/a file.rs)").is_empty());
         assert!(file_mention_links("[other](src/a.rs)").is_empty());
+        assert!(file_mention_links("[a.rs](src/a.rs)").is_empty());
         assert!(file_mention_links("[a.rs](src%5Cfake%5Ca.rs)").is_empty());
         assert!(file_mention_links("[a.rs](src/a%0A.rs)").is_empty());
+    }
+
+    #[test]
+    fn duplicate_mention_basenames_use_unique_suffixes() {
+        let raw = format!(
+            "{} {}",
+            local_file_link("src/one/mod.rs", false),
+            local_file_link("src/two/mod.rs", false)
+        );
+        let projection = TextProjection::new(&raw);
+        assert!(projection.display.contains("one/mod.rs"));
+        assert!(projection.display.contains("two/mod.rs"));
+    }
+
+    #[test]
+    fn mention_suffixes_compare_path_components() {
+        let links = vec![
+            FileMentionLink {
+                range: 0..0,
+                basename: "mod.rs".into(),
+                path: "foo/mod.rs".into(),
+                is_dir: false,
+            },
+            FileMentionLink {
+                range: 0..0,
+                basename: "oomod.rs".into(),
+                path: "bar/oomod.rs".into(),
+                is_dir: false,
+            },
+        ];
+        assert_eq!(
+            mention_display_labels(&links),
+            vec!["mod.rs".to_string(), "oomod.rs".to_string()]
+        );
     }
 
     #[test]

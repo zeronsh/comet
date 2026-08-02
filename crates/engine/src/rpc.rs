@@ -50,6 +50,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::time::Duration;
 use tokio::sync::watch;
 
 use comet_doc::{MessagePart, SessionCommandPayload};
@@ -66,6 +68,9 @@ use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
+
+const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -440,9 +445,35 @@ impl EngineRpc {
                 if chat.device_id != local_device {
                     return Err(RpcError::Failed("chat belongs to another device".into()));
                 }
-                chat.cwd
+                let cwd = chat
+                    .cwd
                     .map(std::path::PathBuf::from)
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))
+                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
+                let space_id = chat
+                    .space_id
+                    .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
+                let space = self
+                    .workspace
+                    .doc()
+                    .space(&space_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
+                if space.device_id != local_device {
+                    return Err(RpcError::Failed(
+                        "chat space belongs to another device".into(),
+                    ));
+                }
+                if let Some(cwd) = self
+                    .repos
+                    .workspace_checkout(std::path::Path::new(&space.path), &cwd)
+                    .await
+                {
+                    Ok(cwd)
+                } else {
+                    Err(RpcError::Failed(
+                        "chat folder is not a workspace checkout".into(),
+                    ))
+                }
             }
             (None, Some(space_id)) => {
                 let space = self
@@ -455,15 +486,13 @@ impl EngineRpc {
                     return Err(RpcError::Failed("space belongs to another device".into()));
                 }
                 let space_path = std::path::PathBuf::from(&space.path);
-                let Some(requested) = p.path.as_deref() else {
-                    return Ok(space_path);
-                };
-                let requested = std::path::PathBuf::from(requested);
-                let same_as_space = std::fs::canonicalize(&space_path)
-                    .ok()
-                    .zip(std::fs::canonicalize(&requested).ok())
-                    .is_some_and(|(space, requested)| space == requested);
-                if same_as_space || self.repos.is_linked_worktree(&space_path, &requested).await {
+                let requested = p
+                    .path
+                    .as_deref()
+                    .map_or_else(|| space_path.clone(), std::path::PathBuf::from);
+                if let Some(requested) =
+                    self.repos.workspace_checkout(&space_path, &requested).await
+                {
                     Ok(requested)
                 } else {
                     Err(RpcError::BadParams(
@@ -480,6 +509,7 @@ impl EngineRpc {
     /// hints, so stale or out-of-workspace tool paths simply disappear.
     fn featured_file_paths(&self, chat_id: &str) -> Vec<String> {
         let mut paths = Vec::new();
+        let mut seen = HashSet::new();
         if let Ok(handle) = self.doc_host.open(chat_id)
             && let Ok(entries) = handle.doc().read_entries()
         {
@@ -488,9 +518,16 @@ impl EngineRpc {
                     if let MessagePart::Tool { call, .. } = part
                         && let Some(path) = tool_file_path(&call)
                         && !path.trim().is_empty()
+                        && seen.insert(path.to_string())
                     {
                         paths.push(path.to_string());
+                        if paths.len() == FILE_SEARCH_FEATURED_PATHS {
+                            break;
+                        }
                     }
+                }
+                if paths.len() == FILE_SEARCH_FEATURED_PATHS {
+                    break;
                 }
             }
         }
@@ -507,7 +544,14 @@ impl EngineRpc {
                         .and_then(|cwd| diffs.iter().find(|diff| diff.cwd == cwd))
                 });
             if let Some(diff) = diff {
-                paths.extend(diff.files.iter().map(|file| file.path.clone()));
+                for file in &diff.files {
+                    if paths.len() == FILE_SEARCH_FEATURED_PATHS {
+                        break;
+                    }
+                    if seen.insert(file.path.clone()) {
+                        paths.push(file.path.clone());
+                    }
+                }
             }
         }
         paths
@@ -1012,18 +1056,21 @@ impl RpcService for EngineRpc {
                         "SearchFiles query must not exceed 256 characters".into(),
                     ));
                 }
-                let root = self.file_search_root(&p).await?;
-                let featured_paths = p
-                    .chat_id
-                    .as_deref()
-                    .filter(|_| p.query.is_empty())
-                    .map(|chat_id| self.featured_file_paths(chat_id))
-                    .unwrap_or_default();
-                let matches = self
-                    .repos
-                    .search_files(root, p.query, featured_paths)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let matches = tokio::time::timeout(FILE_SEARCH_RPC_TIMEOUT, async {
+                    let root = self.file_search_root(&p).await?;
+                    let featured_paths = p
+                        .chat_id
+                        .as_deref()
+                        .filter(|_| p.query.is_empty())
+                        .map(|chat_id| self.featured_file_paths(chat_id))
+                        .unwrap_or_default();
+                    self.repos
+                        .search_files(root, p.query, featured_paths)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))
+                })
+                .await
+                .map_err(|_| RpcError::Failed("file search timed out".into()))??;
                 RpcReply::value(&matches)
             }
             methods::CREATE_WORKTREE => {

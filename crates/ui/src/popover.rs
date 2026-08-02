@@ -226,6 +226,23 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
     )
 }
 
+/// Open an upward menu at a point inside a relative trigger. Useful for text
+/// completions, whose natural anchor is the token/caret rather than the input
+/// element's outer edge.
+pub fn anchored_menu_above_at(
+    id: impl Into<ElementId>,
+    position: Point<Pixels>,
+    content: AnyElement,
+) -> AnyElement {
+    div()
+        .absolute()
+        .left(position.x)
+        .top(position.y)
+        .size_0()
+        .child(anchored_menu_above(id, content))
+        .into_any_element()
+}
+
 /// [`anchored_menu_above`] right-aligned to the trigger's right edge (t3code
 /// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
 /// picker open leftward instead of running off the window).
