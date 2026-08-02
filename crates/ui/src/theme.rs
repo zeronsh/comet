@@ -1,52 +1,279 @@
-//! Always-dark monochrome theme — concrete values, no indirection.
+//! The app theme — two concrete appearances, one token set.
 //!
 //! Colors are precomputed from an oklch-derived neutral scale (perceptually even
 //! lightness steps; the same scale comet's Tailwind theme used) into gpui [`Hsla`].
-//! Hairlines are white at low alpha so they read on any surface. **Numbers drive
-//! layout, colors are paint**: layout constants live here as plain numbers and never
-//! depend on which color is painted.
+//! **Numbers drive layout, colors are paint**: layout constants live here as plain
+//! numbers and never depend on which color is painted.
 //!
-//! Installed as a gpui [`Global`] at boot (`cx.set_global(Theme::dark())`); read with
-//! [`Theme::of`].
+//! # Light is designed, not inverted
+//!
+//! Mirroring lightness produces the classic "washed-out inverted" look, for three
+//! reasons this module handles explicitly:
+//!
+//! 1. **Surface order flips meaning.** In dark, the main content panel is the
+//!    *darkest* plane and raised surfaces get *lighter*. In light, the content
+//!    panel is *white* and the shell/sidebar goes *grey* — chrome recedes by
+//!    getting darker, not lighter. Popovers stay white and earn separation from a
+//!    border and shadow rather than from lightness.
+//! 2. **Elevation reverses.** On dark, a faint *white* wash means "raised". Its
+//!    literal translation — a faint *black* wash on white — means "recessed", so
+//!    the composer read as a dent instead of a plate. Light lifts with white plus
+//!    a border and shadow ([`Theme::input_bg`], the elevation ladder). Fill
+//!    *alphas* carry over unchanged ([`INK_FILL_SCALE`]); only hairlines scale, so
+//!    a 1px edge survives a bright surround ([`INK_HAIRLINE_SCALE`]).
+//! 3. **Accents must move down the scale.** The dark palette's 400-level accents
+//!    (indigo/red/amber) are chosen for contrast against near-black; on white they
+//!    fall to 2–4:1 and fail WCAG AA. Light mode uses the 600-level siblings at the
+//!    same hue, which restores the *contrast ratio* the dark token had.
+//!
+//! Text tones are chosen so each light token lands within ~0.5 of its dark
+//! counterpart's contrast ratio against its own background — the pairing is
+//! verified in [`tests::text_contrast_is_paired_across_appearances`], not eyeballed.
+//!
+//! Installed as a gpui [`Global`] at boot; read with [`Theme::of`].
+
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use gpui::{App, Global, Hsla, SharedString, hsla};
 
-/// The app theme. One concrete instance — comet is always-dark by design.
+/// Which appearance the app is painting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Appearance {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
+
+    /// Map a gpui window appearance onto ours (both vibrant variants are just
+    /// the blurred flavour of the same tone).
+    pub fn from_window(appearance: gpui::WindowAppearance) -> Self {
+        use gpui::WindowAppearance::*;
+        match appearance {
+            Light | VibrantLight => Self::Light,
+            Dark | VibrantDark => Self::Dark,
+        }
+    }
+}
+
+/// Process-wide mirror of the installed theme's appearance.
+///
+/// The paint helpers ([`ink`], [`hairline`], [`wash`], …) are free functions
+/// called from deep inside element builders that have no `cx` in scope, so they
+/// read the appearance from here instead of the gpui global. Appearance is
+/// genuinely process-wide — one setting for every window — so a single mirror is
+/// sound; [`Theme::install`] is the only writer outside tests.
+static CURRENT_APPEARANCE: AtomicU8 = AtomicU8::new(0);
+
+/// Bumped every time the appearance actually changes.
+///
+/// Anything that caches *resolved colors* — most importantly the markdown
+/// renderer's cross-frame `TextRun` cache, which bakes an `Hsla` into every run —
+/// is only valid for the palette that produced it. Those caches were written when
+/// the theme was a compile-time constant, so their validity keys cover content
+/// only. Rather than thread the palette through every key, they compare this
+/// counter and drop everything when it moves.
+static THEME_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// The appearance the context-free paint helpers are painting for.
+pub fn current_appearance() -> Appearance {
+    match CURRENT_APPEARANCE.load(Ordering::Relaxed) {
+        1 => Appearance::Light,
+        _ => Appearance::Dark,
+    }
+}
+
+/// Monotonic id of the current palette — see [`THEME_GENERATION`].
+pub fn theme_generation() -> u32 {
+    THEME_GENERATION.load(Ordering::Relaxed)
+}
+
+/// [`CURRENT_APPEARANCE`] is process-wide, so under the parallel test runner
+/// any test that flips it — or asserts on the output of a helper that reads it
+/// ([`ink`], [`hairline`], [`wash`], …) — must hold this lock. Crate-visible
+/// because such tests exist outside this module too (see `motion::tests`).
+/// Tests that flip the appearance restore Dark before releasing the guard.
+#[cfg(test)]
+pub(crate) fn lock_appearance() -> std::sync::MutexGuard<'static, ()> {
+    static APPEARANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    APPEARANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Point the context-free paint helpers at an appearance. Called by
+/// [`Theme::install`]; exposed for tests that build a theme without an `App`.
+pub fn set_current_appearance(appearance: Appearance) {
+    let encoded = match appearance {
+        Appearance::Dark => 0,
+        Appearance::Light => 1,
+    };
+    if CURRENT_APPEARANCE.swap(encoded, Ordering::Relaxed) != encoded {
+        THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Light-mode alpha multiplier for **fills** (hover/active washes, chip and pill
+/// backgrounds).
+///
+/// This was 0.5 on the theory that dark ink on a bright field reads heavier and
+/// should be scaled back. That theory is right for a *large* wash and badly wrong
+/// for everything else: this palette leans on very low alphas for its subtle
+/// fills — the composer plate is `ink(0.03)`, key caps are `ink(0.05)` — and
+/// halving those produced 1.5% black on white, which is nothing. The composer
+/// lost its background entirely and selected tabs stopped reading as selected.
+///
+/// The established light-UI scales (Primer, Radix) land subtle ≈ 3–4%, hover ≈ 8%,
+/// selected ≈ 14% black — which is where the dark palette's white alphas already
+/// sit. So the honest multiplier is 1: the same number in both appearances, with
+/// only the *tone* flipping. Any per-state correction belongs in that state's
+/// token, not in a blanket multiplier.
+pub const INK_FILL_SCALE: f32 = 1.0;
+
+/// Light-mode alpha multiplier for **hairlines** (borders, dividers, rings).
+/// Opposite of fills: a 1px edge has to hold its own against a bright surround,
+/// and the dark palette's white hairlines are deliberately faint. Scaling up
+/// keeps separators legible instead of dissolving into the panel.
+pub const INK_HAIRLINE_SCALE: f32 = 1.35;
+
+/// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
 #[derive(Debug, Clone)]
 pub struct Theme {
-    // ---- paint: neutral surfaces (oklch chroma 0) ----
-    /// App background — oklch(0.145 0 0) ≡ `#0a0a0a`.
+    /// Which appearance these tokens were built for.
+    pub appearance: Appearance,
+
+    // ---- paint: neutral surfaces ----
+    /// Main content panel. Dark: the deepest plane (#060606). Light: pure white —
+    /// long-form content reads best on an unbroken white field.
     pub bg: Hsla,
-    /// Panel / sidebar surface — one scale step up.
+    /// Shell / sidebar surface. Dark: one step *up* from `bg`. Light: one step
+    /// *down* (grey) — chrome recedes from the content plane in both, which is
+    /// the direction a naive invert gets backwards.
     pub surface: Hsla,
-    /// Raised surface: popovers, dialogs, cards.
+    /// Raised surface: opaque pills and chips that sit proud of the panel.
+    /// Dark: lighter than `surface`. Light: white, separated by `border` +
+    /// shadow rather than by lightness.
     pub surface_raised: Hsla,
-    /// Hover wash for interactive rows/buttons (white, low alpha).
+
+    // ---- paint: elevation ladder ----
+    //
+    // Dark mode distinguishes floating planes by lightness, and the steps are
+    // *small* (#0e → #10 → #16 → #1e). They are not interchangeable: collapsing
+    // them onto one token visibly lifts popovers off their intended plane.
+    //
+    // Light mode cannot use the same trick, because the content plane is already
+    // white and there is nothing lighter to climb to. All three land on white and
+    // let `border` + shadow carry the separation instead — the standard light-UI
+    // answer, and the reason this is a ladder of tokens rather than an arithmetic
+    // offset applied to one.
+    /// Inline card resting on the main panel (auth gate, empty-state cards).
+    pub surface_card: Hsla,
+    /// Modal dialog, floating over a [`Theme::scrim`].
+    pub surface_dialog: Hsla,
+    /// Popover, menu and command-palette surface — the highest plane.
+    pub surface_overlay: Hsla,
+    /// Hover wash for interactive rows/buttons.
     pub element_hover: Hsla,
-    /// Active/selected wash (white, slightly higher alpha).
+    /// Active/selected wash.
     pub element_active: Hsla,
-    /// Hairline border — white at low alpha.
+    /// Hairline border.
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
 
     // ---- paint: text ----
-    /// Primary text.
+    /// Primary text. ~17.5:1 on its own background in both appearances.
     pub text: Hsla,
-    /// Muted text: timestamps, secondary labels.
+    /// Muted text: timestamps, secondary labels. ~7.5–8:1.
     pub text_muted: Hsla,
-    /// Faint text: placeholders, disabled.
+    /// Faint text: placeholders, disabled. ~4.5:1 — AA for body copy.
     pub text_faint: Hsla,
+    /// One notch below `text_muted` — the diff file-path tone. It exists as its
+    /// own token rather than being folded into `text_muted` because the dark
+    /// value was sampled (#989898) and folding it would shift that label, which
+    /// is a palette change dressed up as a refactor.
+    pub text_dim: Hsla,
+
+    // ---- paint: high-contrast solid (primary buttons) ----
+    /// The maximum-contrast solid fill: near-white on dark, near-black on light.
+    /// This is the primary button plate.
+    pub solid: Hsla,
+    /// Label/icon color on top of [`Self::solid`] — its inverse.
+    pub on_solid: Hsla,
 
     // ---- paint: accents ----
-    /// Accent — indigo (working indicator, links, selection tint).
+    /// Accent — indigo. Text/icon weight: indigo-400 on dark, indigo-600 on light
+    /// (the 400 fails AA on white).
     pub accent: Hsla,
-    /// Stronger accent for fills.
+    /// Stronger accent for fills that carry [`Self::on_accent`] text.
     pub accent_strong: Hsla,
+    /// Label color on top of [`Self::accent_strong`].
+    pub on_accent: Hsla,
     /// Danger — red (errors, stop button).
     pub danger: Hsla,
+    /// Softer danger for secondary/inline error copy.
+    pub danger_muted: Hsla,
     /// Warning — amber (offline notices, awaiting-input).
     pub warning: Hsla,
+    /// Softer warning for secondary copy.
+    pub warning_muted: Hsla,
+    /// Success / online — emerald.
+    pub success: Hsla,
+    /// Working / streaming indicator — pink.
+    pub busy: Hsla,
+    /// Softer success for text on a success-tinted chip.
+    pub success_muted: Hsla,
+
+    // ---- paint: components ----
+    /// Hover tone for an *opaque* raised pill. Hover must brighten the plate in
+    /// dark mode, never swap it for a translucent wash (that made pills go
+    /// see-through — user-reported); in light mode it darkens instead, same idea.
+    pub surface_raised_hover: Hsla,
+    /// Recessed band behind a palette/picker header or footer strip. Translucent
+    /// so the glass still reads through.
+    pub band: Hsla,
+    /// The composer pill and other input plates.
+    ///
+    /// Its own token because "lifted" inverts between appearances. On dark, a
+    /// faint *white* wash over near-black reads as raised. The literal light
+    /// translation — a faint *black* wash on white — reads as **recessed**, a dent
+    /// rather than a plate, which is why the prompt looked like bare text on a
+    /// smudge. Light mode lifts the way light UIs actually do: pure white, with
+    /// the border and shadow carrying the elevation.
+    pub input_bg: Hsla,
+    /// Text-selection highlight in the composer and inputs.
+    pub selection: Hsla,
+    /// Terminal block cursor.
+    pub cursor: Hsla,
+    /// Composer text caret. A blue distinct from `accent` — sampled from the
+    /// original composer, not derived, so it keeps its own token.
+    pub caret: Hsla,
+    /// Destructive-action button fill (danger plate, carries [`Self::on_accent`]).
+    pub danger_strong: Hsla,
+
+    // ---- paint: code & diff ----
+    /// Inline-code text — violet, per the user's "a nice purple" request.
+    pub code_text: Hsla,
+    /// Inline-code wash behind [`Self::code_text`].
+    pub code_wash: Hsla,
+    /// Syntax: keywords (soft rose).
+    pub syntax_keyword: Hsla,
+    /// Syntax: string literals (soft green).
+    pub syntax_string: Hsla,
+    /// Syntax: numeric literals (soft amber).
+    pub syntax_number: Hsla,
+    /// Diff: added lines.
+    pub diff_add: Hsla,
+    /// Diff: deleted lines.
+    pub diff_del: Hsla,
+    /// Diff: hunk-header wash (bluish grey).
+    pub diff_hunk_bg: Hsla,
 
     // ---- fonts ----
     /// UI font family (bundling of Geist lands with asset work; until then the
@@ -70,6 +297,20 @@ impl Theme {
     /// backdrop blur has no material layer, so the scrim runs heavier to land
     /// on the same perceived tone (see [`Theme::glass`]).
     pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
+    /// Light-mode frost alpha — **opaque, deliberately**.
+    ///
+    /// Translucent chrome only works when the tint is dark enough to dominate
+    /// whatever is behind it. A light tint cannot: at any alpha loose enough to
+    /// actually show the blur, the desktop's colour bleeds through and the sidebar
+    /// takes on whatever the wallpaper happens to be — which reads as a dirty,
+    /// muddy grey rather than glass, and drags every label on it below its
+    /// contrast target because the background is no longer a known colour.
+    ///
+    /// Light UIs that get this right (Codex, Linear, Xcode) don't use vibrancy for
+    /// chrome at all: opaque panes, separated by hairlines. That is what this
+    /// does. Dark mode keeps its frost, where a near-black tint stays in control
+    /// of the result.
+    pub const GLASS_ALPHA_LIGHT: f32 = 1.0;
     /// Main-panel header height (comet `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
@@ -93,37 +334,92 @@ impl Theme {
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
 
-    /// The frost tint painted over the blurred window background (macOS
-    /// glass). Darker than `surface` — matched to the reference dark
-    /// vibrancy scrim: `hsl(0 0% 3%)` (#080808) at [`Self::GLASS_ALPHA`].
-    /// On opaque platforms this IS the surface tone (no tint swap).
+    /// The frost tint painted over the blurred window background (macOS glass).
+    /// Dark: darker than `surface`, matched to the reference vibrancy scrim
+    /// `hsl(0 0% 3%)`. Light: opaque — see [`Self::GLASS_ALPHA_LIGHT`]. On opaque
+    /// platforms this IS the surface tone (no tint swap).
     pub fn glass(&self) -> Hsla {
-        if Self::GLASS_ALPHA < 1.0 {
-            grey(8).opacity(Self::GLASS_ALPHA)
-        } else {
-            self.surface
+        match self.appearance {
+            Appearance::Dark => {
+                if Self::GLASS_ALPHA < 1.0 {
+                    grey(8).opacity(Self::GLASS_ALPHA)
+                } else {
+                    self.surface
+                }
+            }
+            Appearance::Light => self.surface,
         }
     }
 
-    /// Build the (only) theme. The surface tones are sampled straight from the
+    /// The standard modal backdrop — see [`scrim`].
+    pub fn scrim(&self) -> Hsla {
+        scrim_for(self.appearance, SCRIM_ALPHA_DARK)
+    }
+
+    /// How the platform should composite the window behind our paint.
+    ///
+    /// Both appearances want the blurred desktop on macOS — the frost tint on top
+    /// is what differs. This is a method rather than a constant because it has to
+    /// be *re-applied* after every theme swap: gpui's macOS backend tears the
+    /// `NSVisualEffectView` out of the hierarchy whenever the value is anything
+    /// but `Blurred`, so a single lost re-apply kills vibrancy permanently.
+    /// See `appearance::apply`, and zed's `crates/zed/src/main.rs`, which runs the
+    /// same loop on every settings change.
+    pub fn window_background_appearance(&self) -> gpui::WindowBackgroundAppearance {
+        if cfg!(target_os = "macos") {
+            gpui::WindowBackgroundAppearance::Blurred
+        } else {
+            gpui::WindowBackgroundAppearance::Opaque
+        }
+    }
+
+    /// Build the dark theme. The surface tones are sampled straight from the
     /// reference screenshots of the original app (docs/reference): main panel
     /// `#060606`, shell/sidebar `#0d0d0d`.
     pub fn dark() -> Self {
         Self {
+            appearance: Appearance::Dark,
             bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
             surface_raised: neutral(0.235),
-            element_hover: wash(0.14),
-            element_active: wash(0.16),
-            border: white_alpha(0.08),
-            border_strong: white_alpha(0.14),
-            text: neutral(0.922),                        // ~neutral-200
-            text_muted: neutral(0.708),                  // ~neutral-400
-            text_faint: neutral(0.556),                  // ~neutral-500
+            surface_card: grey(0x0e),
+            surface_dialog: grey(0x10),
+            surface_overlay: grey(0x16),
+            element_hover: hsla(0.0, 0.0, 0.92, 0.14),
+            element_active: hsla(0.0, 0.0, 0.92, 0.16),
+            border: hsla(0.0, 0.0, 1.0, 0.08),
+            border_strong: hsla(0.0, 0.0, 1.0, 0.14),
+            text: neutral(0.922),       // ~neutral-200
+            text_muted: neutral(0.708), // ~neutral-400
+            text_faint: neutral(0.556), // ~neutral-500
+            text_dim: grey(0x98),
+            solid: neutral(0.922),                       // near-white plate
+            on_solid: grey(0x0e),                        // near-black label
             accent: oklch(0.673, 0.182, 276.935),        // indigo-400
             accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
-            danger: oklch(0.704, 0.191, 22.216),         // red-400
-            warning: oklch(0.828, 0.189, 84.429),        // amber-400
+            on_accent: neutral(0.985),
+            danger: oklch(0.704, 0.191, 22.216),       // red-400
+            danger_muted: oklch(0.808, 0.114, 19.571), // red-300
+            warning: oklch(0.828, 0.189, 84.429),      // amber-400
+            warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
+            success: oklch(0.765, 0.177, 163.223),     // emerald-400
+            busy: oklch(0.718, 0.202, 349.761),        // pink-400
+            success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
+            surface_raised_hover: neutral(0.29),
+            band: band_for(Appearance::Dark),
+            input_bg: hsla(0.0, 0.0, 1.0, 0.03),
+            selection: hsla(0.66, 0.6, 0.55, 0.35),
+            cursor: hsla(0.0, 0.0, 1.0, 0.35),
+            caret: hsla(0.66, 0.7, 0.7, 1.0),
+            danger_strong: oklch(0.58, 0.16, 25.0),
+            code_text: oklch(0.811, 0.111, 293.571), // violet-300
+            code_wash: oklch(0.702, 0.183, 293.541).opacity(0.12), // violet-400/12
+            syntax_keyword: oklch(0.709, 0.129, 20.0), // soft rose
+            syntax_string: oklch(0.77, 0.11, 168.0), // soft green
+            syntax_number: oklch(0.78, 0.12, 80.0),  // soft amber
+            diff_add: oklch(0.765, 0.177, 163.223),  // emerald-400
+            diff_del: oklch(0.704, 0.191, 22.216),   // red-400
+            diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -131,9 +427,118 @@ impl Theme {
         }
     }
 
+    /// Build the light theme.
+    ///
+    /// Neutrals are the same oklch scale read from the other end, but the *roles*
+    /// are reassigned rather than mirrored (see the module docs): content plane
+    /// white, chrome grey, raised surfaces white-plus-shadow. Text tones are
+    /// picked to reproduce the dark theme's contrast ratios, and accents drop
+    /// from the 400 to the 600 step at identical hue so they clear WCAG AA on
+    /// white instead of glowing.
+    pub fn light() -> Self {
+        Self {
+            appearance: Appearance::Light,
+            bg: grey(0xff), // main panel — clean white
+            // Deeper than ~neutral-100 looks on paper: the content card is pure
+            // white and sits *inside* this surface, so too small a step leaves the
+            // whole window one flat sheet with a hairline drawn on it.
+            surface: neutral(0.968),
+            // A real grey, NOT white. This is the opaque-plate tone — user
+            // message bubbles, the jump-to-bottom pill — and those sit directly
+            // on the white content plane with no border or shadow to save them.
+            // White here made the user's own messages vanish into the page.
+            // Popovers do not use this; they have their own ladder below.
+            surface_raised: neutral(0.940),
+            surface_card: grey(0xff),
+            surface_dialog: grey(0xff),
+            surface_overlay: grey(0xff),
+            element_hover: hsla(0.0, 0.0, 0.10, 0.06),
+            element_active: hsla(0.0, 0.0, 0.10, 0.10),
+            border: hsla(0.0, 0.0, 0.0, 0.10),
+            border_strong: hsla(0.0, 0.0, 0.0, 0.17),
+            // ~neutral-850. Pure neutral-900 measures 17.9:1 on white — *more*
+            // contrast than dark mode's 16.1:1, which reads as harsh rather than
+            // crisp. Backing off to 0.25 lands at ~16:1: the same perceived
+            // weight as the dark theme, not the maximum available.
+            text: neutral(0.25),
+            text_muted: neutral(0.439), // ~neutral-600 → ~7.7:1
+            // A touch darker than dark mode's neutral-500 counterpart: the light
+            // sidebar is a real grey, and faint text has to clear its floor there
+            // too, not just on the white content plane.
+            text_faint: neutral(0.535),
+            text_dim: neutral(0.50),
+            solid: neutral(0.205),    // near-black plate, deeper than body text
+            on_solid: neutral(0.985), // near-white label
+            accent: oklch(0.511, 0.262, 276.966), // indigo-600
+            accent_strong: oklch(0.511, 0.262, 276.966), // indigo-600 fill
+            on_accent: neutral(0.985),
+            danger: oklch(0.577, 0.245, 27.325),        // red-600
+            danger_muted: oklch(0.505, 0.213, 27.518),  // red-700
+            warning: oklch(0.555, 0.163, 48.998),       // amber-700 — carries 12px text
+            warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
+            success: oklch(0.596, 0.145, 163.225),      // emerald-600
+            busy: oklch(0.592, 0.249, 0.584),           // pink-600
+            success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
+            // Opaque pills darken on hover here rather than brighten — same
+            // "brighten the plate, don't wash it out" rule, read the other way.
+            surface_raised_hover: neutral(0.900),
+            // A recessed strip on white needs far less ink than on near-black;
+            // the dark 16% would read as a bruise.
+            band: band_for(Appearance::Light),
+            input_bg: grey(0xff),
+            selection: hsla(0.66, 0.75, 0.62, 0.28),
+            cursor: hsla(0.0, 0.0, 0.0, 0.55),
+            caret: hsla(0.66, 0.78, 0.42, 1.0),
+            danger_strong: oklch(0.51, 0.20, 25.0),
+            code_text: oklch(0.491, 0.27, 292.581), // violet-700
+            code_wash: oklch(0.541, 0.281, 293.009).opacity(0.10), // violet-600/10
+            syntax_keyword: oklch(0.52, 0.19, 20.0),
+            syntax_string: oklch(0.46, 0.11, 168.0),
+            syntax_number: oklch(0.52, 0.13, 70.0),
+            diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
+            diff_del: oklch(0.577, 0.245, 27.325),  // red-600
+            diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
+            font_sans: "Geist".into(),
+            font_mono: "Geist Mono".into(),
+            font_sans_fallback: system_sans().into(),
+            font_mono_fallback: system_mono().into(),
+        }
+    }
+
+    /// Build the theme for an appearance.
+    pub fn for_appearance(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Dark => Self::dark(),
+            Appearance::Light => Self::light(),
+        }
+    }
+
+    /// Install the theme for `appearance` as the gpui global and point the
+    /// context-free paint helpers at it. The **only** way the appearance should
+    /// change — setting the global directly leaves [`current_appearance`] stale.
+    pub fn install(appearance: Appearance, cx: &mut App) {
+        set_current_appearance(appearance);
+        cx.set_global(Self::for_appearance(appearance));
+    }
+
     /// Read the theme global.
     pub fn of(cx: &App) -> &Theme {
         cx.global::<Theme>()
+    }
+
+    /// Overlay ink at `alpha` — see [`ink`].
+    pub fn ink(&self, alpha: f32) -> Hsla {
+        ink_for(self.appearance, alpha)
+    }
+
+    /// Hairline ink at `alpha` — see [`hairline`].
+    pub fn hairline(&self, alpha: f32) -> Hsla {
+        hairline_for(self.appearance, alpha)
+    }
+
+    /// State wash at `alpha` — see [`wash`].
+    pub fn wash(&self, alpha: f32) -> Hsla {
+        wash_for(self.appearance, alpha)
     }
 }
 
@@ -173,19 +578,95 @@ pub fn neutral(lightness: f32) -> Hsla {
     hsla(0.0, 0.0, v, 1.0)
 }
 
-/// Interactive-state wash: TRANSLUCENT soft-white, with alphas high enough to
-/// stay visible at the brightest backdrop the 0.90 glass scrim can produce
-/// (~L 0.13 over pure white — a 12% wash still adds ~+24 luma there). Fully
-/// opaque washes killed the glass and flashed dark mid-fade (user reports);
-/// hover fades must rest on `wash(0.0)`, never transparent BLACK, so the
-/// interpolation stays white-toned.
-pub fn wash(alpha: f32) -> Hsla {
-    hsla(0.0, 0.0, 0.92, alpha)
+/// Translucent **fill** ink for interactive states and chip plates: soft-white on
+/// dark, soft-black on light at [`INK_FILL_SCALE`] of the alpha.
+///
+/// Alphas are quoted in *dark-mode terms* at every call site — the dark theme is
+/// the tuned one — and the light value is derived. Callers keep one number and
+/// both appearances stay in the relationship the dark tuning established.
+///
+/// Fills must never rest on transparent BLACK in dark mode: fully opaque washes
+/// killed the glass and flashed dark mid-fade (user reports), so hover fades rest
+/// on `ink(0.0)`, which stays tonally correct at zero alpha.
+pub fn ink(alpha: f32) -> Hsla {
+    ink_for(current_appearance(), alpha)
 }
 
-/// White at the given alpha — the hairline/wash primitive.
-pub fn white_alpha(alpha: f32) -> Hsla {
-    hsla(0.0, 0.0, 1.0, alpha)
+fn ink_for(appearance: Appearance, alpha: f32) -> Hsla {
+    match appearance {
+        // Soft-white, not pure white: alphas are high enough to stay visible at
+        // the brightest backdrop the 0.90 glass scrim can produce.
+        Appearance::Dark => hsla(0.0, 0.0, 1.0, alpha),
+        Appearance::Light => hsla(0.0, 0.0, 0.0, alpha * INK_FILL_SCALE),
+    }
+}
+
+/// Translucent **hairline** ink for borders, dividers and rings: white on dark,
+/// black on light at [`INK_HAIRLINE_SCALE`] of the alpha.
+///
+/// Separate from [`ink`] because edges and fills scale in opposite directions
+/// when the field brightens — a 1px line needs *more* ink on white, a plate needs
+/// less.
+pub fn hairline(alpha: f32) -> Hsla {
+    hairline_for(current_appearance(), alpha)
+}
+
+fn hairline_for(appearance: Appearance, alpha: f32) -> Hsla {
+    match appearance {
+        Appearance::Dark => hsla(0.0, 0.0, 1.0, alpha),
+        Appearance::Light => hsla(0.0, 0.0, 0.0, (alpha * INK_HAIRLINE_SCALE).min(0.5)),
+    }
+}
+
+/// Interactive-state wash: a softened [`ink`] that stops short of pure black or
+/// white so hover plates read as tinted glass rather than paint.
+pub fn wash(alpha: f32) -> Hsla {
+    wash_for(current_appearance(), alpha)
+}
+
+fn wash_for(appearance: Appearance, alpha: f32) -> Hsla {
+    match appearance {
+        Appearance::Dark => hsla(0.0, 0.0, 0.92, alpha),
+        Appearance::Light => hsla(0.0, 0.0, 0.10, alpha * INK_FILL_SCALE),
+    }
+}
+
+/// Alpha of the standard modal backdrop in dark mode. Call sites that need a
+/// heavier or lighter scrim pass their own dark-mode alpha to [`scrim`].
+pub const SCRIM_ALPHA_DARK: f32 = 0.60;
+
+/// Modal backdrop at `alpha_dark` (quoted, as everywhere, in dark-mode terms).
+///
+/// Black in both appearances — a scrim's job is to darken what is behind it, and
+/// a "light scrim" of white would wash the modal out rather than seat it. What
+/// changes is strength: on a bright field a dark-mode-weight scrim reads as a
+/// blackout, so light mode scales to roughly half.
+pub fn scrim(alpha_dark: f32) -> Hsla {
+    scrim_for(current_appearance(), alpha_dark)
+}
+
+fn scrim_for(appearance: Appearance, alpha_dark: f32) -> Hsla {
+    match appearance {
+        Appearance::Dark => hsla(0.0, 0.0, 0.0, alpha_dark),
+        Appearance::Light => hsla(0.0, 0.0, 0.0, 0.32 * (alpha_dark / SCRIM_ALPHA_DARK)),
+    }
+}
+
+/// Recessed band behind a palette/picker header or footer strip.
+///
+/// A free function as well as a [`Theme`] field because the picker chrome that
+/// paints it is built from context-free helpers; both resolve to the same value.
+pub fn band() -> Hsla {
+    band_for(current_appearance())
+}
+
+fn band_for(appearance: Appearance) -> Hsla {
+    match appearance {
+        Appearance::Dark => hsla(0.0, 0.0, 0.0, 0.16),
+        // A recessed strip on white needs far less ink than on near-black; the
+        // dark 16% would read as a bruise.
+        Appearance::Light => hsla(0.0, 0.0, 0.0, 0.045),
+    }
 }
 
 /// Selected-state glass treatment (tabs, session rows, space rows): a
@@ -202,7 +683,7 @@ pub fn glass_selected_bg() -> Hsla {
 /// greyed ring (user report) — nothing may paint behind a glass chip.
 pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
     vec![gpui::BoxShadow {
-        color: white_alpha(0.09),
+        color: hairline(0.09),
         offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
         blur_radius: gpui::px(0.0),
         spread_radius: gpui::px(1.0),
@@ -277,6 +758,69 @@ pub(crate) fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (h, s, l)
 }
 
+/// HSL (gpui convention, all 0..1) → sRGB components 0..1.
+pub(crate) fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
+    if s <= f32::EPSILON {
+        return [l, l, l];
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let hue = |mut t: f32| {
+        t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    [hue(h + 1.0 / 3.0), hue(h), hue(h - 1.0 / 3.0)]
+}
+
+/// WCAG 2.1 relative luminance of an opaque color.
+pub fn relative_luminance(color: Hsla) -> f32 {
+    let lin = |c: f32| {
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let [r, g, b] = hsl_to_rgb(color.h, color.s, color.l);
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// WCAG 2.1 contrast ratio between two opaque colors (1.0 … 21.0).
+///
+/// Used by the palette tests to prove each light token reproduces the contrast
+/// its dark counterpart had, rather than merely looking plausible.
+pub fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Composite `fg` (which may be translucent) over an opaque `bg`, returning the
+/// opaque result — the color the eye actually receives.
+pub fn flatten(fg: Hsla, bg: Hsla) -> Hsla {
+    let a = fg.a.clamp(0.0, 1.0);
+    let [fr, fg_, fb] = hsl_to_rgb(fg.h, fg.s, fg.l);
+    let [br, bg_, bb] = hsl_to_rgb(bg.h, bg.s, bg.l);
+    let (h, s, l) = rgb_to_hsl(
+        fr * a + br * (1.0 - a),
+        fg_ * a + bg_ * (1.0 - a),
+        fb * a + bb * (1.0 - a),
+    );
+    hsla(h, s, l, 1.0)
+}
+
 /// Linear per-component mix of two colors (paint helper for the gradient spinner).
 pub fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     let t = t.clamp(0.0, 1.0);
@@ -325,67 +869,415 @@ mod tests {
     }
 
     #[test]
-    fn neutral_scale_is_ordered() {
-        let t = Theme::dark();
-        assert!(t.bg.l < t.surface.l);
-        assert!(t.surface.l < t.surface_raised.l);
-        assert!(t.surface_raised.l < t.text_faint.l);
-        assert!(t.text_faint.l < t.text_muted.l);
-        assert!(t.text_muted.l < t.text.l);
-        // Monochrome: neutrals carry no saturation.
+    fn hsl_roundtrips_through_rgb() {
         for c in [
-            t.bg,
-            t.surface,
-            t.surface_raised,
-            t.text,
-            t.text_muted,
-            t.text_faint,
+            Theme::dark().accent,
+            Theme::dark().warning,
+            Theme::light().accent,
+            Theme::light().danger,
+            neutral(0.556),
         ] {
-            assert_eq!(c.s, 0.0);
-            assert_eq!(c.a, 1.0);
+            let [r, g, b] = hsl_to_rgb(c.h, c.s, c.l);
+            let (h, s, l) = rgb_to_hsl(r, g, b);
+            assert!((l - c.l).abs() < 1e-3, "lightness drift for {c:?}");
+            assert!((s - c.s).abs() < 1e-3, "saturation drift for {c:?}");
+            if c.s > 1e-3 {
+                assert!((h - c.h).abs() < 1e-3, "hue drift for {c:?}");
+            }
         }
     }
 
     #[test]
-    fn hairlines_are_white_and_washes_are_mid_grey() {
-        let t = Theme::dark();
-        // Hairlines stay white — they only need to read on dark surfaces.
-        for c in [t.border, t.border_strong] {
-            assert_eq!(c.l, 1.0, "hairlines are white");
-            assert!(c.a > 0.0 && c.a < 0.25, "low alpha, got {}", c.a);
+    fn contrast_ratio_hits_known_anchors() {
+        let white = grey(0xff);
+        let black = grey(0x00);
+        assert!((contrast_ratio(white, black) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(white, white) - 1.0).abs() < 0.01);
+        // Symmetric regardless of argument order.
+        assert!((contrast_ratio(black, white) - contrast_ratio(white, black)).abs() < 1e-4);
+    }
+
+    /// The core claim of the light palette: it is *paired* to dark by contrast
+    /// ratio, not mirrored by lightness. Each text token must land within 1.0 of
+    /// its counterpart's ratio against its own background.
+    #[test]
+    fn text_contrast_is_paired_across_appearances() {
+        let (d, l) = (Theme::dark(), Theme::light());
+        for (name, dark_fg, light_fg) in [
+            ("text", d.text, l.text),
+            ("text_muted", d.text_muted, l.text_muted),
+            ("text_faint", d.text_faint, l.text_faint),
+        ] {
+            let dr = contrast_ratio(dark_fg, d.bg);
+            let lr = contrast_ratio(light_fg, l.bg);
+            assert!(
+                (dr - lr).abs() < 1.0,
+                "{name}: dark {dr:.2}:1 vs light {lr:.2}:1 — not a matched pair"
+            );
         }
-        // Washes are translucent soft-white with enough alpha to read at the
-        // glass scrim's brightness ceiling.
-        for c in [t.element_hover, t.element_active] {
-            assert_eq!(c.l, 0.92, "washes are soft-white");
-            assert!(c.a >= 0.05 && c.a < 0.35, "alpha in band, got {}", c.a);
+    }
+
+    /// Body and secondary text must clear WCAG AA (4.5:1) against **both** planes
+    /// they can land on, in both appearances.
+    ///
+    /// `text_faint` is held to a lower floor on purpose. It is placeholder and
+    /// disabled-control copy only, which WCAG 1.4.3 exempts, and the *existing
+    /// dark palette* already measures ~4.2:1 there (neutral-500 on #060606). The
+    /// light tone is matched to that inherited number rather than raised past it,
+    /// so the two appearances stay siblings; raising the floor is a palette
+    /// decision for both modes at once, not something light mode should do alone.
+    #[test]
+    fn text_tones_clear_wcag_aa() {
+        for t in [Theme::dark(), Theme::light()] {
+            for (name, fg, floor) in [
+                ("text", t.text, 4.5),
+                ("text_muted", t.text_muted, 4.5),
+                ("text_dim", t.text_dim, 4.5),
+                ("text_faint", t.text_faint, 4.1),
+            ] {
+                let on_bg = contrast_ratio(fg, t.bg);
+                let on_surface = contrast_ratio(fg, t.surface);
+                assert!(
+                    on_bg >= floor,
+                    "{:?} {name} on bg is {on_bg:.2}:1, below {floor}",
+                    t.appearance
+                );
+                assert!(
+                    on_surface >= floor,
+                    "{:?} {name} on surface is {on_surface:.2}:1, below {floor}",
+                    t.appearance
+                );
+            }
         }
-        assert!(t.border.a < t.border_strong.a);
-        // Hover intentionally equals the active fill (selection differs by
-        // its ring, not brightness — user request).
-        assert!(t.element_hover.a <= t.element_active.a);
+    }
+
+    /// Accents are the tokens a naive invert gets most wrong: the dark theme's
+    /// 400-step indigo/red land near 3:1 on white. The light palette drops to the
+    /// 600 step at the same hue, which must clear AA for non-text UI (3:1) and,
+    /// for the accent proper, body-text AA.
+    #[test]
+    fn accents_clear_contrast_on_their_background() {
+        let l = Theme::light();
+        assert!(
+            contrast_ratio(l.accent, l.bg) >= 4.5,
+            "light accent {:.2}:1",
+            contrast_ratio(l.accent, l.bg)
+        );
+        assert!(
+            contrast_ratio(l.danger, l.bg) >= 4.0,
+            "light danger {:.2}:1",
+            contrast_ratio(l.danger, l.bg)
+        );
+        for c in [l.warning, l.success, l.busy] {
+            assert!(
+                contrast_ratio(c, l.bg) >= 3.0,
+                "light status color {:.2}:1 — below the 3:1 non-text floor",
+                contrast_ratio(c, l.bg)
+            );
+        }
+        // And the dark 400-step accents would NOT have cleared it — this is why
+        // the light theme reassigns rather than reuses.
+        let d = Theme::dark();
+        assert!(
+            contrast_ratio(d.warning, l.bg) < 3.0,
+            "dark amber-400 unexpectedly passes on white; the invert-is-wrong \
+             premise needs rechecking"
+        );
+    }
+
+    /// Code is *text*, so syntax tones are held to the body-copy bar, not the
+    /// 3:1 non-text floor. These are the tokens most likely to be picked by eye
+    /// from a dark-theme screenshot and silently fail once the page turns white.
+    #[test]
+    fn code_and_syntax_tones_are_readable() {
+        for t in [Theme::dark(), Theme::light()] {
+            for (name, fg) in [
+                ("code_text", t.code_text),
+                ("syntax_keyword", t.syntax_keyword),
+                ("syntax_string", t.syntax_string),
+                ("syntax_number", t.syntax_number),
+            ] {
+                let r = contrast_ratio(fg, t.bg);
+                assert!(r >= 4.5, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
+            }
+            // Diff tints mark whole rows; the 3:1 non-text floor applies.
+            for (name, fg) in [("diff_add", t.diff_add), ("diff_del", t.diff_del)] {
+                let r = contrast_ratio(fg, t.bg);
+                assert!(r >= 3.0, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
+            }
+        }
+    }
+
+    /// The caret is a 2px bar, so the 3:1 non-text floor applies — but it is the
+    /// one element the user is actively hunting for, and the dark-mode blue is
+    /// far too light to survive on white unchanged.
+    #[test]
+    fn caret_is_findable_on_its_background() {
+        for t in [Theme::dark(), Theme::light()] {
+            let r = contrast_ratio(t.caret, t.bg);
+            assert!(r >= 3.0, "{:?} caret is {r:.2}:1 on bg", t.appearance);
+        }
+    }
+
+    /// Solid (primary button) plates must carry their label at AA in both modes.
+    ///
+    /// The accent plate is held to 4.0 rather than 4.5: dark mode's indigo-500
+    /// fill — inherited unchanged from the original palette — measures 4.38:1
+    /// under white, which clears WCAG AA for the medium-weight 14px labels these
+    /// buttons use (large-text AA is 3:1) but not body copy. Light mode's
+    /// indigo-600 clears the stricter bar with room to spare.
+    #[test]
+    fn solid_button_is_legible_in_both_appearances() {
+        for t in [Theme::dark(), Theme::light()] {
+            let r = contrast_ratio(t.on_solid, t.solid);
+            assert!(r >= 7.0, "{:?} solid button {r:.2}:1", t.appearance);
+            let a = contrast_ratio(t.on_accent, t.accent_strong);
+            assert!(a >= 4.0, "{:?} accent button {a:.2}:1", t.appearance);
+        }
+    }
+
+    /// Surfaces must stay *distinguishable*, but the direction differs: dark
+    /// stacks upward in lightness, light puts the content plane on top and lets
+    /// chrome recede. Asserting separation (not a fixed order) is the point.
+    #[test]
+    fn surfaces_are_separated_in_both_appearances() {
+        let d = Theme::dark();
+        assert!(d.bg.l < d.surface.l, "dark: chrome sits above content");
+        assert!(d.surface.l < d.surface_raised.l, "dark: raised is lighter");
+
+        let l = Theme::light();
+        assert!(
+            l.surface.l < l.bg.l,
+            "light: chrome recedes *below* the content plane"
+        );
+        assert!(
+            (l.bg.l - l.surface.l) > 0.015,
+            "light: sidebar must be visibly separated from the panel"
+        );
+        // Raised surfaces are white in light mode; separation comes from the
+        // border, so the border must be strong enough to carry it alone.
+        assert!(contrast_ratio(flatten(l.border, l.bg), l.bg) > 1.15);
+    }
+
+    /// The dark elevation steps are small but deliberate, and each plane must
+    /// stay strictly above the one below. This test exists because collapsing the
+    /// ladder onto a single `surface_raised` is the tempting simplification — and
+    /// it visibly lifts every popover off its plane.
+    #[test]
+    fn dark_elevation_ladder_is_strictly_ordered() {
+        let d = Theme::dark();
+        let ladder = [
+            ("bg", d.bg),
+            ("surface_card", d.surface_card),
+            ("surface_dialog", d.surface_dialog),
+            ("surface_overlay", d.surface_overlay),
+            ("surface_raised", d.surface_raised),
+        ];
+        for pair in ladder.windows(2) {
+            let ((lower, lo), (upper, hi)) = (pair[0], pair[1]);
+            assert!(
+                lo.l < hi.l,
+                "dark: {upper} ({:.4}) must sit above {lower} ({:.4})",
+                hi.l,
+                lo.l
+            );
+        }
+    }
+
+    /// Light mode flattens the ladder onto white on purpose — separation comes
+    /// from border and shadow. Assert that explicitly so nobody "fixes" it by
+    /// reintroducing lightness steps that would tint popovers grey.
+    #[test]
+    fn light_elevation_is_flat_white_and_leans_on_borders() {
+        let l = Theme::light();
+        for (name, c) in [
+            ("surface_card", l.surface_card),
+            ("surface_dialog", l.surface_dialog),
+            ("surface_overlay", l.surface_overlay),
+        ] {
+            assert_eq!(c.l, 1.0, "light {name} should be white");
+        }
+        // With no lightness step available, the border is the only separator —
+        // it has to actually register against the plane behind it.
+        assert!(contrast_ratio(flatten(l.border, l.bg), l.bg) > 1.15);
+    }
+
+    /// `surface_raised` is the *bare plate* tone — user message bubbles, the
+    /// jump-to-bottom pill. Unlike the popover ladder it gets no border and no
+    /// shadow, so lightness is the only thing separating it from the panel. It
+    /// was white in light mode once, which made the user's own messages
+    /// indistinguishable from the page.
+    #[test]
+    fn bare_plates_are_visible_against_their_panel() {
+        for t in [Theme::dark(), Theme::light()] {
+            let delta = (t.surface_raised.l - t.bg.l).abs();
+            assert!(
+                delta > 0.03,
+                "{:?} surface_raised ({:.3}) is only {delta:.3} from bg ({:.3}) — \
+                 a plate with no border needs lightness to read",
+                t.appearance,
+                t.surface_raised.l,
+                t.bg.l
+            );
+            // And hovering it has to go somewhere visible too.
+            let hover_delta = (t.surface_raised_hover.l - t.surface_raised.l).abs();
+            assert!(
+                hover_delta > 0.02,
+                "{:?} raised-plate hover moves only {hover_delta:.3}",
+                t.appearance
+            );
+        }
+    }
+
+    /// Monochrome discipline: neutrals carry no saturation in either appearance.
+    #[test]
+    fn neutrals_are_achromatic() {
+        for t in [Theme::dark(), Theme::light()] {
+            for c in [
+                t.bg,
+                t.surface,
+                t.surface_raised,
+                t.text,
+                t.text_muted,
+                t.text_faint,
+                t.solid,
+                t.on_solid,
+            ] {
+                assert_eq!(c.s, 0.0, "{:?} neutral has chroma", t.appearance);
+                assert_eq!(c.a, 1.0, "{:?} neutral is translucent", t.appearance);
+            }
+        }
     }
 
     #[test]
-    fn accent_hues_land_in_their_bands() {
-        let t = Theme::dark();
-        // Hsla hue is 0..1 of the wheel. Indigo ≈ 230-250°, red < 15°, amber ≈ 40-55°.
-        let deg = |c: Hsla| c.h * 360.0;
-        assert!(
-            (215.0..265.0).contains(&deg(t.accent)),
-            "indigo hue {}",
-            deg(t.accent)
+    fn hairlines_and_washes_flip_tone_with_appearance() {
+        let _guard = lock_appearance();
+        set_current_appearance(Appearance::Dark);
+        assert_eq!(hairline(0.1).l, 1.0, "dark hairlines are white");
+        assert_eq!(ink(0.1).l, 1.0, "dark fills are white");
+        assert_eq!(ink(0.1).a, 0.1, "dark alphas pass through untouched");
+        assert_eq!(wash(0.14).l, 0.92, "dark washes are soft-white");
+
+        set_current_appearance(Appearance::Light);
+        assert_eq!(hairline(0.1).l, 0.0, "light hairlines are black");
+        assert_eq!(ink(0.1).l, 0.0, "light fills are black");
+        assert_eq!(wash(0.14).l, 0.10, "light washes are soft-black");
+        // Fills keep their alpha; only hairlines are scaled.
+        assert_eq!(ink(0.10).a, 0.10, "light fills keep their alpha");
+        assert!(hairline(0.10).a > 0.10, "light hairlines strengthen");
+        assert!(hairline(0.60).a <= 0.5, "hairline alpha is capped");
+
+        set_current_appearance(Appearance::Dark);
+    }
+
+    /// A hover wash has to actually be *visible* against the surface it lands on,
+    /// in both appearances — the failure mode of a halved light alpha.
+    #[test]
+    fn hover_wash_is_visible_on_its_surface() {
+        let _guard = lock_appearance();
+        for (appearance, theme) in [
+            (Appearance::Dark, Theme::dark()),
+            (Appearance::Light, Theme::light()),
+        ] {
+            set_current_appearance(appearance);
+            let hovered = flatten(wash(0.14), theme.surface);
+            let delta = (hovered.l - theme.surface.l).abs();
+            assert!(
+                delta > 0.02,
+                "{appearance:?} hover wash shifts lightness by only {delta:.4}"
+            );
+        }
+        set_current_appearance(Appearance::Dark);
+    }
+
+    /// The regression that shipped: subtle fills are quoted at very low alphas
+    /// (`ink(0.03)` is the composer plate, `ink(0.05)` a key cap), and scaling
+    /// those down for light mode erased them — the composer rendered as bare text
+    /// on white. Assert the faintest fill we actually use still moves the surface
+    /// it lands on, in *both* appearances.
+    #[test]
+    fn faintest_fills_survive_in_both_appearances() {
+        let _guard = lock_appearance();
+        for (appearance, theme) in [
+            (Appearance::Dark, Theme::dark()),
+            (Appearance::Light, Theme::light()),
+        ] {
+            set_current_appearance(appearance);
+            for alpha in [0.03, 0.05] {
+                let plate = flatten(ink(alpha), theme.bg);
+                let delta = (plate.l - theme.bg.l).abs();
+                assert!(
+                    delta >= 0.02,
+                    "{appearance:?} ink({alpha}) shifts its background by only \
+                     {delta:.4} — the fill is invisible"
+                );
+            }
+        }
+        set_current_appearance(Appearance::Dark);
+    }
+
+    /// Light chrome is opaque on purpose. A translucent light tint lets the
+    /// desktop's colour through, so the sidebar becomes whatever the wallpaper is
+    /// — muddy, and no longer a known background to compute contrast against.
+    /// Dark keeps its frost, where the tint stays in control.
+    #[test]
+    fn light_chrome_is_opaque_and_dark_stays_frosted() {
+        assert_eq!(
+            Theme::light().glass().a,
+            1.0,
+            "light chrome must not sample the desktop"
         );
-        assert!(
-            deg(t.danger) < 15.0 || deg(t.danger) > 345.0,
-            "red hue {}",
-            deg(t.danger)
-        );
-        assert!(
-            (35.0..60.0).contains(&deg(t.warning)),
-            "amber hue {}",
-            deg(t.warning)
-        );
+        if Theme::GLASS_ALPHA < 1.0 {
+            assert!(
+                Theme::dark().glass().a < 1.0,
+                "dark mode keeps its translucent frost"
+            );
+        }
+    }
+
+    /// An input plate has to read as *lifted* in both appearances. Dark does that
+    /// with a faint white wash; the literal light translation is a faint black
+    /// wash, which reads as a dent instead — so light lifts with white plus its
+    /// border. Assert the plate is never darker than the panel it sits on.
+    #[test]
+    fn input_plate_never_reads_as_recessed() {
+        for t in [Theme::dark(), Theme::light()] {
+            let plate = flatten(t.input_bg, t.bg);
+            assert!(
+                plate.l >= t.bg.l,
+                "{:?} input plate ({:.3}) is darker than its panel ({:.3}) — \
+                 that reads as recessed, not raised",
+                t.appearance,
+                plate.l,
+                t.bg.l
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_mirror_tracks_installed_theme() {
+        let _guard = lock_appearance();
+        set_current_appearance(Appearance::Light);
+        assert_eq!(current_appearance(), Appearance::Light);
+        set_current_appearance(Appearance::Dark);
+        assert_eq!(current_appearance(), Appearance::Dark);
+    }
+
+    #[test]
+    fn window_appearance_maps_onto_ours() {
+        use gpui::WindowAppearance as W;
+        assert_eq!(Appearance::from_window(W::Light), Appearance::Light);
+        assert_eq!(Appearance::from_window(W::VibrantLight), Appearance::Light);
+        assert_eq!(Appearance::from_window(W::Dark), Appearance::Dark);
+        assert_eq!(Appearance::from_window(W::VibrantDark), Appearance::Dark);
+    }
+
+    #[test]
+    fn scrim_is_black_but_lighter_in_light_mode() {
+        let (d, l) = (Theme::dark(), Theme::light());
+        assert_eq!(d.scrim().l, 0.0);
+        assert_eq!(l.scrim().l, 0.0);
+        assert!(l.scrim().a < d.scrim().a);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
-use crate::theme::{Theme, white_alpha};
+use crate::theme::{Theme, ink};
 
 /// Centered page column: `mx-auto w-full max-w-3xl px-6 pb-16 pt-8`.
 pub fn page_column() -> gpui::Div {
@@ -54,6 +54,104 @@ pub fn page_subtitle(theme: &Theme, copy: impl Into<SharedString>) -> gpui::Div 
         .child(copy.into())
 }
 
+/// Small label above a group of controls (`text-[13px] font-medium`) — the
+/// "Theme" caption over a picker, not a page headline.
+pub fn field_label(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .text_size(px(13.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.text)
+        .child(label.into())
+}
+
+/// A row of equally-sized preview cards for picking one of N *visual* options.
+///
+/// Deliberately knows nothing about themes: the caller supplies each preview as
+/// an arbitrary element and picks however many cards it wants, so the same
+/// control works for a density picker, a layout picker or anything else where
+/// the choice is easier to show than to describe. Pair with [`option_card`].
+pub fn option_card_row() -> gpui::Div {
+    div().flex().flex_row().items_start().gap(px(16.0)).w_full()
+}
+
+/// Default height of an [`option_card`] preview frame.
+pub const OPTION_CARD_HEIGHT: f32 = 148.0;
+/// Corner radius of the preview frame.
+///
+/// Public because the preview has to round *itself* to this. gpui content masks
+/// are axis-aligned rectangles, so `overflow_hidden` on the frame clips to its
+/// bounding box and not to its corner radius — a preview that paints its own
+/// background will square off the corners and cover the frame's border with it.
+pub const OPTION_CARD_RADIUS: f32 = 10.0;
+/// Clear space between the frame and the selection ring.
+const RING_GAP: f32 = 2.0;
+/// Thickness of the selection ring.
+const RING_WIDTH: f32 = 2.0;
+
+/// One card in an [`option_card_row`]: a fixed-height preview frame that carries
+/// the selection ring, with a caption underneath.
+///
+/// `preview` fills the frame and **must round its own corners** to
+/// [`OPTION_CARD_RADIUS`] if it paints a background — see that constant.
+///
+/// Returns a plain `Div` like the rest of this module — the caller adds `.id(..)`
+/// and `.on_click(..)`, so selection behaviour stays with the page that owns the
+/// state.
+pub fn option_card(
+    theme: &Theme,
+    label: impl Into<SharedString>,
+    selected: bool,
+    preview: AnyElement,
+) -> gpui::Div {
+    let frame = div()
+        .h(px(OPTION_CARD_HEIGHT))
+        .w_full()
+        .rounded(px(OPTION_CARD_RADIUS))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border)
+        .child(preview);
+
+    // The ring is a *wrapper border*, not a spread shadow. A shadow's spread
+    // grows the rectangle without growing its corner radius, so the halo's
+    // corners tighten relative to the frame's and the two visibly drift apart by
+    // a pixel at each rounded corner. Concentric borders can't do that: each
+    // element rounds itself, and the outer radius is the inner one plus the gap
+    // it sits behind. Always present, transparent when unselected, so selecting a
+    // card never reflows the row.
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .child(
+            div()
+                .w_full()
+                .rounded(px(OPTION_CARD_RADIUS + RING_GAP + RING_WIDTH))
+                .p(px(RING_GAP))
+                .border_2()
+                .border_color(if selected {
+                    theme.accent
+                } else {
+                    gpui::transparent_black()
+                })
+                .child(frame),
+        )
+        .child(
+            div()
+                .text_size(px(13.0))
+                .text_color(if selected {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .child(label.into()),
+        )
+}
+
 /// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
 /// — the opaque raised-card tone (comet `--card`), not a translucent wash.
 pub fn section_card(theme: &Theme) -> gpui::Div {
@@ -75,7 +173,7 @@ pub fn card_row(theme: &Theme, first: bool) -> gpui::Div {
         .px(px(20.0))
         .py(px(14.0))
         .when(!first, |el| el.border_t_1().border_color(theme.border))
-        .hover(|s| s.bg(white_alpha(0.015)))
+        .hover(|s| s.bg(ink(0.015)))
         .flex()
         .flex_row()
         .items_center()
@@ -91,7 +189,7 @@ pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
         .rounded(px(10.0))
         .border_1()
         .border_color(theme.border)
-        .bg(white_alpha(0.03))
+        .bg(ink(0.03))
         .flex()
         .items_center()
         .justify_center()
@@ -157,9 +255,9 @@ pub fn badge(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
 
 /// Emerald status pill (the Accounts "Active" badge:
 /// `bg-emerald-400/[0.12] text-emerald-300/90`).
-pub fn badge_active(label: impl Into<SharedString>) -> gpui::Div {
-    let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
-    let emerald_text = crate::theme::oklch(0.845, 0.143, 164.978); // emerald-300
+pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
+    let emerald = theme.success;
+    let emerald_text = theme.success_muted; // emerald-300
     div()
         .flex_none()
         .px(px(8.0))
@@ -191,16 +289,16 @@ pub fn ghost_action(theme: &Theme) -> gpui::Div {
 
 /// The default ghost-action hover wash (`hover:bg-white/[0.06]
 /// hover:text-foreground`).
-pub fn ghost_hover(s: gpui::StyleRefinement) -> gpui::StyleRefinement {
-    s.bg(white_alpha(0.06)).text_color(Theme::dark().text)
+pub fn ghost_hover(theme: &Theme, s: gpui::StyleRefinement) -> gpui::StyleRefinement {
+    s.bg(ink(0.06)).text_color(theme.text)
 }
 
 /// The dismissible red error strip (`flex items-start gap-2 rounded-xl border
 /// border-red-400/20 bg-red-400/[0.06] text-red-300/90` with a leading
 /// `DangerTriangle mt-0.5 size-4`).
-pub fn error_strip(message: impl Into<SharedString>) -> gpui::Div {
-    let red = crate::theme::oklch(0.704, 0.191, 22.216); // red-400
-    let red_text = crate::theme::oklch(0.81, 0.108, 19.6); // red-300
+pub fn error_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div {
+    let red = theme.danger; // red-400
+    let red_text = theme.danger_muted; // red-300
     div()
         .mt(px(16.0))
         .px(px(16.0))
@@ -228,9 +326,9 @@ pub fn error_strip(message: impl Into<SharedString>) -> gpui::Div {
 /// The amber warning strip (`flex items-start gap-2 border-amber-400/20
 /// bg-amber-400/[0.06] text-amber-200/90` with a leading `DangerTriangle
 /// mt-0.5 size-3.5`).
-pub fn warning_strip(message: impl Into<SharedString>) -> gpui::Div {
-    let amber = crate::theme::oklch(0.828, 0.189, 84.429); // amber-400
-    let amber_text = crate::theme::oklch(0.924, 0.12, 95.746); // amber-200
+pub fn warning_strip(theme: &Theme, message: impl Into<SharedString>) -> gpui::Div {
+    let amber = theme.warning; // amber-400
+    let amber_text = theme.warning_muted; // amber-200
     div()
         .mt(px(8.0))
         .px(px(16.0))

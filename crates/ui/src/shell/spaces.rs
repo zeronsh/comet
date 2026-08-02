@@ -115,7 +115,7 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
         // Pink, not amber — the harsh yellow read as a warning; running is
         // routine (user request).
         ChatIndicator::Working => {
-            crate::theme::oklch(0.718, 0.202, 349.761).opacity(0.85) // pink-400
+            theme.busy.opacity(0.85) // pink-400
         }
         // Blue: "asking you a question" must read differently from "busy
         // working" at a glance.
@@ -123,9 +123,9 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
         ChatIndicator::Errored => theme.danger,
         // Green: finished-but-unseen reads as "ready for you".
         ChatIndicator::Completed => {
-            crate::theme::oklch(0.765, 0.177, 163.223).opacity(0.9) // emerald-400
+            theme.success.opacity(0.9) // emerald-400
         }
-        ChatIndicator::Idle => crate::theme::white_alpha(0.14),
+        ChatIndicator::Idle => crate::theme::ink(0.14),
     }
 }
 
@@ -308,12 +308,12 @@ impl Shell {
                     .text_color(motion::hover_blend(
                         "add-space-ghost",
                         theme.text_muted,
-                        Theme::dark().text,
+                        theme.text,
                     ))
                     .bg(motion::hover_blend(
                         "add-space-ghost",
                         crate::theme::wash(0.0),
-                        Theme::dark().element_hover,
+                        theme.element_hover,
                     ))
                     .on_hover(motion::hover_listener("add-space-ghost"))
                     .cursor_pointer()
@@ -526,7 +526,7 @@ impl Shell {
             .child(
                 div().size(px(6.0)).rounded_full().flex_none().bg(attention
                     .map(|status| status_dot_color(status, theme))
-                    .unwrap_or_else(|| crate::theme::white_alpha(0.14))),
+                    .unwrap_or_else(|| crate::theme::ink(0.14))),
             )
             .child(
                 icon(icons::FOLDER)
@@ -1018,7 +1018,7 @@ impl Shell {
         let devices = self.state.read(cx).devices.clone();
         let rows = self.add_space_filtered(cx);
         let query_empty = search.read(cx).is_empty();
-        let hairline = crate::theme::white_alpha(0.06);
+        let hairline = crate::theme::hairline(0.06);
         let now = Utc::now();
         // (browsed device name, online) per rail row — presence is the same
         // signal the sidebar space rows use.
@@ -1046,7 +1046,7 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .gap(px(2.0))
-                .bg(crate::theme::white_alpha(0.05))
+                .bg(crate::theme::ink(0.05))
                 .text_size(px(11.0))
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text_muted.opacity(0.7))
@@ -1075,7 +1075,7 @@ impl Shell {
                 el.child(
                     icon(icons::COMMAND)
                         .size(px(11.0))
-                        .text_color(crate::theme::grey(0x0e).opacity(0.8)),
+                        .text_color(theme.on_solid.opacity(0.8)),
                 )
                 .child(SharedString::from("Enter"))
             })
@@ -1117,7 +1117,7 @@ impl Shell {
                 key_chip(&theme)
                     .id("add-space-esc")
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::white_alpha(0.09)))
+                    .hover(|s| s.bg(crate::theme::ink(0.09)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.add_space = None;
                         cx.notify();
@@ -1168,7 +1168,7 @@ impl Shell {
                             crumb
                                 .text_color(theme.text_muted.opacity(0.55))
                                 .cursor_pointer()
-                                .hover(|s| s.text_color(Theme::dark().text))
+                                .hover(|s| s.text_color(theme.text))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(flow) = this.add_space.as_mut() {
                                         flow.browser_repo = false;
@@ -1206,7 +1206,7 @@ impl Shell {
                                     } else {
                                         crumb
                                             .cursor_pointer()
-                                            .hover(|s| s.text_color(Theme::dark().text))
+                                            .hover(|s| s.text_color(theme.text))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(flow) = this.add_space.as_mut() {
                                                     flow.browser_repo = false;
@@ -1405,7 +1405,7 @@ impl Shell {
                             .when(online, |el| {
                                 // The Devices-page presence emerald, soft glow
                                 // included.
-                                let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
+                                let emerald = theme.success;
                                 el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
                                     color: emerald.opacity(0.55),
                                     offset: gpui::point(px(0.0), px(0.0)),
@@ -1414,7 +1414,7 @@ impl Shell {
                                     inset: false,
                                 }])
                             })
-                            .when(!online, |el| el.bg(crate::theme::white_alpha(0.22))),
+                            .when(!online, |el| el.bg(crate::theme::ink(0.22))),
                     )
             }))
             .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
@@ -1496,14 +1496,14 @@ impl Shell {
                 .w(px(680.0))
                 .rounded(px(14.0))
                 .border_1()
-                .border_color(crate::theme::white_alpha(0.10))
+                .border_color(crate::theme::hairline(0.10))
                 // The popover_card glass recipe: a translucent tint over the
                 // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
                 // an opaque fill here killed the vibrancy every other float has.
                 .bg(if Theme::GLASS_ALPHA < 1.0 {
-                    crate::theme::grey(0x16).opacity(0.65)
+                    theme.surface_overlay.opacity(0.65)
                 } else {
-                    crate::theme::grey(0x16)
+                    theme.surface_overlay
                 })
                 .shadow_lg()
                 .overflow_hidden()

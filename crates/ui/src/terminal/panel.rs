@@ -860,7 +860,7 @@ impl TerminalPanel {
             .pl(px(8.0))
             .pr(px(6.0))
             .border_b_1()
-            .border_color(crate::theme::white_alpha(0.07))
+            .border_color(crate::theme::hairline(0.07))
             .on_drag_move::<TabDragPayload>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
                     let payload = event.drag(cx);
@@ -895,7 +895,7 @@ impl TerminalPanel {
                         // Comet tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
                         // terminal glyph + label + close; active = white/8 wash.
                         let (text_color, bg, glyph_alpha) = if selected {
-                            (theme.text, crate::theme::white_alpha(0.08), 0.8)
+                            (theme.text, crate::theme::ink(0.08), 0.8)
                         } else {
                             (
                                 theme.text_muted.opacity(0.6),
@@ -913,7 +913,7 @@ impl TerminalPanel {
                             .rounded(px(6.0))
                             .when(!selected, |el| el.invisible())
                             .cursor_pointer()
-                            .hover(|s| s.bg(crate::theme::white_alpha(0.09)))
+                            .hover(|s| s.bg(crate::theme::ink(0.09)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(&chat_close2, key, window, cx);
@@ -1017,7 +1017,7 @@ impl TerminalPanel {
                     .bg(motion::hover_blend(
                         "term-new-tab",
                         gpui::transparent_black(),
-                        crate::theme::white_alpha(0.05),
+                        crate::theme::ink(0.05),
                     ))
                     .on_hover(motion::hover_listener("term-new-tab"))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1046,7 +1046,7 @@ impl TerminalPanel {
                     .bg(motion::hover_blend(
                         "term-collapse",
                         gpui::transparent_black(),
-                        crate::theme::white_alpha(0.05),
+                        crate::theme::ink(0.05),
                     ))
                     .on_hover(motion::hover_listener("term-collapse"))
                     .on_click(|_, window, cx| {

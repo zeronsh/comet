@@ -408,13 +408,9 @@ impl gpui::Element for TerminalElement {
             );
             if self.focused {
                 // Translucent block: the glyph underneath stays legible.
-                fill(cursor_bounds, gpui::hsla(0.0, 0.0, 1.0, 0.35))
+                fill(cursor_bounds, theme.cursor)
             } else {
-                outline(
-                    cursor_bounds,
-                    gpui::hsla(0.0, 0.0, 1.0, 0.35),
-                    gpui::BorderStyle::Solid,
-                )
+                outline(cursor_bounds, theme.cursor, gpui::BorderStyle::Solid)
             }
         });
 

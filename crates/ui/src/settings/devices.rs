@@ -210,7 +210,7 @@ impl Render for DevicesPage {
         };
         let copied = self.copied.clone();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
-        let emerald = crate::theme::oklch(0.765, 0.177, 163.223); // emerald-400
+        let emerald = theme.success; // emerald-400
         let count = devices.len();
 
         let rows: Vec<AnyElement> = devices
@@ -252,7 +252,7 @@ impl Render for DevicesPage {
                                 inset: false,
                             }])
                         })
-                        .when(!online, |el| el.bg(crate::theme::white_alpha(0.22))),
+                        .when(!online, |el| el.bg(crate::theme::ink(0.22))),
                 );
                 // One quiet meta line: platform · version · (offline: last
                 // seen) · id chip.
@@ -297,12 +297,12 @@ impl Render for DevicesPage {
                         .font_family(theme.font_mono.clone())
                         .text_size(px(10.5))
                         .text_color(if id_copied {
-                            crate::theme::oklch(0.845, 0.143, 164.978).opacity(0.9)
+                            theme.success_muted.opacity(0.9)
                         } else {
                             theme.text_muted.opacity(0.5)
                         })
                         .cursor_pointer()
-                        .hover(|s| s.text_color(Theme::dark().text_muted))
+                        .hover(|s| s.text_color(theme.text_muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.copy_id(copy_id.clone(), cx);
                         }))
@@ -337,8 +337,8 @@ impl Render for DevicesPage {
                             .opacity(0.7)
                             .hover(|s| {
                                 s.opacity(1.0)
-                                    .bg(crate::theme::white_alpha(0.06))
-                                    .text_color(Theme::dark().text)
+                                    .bg(crate::theme::ink(0.06))
+                                    .text_color(theme.text)
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_rename(rename_id.clone(), rename_name.clone(), cx);
@@ -386,7 +386,7 @@ impl Render for DevicesPage {
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
-                            widgets::error_strip(message)
+                            widgets::error_strip(&theme, message)
                                 .id("devices-error")
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {

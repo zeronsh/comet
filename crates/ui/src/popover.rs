@@ -16,7 +16,7 @@ use gpui::{
 };
 
 use crate::motion::{self, AnimationExt as _, COMET_PULSE};
-use crate::theme::{Theme, grey, white_alpha};
+use crate::theme::{Theme, hairline, ink};
 
 // ---------------------------------------------------------------------------
 // Loadable — async slot state shared by pickers/settings pages
@@ -146,7 +146,7 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
-        .border_color(white_alpha(0.10))
+        .border_color(hairline(0.10))
         .rounded(px(12.0))
         .shadow_lg()
         .p(px(4.0))
@@ -156,9 +156,9 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
     if Theme::GLASS_ALPHA < 1.0 {
         // Translucent tint — the backdrop blur beneath it comes from the
         // [`crate::frost::frosted`] wrapper at the mount helpers below.
-        card.bg(grey(0x16).opacity(0.65))
+        card.bg(theme.surface_overlay.opacity(0.65))
     } else {
-        card.bg(grey(0x16))
+        card.bg(theme.surface_overlay)
     }
 }
 
@@ -288,6 +288,18 @@ pub fn menu_at(
     .into_any_element()
 }
 
+/// Modal/overlay scrim at the *current* appearance, quoted in dark-mode terms
+/// like [`ink`]/[`hairline`] — for callers (`modal`, the attachment lightbox)
+/// that paint from a `deferred`/`anchored` layer with no `Theme`/`cx` in
+/// scope. Mirrors [`Theme::scrim`], which is pinned at `X = 0.6` dark /
+/// `0.32` light; other dark-mode alphas scale the light side by the same
+/// ratio so the *dark* result is always exactly `alpha_dark` (never routed
+/// through [`Hsla::opacity`], whose `0..=1` clamp would clip a
+/// larger-than-0.6 alpha before it could scale the light side).
+pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
+    crate::theme::scrim(alpha_dark)
+}
+
 /// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
 /// The scrim swallows clicks; the caller wires its own dismiss/confirm.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
@@ -306,7 +318,7 @@ pub fn modal(
                     .occlude()
                     .w(viewport.width)
                     .h(viewport.height)
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.6))
+                    .bg(scrim_alpha(0.6))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -342,7 +354,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             .text_color(motion::hover_blend(
                 &fade_key,
                 theme.text.opacity(0.9),
-                Theme::dark().text,
+                theme.text,
             ))
             .bg(motion::hover_blend(
                 &fade_key,
@@ -410,11 +422,7 @@ pub fn tracked_upper(label: &str) -> String {
 pub fn menu_separator() -> gpui::Div {
     // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
     // runs border to border (user request).
-    div()
-        .h(px(1.0))
-        .mx(px(-4.0))
-        .my(px(4.0))
-        .bg(white_alpha(0.07))
+    div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(hairline(0.07))
 }
 
 /// The trailing check on the selected row (comet `MenuCheck`): 14px,
@@ -428,8 +436,12 @@ pub fn menu_check(theme: &Theme) -> impl IntoElement {
 /// The recessed band tone for a palette/picker header or footer strip — a
 /// translucent black so the glass still reads through (the add-space palette
 /// converged on this; measured subtler tones vanish against the dim scrim).
+/// Free function (like [`ink`]/[`hairline`]/[`wash`]), mirroring
+/// [`Theme::band`], for the several callers with no `Theme`/`cx` in scope
+/// (some outside this crate's `ui` module tree — threading a `&Theme` param
+/// would ripple past this task's file scope).
 pub fn band() -> gpui::Hsla {
-    gpui::hsla(0.0, 0.0, 0.0, 0.16)
+    crate::theme::band()
 }
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
@@ -445,7 +457,7 @@ pub fn key_cap(_theme: &Theme) -> gpui::Div {
         .items_center()
         .justify_center()
         .gap(px(4.0))
-        .bg(white_alpha(0.05))
+        .bg(ink(0.05))
 }
 
 /// The tiny verb after a key-cap.
@@ -494,7 +506,7 @@ pub fn key_hint_pair(
                         .size(px(12.5))
                         .text_color(theme.text_muted.opacity(0.7)),
                 )
-                .child(div().w(px(1.0)).h(px(11.0)).bg(white_alpha(0.10)))
+                .child(div().w(px(1.0)).h(px(11.0)).bg(hairline(0.10)))
                 .child(
                     crate::icons::icon(second)
                         .size(px(12.5))
@@ -511,9 +523,9 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .px(px(5.0))
         .py(px(1.0))
         .rounded(px(5.0))
-        .bg(white_alpha(0.05))
+        .bg(ink(0.05))
         .text_size(px(10.0))
-        .font_family(Theme::dark().font_mono.clone())
+        .font_family(theme.font_mono.clone())
         .text_color(theme.text_muted.opacity(0.6))
         .child(SharedString::from(label.to_string()))
 }
@@ -528,7 +540,7 @@ pub fn search_input_frame(_theme: &Theme, input: AnyElement) -> gpui::Div {
         .px(px(10.0))
         .py(px(6.0))
         .rounded(px(8.0))
-        .bg(white_alpha(0.04))
+        .bg(ink(0.04))
         .text_size(px(13.0))
         .child(input)
 }
@@ -542,7 +554,7 @@ pub fn menu_section() -> gpui::Div {
         .mt(px(4.0))
         .pt(px(4.0))
         .border_t_1()
-        .border_color(white_alpha(0.06))
+        .border_color(hairline(0.06))
         .flex()
         .flex_col()
         .gap(px(2.0))
@@ -559,9 +571,9 @@ pub fn dialog_card(theme: &Theme) -> gpui::Div {
         .w(px(360.0))
         .p(px(20.0))
         .rounded(px(16.0))
-        .bg(grey(0x10))
+        .bg(theme.surface_dialog)
         .border_1()
-        .border_color(white_alpha(0.10))
+        .border_color(hairline(0.10))
         .shadow_lg()
         .flex()
         .flex_col()
@@ -595,8 +607,8 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
         .py(px(8.0))
         .rounded(px(8.0))
         .border_1()
-        .border_color(white_alpha(0.08))
-        .bg(white_alpha(0.04))
+        .border_color(hairline(0.08))
+        .bg(ink(0.04))
         .text_size(px(14.0))
         .child(input)
 }
@@ -611,15 +623,11 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         .py(px(6.0))
         .rounded(px(8.0))
         .text_size(px(13.0))
-        .text_color(motion::hover_blend(
-            &fade_key,
-            theme.text_muted,
-            Theme::dark().text,
-        ))
+        .text_color(motion::hover_blend(&fade_key, theme.text_muted, theme.text))
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
-            white_alpha(0.06),
+            ink(0.06),
         ))
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
@@ -637,19 +645,19 @@ pub fn btn_primary(theme: &Theme, label: &str) -> gpui::Div {
         .bg(theme.text)
         .text_size(px(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(grey(0x0e))
+        .text_color(theme.on_solid)
         .cursor_pointer()
         .hover(|s| s.opacity(0.9))
         .child(SharedString::from(label.to_string()))
 }
 
 /// Destructive button (`btnDestructive`): the muted red fill.
-pub fn btn_danger(_theme: &Theme, label: &str) -> gpui::Div {
+pub fn btn_danger(theme: &Theme, label: &str) -> gpui::Div {
     div()
         .px(px(12.0))
         .py(px(6.0))
         .rounded(px(8.0))
-        .bg(crate::theme::oklch(0.58, 0.16, 25.0))
+        .bg(theme.danger_strong)
         .text_size(px(13.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(gpui::white())
@@ -661,7 +669,7 @@ pub fn btn_danger(_theme: &Theme, label: &str) -> gpui::Div {
 /// Pulsing skeleton rows shown while a list loads (comet:
 /// `h-7 animate-pulse rounded-md bg-white/[0.04]`).
 pub fn skeleton_rows(id: &'static str, _theme: &Theme, count: usize) -> AnyElement {
-    let wash = white_alpha(0.04);
+    let wash = ink(0.04);
     div()
         .flex()
         .flex_col()

@@ -58,7 +58,7 @@ pub const TABLE_MIN_COLUMN_CONTENT: f32 = 48.0;
 pub const TABLE_MIN_COLUMN_WIDTH: f32 = 96.0;
 /// Hairline tone (comet md theme `table.borderColor`: rgba(255,255,255,0.1)).
 pub fn table_hairline() -> Hsla {
-    crate::theme::white_alpha(0.10)
+    crate::theme::hairline(0.10)
 }
 
 /// Options for one rendered tree (a transcript row or a whole live message).
@@ -114,10 +114,16 @@ impl RenderOptions {
 /// below that boundary is byte-identical and its flatten result (and, via
 /// gpui's line-layout cache keyed on identical text+runs, its shaping) can be
 /// reused as-is. `SharedString`/`Rc` make the reuse O(1) per block.
+/// Cached runs carry a resolved [`gpui::Hsla`] per span, so an entry is only
+/// valid for the palette that produced it — content-only keys silently serve
+/// dark-mode text onto a light background after an appearance switch.
+/// [`RenderCache::sync_palette`] drops everything when the palette moves.
 #[derive(Default)]
 pub struct RenderCache {
     flats: HashMap<(SharedString, usize, usize), Rc<FlatText>>,
     code: HashMap<(SharedString, usize, usize), Rc<CachedCode>>,
+    /// The [`crate::theme::theme_generation`] these entries were shaped under.
+    generation: u32,
 }
 
 /// Cached per-line code runs (validity: code length + highlight identity).
@@ -138,6 +144,16 @@ impl RenderCache {
     pub fn clear(&mut self) {
         self.flats.clear();
         self.code.clear();
+    }
+
+    /// Drop every entry if the palette changed since they were shaped. Cheap
+    /// enough (one relaxed atomic load) to call on every cache access.
+    fn sync_palette(&mut self) {
+        let generation = crate::theme::theme_generation();
+        if self.generation != generation {
+            self.clear();
+            self.generation = generation;
+        }
     }
 }
 
@@ -447,7 +463,12 @@ fn render_table(
                 TableAlign::Right => cell.text_right(),
             };
             if let Some(flat) = cell_flat {
-                cell = cell.child(flat_text_element(flat, table_cell_ix(ix, r, c), opts));
+                cell = cell.child(flat_text_element(
+                    flat,
+                    table_cell_ix(ix, r, c),
+                    opts,
+                    theme,
+                ));
             }
             row_el = row_el.child(cell);
         }
@@ -479,11 +500,11 @@ pub struct FlatText {
 /// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
 /// `inlineCode: #f0f0f0 on white/8%`), but the user asked for "a nice purple"
 /// — violet-300 text over a violet-400 wash, readable on the #060606 panel.
-pub fn inline_code_text() -> Hsla {
-    crate::theme::oklch(0.811, 0.111, 293.571) // violet-300
+pub fn inline_code_text(theme: &Theme) -> Hsla {
+    theme.code_text // violet-300
 }
-pub fn inline_code_wash() -> Hsla {
-    crate::theme::oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400/12
+pub fn inline_code_wash(theme: &Theme) -> Hsla {
+    theme.code_wash // violet-400/12
 }
 /// Rounded-wash geometry: small radius on a slightly inset box (paint-only —
 /// x extends 2px past the glyphs, y insets 2px from the 22px line box).
@@ -539,7 +560,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // Inline code reads violet (see `inline_code_text`); everything else
         // stays the monochrome foreground.
         let color = if run.style.code {
-            inline_code_text()
+            inline_code_text(theme)
         } else {
             theme.text
         };
@@ -603,18 +624,26 @@ fn flatten_cached(
     theme: &Theme,
 ) -> Rc<FlatText> {
     match &opts.cache {
-        Some(cache) => cache
-            .borrow_mut()
-            .flats
-            .entry((opts.row_key.clone(), top_ix, ix))
-            .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
-            .clone(),
+        Some(cache) => {
+            let mut cache = cache.borrow_mut();
+            cache.sync_palette();
+            cache
+                .flats
+                .entry((opts.row_key.clone(), top_ix, ix))
+                .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
+                .clone()
+        }
         None => Rc::new(flatten_runs_weighted(runs, theme, base_weight)),
     }
 }
 
 /// Veiled, clickable text for a flattened block (no sizing wrapper).
-fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyElement {
+fn flat_text_element(
+    flat: &FlatText,
+    ix: usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+) -> AnyElement {
     // Streaming veil: opacity-only recolor of the runs covering newly appended
     // chunks. Same text, same fonts, same lengths — layout is untouched.
     // Settled elements return no spans and reuse the cached runs unsplit.
@@ -648,10 +677,11 @@ fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyEle
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
     let code_ranges = flat.code_ranges.clone();
     let flat_text = flat.text.clone();
+    let wash = inline_code_wash(theme);
+    let sel_wash = selection_wash(theme);
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
-            let wash = inline_code_wash();
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
                     window.paint_quad(quad(
@@ -669,7 +699,7 @@ fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyEle
                     window.paint_quad(quad(
                         rect,
                         px(0.0),
-                        selection_wash(),
+                        sel_wash,
                         px(0.0),
                         gpui::transparent_black(),
                         BorderStyle::default(),
@@ -699,8 +729,8 @@ fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyEle
 }
 
 /// Selection tint: the accent hue under the glyphs, dark-panel strength.
-fn selection_wash() -> Hsla {
-    crate::theme::oklch(0.673, 0.182, 276.935).opacity(0.35) // indigo-400
+fn selection_wash(theme: &Theme) -> Hsla {
+    theme.accent.opacity(0.35) // indigo-400
 }
 
 /// One painted text element, registered per frame in document order — the
@@ -923,7 +953,7 @@ fn text_element(
         FontWeight::NORMAL
     };
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
-    let inner = flat_text_element(&flat, ix, opts);
+    let inner = flat_text_element(&flat, ix, opts, theme);
     div()
         .text_size(px(size))
         .line_height(px(line_height))
@@ -969,6 +999,7 @@ fn render_code_block(
     let cached: Rc<CachedCode> = match &opts.cache {
         Some(cache) => {
             let mut cache = cache.borrow_mut();
+            cache.sync_palette();
             let entry = cache
                 .code
                 .entry((opts.row_key.clone(), top_ix, ix))
@@ -1015,7 +1046,7 @@ fn render_code_block(
             .bg(crate::motion::hover_blend(
                 &fade_key,
                 gpui::transparent_black(),
-                crate::theme::white_alpha(0.08),
+                crate::theme::ink(0.08),
             ))
             .on_hover(crate::motion::hover_listener(fade_key))
             .text_size(px(10.5))
@@ -1036,7 +1067,7 @@ fn render_code_block(
         .rounded(px(10.0))
         // Faint white wash over the near-black panel ≈ #101010 (comet's code
         // surface), with the hairline border.
-        .bg(crate::theme::white_alpha(0.035))
+        .bg(crate::theme::ink(0.035))
         .border_1()
         .border_color(theme.border)
         .overflow_hidden()
@@ -1049,7 +1080,7 @@ fn render_code_block(
                     .border_b_1()
                     .border_color(theme.border)
                     // A whisper of tone separation between header and body.
-                    .bg(crate::theme::white_alpha(0.02))
+                    .bg(crate::theme::ink(0.02))
                     .text_size(px(11.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(lang.to_string())),
@@ -1091,9 +1122,9 @@ fn render_code_block(
 /// asked for color; these are the diff pane's hues, now shared by both).
 pub fn token_color(class: TokenClass, theme: &Theme) -> Hsla {
     match class {
-        TokenClass::Keyword => crate::theme::oklch(0.709, 0.129, 20.0), // soft rose
-        TokenClass::StringLit => crate::theme::oklch(0.77, 0.11, 168.0), // soft green
-        TokenClass::Number => crate::theme::oklch(0.78, 0.12, 80.0),    // soft amber
+        TokenClass::Keyword => theme.syntax_keyword, // soft rose
+        TokenClass::StringLit => theme.syntax_string, // soft green
+        TokenClass::Number => theme.syntax_number,   // soft amber
         TokenClass::Comment => theme.text_faint,
     }
 }
@@ -1207,7 +1238,7 @@ mod tests {
         assert_eq!(flat.code_ranges, vec![4..9, 14..17]);
         // Code text is the violet tint; the square run background is gone
         // (the rounded wash is painted by the canvas underlay instead).
-        assert_eq!(flat.runs[1].color, inline_code_text());
+        assert_eq!(flat.runs[1].color, inline_code_text(&theme));
         assert_eq!(flat.runs[1].background_color, None);
         assert_eq!(flat.runs[0].color, theme.text);
     }

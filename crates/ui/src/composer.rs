@@ -1060,9 +1060,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-cmd-right", SelectEnd, ctx),
         KeyBinding::new("shift-cmd-up", SelectDocStart, ctx),
         KeyBinding::new("shift-cmd-down", SelectDocEnd, ctx),
-        // Deletion by word / to the line edge (Opt+Delete, Cmd+Delete).
-        KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
-        KeyBinding::new("alt-delete", DeleteWordRight, ctx),
+        // Line-edge deletion (Cmd+Delete on macOS).
         KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
         KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
     ];
@@ -1070,22 +1068,42 @@ pub fn init(cx: &mut App) {
         bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, ctx));
         bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, ctx));
     }
-    // Word navigation and clipboard: bind both modifier conventions so the same
-    // map works across platforms.
-    for prefix in ["ctrl", "alt"] {
-        bindings.push(KeyBinding::new(&format!("{prefix}-left"), WordLeft, ctx));
-        bindings.push(KeyBinding::new(&format!("{prefix}-right"), WordRight, ctx));
-        bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-left"),
-            SelectWordLeft,
-            ctx,
-        ));
-        bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-right"),
-            SelectWordRight,
-            ctx,
-        ));
-    }
+    // Word-level editing: Option on macOS, Ctrl on Windows/Linux.
+    let word_edit_prefix = if cfg!(target_os = "macos") {
+        "alt"
+    } else {
+        "ctrl"
+    };
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-backspace"),
+        DeleteWordLeft,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-delete"),
+        DeleteWordRight,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-left"),
+        WordLeft,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-right"),
+        WordRight,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-left"),
+        SelectWordLeft,
+        ctx,
+    ));
+    bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-right"),
+        SelectWordRight,
+        ctx,
+    ));
     for prefix in ["cmd", "ctrl"] {
         bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, ctx));
@@ -1111,31 +1129,38 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-right", End, palette),
         KeyBinding::new("shift-cmd-left", SelectHome, palette),
         KeyBinding::new("shift-cmd-right", SelectEnd, palette),
-        KeyBinding::new("alt-backspace", DeleteWordLeft, palette),
         KeyBinding::new("cmd-backspace", DeleteToLineStart, palette),
     ];
-    for prefix in ["ctrl", "alt"] {
-        palette_bindings.push(KeyBinding::new(
-            &format!("{prefix}-left"),
-            WordLeft,
-            palette,
-        ));
-        palette_bindings.push(KeyBinding::new(
-            &format!("{prefix}-right"),
-            WordRight,
-            palette,
-        ));
-        palette_bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-left"),
-            SelectWordLeft,
-            palette,
-        ));
-        palette_bindings.push(KeyBinding::new(
-            &format!("shift-{prefix}-right"),
-            SelectWordRight,
-            palette,
-        ));
-    }
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-backspace"),
+        DeleteWordLeft,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-delete"),
+        DeleteWordRight,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-left"),
+        WordLeft,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("{word_edit_prefix}-right"),
+        WordRight,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-left"),
+        SelectWordLeft,
+        palette,
+    ));
+    palette_bindings.push(KeyBinding::new(
+        &format!("shift-{word_edit_prefix}-right"),
+        SelectWordRight,
+        palette,
+    ));
     for prefix in ["cmd", "ctrl"] {
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, palette));
@@ -2690,7 +2715,8 @@ impl gpui::Element for ComposerTextElement {
         let input = self.input.read(cx);
         let scroll = px(input.scroll_top);
         let origin = point(bounds.left(), bounds.top() - scroll);
-        let selection_color = gpui::hsla(0.66, 0.6, 0.55, 0.35);
+        let selection_color = Theme::of(cx).selection;
+        let caret_color = Theme::of(cx).caret;
         let mention_color = Theme::of(cx).accent.opacity(0.22);
 
         let mut mention_quads = Vec::new();
@@ -2777,12 +2803,12 @@ impl gpui::Element for ComposerTextElement {
                         point(origin.x + p.x, origin.y + p.y),
                         size(px(2.0), input.line_height),
                     ),
-                    gpui::hsla(0.66, 0.7, 0.7, 1.0),
+                    caret_color,
                 ));
             } else if input.display_is_placeholder {
                 cursor = Some(fill(
                     Bounds::new(origin, size(px(2.0), input.line_height)),
-                    gpui::hsla(0.66, 0.7, 0.7, 1.0),
+                    caret_color,
                 ));
             }
         } else if let (Some(start), Some(end)) = (
@@ -3323,7 +3349,7 @@ impl Composer {
                             .rounded(px(8.0))
                             .overflow_hidden()
                             .border_1()
-                            .border_color(crate::theme::white_alpha(0.10))
+                            .border_color(crate::theme::hairline(0.10))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.preview = Some(preview.clone());
@@ -4309,18 +4335,18 @@ impl Composer {
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(if picked {
-                    crate::theme::white_alpha(0.16)
+                    crate::theme::ink(0.16)
                 } else {
                     gpui::transparent_black()
                 })
                 // comet question-panel.tsx option rows: `transition-colors`.
                 .bg(if picked {
-                    crate::theme::white_alpha(0.09)
+                    crate::theme::ink(0.09)
                 } else {
                     motion::hover_blend(
                         &format!("wizard-option-{ix}"),
-                        crate::theme::white_alpha(0.025),
-                        crate::theme::white_alpha(0.06),
+                        crate::theme::ink(0.025),
+                        crate::theme::ink(0.06),
                     )
                 })
                 .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
@@ -4350,9 +4376,9 @@ impl Composer {
                             .justify_center()
                             .rounded(px(6.0))
                             .bg(if picked {
-                                crate::theme::white_alpha(0.16)
+                                crate::theme::ink(0.16)
                             } else {
-                                crate::theme::white_alpha(0.05)
+                                crate::theme::ink(0.05)
                             })
                             .text_size(px(11.0))
                             .text_color(if picked {
@@ -4374,7 +4400,7 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(crate::theme::white_alpha(0.03))
+            .bg(theme.input_bg)
             .shadow_lg()
             .flex()
             .flex_col()
@@ -4408,7 +4434,7 @@ impl Composer {
                                         .flex()
                                         .items_center()
                                         .rounded(px(6.0))
-                                        .bg(crate::theme::white_alpha(0.06))
+                                        .bg(crate::theme::ink(0.06))
                                         .text_size(px(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text_muted.opacity(0.6))
@@ -4448,7 +4474,7 @@ impl Composer {
                         div()
                             .mt(px(12.0))
                             .border_t_1()
-                            .border_color(crate::theme::white_alpha(0.06))
+                            .border_color(crate::theme::hairline(0.06))
                             .pt(px(12.0))
                             .pb(px(4.0))
                             .px(px(4.0))
@@ -4667,7 +4693,7 @@ impl Render for Composer {
                 let offline = message.as_ref() == "Engine not connected";
                 let (border_c, wash, text_c) = if offline {
                     let amber = theme.warning; // amber-400
-                    let amber_200 = crate::theme::oklch(0.924, 0.12, 95.746);
+                    let amber_200 = theme.warning_muted;
                     (
                         amber.opacity(0.16),
                         amber.opacity(0.05),
@@ -4675,7 +4701,7 @@ impl Render for Composer {
                     )
                 } else {
                     let danger = theme.danger; // red-400
-                    let red_300 = crate::theme::oklch(0.808, 0.114, 19.571);
+                    let red_300 = theme.danger_muted;
                     (
                         danger.opacity(0.16),
                         danger.opacity(0.05),
@@ -4771,7 +4797,7 @@ impl Render for Composer {
             .bg(motion::hover_blend(
                 "composer-attach",
                 gpui::transparent_black(),
-                crate::theme::white_alpha(0.10),
+                crate::theme::ink(0.10),
             ))
             .on_hover(motion::hover_listener("composer-attach"))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
@@ -4788,7 +4814,7 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = crate::theme::white_alpha(0.03);
+        let pill_bg = theme.input_bg;
         let pill = div()
             .rounded(px(26.0))
             .bg(pill_bg)

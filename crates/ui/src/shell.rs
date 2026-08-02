@@ -32,6 +32,7 @@ use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
+use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -142,14 +143,16 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 pub enum SettingsSection {
     Devices,
     Agents,
+    Appearance,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 4] = [
+    pub const ALL: [SettingsSection; 5] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
+        SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -160,6 +163,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -429,6 +433,7 @@ pub struct Shell {
     nav: NavHistory,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
+    appearance_page: Option<Entity<AppearancePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     shortcuts_sub: Option<Subscription>,
@@ -595,6 +600,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -633,6 +639,7 @@ impl Shell {
             nav,
             devices_page: None,
             archived_page: None,
+            appearance_page: None,
             shortcuts_page: None,
             accounts_page: None,
             shortcuts_sub: None,
@@ -1037,7 +1044,15 @@ impl Shell {
             cx.background_executor()
                 .timer(Duration::from_millis(SAVE_DEBOUNCE_MS))
                 .await;
-            let Ok(snapshot) = this.update(cx, |shell, _| shell.settings.clone()) else {
+            // Re-stamp the appearance from the global before writing. The View
+            // menu changes it through `appearance::set_mode`, which never touches
+            // this shell's in-memory copy — without this, the next pane resize
+            // would quietly write the boot-time appearance back over the user's
+            // choice.
+            let Ok(snapshot) = this.update(cx, |shell, cx| {
+                shell.settings.appearance = crate::appearance::mode(cx);
+                shell.settings.clone()
+            }) else {
                 return;
             };
             cx.background_executor()
@@ -1124,6 +1139,15 @@ impl Shell {
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
                 }
                 match &self.accounts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Appearance => {
+                if self.appearance_page.is_none() {
+                    self.appearance_page = Some(cx.new(AppearancePage::new));
+                }
+                match &self.appearance_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1626,6 +1650,7 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -1677,10 +1702,7 @@ impl Shell {
                                     theme.text_muted
                                 })
                                 .cursor_pointer()
-                                .hover(|s| {
-                                    s.bg(crate::theme::wash(0.11))
-                                        .text_color(Theme::dark().text)
-                                })
+                                .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
@@ -1708,10 +1730,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| {
-                            s.bg(crate::theme::wash(0.11))
-                                .text_color(Theme::dark().text)
-                        })
+                        .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (comet settings-sidebar.tsx),
@@ -2771,7 +2790,7 @@ impl Shell {
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.4))
+                        .bg(theme.scrim().opacity(0.4 / 0.6))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2825,7 +2844,7 @@ impl Shell {
                         .bg(motion::hover_blend(
                             "jump-pill",
                             theme.surface_raised,
-                            crate::theme::neutral(0.29),
+                            theme.surface_raised_hover,
                         ))
                         .on_hover(motion::hover_listener("jump-pill"))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3076,7 +3095,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text)
                         .cursor_pointer()
-                        .hover(|s| s.bg(Theme::dark().element_hover))
+                        .hover(|s| s.bg(theme.element_hover))
                         .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
                         .child(SharedString::from("Retry")),
                 )
@@ -3090,7 +3109,7 @@ impl Shell {
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(theme.border)
-                .bg(crate::theme::grey(0x0e))
+                .bg(theme.surface_card)
                 .shadow_lg()
                 .flex()
                 .flex_col()
@@ -3133,7 +3152,7 @@ impl Shell {
                         .bg(theme.text)
                         .text_size(px(14.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(crate::theme::grey(0x0e))
+                        .text_color(theme.on_solid)
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.9))
                         .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
@@ -3271,7 +3290,7 @@ impl Shell {
             .rounded(px(12.0))
             .border_1()
             .border_color(theme.border)
-            .bg(crate::theme::grey(0x0e))
+            .bg(theme.surface_card)
             .shadow_lg()
             .flex()
             .flex_col()
@@ -3329,7 +3348,7 @@ impl Shell {
                             .bg(theme.text)
                             .text_size(px(14.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(crate::theme::grey(0x0e))
+                            .text_color(theme.on_solid)
                             .when(submitting, |el| el.opacity(0.5))
                             .cursor_pointer()
                             .hover(|s| s.opacity(0.9))
@@ -3348,7 +3367,7 @@ impl Shell {
                         .mt(px(16.0))
                         .text_size(px(12.0))
                         .line_height(px(17.0))
-                        .text_color(crate::theme::oklch(0.81, 0.108, 19.6).opacity(0.9)) // red-300
+                        .text_color(theme.danger_muted.opacity(0.9)) // red-300
                         .child(message),
                 )
             })
@@ -3359,7 +3378,7 @@ impl Shell {
                         .text_size(px(12.0))
                         .text_color(theme.text_muted.opacity(0.6))
                         .cursor_pointer()
-                        .hover(|s| s.text_color(Theme::dark().text))
+                        .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
                         .child(SharedString::from("Use a different account")),
                 ),
@@ -3387,7 +3406,7 @@ impl Shell {
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 fn grid_backdrop(theme: &Theme) -> AnyElement {
-    let line = crate::theme::white_alpha(0.035);
+    let line = crate::theme::hairline(0.035);
     let bg = theme.bg;
     const STEP: f32 = 44.0;
     const SPAN: f32 = 2640.0;
@@ -3495,7 +3514,7 @@ fn window_control_button(
         .bg(motion::hover_blend(
             &fade_key,
             crate::theme::wash(0.0),
-            Theme::dark().element_hover,
+            theme.element_hover,
         ))
         .on_hover(motion::hover_listener(fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
+pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
@@ -72,6 +73,8 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Light/dark preference. Defaults to following the OS.
+    pub appearance: crate::appearance::AppearanceMode,
 }
 
 impl Default for UiSettings {
@@ -89,6 +92,7 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            appearance: crate::appearance::AppearanceMode::default(),
         }
     }
 }
@@ -347,9 +351,27 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            appearance: crate::appearance::AppearanceMode::Light,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
+    }
+
+    /// A settings file written before light mode existed has no `appearance`
+    /// key; it must load as "follow the OS" rather than failing the whole parse
+    /// and resetting every other preference to defaults.
+    #[test]
+    fn settings_without_appearance_default_to_system() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled, "other keys still parse");
     }
 
     #[test]

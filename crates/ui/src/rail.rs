@@ -475,7 +475,7 @@ impl Transcript {
                 let bar_color = if is_active || is_hovered {
                     theme.text.opacity(0.8)
                 } else {
-                    crate::theme::white_alpha(0.16)
+                    crate::theme::ink(0.16)
                 };
                 let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
                 let reply = tick
