@@ -990,6 +990,7 @@ impl ComposerInput {
         self.selected_range = snapshot.selected_range;
         self.selection_reversed = snapshot.selection_reversed;
         self.marked_range = None;
+        self.follow_cursor = true;
         // Never merge a subsequent edit into a step that undo just crossed.
         self.last_edit = None;
         self.reset_blink();
