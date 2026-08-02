@@ -30,9 +30,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent, ListState,
-    ObjectFit, SharedString, StyledImage as _, Subscription, Task, Window, div, img, list,
-    prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable as _, KeyBinding,
+    KeyDownEvent, KeyUpEvent, ListAlignment, ListOffset, ListScrollEvent, ListState, MouseButton,
+    ObjectFit, SharedString, StyledImage as _, Subscription, Task, Window, actions, div, img,
+    list, prelude::*, px,
 };
 
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -81,6 +82,115 @@ pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
 
 // ---------------------------------------------------------------------------
+// Keyboard scrolling (NSScrollView parity)
+// ---------------------------------------------------------------------------
+
+/// One arrow-key press worth of scroll (NSScrollView's line scroll).
+pub const KEY_LINE_STEP_PX: f32 = 52.0;
+/// Time-constant of the keyboard nudge's exponential ease-out. Native apps
+/// (Chrome, AppKit scroll views) complete an arrow step in ~50ms — animated,
+/// but never lingering. 95% of the distance lands at 3·tau ≈ 48ms. Key-repeat
+/// still folds into one motion: each repeat tops up the remaining distance
+/// faster than the drain empties it.
+const NUDGE_TAU_MS: f32 = 16.0;
+/// Page Up/Down step, as a fraction of the viewport (the native overlap:
+/// a strip of the previous page stays visible for continuity).
+const PAGE_STEP_FRACTION: f32 = 0.85;
+/// Cap on queued keyboard scroll distance, in viewports — bounds how far a
+/// held key can "wind up" beyond what's on screen.
+const NUDGE_MAX_VIEWPORTS: f32 = 2.5;
+/// Held-arrow continuous scroll: cruise speed and spin-up. Holding an arrow
+/// feeds velocity per FRAME from the moment it's pressed — key-repeat events
+/// are only "still held" proof — so there's no OS repeat-delay stutter (the
+/// line…pause…line-line terminal feel this replaces). A quick tap accumulates
+/// less than one line and is topped up to exactly [`KEY_LINE_STEP_PX`] on
+/// release: tap = crisp line, hold = continuous glide.
+const HOLD_SPEED_PX_S: f32 = 1000.0;
+/// Spin-up to cruise speed over this long (gentle first frames).
+const HOLD_RAMP_MS: f32 = 250.0;
+/// Fraction of cruise speed the hold starts at.
+const HOLD_START_FRACTION: f32 = 0.35;
+/// Drop a hold when neither a key-repeat nor a key-up has arrived for this
+/// long — the missed-key-up backstop. Must exceed the slowest OS
+/// "delay until repeat" setting, or a patient hold would self-cancel.
+const HOLD_EVENT_TIMEOUT_MS: f32 = 2500.0;
+/// Overtime landing tail for the row glide (see [`Transcript::step_glide`]).
+const GLIDE_OVERTIME_TAU_MS: f32 = 40.0;
+
+actions!(
+    transcript,
+    [
+        LineUp,
+        LineDown,
+        SegmentUp,
+        SegmentDown,
+        PageUp,
+        PageDown,
+        GoToTop,
+        GoToBottom,
+        CopySelection,
+    ]
+);
+
+/// An in-flight scroll-to-row glide (rail click / Option+arrow segment step),
+/// driven per display frame from `render` — vsync-locked, so 120Hz on
+/// ProMotion — never from wall-clock timers, whose ~60Hz drift against the
+/// refresh reads as judder.
+struct RowGlide {
+    target: usize,
+    started: Instant,
+    /// Wall-clock of the previous glide frame (overtime-landing dt).
+    last_frame: Instant,
+    /// Wall-clock span ([`motion::SCROLL_GLIDE`] × the speed-scale knob).
+    total: Duration,
+    timeline: crate::rail::GlideTimeline,
+    /// Row-height EMA for unmeasured territory (see [`Transcript::step_glide`]).
+    height_ema: Option<f32>,
+}
+
+/// A held arrow key driving continuous keyboard scroll.
+struct ArrowHold {
+    /// −1 up / +1 down.
+    dir: f32,
+    started: Instant,
+    /// Last key event seen (press or OS repeat) — missed-key-up backstop.
+    last_event: Instant,
+    /// Absolute px fed so far (a tap gets topped up to one line step).
+    fed: f32,
+}
+
+/// Bind the transcript keymap. Called from `apply_keymap` after the composer's.
+pub fn bind_keys(cx: &mut App) {
+    let t = Some("Transcript");
+    let c = Some("Composer");
+    cx.bind_keys([
+        // Transcript focused (click into the chat history): full scroll set.
+        KeyBinding::new("up", LineUp, t),
+        KeyBinding::new("down", LineDown, t),
+        KeyBinding::new("alt-up", SegmentUp, t),
+        KeyBinding::new("alt-down", SegmentDown, t),
+        KeyBinding::new("pageup", PageUp, t),
+        KeyBinding::new("pagedown", PageDown, t),
+        KeyBinding::new("home", GoToTop, t),
+        KeyBinding::new("end", GoToBottom, t),
+        KeyBinding::new("cmd-up", GoToTop, t),
+        KeyBinding::new("cmd-down", GoToBottom, t),
+        // Focus sits here, so the markdown-selection copy the composer's
+        // Copy fallback provides must exist in this context too.
+        KeyBinding::new("cmd-c", CopySelection, t),
+        KeyBinding::new("ctrl-c", CopySelection, t),
+        // Composer focused (typing): bare arrows belong to the caret, but
+        // modifier/page keys still drive the transcript (Messages-style) —
+        // the shell forwards these, since the composer isn't in the
+        // transcript's dispatch subtree.
+        KeyBinding::new("alt-up", SegmentUp, c),
+        KeyBinding::new("alt-down", SegmentDown, c),
+        KeyBinding::new("pageup", PageUp, c),
+        KeyBinding::new("pagedown", PageDown, c),
+    ]);
+}
+
+// ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
 // which follows the shape of stackblitz/use-stick-to-bottom)
 // ---------------------------------------------------------------------------
@@ -102,6 +212,14 @@ pub const SPRING_GROWTH_EMA: f32 = 0.12;
 pub const SPRING_CHASE_MAX_LEAD: f32 = 32.0;
 /// Treat as exactly pinned within this distance of the bottom.
 pub const AT_BOTTOM_PX: f32 = 2.0;
+/// Terminal-phase minimum closing speed, px per 60fps reference frame. A
+/// damped spring approaches its target ASYMPTOTICALLY — closing speed decays
+/// ~9%/frame, so the last ~10px crawl for ~300ms below the threshold of
+/// visible motion, and everything keyed on "at bottom" (rail active tick,
+/// arrow-key guard) lags a visually-finished scroll by that much. The floor
+/// bounds the landing to a few frames; UIKit springs use the same
+/// epsilon-velocity cutoff.
+pub const SPRING_MIN_CLOSE_PX_FRAME: f32 = 3.0;
 /// Keep the spring loop warm this long after landing, so a streaming pause
 /// resumes at cruise instead of re-accelerating from zero.
 pub const SPRING_SETTLE_GRACE_MS: u64 = 500;
@@ -894,7 +1012,23 @@ pub struct Transcript {
     spring_kick: bool,
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
-    scroll_anim: Option<Task<()>>,
+    /// In-flight scroll-to-row glide; frame-driven from `render`.
+    glide: Option<RowGlide>,
+    /// One glide/nudge `on_next_frame` callback in flight at most.
+    anim_scheduled: bool,
+    /// Keyboard focus for click-into-the-chat scrolling ("Transcript" context).
+    focus_handle: FocusHandle,
+    /// The composer's input, for handing focus back: typing a character while
+    /// the transcript is focused hops to the composer and inserts it there.
+    composer_input: Option<Entity<crate::composer::ComposerInput>>,
+    /// Signed px still owed to the keyboard nudge glide (+down / −up).
+    nudge_remaining: f32,
+    /// Whether the nudge drain is live (frame-driven from `render`).
+    nudge_active: bool,
+    /// Wall-clock of the previous nudge frame (`None` = fresh).
+    nudge_last_tick: Option<Instant>,
+    /// A held arrow key feeding continuous scroll velocity per frame.
+    arrow_hold: Option<ArrowHold>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
     /// Hovered rail tick (grows + shows the preview card).
@@ -954,7 +1088,14 @@ impl Transcript {
             spring_settled_at: None,
             spring_kick: false,
             spring_scheduled: false,
-            scroll_anim: None,
+            glide: None,
+            anim_scheduled: false,
+            focus_handle: cx.focus_handle(),
+            composer_input: None,
+            nudge_remaining: 0.0,
+            nudge_active: false,
+            nudge_last_tick: None,
+            arrow_hold: None,
             rail_enabled: true,
             rail_hover: None,
             hovered_entry: None,
@@ -1003,10 +1144,14 @@ impl Transcript {
         &self.state
     }
 
-    /// Replace the transcript's scroll animation task (rail click / jump).
-    pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
-        self.pinned = false;
-        self.scroll_anim = Some(task);
+    /// Cancel any in-flight programmatic scroll (row glide / keyboard nudge /
+    /// held arrow).
+    fn cancel_scroll_anims(&mut self) {
+        self.glide = None;
+        self.nudge_active = false;
+        self.nudge_remaining = 0.0;
+        self.nudge_last_tick = None;
+        self.arrow_hold = None;
     }
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
@@ -1032,6 +1177,9 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
+                // Wheel/touch input always wins: drop any in-flight keyboard
+                // nudge or rail-click glide rather than fighting it per frame.
+                this.cancel_scroll_anims();
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
@@ -1088,6 +1236,9 @@ impl Transcript {
     fn engage_pin(&mut self, cx: &mut Context<Self>) {
         self.pinned = true;
         self.show_jump_button = false;
+        // Any in-flight glide (rail click, keyboard nudge) yields to the pin's
+        // spring instead of fighting it frame-by-frame.
+        self.cancel_scroll_anims();
         if motion::reduced_motion(cx) {
             self.list.scroll_to_end();
             cx.notify();
@@ -1101,6 +1252,496 @@ impl Transcript {
         }
         self.wake_spring();
         cx.notify();
+    }
+
+    // ---- keyboard scrolling ----
+
+    /// Wire the composer's input entity (shell boot): the transcript hands
+    /// focus back to it on Escape and on type-ahead.
+    pub fn set_composer_input(&mut self, input: Entity<crate::composer::ComposerInput>) {
+        self.composer_input = Some(input);
+    }
+
+    /// An arrow key-down (initial press or OS repeat): `dir` −1 up / +1 down.
+    /// A press starts a HOLD — [`Self::step_nudge`] feeds velocity per frame,
+    /// so holding scrolls continuously from the first frame instead of
+    /// stuttering through the OS repeat delay. Key-up ends it
+    /// ([`Self::end_arrow_hold`]); a quick tap is topped up to one crisp
+    /// [`KEY_LINE_STEP_PX`] line there.
+    pub fn line_scroll(&mut self, dir: f32, cx: &mut Context<Self>) {
+        if motion::reduced_motion(cx) {
+            self.nudge(dir * KEY_LINE_STEP_PX, cx);
+            return;
+        }
+        let now = Instant::now();
+        if let Some(hold) = &mut self.arrow_hold {
+            if hold.dir == dir {
+                // OS key-repeat: proof of life only — the per-frame feed is
+                // already scrolling.
+                hold.last_event = now;
+                return;
+            }
+        }
+        if dir > 0.0 && self.distance_from_bottom() <= AT_BOTTOM_PX {
+            return;
+        }
+        self.arrow_hold = Some(ArrowHold {
+            dir,
+            started: now,
+            last_event: now,
+            fed: 0.0,
+        });
+        // Engage the drain loop (unpins, cancels any glide); the hold feeds it.
+        self.nudge(0.0, cx);
+    }
+
+    /// Key-up on an arrow: stop the hold. A tap that fed less than one line
+    /// step is topped up to exactly one, so a quick press always moves a
+    /// crisp line.
+    pub fn end_arrow_hold(&mut self, cx: &mut Context<Self>) {
+        if let Some(hold) = self.arrow_hold.take() {
+            let shortfall = KEY_LINE_STEP_PX - hold.fed;
+            if shortfall > 0.5 {
+                self.nudge(hold.dir * shortfall, cx);
+            } else {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Page Up/Down: nudge by most of a viewport.
+    pub fn page_scroll(&mut self, dir: f32, cx: &mut Context<Self>) {
+        let viewport = f32::from(self.list.viewport_bounds().size.height);
+        let viewport = if viewport > 0.0 { viewport } else { 600.0 };
+        self.nudge(dir * viewport * PAGE_STEP_FRACTION, cx);
+    }
+
+    /// Option+arrow: glide to the previous/next segment (user prompt), riding
+    /// the same [`Self::scroll_to_row`] glide as a rail-tick click. Past the
+    /// last segment the jump-to-bottom spring takes over (and re-pins).
+    pub fn segment_step(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let rows = self.segment_rows(cx);
+        let top = self.list.logical_scroll_top();
+        let at = top.item_ix;
+        let past = f32::from(top.offset_in_item) > 1.0;
+        let target = if dir > 0 {
+            match rows.iter().copied().find(|&r| r > at) {
+                Some(row) => row,
+                None => {
+                    self.jump_to_bottom(cx);
+                    return;
+                }
+            }
+        } else {
+            // Option+Up first returns to the top of the CURRENT segment, then
+            // steps to the previous one (macOS paragraph-motion convention).
+            rows.iter()
+                .copied()
+                .filter(|&r| r < at || (r == at && past))
+                .next_back()
+                .unwrap_or(0)
+        };
+        self.scroll_to_row(target, cx);
+    }
+
+    /// Home / Cmd+Up: glide to the very top.
+    pub fn go_to_top(&mut self, cx: &mut Context<Self>) {
+        self.scroll_to_row(0, cx);
+    }
+
+    /// Accumulate a signed pixel target and drain it with an exponential
+    /// ease-out (~[`NUDGE_TAU_MS`]). Key-repeat keeps feeding the target while
+    /// one drain runs, so a held arrow reads as a single continuous glide
+    /// instead of a stutter of restarting animations — the NSScrollView
+    /// arrow-key feel. `render` drives [`Self::step_nudge`] per display frame
+    /// (vsync-locked, 120Hz on ProMotion).
+    fn nudge(&mut self, delta_px: f32, cx: &mut Context<Self>) {
+        if delta_px > 0.0 && self.distance_from_bottom() <= AT_BOTTOM_PX {
+            return;
+        }
+        // Keyboard input takes over from any running glide and the bottom pin.
+        self.glide = None;
+        if self.pinned {
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+        }
+        if motion::reduced_motion(cx) {
+            self.nudge_active = false;
+            self.nudge_remaining = 0.0;
+            self.materialize_glued_anchor();
+            self.list.scroll_by(px(delta_px));
+            self.after_keyboard_scroll(delta_px);
+            cx.notify();
+            return;
+        }
+        let viewport = f32::from(self.list.viewport_bounds().size.height).max(OVERDRAW_PX);
+        let cap = NUDGE_MAX_VIEWPORTS * viewport;
+        self.nudge_remaining = (self.nudge_remaining + delta_px).clamp(-cap, cap);
+        self.nudge_active = true;
+        cx.notify();
+    }
+
+    /// A pinned-at-bottom offset is stored GLUED — anchored past the end, one
+    /// viewport below the visible top — and layout hard-snaps such an anchor
+    /// back to the end, silently undoing any small programmatic step (this
+    /// was "keyboard scrolling only works after a wheel scroll": the wheel
+    /// materializes the anchor as a side effect). Convert it to the
+    /// equivalent viewport-top anchor — same visual position, sticky —
+    /// before stepping, exactly as [`Self::step_glide`] does.
+    fn materialize_glued_anchor(&mut self) {
+        let viewport = f32::from(self.list.viewport_bounds().size.height);
+        if self.is_glued() && viewport > 0.0 {
+            self.list.scroll_by(px(-(viewport + 0.5)));
+        }
+    }
+
+    /// One nudge frame (from `render`'s `on_next_frame` driver, post-layout).
+    fn step_nudge(&mut self, cx: &mut Context<Self>) {
+        if !self.nudge_active {
+            self.nudge_last_tick = None;
+            return;
+        }
+        let now = Instant::now();
+        let dt_ms = self
+            .nudge_last_tick
+            .map(|last| (now.duration_since(last).as_secs_f32() * 1000.0).min(100.0))
+            .unwrap_or(8.0);
+        self.nudge_last_tick = Some(now);
+        // Held arrow: feed velocity into the drain, ramping to cruise speed.
+        if let Some(hold) = &mut self.arrow_hold {
+            if hold.last_event.elapsed().as_secs_f32() * 1000.0 > HOLD_EVENT_TIMEOUT_MS {
+                // Neither a repeat nor a key-up in ages — the release was
+                // missed (focus moved mid-hold); stop feeding.
+                self.arrow_hold = None;
+            } else {
+                let ramp = HOLD_START_FRACTION
+                    + (1.0 - HOLD_START_FRACTION)
+                        * (hold.started.elapsed().as_secs_f32() * 1000.0 / HOLD_RAMP_MS).min(1.0);
+                let feed = hold.dir * HOLD_SPEED_PX_S * ramp * (dt_ms / 1000.0);
+                hold.fed += feed.abs();
+                let viewport =
+                    f32::from(self.list.viewport_bounds().size.height).max(OVERDRAW_PX);
+                let cap = NUDGE_MAX_VIEWPORTS * viewport;
+                self.nudge_remaining = (self.nudge_remaining + feed).clamp(-cap, cap);
+            }
+        }
+        self.materialize_glued_anchor();
+        let step = if self.nudge_remaining.abs() <= 0.5 {
+            std::mem::replace(&mut self.nudge_remaining, 0.0)
+        } else {
+            self.nudge_remaining * (1.0 - (-dt_ms / NUDGE_TAU_MS).exp())
+        };
+        if step != 0.0 {
+            let before = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+            self.list.scroll_by(px(step));
+            self.nudge_remaining -= step;
+            // No movement despite a real step: an edge — drop the queued
+            // distance instead of grinding against it.
+            let after = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+            if (after - before).abs() < 0.01 && step.abs() > 0.5 {
+                self.nudge_remaining = 0.0;
+            }
+        }
+        self.after_keyboard_scroll(step);
+        if (self.nudge_remaining == 0.0 && self.arrow_hold.is_none()) || self.pinned {
+            self.nudge_active = false;
+            self.nudge_remaining = 0.0;
+            self.nudge_last_tick = None;
+            self.arrow_hold = None;
+        }
+        cx.notify();
+    }
+
+    /// Post-step bookkeeping for programmatic keyboard scrolls, mirroring the
+    /// wheel path in [`Self::handle_scroll`] (programmatic `scroll_by` never
+    /// fires the list's scroll handler): keep the restick band and the
+    /// jump-pill visibility honest.
+    /// `step` is the px the keyboard scroll just applied (+down / −up): the
+    /// re-pin decision keys off INTENT, never off position deltas. Near the
+    /// bottom, per-frame layout corrections make the read-back distance
+    /// wobble; inferring direction from it re-armed the pin mid-up-scroll and
+    /// the spring yanked the view back down (the ball-toss bug, user report).
+    fn after_keyboard_scroll(&mut self, step: f32) {
+        let distance = self.distance_from_bottom();
+        let previous = self.last_scroll_distance;
+        self.last_scroll_distance = distance;
+        if !self.pinned
+            && step > 0.0
+            && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
+        {
+            // Arrowing deliberately down into the 70px band re-engages the
+            // pin, same as a wheel scroll would — the spring glides the
+            // landing. Upward motion can NEVER re-pin.
+            self.pinned = true;
+            self.wake_spring();
+        }
+        self.show_jump_button = distance > SCROLL_BUTTON_THRESHOLD_PX && !self.pinned;
+    }
+
+    /// Pill visibility + distance bookkeeping WITHOUT the restick rules — the
+    /// row glide handles its own landing (a glide passing through the 70px
+    /// band must not get hijacked by the pin's spring mid-flight).
+    fn refresh_scroll_ui(&mut self) {
+        let distance = self.distance_from_bottom();
+        self.last_scroll_distance = distance;
+        self.show_jump_button = distance > SCROLL_BUTTON_THRESHOLD_PX && !self.pinned;
+    }
+
+    /// Smooth-scroll the list so `target` sits at the viewport top — the
+    /// rail-tick click and the Option+arrow segment step.
+    ///
+    /// A [`motion::SCROLL_GLIDE`] (500ms ease-in-out) timeline drives every
+    /// frame's position; per-frame movement comes from the timeline, never
+    /// from a percent of the remaining distance:
+    ///
+    /// - a glued bottom anchor (`item_ix == len`, one viewport BELOW the
+    ///   visible top) is first materialized as the true viewport-top anchor —
+    ///   stepping straight from the glued anchor lands inside the re-glue band
+    ///   and layout undoes it every frame (the old stall→double-jump path);
+    /// - rows above the viewport are unmeasured, so the anchor glides in item
+    ///   space along the same timeline, estimating sub-row offsets from a
+    ///   local row-height EMA; the position is read back each frame, so a
+    ///   measurement correcting the estimate just re-enters the timeline;
+    /// - once the target row is measured the glide is pixel-exact.
+    ///
+    /// Frames come from `render`'s `on_next_frame` driver (vsync-locked, so
+    /// 120Hz on ProMotion), never wall-clock timers — a 16ms timer drifts
+    /// against the refresh and reads as judder.
+    pub fn scroll_to_row(&mut self, target: usize, cx: &mut Context<Self>) {
+        if motion::reduced_motion(cx) {
+            self.list.scroll_to(ListOffset {
+                item_ix: target,
+                offset_in_item: px(0.0),
+            });
+            cx.notify();
+            return;
+        }
+        self.cancel_scroll_anims();
+        self.pinned = false;
+        let now = Instant::now();
+        self.glide = Some(RowGlide {
+            target,
+            started: now,
+            last_frame: now,
+            total: motion::SCROLL_GLIDE.total().mul_f32(motion::speed_scale()),
+            timeline: crate::rail::GlideTimeline::new(),
+            height_ema: None,
+        });
+        cx.notify();
+    }
+
+    /// One glide frame (from `render`'s `on_next_frame` driver, post-layout —
+    /// measurements are fresh).
+    fn step_glide(&mut self, cx: &mut Context<Self>) {
+        let Some(mut anim) = self.glide.take() else {
+            return;
+        };
+        let now = Instant::now();
+        let dt_ms = (now.duration_since(anim.last_frame).as_secs_f32() * 1000.0).min(100.0);
+        anim.last_frame = now;
+        let raw = (anim.started.elapsed().as_secs_f32() / anim.total.as_secs_f32()).min(1.0);
+        let eased = motion::SCROLL_GLIDE.curve.eval(raw);
+        let frac = anim.timeline.step(eased);
+        let list = self.list.clone();
+        // Materialize the glued bottom representation as the true top anchor
+        // (same visual position, sticky anchor).
+        let viewport = f32::from(list.viewport_bounds().size.height);
+        if self.is_glued() && viewport > 0.0 {
+            list.scroll_by(px(-(viewport + 0.5)));
+        }
+        let top = list.logical_scroll_top();
+        let top_height = list
+            .bounds_for_item(top.item_ix)
+            .map(|b| f32::from(b.size.height).max(1.0));
+        // Row-height estimate for unmeasured territory: the mean over the
+        // whole visible span, recomputed per frame (the ~dozen mixed row kinds
+        // in a viewport average out — a single-row estimate whipsaws between
+        // paragraphs and code blocks and modulates the per-frame step
+        // visibly).
+        if viewport > 0.0 {
+            let bottom = f32::from(list.viewport_bounds().bottom());
+            let mut ix = top.item_ix;
+            let mut count = 0.0f32;
+            while let Some(b) = list.bounds_for_item(ix) {
+                if f32::from(b.top()) >= bottom {
+                    break;
+                }
+                count += 1.0;
+                ix += 1;
+            }
+            if count > 0.0 {
+                let mean = viewport / count;
+                let ema = anim.height_ema.get_or_insert(mean);
+                *ema += 0.5 * (mean - *ema);
+            }
+        }
+        if anim.height_ema.is_none() {
+            anim.height_ema = top_height;
+        }
+        // Where the viewport top actually is, in fractional item space — read
+        // back per frame (self-correcting: an anchor the layout adjusted or
+        // re-glued keeps its real remaining distance and continues the same
+        // timeline).
+        let here = top.item_ix as f32
+            + top_height
+                .map(|h| (f32::from(top.offset_in_item) / h).clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+        if crate::rail::scroll_trace_enabled() {
+            tracing::warn!(
+                ms = anim.started.elapsed().as_millis() as u64,
+                eased,
+                here,
+                dist = self.distance_from_bottom(),
+                "scroll-glide"
+            );
+        }
+
+        let target = anim.target;
+        if raw >= 1.0 {
+            // Timeline expired. With good estimates we're already within a
+            // hair of the target — land exactly. But a tall unmeasured row
+            // (a 20–40 line prompt) can leave the item-space estimate
+            // hundreds of px short, and snapping that difference reads as a
+            // layout jump — so overtime closes the remainder with a quick
+            // exponential tail instead, hard-landing only past 3× the
+            // timeline.
+            let k = 1.0 - (-dt_ms / GLIDE_OVERTIME_TAU_MS).exp();
+            if anim.started.elapsed() >= anim.total.mul_f32(3.0) {
+                list.scroll_to(ListOffset {
+                    item_ix: target,
+                    offset_in_item: px(0.0),
+                });
+            } else if let Some(bounds) = list.bounds_for_item(target) {
+                let delta = f32::from(bounds.top() - list.viewport_bounds().top());
+                if delta.abs() <= 0.5 {
+                    list.scroll_to(ListOffset {
+                        item_ix: target,
+                        offset_in_item: px(0.0),
+                    });
+                } else {
+                    // Measured: pixel-exact exponential landing.
+                    list.scroll_by(px(delta * k));
+                    self.glide = Some(anim);
+                }
+            } else {
+                // Still unmeasured: keep closing in item space; the row
+                // measures once it enters the overdraw and the arm above
+                // finishes pixel-exact.
+                let next = here + (target as f32 - here) * k;
+                let ix = (next.floor().max(0.0) as usize).min(target.max(top.item_ix));
+                let within = (next - ix as f32).max(0.0);
+                list.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(within * anim.height_ema.unwrap_or(0.0)),
+                });
+                self.glide = Some(anim);
+            }
+            self.refresh_scroll_ui();
+            cx.notify();
+            return;
+        }
+        if target < top.item_ix {
+            // Above the viewport (unmeasured): progressive item-space
+            // anchoring within the eased timeline.
+            let next = here - frac * (here - target as f32);
+            // Small steps ride `scroll_by` — the list keeps a 320px measured
+            // leading overdraw, so a step that fits inside it crosses rows at
+            // their TRUE heights (pixel-exact frames through the gentle start
+            // and landing, where jitter would show most).
+            let step_px = (here - next) * anim.height_ema.unwrap_or(0.0);
+            if step_px > 0.0 && step_px <= OVERDRAW_PX * 0.8 {
+                list.scroll_by(px(-step_px));
+            } else {
+                let ix = (next.floor().max(0.0) as usize).min(top.item_ix);
+                let within = next - ix as f32;
+                let offset = if ix == top.item_ix {
+                    // Same row as the current anchor: measured height,
+                    // pixel-exact — and never below the current offset, so
+                    // motion stays monotone even when a height estimate was
+                    // corrected.
+                    top_height
+                        .map(|h| (within * h).min(f32::from(top.offset_in_item)))
+                        .unwrap_or(0.0)
+                } else {
+                    within * anim.height_ema.unwrap_or(0.0)
+                };
+                list.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(offset),
+                });
+            }
+        } else {
+            match list.bounds_for_item(target) {
+                Some(bounds) => {
+                    // Measured: pixel-exact step along the timeline.
+                    let delta = f32::from(bounds.top() - list.viewport_bounds().top());
+                    list.scroll_by(px(frac * delta));
+                }
+                None => {
+                    // Below but unmeasured: item space, same timeline.
+                    let next = here + frac * (target as f32 - here);
+                    let ix = (next.floor().max(0.0) as usize).min(target);
+                    let within = next - ix as f32;
+                    list.scroll_to(ListOffset {
+                        item_ix: ix,
+                        offset_in_item: px(within * anim.height_ema.unwrap_or(0.0)),
+                    });
+                }
+            }
+        }
+        self.glide = Some(anim);
+        self.refresh_scroll_ui();
+        cx.notify();
+    }
+
+    /// Cmd+C / Ctrl+C while the transcript holds focus: copy the markdown
+    /// selection (the composer's Copy fallback does this when IT is focused).
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = crate::markdown::selection::selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Arrow key-ups end the held-arrow scroll (fires whether the transcript
+    /// or the composer holds focus — the shell forwards its copy).
+    fn on_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(event.keystroke.key.as_str(), "up" | "down") {
+            self.end_arrow_hold(cx);
+        }
+    }
+
+    /// Raw keys while the transcript holds focus. Escape returns focus to the
+    /// composer; a printable character hops there AND lands in the input —
+    /// focus takes care of itself, like typing anywhere in Slack.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.composer_input.clone() else {
+            return;
+        };
+        let keystroke = &event.keystroke;
+        if keystroke.key == "escape" {
+            window.focus(&input.focus_handle(cx), cx);
+            cx.stop_propagation();
+            return;
+        }
+        if keystroke.modifiers.platform
+            || keystroke.modifiers.control
+            || keystroke.modifiers.function
+        {
+            return;
+        }
+        let Some(ch) = keystroke.key_char.clone() else {
+            return;
+        };
+        if ch.is_empty() || ch.chars().any(char::is_control) {
+            return;
+        }
+        window.focus(&input.focus_handle(cx), cx);
+        input.update(cx, |input, cx| {
+            use gpui::EntityInputHandler as _;
+            input.replace_text_in_range(None, &ch, window, cx);
+        });
+        cx.stop_propagation();
     }
 
     /// Arm the per-frame spring driver — `render` schedules the next frame
@@ -1153,11 +1794,30 @@ impl Transcript {
             distance = glide_max;
         }
         let pos = target - distance;
-        let next = self.spring.step(pos, target, frames);
-        if next > pos {
-            self.list.scroll_by(px(next - pos));
+        let mut next = self.spring.step(pos, target, frames);
+        // Terminal phase: once the spring's own step falls below the closing
+        // floor, close at the floor rate — continuous motion, bounded landing.
+        if next < target {
+            let min_close = SPRING_MIN_CLOSE_PX_FRAME * frames;
+            if next - pos < min_close {
+                next = (pos + min_close).min(target);
+            }
         }
-        self.last_scroll_distance = (target - next).max(0.0);
+        if target - next <= 0.5 {
+            // Land in the GLUED representation, not at the estimate's px
+            // bottom: scrollbar-space estimates can sit 2–3px shy of the true
+            // end, and the app defines "at bottom" as glued everywhere
+            // (`is_glued`, the rail's active tick, the arrow-key at-bottom
+            // guard). A pixel landing left Cmd+Down visibly short with the
+            // previous rail tick still active (user report).
+            self.list.scroll_to_end();
+            self.last_scroll_distance = 0.0;
+        } else {
+            if next > pos {
+                self.list.scroll_by(px(next - pos));
+            }
+            self.last_scroll_distance = (target - next).max(0.0);
+        }
 
         if target - next <= 0.5 {
             let settled = *self.spring_settled_at.get_or_insert(now);
@@ -1200,6 +1860,7 @@ impl Transcript {
             self.highlights.entries.clear();
             self.list.reset(0);
             self.pinned = true;
+            self.cancel_scroll_anims();
             self.spring.reset();
             self.spring_last_tick = None;
             self.spring_settled_at = None;
@@ -2196,6 +2857,26 @@ impl Render for Transcript {
                     .ok();
             });
         }
+        // Row-glide / keyboard-nudge driver: the same vsync-locked scheme
+        // (one on_next_frame at a time, each tick notifies and re-schedules).
+        // The two are mutually exclusive with each other and with the spring
+        // by construction — starting either unpins and cancels the other.
+        if (self.glide.is_some() || self.nudge_active)
+            && !motion::reduced_motion(cx)
+            && !self.anim_scheduled
+        {
+            self.anim_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.anim_scheduled = false;
+                        this.step_glide(cx);
+                        this.step_nudge(cx);
+                    })
+                    .ok();
+            });
+        }
         let rail = self.render_rail(cx);
         // The scroll-to-bottom pill is rendered by the SHELL (conversation
         // region overlay): it must float just above the composer and paint
@@ -2205,6 +2886,29 @@ impl Render for Transcript {
             .relative()
             .size_full()
             .min_h_0()
+            // Keyboard scrolling: clicking into the chat history focuses it
+            // (native scroll-view behavior); the "Transcript" keymap then
+            // drives line/segment/page glides. Typing hops back to the
+            // composer (see `on_key_down`), so focus takes care of itself.
+            .key_context("Transcript")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window: &mut Window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &LineUp, _, cx| this.line_scroll(-1.0, cx)))
+            .on_action(cx.listener(|this, _: &LineDown, _, cx| this.line_scroll(1.0, cx)))
+            .on_action(cx.listener(|this, _: &SegmentUp, _, cx| this.segment_step(-1, cx)))
+            .on_action(cx.listener(|this, _: &SegmentDown, _, cx| this.segment_step(1, cx)))
+            .on_action(cx.listener(|this, _: &PageUp, _, cx| this.page_scroll(-1.0, cx)))
+            .on_action(cx.listener(|this, _: &PageDown, _, cx| this.page_scroll(1.0, cx)))
+            .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.go_to_top(cx)))
+            .on_action(cx.listener(|this, _: &GoToBottom, _, cx| this.jump_to_bottom(cx)))
+            .on_action(cx.listener(Self::copy_selection))
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).

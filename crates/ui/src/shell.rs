@@ -111,6 +111,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     }
     cx.clear_key_bindings();
     crate::composer::init(cx);
+    crate::transcript::bind_keys(cx);
     // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
     // these back the native menu key equivalents and must survive keymap
     // re-application.
@@ -553,6 +554,10 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        // Focus handoff wiring: typing while the transcript is focused hops
+        // back to the composer's input, keystroke included.
+        let composer_input = composer.read(cx).input();
+        transcript.update(cx, |t, _| t.set_composer_input(composer_input));
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
@@ -3587,6 +3592,14 @@ fn header_icon_button(
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
+impl Shell {
+    /// Whether transcript scroll keys should act: chat route with a transcript
+    /// on screen (not settings, not the new-chat canvas).
+    fn transcript_keys_active(&self, cx: &App) -> bool {
+        matches!(self.route, Route::Chat) && self.state.read(cx).selected_chat.is_some()
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
@@ -3675,6 +3688,50 @@ impl Render for Shell {
                     cx.notify();
                 } else {
                     this.open_add_space(cx);
+                }
+            }))
+            // Transcript keyboard scrolling while the COMPOSER holds focus.
+            // Bare arrows arrive only when the composer is empty (it
+            // propagates them instead of moving a caret); alt-arrows and
+            // page keys are bound to transcript actions in its context
+            // outright. The transcript handles its own bindings itself when
+            // it holds focus — these forwards never double-fire.
+            .on_action(cx.listener(|this, _: &crate::composer::Up, _, cx| {
+                if this.transcript_keys_active(cx) {
+                    this.transcript.update(cx, |t, cx| t.line_scroll(-1.0, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::composer::Down, _, cx| {
+                if this.transcript_keys_active(cx) {
+                    this.transcript.update(cx, |t, cx| t.line_scroll(1.0, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &transcript::SegmentUp, _, cx| {
+                if this.transcript_keys_active(cx) {
+                    this.transcript.update(cx, |t, cx| t.segment_step(-1, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &transcript::SegmentDown, _, cx| {
+                if this.transcript_keys_active(cx) {
+                    this.transcript.update(cx, |t, cx| t.segment_step(1, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &transcript::PageUp, _, cx| {
+                if this.transcript_keys_active(cx) {
+                    this.transcript.update(cx, |t, cx| t.page_scroll(-1.0, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &transcript::PageDown, _, cx| {
+                if this.transcript_keys_active(cx) {
+                    this.transcript.update(cx, |t, cx| t.page_scroll(1.0, cx));
+                }
+            }))
+            // Arrow key-ups end the transcript's held-arrow scroll no matter
+            // where focus sits (the composer path never reaches the
+            // transcript's own listener).
+            .on_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "up" | "down") {
+                    this.transcript.update(cx, |t, cx| t.end_arrow_hold(cx));
                 }
             }));
 

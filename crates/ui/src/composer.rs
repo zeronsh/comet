@@ -1133,12 +1133,22 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.content.is_empty() {
+            // Nothing to move a caret through — the arrow belongs to the chat
+            // history (the shell forwards it to the transcript's line glide).
+            cx.propagate();
+            return;
+        }
         if let Some(ix) = self.vertical_target(-1.0) {
             self.move_to(ix, cx);
         }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.content.is_empty() {
+            cx.propagate();
+            return;
+        }
         if let Some(ix) = self.vertical_target(1.0) {
             self.move_to(ix, cx);
         }
@@ -2151,6 +2161,12 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    /// The underlying text input — the shell wires it into the transcript so
+    /// typing there hands focus (and the keystroke) back to the composer.
+    pub fn input(&self) -> Entity<ComposerInput> {
+        self.input.clone()
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| ComposerInput::new("Do anything…", cx));
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
