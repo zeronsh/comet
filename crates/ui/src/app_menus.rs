@@ -118,6 +118,11 @@ pub fn app_menus() -> Vec<Menu> {
         // input — zed wires its editor actions identically
         // (crates/zed/src/zed/app_menus.rs, Edit/Selection menus).
         Menu::new("Edit").items([
+            // Undo/Redo have no `OsAction` counterpart — they dispatch as plain
+            // actions to the focused input, same as the composer keymap.
+            MenuItem::action("Undo", composer::Undo),
+            MenuItem::action("Redo", composer::Redo),
+            MenuItem::separator(),
             MenuItem::os_action("Cut", composer::Cut, OsAction::Cut),
             MenuItem::os_action("Copy", composer::Copy, OsAction::Copy),
             MenuItem::os_action("Paste", composer::Paste, OsAction::Paste),
@@ -167,7 +172,10 @@ mod tests {
     fn about_is_disabled_placeholder() {
         let menus = app_menus();
         let first = &menus[0].items[0];
-        assert!(first.is_disabled(), "About stays disabled until implemented");
+        assert!(
+            first.is_disabled(),
+            "About stays disabled until implemented"
+        );
     }
 
     #[test]

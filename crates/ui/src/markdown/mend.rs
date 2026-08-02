@@ -272,10 +272,13 @@ fn setext_partial(text: &str) -> bool {
     };
     let last = &text[nl + 1..];
     let trimmed = last.trim_start();
-    let underline = |c: char| {
-        !trimmed.is_empty() && trimmed.len() <= 2 && trimmed.chars().all(|x| x == c)
-    };
-    (underline('-') || underline('=')) && text[..nl].lines().last().is_some_and(|l| !l.trim().is_empty())
+    let underline =
+        |c: char| !trimmed.is_empty() && trimmed.len() <= 2 && trimmed.chars().all(|x| x == c);
+    (underline('-') || underline('='))
+        && text[..nl]
+            .lines()
+            .last()
+            .is_some_and(|l| !l.trim().is_empty())
 }
 
 #[cfg(test)]

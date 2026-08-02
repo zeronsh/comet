@@ -110,7 +110,7 @@ impl Theme {
     /// `#060606`, shell/sidebar `#0d0d0d`.
     pub fn dark() -> Self {
         Self {
-            bg: grey(6),      // main panel — sampled #060606
+            bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
             surface_raised: neutral(0.235),
             element_hover: wash(0.14),

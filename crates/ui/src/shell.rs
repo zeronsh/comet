@@ -697,9 +697,7 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         // Capture knob: the add-space palette needs only the device registry.
-        if self.debug_dialog.as_deref() == Some("add-space")
-            && !state.read(cx).devices.is_empty()
-        {
+        if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
             self.open_add_space(cx);
         }
@@ -774,10 +772,12 @@ impl Shell {
         {
             let (selected_space, selected_chat, chat_space) = {
                 let s = state.read(cx);
-                let chat_space = s
-                    .selected_chat_row()
-                    .and_then(|c| c.space_id.clone());
-                (s.selected_space.clone(), s.selected_chat.clone(), chat_space)
+                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
+                (
+                    s.selected_space.clone(),
+                    s.selected_chat.clone(),
+                    chat_space,
+                )
             };
             if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
                 self.space_last_chat.insert(space, chat);
@@ -1792,7 +1792,9 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover))
-            .when(selected, |el| el.shadow(crate::theme::glass_selected_shadows()))
+            .when(selected, |el| {
+                el.shadow(crate::theme::glass_selected_shadows())
+            })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2004,48 +2006,42 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(spaces_section)
-                    .child(
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from("Sessions")),
-                    )
-                    .child(if !list_items.is_empty() {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(Theme::SPACE_SM))
-                            .children(list_items)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pb(px(Theme::SPACE_SM))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from("No sessions yet"))
-                            .into_any_element()
-                    }),
+                            .child(
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pt(px(12.0))
+                                    .pb(px(4.0))
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from("Sessions")),
+                            )
+                            .child(if !list_items.is_empty() {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .children(list_items)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from("No sessions yet"))
+                                    .into_any_element()
+                            }),
                     )
                     .when(lists_fade_top && !glass, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(sidebar_fade, 0.0),
-                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                                )),
-                        )
+                        el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
+                            gpui::linear_gradient(
+                                180.0,
+                                gpui::linear_color_stop(sidebar_fade, 0.0),
+                                gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
+                            ),
+                        ))
                     })
                     .when(lists_fade_bottom && !glass, |el| {
                         el.child(
@@ -2098,11 +2094,7 @@ impl Shell {
     /// it drives the whole flow — click to download, then click to restart into
     /// the staged bundle. Elsewhere (managed/source installs) it is advisory
     /// (`comet update`); click dismisses it for that version.
-    fn render_update_strip(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
             return None;
@@ -2118,9 +2110,7 @@ impl Shell {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
                 UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => {
-                    (format!("Update failed: {message}").into(), true)
-                }
+                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
             }
         } else {
             (
@@ -2136,10 +2126,7 @@ impl Shell {
         let (chip_bg, chip_bg_hover) = if failed {
             (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
         } else {
-            (
-                crate::theme::wash(0.11),
-                crate::theme::wash(0.16),
-            )
+            (crate::theme::wash(0.11), crate::theme::wash(0.16))
         };
 
         let mut strip = div()
@@ -2675,9 +2662,7 @@ impl Shell {
                             popover::btn_primary(&theme_owned, "Add a space")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_add_space(cx)
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
                         ),
                 ))
                 .into_any_element()
@@ -3810,13 +3795,7 @@ impl Render for Shell {
                     .h_full()
                     .flex_none()
                     .relative()
-                    .child(
-                        sidebar_handle
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(-2.0)),
-                    );
+                    .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
                 let title_bar = self.render_title_bar(cx);
                 // Sidebar tone: a slightly lighter column behind the sidebar,
                 // spanning the FULL window height (under the traffic lights,

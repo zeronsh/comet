@@ -471,8 +471,10 @@ pub enum CheckoutKind {
 /// The resolved on-send checkout action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckoutPlan {
-    /// Run in the space folder as-is.
-    CurrentCheckout,
+    /// Run in the space folder as-is. `branch` is the checkout's branch (the
+    /// picked or current ref), carried onto `createChat` so the session names
+    /// it from the first frame; `None` = refs never loaded.
+    CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
     /// `CreateWorktree` off `base` on send (the engine mints a `comet/<name>`
@@ -491,7 +493,7 @@ pub fn checkout_plan(kind: CheckoutKind, picked: Option<&crate::RepoRef>) -> Che
                 path,
                 branch: name.unwrap_or_default(),
             },
-            None => CheckoutPlan::CurrentCheckout,
+            None => CheckoutPlan::CurrentCheckout { branch: name },
         },
     }
 }
@@ -537,7 +539,9 @@ mod checkout_tests {
         // is exactly why "current worktree" is not its own state.
         assert_eq!(
             checkout_plan(CheckoutKind::Local, Some(&plain("main"))),
-            CheckoutPlan::CurrentCheckout
+            CheckoutPlan::CurrentCheckout {
+                branch: Some("main".into())
+            }
         );
         assert_eq!(
             checkout_plan(CheckoutKind::Local, Some(&materialized("feat", "/wt/feat"))),
@@ -546,10 +550,11 @@ mod checkout_tests {
                 branch: "feat".into()
             }
         );
-        // No ref picked at all is still the space folder.
+        // No ref picked at all is still the space folder — with no branch to
+        // stamp until refs load.
         assert_eq!(
             checkout_plan(CheckoutKind::Local, None),
-            CheckoutPlan::CurrentCheckout
+            CheckoutPlan::CurrentCheckout { branch: None }
         );
     }
 

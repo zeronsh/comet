@@ -913,7 +913,10 @@ mod tests {
         let Block::Paragraph { runs } = &p.display_tree().blocks[0].block else {
             panic!("expected paragraph");
         };
-        let link = runs.iter().find(|r| r.style.link.is_some()).expect("link run");
+        let link = runs
+            .iter()
+            .find(|r| r.style.link.is_some())
+            .expect("link run");
         assert_eq!(link.text, "docs");
         assert_eq!(
             link.style.link.as_deref(),
@@ -936,7 +939,10 @@ mod tests {
         p.set_text("para\n-");
         let display = p.display_tree();
         assert!(
-            matches!(display.blocks.last().unwrap().block, Block::Paragraph { .. }),
+            matches!(
+                display.blocks.last().unwrap().block,
+                Block::Paragraph { .. }
+            ),
             "expected paragraph, got {display:?}"
         );
     }

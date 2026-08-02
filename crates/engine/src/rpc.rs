@@ -784,9 +784,7 @@ impl RpcService for EngineRpc {
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
             }
-            methods::UPDATE_STATUS => {
-                Ok(RpcReply::Stream(watch_stream(self.updater()?.watch())))
-            }
+            methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
                 let version = self
                     .updater()?

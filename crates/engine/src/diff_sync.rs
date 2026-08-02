@@ -830,7 +830,7 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{exceeds_watch_budget, MAX_WATCH_DIRS};
+    use super::{MAX_WATCH_DIRS, exceeds_watch_budget};
 
     #[test]
     fn small_tree_is_watchable() {

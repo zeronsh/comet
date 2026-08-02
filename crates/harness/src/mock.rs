@@ -120,8 +120,9 @@ impl Harness for MockHarness {
                 };
                 tokio::time::sleep(pause).await;
                 let _ = tx.send(AgentEvent::TextDelta {
-                    text: "Before I wire the reconciliation path I need two decisions from you.\n\n"
-                        .into(),
+                    text:
+                        "Before I wire the reconciliation path I need two decisions from you.\n\n"
+                            .into(),
                 });
                 tokio::time::sleep(pause).await;
                 let answers = request_input(question_script()).await.unwrap_or_default();
@@ -297,7 +298,11 @@ impl Harness for MockHarness {
                         let chars: Vec<char> = text.chars().collect();
                         chars
                             .chunks(n)
-                            .map(|c| Ok(AgentEvent::TextDelta { text: c.iter().collect() }))
+                            .map(|c| {
+                                Ok(AgentEvent::TextDelta {
+                                    text: c.iter().collect(),
+                                })
+                            })
                             .collect::<Vec<_>>()
                     }
                     other => vec![other],

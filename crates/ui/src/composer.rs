@@ -583,18 +583,58 @@ actions!(
         Down,
         SelectLeft,
         SelectRight,
+        SelectUp,
+        SelectDown,
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
         WordLeft,
         WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DeleteToLineStart,
+        DeleteToLineEnd,
         Copy,
         Cut,
         Paste,
         Newline,
         Submit,
+        Undo,
+        Redo,
     ]
 );
+
+/// How long a run of single-character edits keeps merging into one undo step.
+/// A pause longer than this starts a fresh step, so undo rewinds in the
+/// bursts the user actually typed rather than one character at a time.
+const UNDO_COALESCE: Duration = Duration::from_millis(700);
+
+/// Cap on retained undo steps — a long-lived composer must not grow forever.
+const UNDO_LIMIT: usize = 200;
+
+/// A restorable point in the input's history: text plus where the caret and
+/// selection sat when the edit landed.
+#[derive(Clone)]
+struct EditSnapshot {
+    content: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+/// Direction of the last edit — a run only merges with edits of its own kind.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Insert,
+    Delete,
+}
 
 /// Bind the composer keymap. Call once at app boot.
 pub fn init(cx: &mut App) {
@@ -610,14 +650,47 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", Down, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
+        KeyBinding::new("shift-up", SelectUp, ctx),
+        KeyBinding::new("shift-down", SelectDown, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-home", SelectHome, ctx),
+        KeyBinding::new("shift-end", SelectEnd, ctx),
+        // macOS line/document motion — a laptop keyboard has no home/end keys,
+        // so Cmd+arrow is the only way users reach either edge.
+        KeyBinding::new("cmd-left", Home, ctx),
+        KeyBinding::new("cmd-right", End, ctx),
+        KeyBinding::new("cmd-up", DocStart, ctx),
+        KeyBinding::new("cmd-down", DocEnd, ctx),
+        KeyBinding::new("shift-cmd-left", SelectHome, ctx),
+        KeyBinding::new("shift-cmd-right", SelectEnd, ctx),
+        KeyBinding::new("shift-cmd-up", SelectDocStart, ctx),
+        KeyBinding::new("shift-cmd-down", SelectDocEnd, ctx),
+        // Deletion by word / to the line edge (Opt+Delete, Cmd+Delete).
+        KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
+        KeyBinding::new("alt-delete", DeleteWordRight, ctx),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, ctx),
+        KeyBinding::new("cmd-delete", DeleteToLineEnd, ctx),
     ];
+    for prefix in ["cmd", "ctrl"] {
+        bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, ctx));
+        bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, ctx));
+    }
     // Word navigation and clipboard: bind both modifier conventions so the same
     // map works across platforms.
     for prefix in ["ctrl", "alt"] {
         bindings.push(KeyBinding::new(&format!("{prefix}-left"), WordLeft, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-right"), WordRight, ctx));
+        bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-left"),
+            SelectWordLeft,
+            ctx,
+        ));
+        bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-right"),
+            SelectWordRight,
+            ctx,
+        ));
     }
     for prefix in ["cmd", "ctrl"] {
         bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, ctx));
@@ -638,12 +711,44 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("end", End, palette),
         KeyBinding::new("shift-left", SelectLeft, palette),
         KeyBinding::new("shift-right", SelectRight, palette),
+        // Modifier-qualified motion is safe here: the palette's own navigation
+        // uses BARE arrows/enter, which stay unbound and bubble to its frame.
+        KeyBinding::new("cmd-left", Home, palette),
+        KeyBinding::new("cmd-right", End, palette),
+        KeyBinding::new("shift-cmd-left", SelectHome, palette),
+        KeyBinding::new("shift-cmd-right", SelectEnd, palette),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, palette),
+        KeyBinding::new("cmd-backspace", DeleteToLineStart, palette),
     ];
+    for prefix in ["ctrl", "alt"] {
+        palette_bindings.push(KeyBinding::new(
+            &format!("{prefix}-left"),
+            WordLeft,
+            palette,
+        ));
+        palette_bindings.push(KeyBinding::new(
+            &format!("{prefix}-right"),
+            WordRight,
+            palette,
+        ));
+        palette_bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-left"),
+            SelectWordLeft,
+            palette,
+        ));
+        palette_bindings.push(KeyBinding::new(
+            &format!("shift-{prefix}-right"),
+            SelectWordRight,
+            palette,
+        ));
+    }
     for prefix in ["cmd", "ctrl"] {
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-a"), SelectAll, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-x"), Cut, palette));
         palette_bindings.push(KeyBinding::new(&format!("{prefix}-v"), Paste, palette));
+        palette_bindings.push(KeyBinding::new(&format!("{prefix}-z"), Undo, palette));
+        palette_bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, palette));
     }
     cx.bind_keys(palette_bindings);
     cx.bind_keys(bindings);
@@ -700,6 +805,12 @@ pub struct ComposerInput {
     blink_anchor: Instant,
     /// Half-period repaint driver, alive only while the input is focused.
     blink_task: Option<Task<()>>,
+    // -- undo history --
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    /// Kind, trailing offset, and time of the last edit — the merge test that
+    /// decides whether the next edit extends the current undo step.
+    last_edit: Option<(EditKind, usize, Instant)>,
 }
 
 impl ComposerInput {
@@ -740,6 +851,9 @@ impl ComposerInput {
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
             blink_task: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: None,
         }
     }
 
@@ -811,9 +925,92 @@ impl ComposerInput {
         self.marked_range = None;
         self.scroll_top = 0.0;
         self.follow_cursor = true;
+        // Programmatic replacement (draft load, clear-on-submit) is a new
+        // document, not an edit — undo must not reach back past it.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = None;
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
+    }
+
+    // ---- undo history ----
+
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            content: self.content.clone(),
+            selected_range: self.selected_range.clone(),
+            selection_reversed: self.selection_reversed,
+        }
+    }
+
+    /// Called with the range about to be replaced, BEFORE the content changes,
+    /// so the pushed snapshot is the pre-edit state.
+    fn record_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        let kind = if new_text.is_empty() {
+            EditKind::Delete
+        } else {
+            EditKind::Insert
+        };
+        // A run merges only while it stays single-character, contiguous with
+        // the previous edit, of the same kind, and inside the idle window. A
+        // pause, a word break, a paste, or a caret jump all break the run so
+        // undo lands on a boundary the user recognizes.
+        let mergeable = match (kind, &self.last_edit) {
+            (EditKind::Insert, Some((EditKind::Insert, at, when))) => {
+                range.is_empty()
+                    && range.start == *at
+                    && new_text.chars().count() == 1
+                    && !new_text.starts_with(['\n', ' ', '\t'])
+                    && when.elapsed() < UNDO_COALESCE
+            }
+            (EditKind::Delete, Some((EditKind::Delete, at, when))) => {
+                range.end == *at && when.elapsed() < UNDO_COALESCE
+            }
+            _ => false,
+        };
+        if !mergeable {
+            self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+        }
+        // Any fresh edit invalidates the redo branch.
+        self.redo_stack.clear();
+        let tail = match kind {
+            EditKind::Insert => range.start + new_text.len(),
+            EditKind::Delete => range.start,
+        };
+        self.last_edit = Some((kind, tail, Instant::now()));
+    }
+
+    fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.content;
+        self.selected_range = snapshot.selected_range;
+        self.selection_reversed = snapshot.selection_reversed;
+        self.marked_range = None;
+        // Never merge a subsequent edit into a step that undo just crossed.
+        self.last_edit = None;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(previous) = self.undo_stack.pop() else {
+            return;
+        };
+        self.redo_stack.push(self.snapshot());
+        self.restore(previous, cx);
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        self.undo_stack.push(self.snapshot());
+        self.restore(next, cx);
     }
 
     // ---- editing ops ----
@@ -935,28 +1132,42 @@ impl ComposerInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(-1.0, cx);
+        if let Some(ix) = self.vertical_target(-1.0) {
+            self.move_to(ix, cx);
+        }
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_vertical(1.0, cx);
+        if let Some(ix) = self.vertical_target(1.0) {
+            self.move_to(ix, cx);
+        }
     }
 
-    fn move_vertical(&mut self, dir: f32, cx: &mut Context<Self>) {
-        let Some(current) = self.point_for_index(self.cursor_offset()) else {
-            return;
-        };
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.vertical_target(-1.0) {
+            self.select_to(ix, cx);
+        }
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.vertical_target(1.0) {
+            self.select_to(ix, cx);
+        }
+    }
+
+    /// Offset one wrapped line above/below the cursor, keeping its x column.
+    /// Clamps to the document edges, matching the platform's behavior on the
+    /// first and last line.
+    fn vertical_target(&self, dir: f32) -> Option<usize> {
+        let current = self.point_for_index(self.cursor_offset())?;
         let target_y = f32::from(current.y) + dir * f32::from(self.line_height);
         if target_y < 0.0 {
-            self.move_to(0, cx);
-            return;
+            return Some(0);
         }
         if target_y >= self.content_height {
-            self.move_to(self.content.len(), cx);
-            return;
+            return Some(self.content.len());
         }
-        let ix = self.index_for_point(point(current.x, px(target_y)));
-        self.move_to(ix, cx);
+        Some(self.index_for_point(point(current.x, px(target_y))))
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -982,6 +1193,32 @@ impl ComposerInput {
         self.move_to(line.end, cx);
     }
 
+    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.line_range_at(self.cursor_offset());
+        self.select_to(line.start, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.line_range_at(self.cursor_offset());
+        self.select_to(line.end, cx);
+    }
+
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
         let prev = self.previous_word_boundary(self.cursor_offset());
         self.move_to(prev, cx);
@@ -990,6 +1227,68 @@ impl ComposerInput {
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
         let next = self.next_word_boundary(self.cursor_offset());
         self.move_to(next, cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let prev = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(prev, cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let next = self.next_word_boundary(self.cursor_offset());
+        self.select_to(next, cx);
+    }
+
+    /// Opt/Cmd + Delete family. With a live selection these delete the
+    /// selection only (platform behavior) — the extend runs off the cursor.
+    fn delete_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            if self.cursor_offset() == offset {
+                return;
+            }
+            self.select_to(offset, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prev = self.previous_word_boundary(self.cursor_offset());
+        self.delete_to(prev, window, cx);
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.next_word_boundary(self.cursor_offset());
+        self.delete_to(next, window, cx);
+    }
+
+    fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = self.line_range_at(self.cursor_offset()).start;
+        self.delete_to(start, window, cx);
+    }
+
+    fn delete_to_line_end(
+        &mut self,
+        _: &DeleteToLineEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = self.line_range_at(self.cursor_offset()).end;
+        self.delete_to(end, window, cx);
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
@@ -1426,6 +1725,12 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        // An IME commit is the tail of a composition whose pre-composition
+        // snapshot was already taken (`replace_and_mark_text_in_range`);
+        // recording here would pin undo to the half-composed text instead.
+        if self.marked_range.is_none() {
+            self.record_edit(&range, new_text);
+        }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         let cursor = range.start + new_text.len();
@@ -1450,6 +1755,16 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        // First keystroke of a composition: snapshot the text as it stood
+        // before any of it existed, so one undo drops the whole composition.
+        if self.marked_range.is_none() {
+            self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+            self.last_edit = None;
+        }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         if new_text.is_empty() {
@@ -1719,16 +2034,32 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
             .on_action(cx.listener(Self::word_left))
             .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::delete_to_line_end))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -2322,7 +2653,9 @@ impl Composer {
                 let mut chat_branch: Option<String> = None;
                 if is_new {
                     match &plan {
-                        crate::pickers::CheckoutPlan::CurrentCheckout => {}
+                        crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
+                            chat_branch = branch.clone();
+                        }
                         crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
                             cwd = path.clone();
                             worktree_cwd = Some(path.clone());

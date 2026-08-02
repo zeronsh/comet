@@ -193,8 +193,7 @@ impl Render for ArchivedPage {
                                     meta = meta.child(SharedString::from("·"));
                                 }
                                 if let Some(location) = location {
-                                    meta =
-                                        meta.child(div().min_w_0().truncate().child(location));
+                                    meta = meta.child(div().min_w_0().truncate().child(location));
                                 }
                                 meta
                             }),

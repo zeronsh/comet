@@ -75,7 +75,13 @@ fn run_player(path: &Path) -> Result<(), String> {
         path.display()
     );
     let output = std::process::Command::new("powershell.exe")
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &script])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
         .output()
         .map_err(|e| format!("powershell failed: {e}"))?;
     if output.status.success() {
@@ -166,8 +172,14 @@ mod tests {
     fn transition_mapping_matches_herdr_semantics() {
         use SessionStatus::*;
         // A question always chimes, wherever it came from.
-        assert_eq!(sound_for_transition(Working, AwaitingInput), Some(Sound::Request));
-        assert_eq!(sound_for_transition(Idle, AwaitingInput), Some(Sound::Request));
+        assert_eq!(
+            sound_for_transition(Working, AwaitingInput),
+            Some(Sound::Request)
+        );
+        assert_eq!(
+            sound_for_transition(Idle, AwaitingInput),
+            Some(Sound::Request)
+        );
         // Completion = the Working→Idle edge only.
         assert_eq!(sound_for_transition(Working, Idle), Some(Sound::Done));
         assert_eq!(sound_for_transition(AwaitingInput, Idle), None);

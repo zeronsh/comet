@@ -770,7 +770,10 @@ mod tests {
         let ws = WorkspaceDoc::new();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         let mut options = serde_json::Map::new();
-        options.insert("contextWindow".into(), serde_json::Value::String("1m".into()));
+        options.insert(
+            "contextWindow".into(),
+            serde_json::Value::String("1m".into()),
+        );
         let config = ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
@@ -955,11 +958,19 @@ mod tests {
         for ws in [&a, &b] {
             let state = ws.read_all().unwrap();
             assert_eq!(
-                state.spaces.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+                state
+                    .spaces
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["sp-2"]
             );
             assert_eq!(
-                state.chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+                state
+                    .chats
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["chat-2"]
             );
             assert!(state.sessions.is_empty());
@@ -1007,9 +1018,15 @@ mod tests {
     #[test]
     fn schema_version_stamp_is_idempotent() {
         let ws = WorkspaceDoc::new();
-        assert_eq!(ws.ensure_schema_version().unwrap(), WORKSPACE_SCHEMA_VERSION);
+        assert_eq!(
+            ws.ensure_schema_version().unwrap(),
+            WORKSPACE_SCHEMA_VERSION
+        );
         let before = ws.doc().oplog_vv();
-        assert_eq!(ws.ensure_schema_version().unwrap(), WORKSPACE_SCHEMA_VERSION);
+        assert_eq!(
+            ws.ensure_schema_version().unwrap(),
+            WORKSPACE_SCHEMA_VERSION
+        );
         assert_eq!(ws.doc().oplog_vv(), before);
     }
 

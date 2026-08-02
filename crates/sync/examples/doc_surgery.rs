@@ -115,7 +115,10 @@ fn main() {
                 .export(loro::ExportMode::Snapshot)
                 .expect("export workspace");
             store.save_snapshot("workspace2", &bytes).expect("save");
-            println!("workspace2 preview updated for {chat_id} ({} bytes)", bytes.len());
+            println!(
+                "workspace2 preview updated for {chat_id} ({} bytes)",
+                bytes.len()
+            );
         }
         other => panic!("unknown mode {other}"),
     }

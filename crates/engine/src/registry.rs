@@ -124,6 +124,9 @@ impl HarnessRegistry {
 /// `claude-code` slot resolved through `comet_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
 pub fn default_registry() -> HarnessRegistry {
+    // Warm the login-shell PATH snapshot in the background so the first
+    // claude/codex resolve doesn't pay the shell-startup latency inline.
+    comet_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness {
         script: vec![

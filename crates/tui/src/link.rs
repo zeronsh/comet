@@ -526,7 +526,7 @@ fn spawn_start_session(
         let mut branch: Option<String> = None;
 
         match &start.plan {
-            CheckoutPlan::CurrentCheckout => {}
+            CheckoutPlan::CurrentCheckout { branch: name } => branch.clone_from(name),
             CheckoutPlan::ReuseWorktree { path, branch: name } => {
                 cwd = Some(path.clone());
                 branch = Some(name.clone());

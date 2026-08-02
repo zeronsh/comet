@@ -830,15 +830,16 @@ fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<S
 /// point the device is, for every purpose the app has, genuinely offline.
 /// Steady state (healthy room, fresh heartbeats) probes nothing.
 async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
-    let mut tick =
-        tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
     let client = reqwest::Client::new();
     loop {
         tick.tick().await;
         let Some(inner) = weak.upgrade() else { return };
-        let Some(edge) = inner.config.edge.clone() else { return };
+        let Some(edge) = inner.config.edge.clone() else {
+            return;
+        };
         let self_id = inner.config.device_id.clone();
         let now = now_ms();
         let stale: Vec<String> = {
@@ -883,7 +884,11 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
             let Ok(body) = response.json::<serde_json::Value>().await else {
                 continue;
             };
-            if body.get("hostConnected").and_then(serde_json::Value::as_bool) == Some(true) {
+            if body
+                .get("hostConnected")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
                 let Some(inner) = weak.upgrade() else { return };
                 lock(&inner.presence_seen).insert(device_id.clone(), now_ms());
                 tracing::debug!(device = %device_id, "presence: relay-verified alive");

@@ -12,7 +12,10 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
     let manifest = comet_update::fetch_latest(edge_url).await?;
     let current = current_version();
     if !version_newer(&manifest.version, current) {
-        println!("comet {current} is up to date (latest: {}).", manifest.version);
+        println!(
+            "comet {current} is up to date (latest: {}).",
+            manifest.version
+        );
         return Ok(());
     }
     println!("comet {current} → {} available", manifest.version);
@@ -22,7 +25,10 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
 
     match comet_update::detect_install() {
         InstallKind::Managed { app_root } => {
-            println!("downloading {}…", comet_update::headless_artifact(&manifest.version));
+            println!(
+                "downloading {}…",
+                comet_update::headless_artifact(&manifest.version)
+            );
             comet_update::stage_headless(edge_url, &manifest, &app_root).await?;
             comet_update::apply_headless(&app_root, &manifest.version)?;
             println!(
@@ -39,7 +45,10 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             Ok(())
         }
         InstallKind::MacApp { bundle } => {
-            println!("downloading {}…", comet_update::mac_app_artifact(&manifest.version));
+            println!(
+                "downloading {}…",
+                comet_update::mac_app_artifact(&manifest.version)
+            );
             let data_dir = std::env::var_os("COMET_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(super::dirs_data_dir);

@@ -54,9 +54,11 @@ use normalize::{
 };
 use rpc::{Incoming, RpcClient};
 
-/// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then PATH, then
-/// common install locations GUI launches miss. Resolved per call — cheap, and
-/// PATH may be adopted from the login shell after startup.
+/// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
+/// PATH, then the login-shell PATH snapshot (the user's shell init shapes
+/// PATH in ways a GUI/service launch never sees — see [`crate::shell_env`]),
+/// then known install locations as a last resort. Resolved per call — cheap
+/// after the snapshot is cached.
 fn resolve_codex_executable() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
         && !p.is_empty()
@@ -72,6 +74,13 @@ fn resolve_codex_executable() -> Option<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(shell_path) = crate::shell_env::login_shell_path() {
+        candidates.extend(
+            std::env::split_paths(shell_path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe)),
+        );
+    }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         candidates.push(home.join(".local").join("bin").join("codex"));
         candidates.push(home.join(".codex").join("bin").join("codex"));
@@ -159,9 +168,10 @@ impl CodexHarness {
         }
         resolve_codex_executable().ok_or_else(|| {
             HarnessError::NotInstalled(
-                "codex (searched PATH, ~/.local/bin, ~/.codex/bin, ~/.npm-global/bin, \
-                 /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun install \
-                 dirs; set CODEX_EXECUTABLE to override)"
+                "codex (searched PATH, the login shell's PATH, ~/.local/bin, \
+                 ~/.codex/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, \
+                 and fnm/nvm/volta/pnpm/bun install dirs; set CODEX_EXECUTABLE to \
+                 override)"
                     .into(),
             )
         })
@@ -226,7 +236,7 @@ impl Harness for CodexHarness {
         }
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
-        crate::prepend_exe_dir_to_path(&mut cmd, &exe);
+        crate::compose_child_path(&mut cmd, &exe);
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -1145,7 +1155,10 @@ mod tests {
             std::fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
             wt.display().to_string()
         };
-        assert!(worktree_on_slashed_branch(&make("slashed", "wing/prd-5645")));
+        assert!(worktree_on_slashed_branch(&make(
+            "slashed",
+            "wing/prd-5645"
+        )));
         assert!(!worktree_on_slashed_branch(&make("plain", "brave-ember")));
         // A main checkout (`.git` DIRECTORY) never escalates.
         let main = tmp.path().join("main");

@@ -270,10 +270,7 @@ impl AccountsPage {
                 .cmp(&b.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let effective = self
-            .target_device
-            .clone()
-            .or_else(|| local_id.clone());
+        let effective = self.target_device.clone().or_else(|| local_id.clone());
         let selected = devices
             .iter()
             .find(|d| Some(d.id.as_str()) == effective.as_deref())
@@ -296,65 +293,62 @@ impl AccountsPage {
         let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
         let open = self.device_menu_open;
 
-        let mut trigger = div()
-            .id("accounts-device-switcher")
-            .flex_none()
-            .h(px(28.0))
-            .px(px(8.0))
-            .rounded(px(6.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .cursor_pointer()
-            .bg(if open {
-                crate::theme::white_alpha(0.06)
-            } else {
-                gpui::transparent_black()
-            })
-            .when(!open, |el| {
-                el.hover(|s| s.bg(crate::theme::white_alpha(0.04)))
-            })
-            .on_click(cx.listener(|this, _, _, cx| {
-                let just_dismissed = this
-                    .device_menu_dismissed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.device_menu_open = !this.device_menu_open && !just_dismissed;
-                this.device_menu_dismissed_at = None;
-                cx.notify();
-            }))
-            .child(
-                icon(trigger_glyph)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.5))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(trigger_label),
-            )
-            .child(
-                div()
-                    .size(px(6.0))
-                    .rounded_full()
-                    .flex_none()
-                    .bg(if effective == local_id {
+        let mut trigger =
+            div()
+                .id("accounts-device-switcher")
+                .flex_none()
+                .h(px(28.0))
+                .px(px(8.0))
+                .rounded(px(6.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .bg(if open {
+                    crate::theme::white_alpha(0.06)
+                } else {
+                    gpui::transparent_black()
+                })
+                .when(!open, |el| {
+                    el.hover(|s| s.bg(crate::theme::white_alpha(0.04)))
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let just_dismissed = this
+                        .device_menu_dismissed_at
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
+                    this.device_menu_dismissed_at = None;
+                    cx.notify();
+                }))
+                .child(
+                    icon(trigger_glyph)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(trigger_label),
+                )
+                .child(div().size(px(6.0)).rounded_full().flex_none().bg(
+                    if effective == local_id {
                         emerald
                     } else {
                         crate::theme::white_alpha(0.2)
-                    }),
-            )
-            .child(
-                icon(icons::SORT_VERTICAL)
-                    .size(px(14.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
-            );
+                    },
+                ))
+                .child(
+                    icon(icons::SORT_VERTICAL)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
+                );
 
         if open {
             let menu = popover::popover_card(theme)
@@ -812,11 +806,7 @@ impl AccountsPage {
                                 .text_color(Theme::dark().text)
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(
-                                methods::FORGET_AGENT_ACCOUNT,
-                                &forget_account,
-                                cx,
-                            );
+                            this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
                         }))
                         .child(
                             crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
@@ -931,23 +921,24 @@ impl AccountsPage {
         let red_text = crate::theme::oklch(0.81, 0.108, 19.6).opacity(0.9); // red-300
         let login = self.login.as_ref()?;
         let title = login.title();
-        let url_link = |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
-            let open_url = url.to_string();
-            // "Reopen the …" text link (comet: `text-[12px]
-            // text-muted-foreground/60 hover:underline`).
-            div()
-                .id(id)
-                .mt(px(6.0))
-                .text_size(px(12.0))
-                .text_color(theme.text_muted.opacity(0.6))
-                .truncate()
-                .cursor_pointer()
-                .hover(|s| s.text_color(Theme::dark().text))
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.open_url(&open_url);
-                }))
-                .child(SharedString::from(label))
-        };
+        let url_link =
+            |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
+                let open_url = url.to_string();
+                // "Reopen the …" text link (comet: `text-[12px]
+                // text-muted-foreground/60 hover:underline`).
+                div()
+                    .id(id)
+                    .mt(px(6.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(Theme::dark().text))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.open_url(&open_url);
+                    }))
+                    .child(SharedString::from(label))
+            };
         let body: AnyElement = match login {
             LoginFlow::Starting { .. } => div()
                 .mt(px(8.0))
@@ -1001,14 +992,16 @@ impl AccountsPage {
                             .child(
                                 popover::btn_ghost(&theme, "Cancel", "login-cancel")
                                     .id("login-cancel")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.cancel_login(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
                             )
                             .child(
                                 popover::btn_primary(
                                     &theme,
-                                    if submitting { "Verifying…" } else { "Add account" },
+                                    if submitting {
+                                        "Verifying…"
+                                    } else {
+                                        "Add account"
+                                    },
                                 )
                                 .id("login-submit-code")
                                 .when(submitting, |el| el.opacity(0.5))
@@ -1068,20 +1061,15 @@ impl AccountsPage {
                         )
                     })
                     .child(
-                        div()
-                            .mt(px(16.0))
-                            .flex()
-                            .flex_row()
-                            .justify_end()
-                            .child(
-                                popover::btn_ghost(
-                                    &theme,
-                                    if has_error { "Close" } else { "Cancel" },
-                                    "login-cancel",
-                                )
-                                .id("login-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
-                            ),
+                        div().mt(px(16.0)).flex().flex_row().justify_end().child(
+                            popover::btn_ghost(
+                                &theme,
+                                if has_error { "Close" } else { "Cancel" },
+                                "login-cancel",
+                            )
+                            .id("login-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                        ),
                     )
                     .into_any_element()
             }
@@ -1118,8 +1106,12 @@ impl AccountsPage {
                 })
                 .bg(crate::theme::white_alpha(0.05))
         };
-        let meters = div().mt(px(8.0)).flex().flex_col().gap(px(7.0)).children(
-            (0..2).map(|_| {
+        let meters = div()
+            .mt(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .children((0..2).map(|_| {
                 div()
                     .flex()
                     .flex_row()
@@ -1136,8 +1128,7 @@ impl AccountsPage {
                             .bg(crate::theme::white_alpha(0.04)),
                     )
                     .child(ghost(px(64.0).into(), 9.0, false))
-            }),
-        );
+            }));
         let inner = div()
             .flex()
             .flex_row()
@@ -1158,14 +1149,11 @@ impl AccountsPage {
                     .child(ghost(px(176.0).into(), 13.0, false).max_w(gpui::relative(0.6)))
                     .child(meters),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .child(ghost(px(64.0).into(), 21.0, true)),
-            );
+            .child(div().flex_none().flex().flex_col().items_end().child(ghost(
+                px(64.0).into(),
+                21.0,
+                true,
+            )));
         div()
             .px(px(20.0))
             .py(px(14.0))
@@ -1196,7 +1184,10 @@ impl Render for AccountsPage {
         let provider_icon = |harness: HarnessId| match harness {
             HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
             HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-            _ => (crate::icons::CLAUDE_MARK, Some(crate::icons::claude_brand())),
+            _ => (
+                crate::icons::CLAUDE_MARK,
+                Some(crate::icons::claude_brand()),
+            ),
         };
         // Brand mark inside a 24px centered box (comet: `grid size-6
         // place-items-center [&_svg]:size-4`).

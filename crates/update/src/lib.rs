@@ -217,7 +217,10 @@ pub async fn download_release_file(
     let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
-        tracing::warn!(file, "no checksum in release metadata; skipping verification");
+        tracing::warn!(
+            file,
+            "no checksum in release metadata; skipping verification"
+        );
     }
     let partial = dest.with_extension("partial");
     let resp = http_client()?
@@ -287,8 +290,7 @@ pub async fn stage_headless(
     let file = headless_artifact(version);
     let stage = app_root.join(format!(".stage-{version}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)
-        .with_context(|| format!("creating {}", stage.display()))?;
+    std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let result = async {
         let tarball = stage.join(&file);
         download_release_file(edge_url, manifest, &file, &tarball).await?;
@@ -358,10 +360,7 @@ pub fn restart_service() -> anyhow::Result<()> {
             &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.comet")],
         )
     } else {
-        run(
-            "systemctl",
-            &["--user", "restart", "comet-native.service"],
-        )
+        run("systemctl", &["--user", "restart", "comet-native.service"])
     }
 }
 
@@ -389,7 +388,12 @@ pub async fn stage_mac_app(
     download_release_file(edge_url, manifest, &file, &tarball).await?;
     run(
         "tar",
-        &["-xzf", &tarball.to_string_lossy(), "-C", &dir.to_string_lossy()],
+        &[
+            "-xzf",
+            &tarball.to_string_lossy(),
+            "-C",
+            &dir.to_string_lossy(),
+        ],
     )?;
     std::fs::remove_file(&tarball).ok();
     if !staged.join("Contents/MacOS/comet").exists() {
@@ -605,7 +609,8 @@ impl Updater {
             }
             Err(err) => {
                 tracing::debug!(error = %err, "update check failed");
-                self.status_tx.send_modify(|s| s.error = Some(format!("{err:#}")));
+                self.status_tx
+                    .send_modify(|s| s.error = Some(format!("{err:#}")));
                 false
             }
         }
@@ -688,7 +693,10 @@ mod tests {
             InstallKind::Unmanaged
         );
         assert_eq!(
-            detect_install_from(Path::new("/src/target/release/comet"), Some(Path::new("/home/u"))),
+            detect_install_from(
+                Path::new("/src/target/release/comet"),
+                Some(Path::new("/home/u"))
+            ),
             InstallKind::Unmanaged
         );
     }
@@ -697,7 +705,10 @@ mod tests {
     fn artifact_names_match_packaging() {
         let (os, arch) = platform_key();
         assert!(headless_artifact("0.2.0").starts_with("comet-0.2.0-"));
-        assert_eq!(headless_artifact("0.2.0"), format!("comet-0.2.0-{os}-{arch}.tar.gz"));
+        assert_eq!(
+            headless_artifact("0.2.0"),
+            format!("comet-0.2.0-{os}-{arch}.tar.gz")
+        );
         assert!(mac_app_artifact("0.2.0").ends_with("-app.tar.gz"));
     }
 
@@ -709,7 +720,9 @@ mod tests {
         .unwrap();
         assert_eq!(full.version, "0.1.1");
         assert_eq!(
-            full.files["comet-0.1.1-linux-x86_64.tar.gz"].sha256.as_deref(),
+            full.files["comet-0.1.1-linux-x86_64.tar.gz"]
+                .sha256
+                .as_deref(),
             Some("abc")
         );
         let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();

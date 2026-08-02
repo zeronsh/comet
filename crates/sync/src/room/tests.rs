@@ -687,7 +687,10 @@ async fn hung_dial_times_out_and_redials() {
     // retried on backoff. A wedged dial would freeze the count at 2.
     tokio::time::sleep(Duration::from_secs(120)).await;
     let dials = connector.dials.load(Ordering::SeqCst);
-    assert!(dials >= 4, "hung dials must time out and be retried; saw {dials}");
+    assert!(
+        dials >= 4,
+        "hung dials must time out and be retried; saw {dials}"
+    );
     drop(client);
 }
 

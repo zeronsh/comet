@@ -155,7 +155,10 @@ mod tests {
         defaults.remember_model(HarnessId::Codex, "m1".into(), "One".into());
         defaults.remember_model(HarnessId::Codex, "m2".into(), "Two".into());
         assert_eq!(defaults.harness, Some(HarnessId::Codex));
-        assert_eq!(defaults.model_for(HarnessId::Codex).map(|m| &*m.id), Some("m2"));
+        assert_eq!(
+            defaults.model_for(HarnessId::Codex).map(|m| &*m.id),
+            Some("m2")
+        );
         assert!(defaults.model_for(HarnessId::ClaudeCode).is_none());
     }
 }

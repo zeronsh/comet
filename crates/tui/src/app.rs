@@ -2712,8 +2712,9 @@ mod tests {
         assert_eq!(start.space_id, "s1");
         assert_eq!(start.command["kind"], "run");
         assert_eq!(start.command["request"]["prompt"], "first prompt");
-        // Default plan with no refs loaded: the space folder as-is.
-        assert_eq!(start.plan, CheckoutPlan::CurrentCheckout);
+        // Default plan with no refs loaded: the space folder as-is, no branch
+        // to stamp yet.
+        assert_eq!(start.plan, CheckoutPlan::CurrentCheckout { branch: None });
 
         // The draft is gone and its echo is already on screen.
         assert!(app.draft.is_none());
@@ -2741,11 +2742,17 @@ mod tests {
             },
         ]));
 
-        // Default: current branch, no worktree -> run in place.
+        // Default: current branch, no worktree -> run in place, and the
+        // branch still rides createChat so the session footer names it.
         let draft = app.draft.as_ref().unwrap();
         assert_eq!(draft.ref_label(), "main");
         assert_eq!(draft.checkout_label(), "Current checkout");
-        assert_eq!(draft.plan(), CheckoutPlan::CurrentCheckout);
+        assert_eq!(
+            draft.plan(),
+            CheckoutPlan::CurrentCheckout {
+                branch: Some("main".into())
+            }
+        );
 
         // Switch to a new worktree off main.
         app.act(Action::PickCheckout);

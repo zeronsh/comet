@@ -75,8 +75,10 @@ pub enum CheckoutKind {
 /// [`Pickers::checkout_plan`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckoutPlan {
-    /// Run in the space folder as-is.
-    CurrentCheckout,
+    /// Run in the space folder as-is. `branch` is the checkout's branch (the
+    /// picked or current ref), carried onto `createChat` so the session names
+    /// it from the first frame; `None` = refs never loaded.
+    CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
     /// `CreateWorktree` off `base` on send (comet mints a `comet/<name>`
@@ -698,9 +700,9 @@ impl Pickers {
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 if let Loadable::Ready(models) = &loaded {
-                    let fresh = pickers.defaults.remember_labels(
-                        models.iter().map(|m| (m.id.as_str(), m.label.as_str())),
-                    );
+                    let fresh = pickers
+                        .defaults
+                        .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
                     if fresh {
                         pickers.save_defaults();
                     }
@@ -1141,37 +1143,6 @@ impl Pickers {
             .unwrap_or_default()
     }
 
-    /// Keyboard-row count of the traits popover (ladder + all option choices).
-    fn trait_rows_len(&self, cx: &App) -> usize {
-        let ladder = self.trait_ladder(cx).len();
-        let choices = self
-            .selected_model(cx)
-            .map(|m| m.options.iter().map(|o| o.choices.len()).sum::<usize>())
-            .unwrap_or(0);
-        ladder + choices
-    }
-
-    /// Enter on the traits popover: ladder rows and choices select.
-    fn activate_trait_row(&mut self, cx: &mut Context<Self>) {
-        let ladder = self.trait_ladder(cx);
-        if let Some(level) = ladder.get(self.active).copied() {
-            self.pick_reasoning(level, cx);
-            return;
-        }
-        let mut ix = self.active - ladder.len();
-        let Some(model) = self.selected_model(cx).cloned() else {
-            return;
-        };
-        for option in &model.options {
-            if let Some(choice) = option.choices.get(ix) {
-                let is_default = choice.id == option.default_choice;
-                self.pick_option(option.id.clone(), choice.id.clone(), is_default, cx);
-                return;
-            }
-            ix -= option.choices.len();
-        }
-    }
-
     /// The viewed harness's model list, when loaded (keyboard nav rows).
     fn model_rows_len(&self, cx: &App) -> usize {
         self.effective_harness(cx)
@@ -1260,7 +1231,9 @@ impl Pickers {
                     path,
                     branch: self.effective_ref_name().unwrap_or_default(),
                 },
-                None => CheckoutPlan::CurrentCheckout,
+                None => CheckoutPlan::CurrentCheckout {
+                    branch: self.effective_ref_name(),
+                },
             },
         }
     }
@@ -1315,10 +1288,10 @@ impl Pickers {
                 let count = match self.open {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
                     Some(PickerKind::Checkout) => 2,
-                    Some(PickerKind::HarnessModel) => {
-                        // Combined menu: models first, then the ladder/options.
-                        self.model_rows_len(cx) + self.trait_rows_len(cx)
-                    }
+                    // Keyboard nav walks the MODEL list only; the traits
+                    // chips below (reasoning ladder, model options) are
+                    // mouse-only.
+                    Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
                     Some(PickerKind::Traits) => 0, // merged into HarnessModel
                     None => 0,
                 };
@@ -1336,16 +1309,7 @@ impl Pickers {
             }
             MenuKey::Enter if !search_focused => {
                 if self.open == Some(PickerKind::HarnessModel) {
-                    // Combined flat index: models, then ladder/options.
-                    let models = self.model_rows_len(cx);
-                    if self.active < models {
-                        self.activate_model_row(cx);
-                    } else {
-                        let saved = self.active;
-                        self.active = saved - models;
-                        self.activate_trait_row(cx);
-                        self.active = saved;
-                    }
+                    self.activate_model_row(cx);
                 } else if self.open == Some(PickerKind::Checkout) {
                     let kind = if self.active == 0 {
                         CheckoutKind::Local
@@ -1488,11 +1452,7 @@ impl Pickers {
 
     /// A read-only footer label (locked sessions — t3code's
     /// `resolveLockedWorkspaceLabel` span).
-    fn footer_label(
-        icon_path: &'static str,
-        label: SharedString,
-        theme: &Theme,
-    ) -> gpui::Div {
+    fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
             .max_w(px(280.0))
@@ -1725,80 +1685,81 @@ impl Pickers {
             .selected_chat_row()
             .and_then(|c| c.branch.clone());
         let switching = self.switching.clone();
-        let body: AnyElement = match &self.refs {
-            Loadable::Loading | Loadable::Idle => {
-                popover::skeleton_rows("branch-skeleton", &theme, 4)
-            }
-            Loadable::Error(message) => {
-                let message = message.clone();
-                self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
-            }
-            Loadable::Ready(_) if rows.is_empty() => div()
-                .p(px(Theme::SPACE_SM))
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("No refs found."))
-                .into_any_element(),
-            Loadable::Ready(_) => {
-                let active = self.active;
-                let selected = session_branch.or_else(|| self.config.branch.clone());
-                div()
-                    .id("branch-list")
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .max_h(px(224.0))
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
-                        |(ix, row)| {
-                            let label: SharedString = row.name.clone().into();
-                            let is_selected = selected.as_deref() == Some(row.name.as_str());
-                            // Right-aligned muted tag (t3code `text-[10px]
-                            // text-muted-foreground/45`): current beats worktree.
-                            let tag: Option<&'static str> = if row.current {
-                                Some("current")
-                            } else if row.worktree_path.is_some() {
-                                Some("worktree")
-                            } else {
-                                None
-                            };
-                            let is_switching = switching.as_deref() == Some(row.name.as_str());
-                            popover::menu_row_nav(
-                                &theme,
-                                is_selected,
-                                ix == active,
-                                format!("branch-row-{ix}"),
-                            )
-                            .id(("branch-row", ix))
-                            .when(switching.is_some(), |el| el.opacity(0.55))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pick_ref(row.clone(), cx);
-                            }))
-                            .child(div().flex_1().min_w_0().truncate().child(label))
-                            .when(is_switching, |el| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from("switching…")),
+        let body: AnyElement =
+            match &self.refs {
+                Loadable::Loading | Loadable::Idle => {
+                    popover::skeleton_rows("branch-skeleton", &theme, 4)
+                }
+                Loadable::Error(message) => {
+                    let message = message.clone();
+                    self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
+                }
+                Loadable::Ready(_) if rows.is_empty() => div()
+                    .p(px(Theme::SPACE_SM))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("No refs found."))
+                    .into_any_element(),
+                Loadable::Ready(_) => {
+                    let active = self.active;
+                    let selected = session_branch.or_else(|| self.config.branch.clone());
+                    div()
+                        .id("branch-list")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(224.0))
+                        .overflow_y_scroll()
+                        .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
+                            |(ix, row)| {
+                                let label: SharedString = row.name.clone().into();
+                                let is_selected = selected.as_deref() == Some(row.name.as_str());
+                                // Right-aligned muted tag (t3code `text-[10px]
+                                // text-muted-foreground/45`): current beats worktree.
+                                let tag: Option<&'static str> = if row.current {
+                                    Some("current")
+                                } else if row.worktree_path.is_some() {
+                                    Some("worktree")
+                                } else {
+                                    None
+                                };
+                                let is_switching = switching.as_deref() == Some(row.name.as_str());
+                                popover::menu_row_nav(
+                                    &theme,
+                                    is_selected,
+                                    ix == active,
+                                    format!("branch-row-{ix}"),
                                 )
-                            })
-                            .when_some(tag, |el, tag| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.45))
-                                        .child(SharedString::from(tag)),
-                                )
-                            })
-                            .when(is_selected, |el| el.child(popover::menu_check(&theme)))
-                        },
-                    ))
-                    .into_any_element()
-            }
-        };
+                                .id(("branch-row", ix))
+                                .when(switching.is_some(), |el| el.opacity(0.55))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_ref(row.clone(), cx);
+                                }))
+                                .child(div().flex_1().min_w_0().truncate().child(label))
+                                .when(is_switching, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .child(SharedString::from("switching…")),
+                                    )
+                                })
+                                .when_some(tag, |el, tag| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted.opacity(0.45))
+                                            .child(SharedString::from(tag)),
+                                    )
+                                })
+                                .when(is_selected, |el| el.child(popover::menu_check(&theme)))
+                            },
+                        ))
+                        .into_any_element()
+                }
+            };
         let mut popover = div()
             .flex()
             .flex_col()
@@ -1807,14 +1768,16 @@ impl Pickers {
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
-            popover = popover.child(popover::menu_section().child(
-                div()
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.danger.opacity(0.9))
-                    .child(SharedString::from(error.clone())),
-            ));
+            popover = popover.child(
+                popover::menu_section().child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.danger.opacity(0.9))
+                        .child(SharedString::from(error.clone())),
+                ),
+            );
         }
         if total > shown {
             popover = popover.child(
@@ -1973,13 +1936,16 @@ impl Pickers {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
                             }))
-                            .child(crate::icons::icon(icon_path).size(px(16.0)).flex_none().text_color(
-                                tint.unwrap_or(if is_viewed {
-                                    theme.text
-                                } else {
-                                    theme.text_muted
-                                }),
-                            ))
+                            .child(
+                                crate::icons::icon(icon_path)
+                                    .size(px(16.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(if is_viewed {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    })),
+                            )
                             .child(div().min_w_0().truncate().child(name))
                     }))
                     .into_any_element()
@@ -2071,7 +2037,7 @@ impl Pickers {
         // One combined menu (user request): harness tabs across the top,
         // then the viewed harness's models, then the reasoning ladder and
         // model options that used to live in the separate traits popover.
-        let traits = self.render_traits_sections(self.model_rows_len(cx), cx);
+        let traits = self.render_traits_sections(cx);
         // The palette architecture: agents rail LEFT, models pane beside it
         // with the traits INSPECTOR pinned below (models are the decision;
         // reasoning/options are properties of it — they never scroll away
@@ -2172,9 +2138,8 @@ impl Pickers {
     /// model option as headed segmented-chip sections, pinned under the
     /// models pane (formerly menu rows in the shared scroll). Selecting
     /// keeps the menu open; the active chip carries the wash + ring.
-    /// `nav_offset` is the flat keyboard index where these chips start (the
-    /// model rows come first in the combined index).
-    fn render_traits_sections(&mut self, nav_offset: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// Mouse-only — arrow keys walk the model list above, never these chips.
+    fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
             return popover::skeleton_rows("traits-skeleton", &theme, 3);
@@ -2183,10 +2148,6 @@ impl Pickers {
         // Display the effective level (draft pick or the chat's config), so
         // the ladder check mirrors the chip summary.
         let current = self.effective_reasoning(cx);
-        // Keyboard nav: flat row index — ladder first, then option choices in
-        // render order — offset past the model rows above.
-        let nav_active = self.active.wrapping_sub(nav_offset);
-        let ladder_len = levels.len();
 
         let ladder: AnyElement = if levels.is_empty() {
             gpui::Empty.into_any_element()
@@ -2204,7 +2165,7 @@ impl Pickers {
                         .gap(px(4.0))
                         .children(levels.into_iter().enumerate().map(|(ix, level)| {
                             let is_active = current == Some(level);
-                            trait_chip(&theme, is_active, ix == nav_active)
+                            trait_chip(&theme, is_active)
                                 .id(("reasoning-row", ix))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_reasoning(level, cx);
@@ -2216,26 +2177,12 @@ impl Pickers {
         };
 
         let selections = self.explicit_options(cx);
-        // Per-option flat-index bases for the keyboard highlight.
-        let option_bases: Vec<usize> = {
-            let mut offset = ladder_len;
-            model
-                .options
-                .iter()
-                .map(|o| {
-                    let base = offset;
-                    offset += o.choices.len();
-                    base
-                })
-                .collect()
-        };
         let options =
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
                 .children(model.options.iter().enumerate().map(|(opt_ix, option)| {
-                    let option_base = option_bases[opt_ix];
                     let selected_choice = selections
                         .get(&option.id)
                         .and_then(|v| v.as_str())
@@ -2260,21 +2207,17 @@ impl Pickers {
                                         let choice_id = choice.id.clone();
                                         let option_id = option_id.clone();
                                         let is_default = choice.id == default_choice;
-                                        trait_chip(
-                                            &theme,
-                                            is_active,
-                                            option_base + choice_ix == nav_active,
-                                        )
-                                        .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.pick_option(
-                                                option_id.clone(),
-                                                choice_id.clone(),
-                                                is_default,
-                                                cx,
-                                            );
-                                        }))
-                                        .child(SharedString::from(choice.label.clone()))
+                                        trait_chip(&theme, is_active)
+                                            .id(("trait-choice", opt_ix * 32 + choice_ix))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.pick_option(
+                                                    option_id.clone(),
+                                                    choice_id.clone(),
+                                                    is_default,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(SharedString::from(choice.label.clone()))
                                     },
                                 )),
                         )
@@ -2294,9 +2237,9 @@ impl Pickers {
 /// A segmented choice chip for the traits inspector (reasoning ladder /
 /// model options): the key-cap voice — every chip carries a faint fill so it
 /// reads as a pressable segment (bare text read as labels, not buttons);
-/// the active/keyboard-highlighted chip adds the app-wide wash + glass ring.
+/// the active chip adds the app-wide wash + glass ring.
 /// The caller adds id/click/label.
-fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
+fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
     div()
         .h(px(24.0))
         .px(px(10.0))
@@ -2307,14 +2250,15 @@ fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
         .text_size(px(11.5))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(crate::theme::glass_selected_bg()).text_color(theme.text)
+            el.bg(crate::theme::glass_selected_bg())
+                .text_color(theme.text)
         })
         .when(!active, |el| {
             el.bg(crate::theme::white_alpha(0.04))
                 .text_color(theme.text_muted.opacity(0.7))
                 .hover(|s| s.bg(theme.element_hover))
         })
-        .when(active || highlighted, |el| {
+        .when(active, |el| {
             el.shadow(crate::theme::glass_selected_shadows())
         })
 }
@@ -2466,8 +2410,10 @@ impl Render for Pickers {
         }
         // A popover opened data-side (COMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
-        if matches!(self.open, Some(PickerKind::Branch) | Some(PickerKind::Checkout))
-            && matches!(self.refs, Loadable::Idle)
+        if matches!(
+            self.open,
+            Some(PickerKind::Branch) | Some(PickerKind::Checkout)
+        ) && matches!(self.refs, Loadable::Idle)
         {
             self.ensure_refs(false, cx);
         }

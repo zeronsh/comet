@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, ListAlignment, ListState, SharedString,
-    Subscription, Task, Window, div, font, list, prelude::*, px,
+    AnyElement, App, Context, Entity, ListAlignment, ListState, SharedString, Subscription, Task,
+    Window, div, font, list, prelude::*, px,
 };
 
 use comet_proto::{Chat, CheckoutDiff};
@@ -547,7 +547,11 @@ impl Changes {
         self.watch_task = Some(Self::spawn_watch(engine, target, cx));
     }
 
-    fn spawn_watch(engine: EngineHandle, target: Option<String>, cx: &mut Context<Self>) -> Task<()> {
+    fn spawn_watch(
+        engine: EngineHandle,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
                 let mut params = serde_json::Map::new();
@@ -1043,7 +1047,10 @@ fn render_file_body(
                         .flex_none()
                         .flex()
                         .items_center()
-                        .pl(px(ACCENT_BAR_WIDTH + 2.0 * GUTTER_WIDTH + MARKER_WIDTH + 12.0))
+                        .pl(px(ACCENT_BAR_WIDTH
+                            + 2.0 * GUTTER_WIDTH
+                            + MARKER_WIDTH
+                            + 12.0))
                         .text_size(px(10.5))
                         .text_color(theme.text_faint)
                         .italic()
@@ -1545,5 +1552,4 @@ rename to new_name.rs
         assert_eq!(lang_for_path("README"), None);
         assert_eq!(lang_for_path("img.png"), None);
     }
-
 }
