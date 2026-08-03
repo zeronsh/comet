@@ -161,7 +161,7 @@ impl HermesHarness {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("acp");
-        crate::prepend_exe_dir_to_path(&mut cmd, &exe);
+        crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
         }
