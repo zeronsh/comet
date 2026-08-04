@@ -99,8 +99,18 @@ lto = "thin"
 strip = "symbols"
 
 [profile.dev]
-# gpui is slow unoptimized; match zed's approach for deps
+# Keep workspace crates quick to compile while optimizing dependencies: gpui is
+# too slow to use unoptimized. Limited debug info keeps normal development
+# builds debuggable without producing full symbols for the entire dependency
+# graph.
 opt-level = 0
+debug = "limited"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Opt in when a debugging session needs full local and dependency symbols.
+[profile.dbg]
+inherits = "dev"
+debug = "full"
+incremental = false
