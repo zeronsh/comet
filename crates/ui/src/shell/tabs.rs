@@ -569,7 +569,10 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(6.0))
             .pl(px(tabs_left))
-            .pr(px(Theme::SPACE_LG))
+            .pr(px(titlebar_right_padding(
+                cfg!(target_os = "windows"),
+                Theme::SPACE_LG,
+            )))
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())

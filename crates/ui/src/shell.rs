@@ -1517,7 +1517,10 @@ impl Shell {
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
-                    .pr(px(Theme::SPACE_LG));
+                    .pr(px(titlebar_right_padding(
+                        cfg!(target_os = "windows"),
+                        Theme::SPACE_LG,
+                    )));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
@@ -1622,6 +1625,56 @@ impl Shell {
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             ))
             .into_any_element()
+    }
+
+    /// Native Windows caption controls integrated into Comet's unified
+    /// titlebar. `WindowControlArea` maps these hit targets to HTMINBUTTON,
+    /// HTMAXBUTTON, and HTCLOSE, so Windows owns their behavior (including
+    /// Snap Layouts) while GPUI renders the system Segoe caption glyphs.
+    fn render_windows_caption_controls(&self, window: &Window, cx: &App) -> Option<AnyElement> {
+        if !cfg!(target_os = "windows") {
+            return None;
+        }
+
+        let theme = Theme::of(cx);
+        let (maximize_id, maximize_glyph) = if window.is_maximized() {
+            ("window-restore", "\u{e923}")
+        } else {
+            ("window-maximize", "\u{e922}")
+        };
+        Some(
+            div()
+                .id("windows-window-controls")
+                .absolute()
+                .top_0()
+                .right_0()
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_row()
+                .font_family("Segoe Fluent Icons")
+                .child(windows_caption_button(
+                    "window-minimize",
+                    "\u{e921}",
+                    WindowControlArea::Min,
+                    theme,
+                    false,
+                ))
+                .child(windows_caption_button(
+                    maximize_id,
+                    maximize_glyph,
+                    WindowControlArea::Max,
+                    theme,
+                    false,
+                ))
+                .child(windows_caption_button(
+                    "window-close",
+                    "\u{e8bb}",
+                    WindowControlArea::Close,
+                    theme,
+                    true,
+                ))
+                .into_any_element(),
+        )
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -3565,6 +3618,59 @@ fn window_control_button(
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
+const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
+const WINDOWS_CAPTION_WIDTH: f32 = WINDOWS_CAPTION_BUTTON_WIDTH * 3.0;
+
+fn titlebar_right_padding(is_windows: bool, base: f32) -> f32 {
+    base + if is_windows {
+        WINDOWS_CAPTION_WIDTH
+    } else {
+        0.0
+    }
+}
+
+/// A Windows-owned caption target using the same system glyphs and native
+/// non-client hit-test areas as GPUI/Zed's platform titlebar.
+fn windows_caption_button(
+    id: &'static str,
+    glyph: &'static str,
+    area: WindowControlArea,
+    theme: &Theme,
+    close: bool,
+) -> impl IntoElement {
+    let (hover_bg, hover_fg, active_bg, active_fg) = if close {
+        let red: gpui::Hsla = gpui::rgb(0xe81123).into();
+        (
+            red,
+            gpui::white(),
+            red.opacity(0.8),
+            gpui::white().opacity(0.8),
+        )
+    } else {
+        (
+            theme.glass_hover(),
+            theme.text,
+            theme.glass_hover().opacity(0.7),
+            theme.text,
+        )
+    };
+    div()
+        .id(id)
+        .w(px(WINDOWS_CAPTION_BUTTON_WIDTH))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(10.0))
+        .text_color(theme.text)
+        .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+        .active(move |style| style.bg(active_bg).text_color(active_fg))
+        .occlude()
+        .window_control_area(area)
+        .child(glyph)
+}
+
 /// A titlebar history button (comet window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
@@ -3901,7 +4007,7 @@ impl Render for Shell {
         }
 
         // Boot splash overlay: visible → crossfades out on Ready → removed.
-        match self.splash {
+        let root = match self.splash {
             SplashPhase::Visible => {
                 let theme = Theme::of(cx).clone();
                 let view = cx.entity_id();
@@ -3913,7 +4019,26 @@ impl Render for Shell {
                 root.child(loaders::splash_overlay(&theme, true, view, cx))
             }
             SplashPhase::Gone => root,
-        }
+        };
+
+        // Caption controls are shell-level chrome, not Ready-page content:
+        // keep them above the splash and every auth/org/error gate as well as
+        // the full application. Gate pages also need a native drag surface
+        // because they do not render the unified tabs/settings titlebar.
+        let root = if matches!(gate, GatePhase::Ready) || !cfg!(target_os = "windows") {
+            root
+        } else {
+            root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(Theme::TITLEBAR_HEIGHT))
+                    .window_control_area(WindowControlArea::Drag),
+            )
+        };
+        root.children(self.render_windows_caption_controls(window, cx))
     }
 }
 
@@ -3943,6 +4068,12 @@ mod tests {
         // Linux / Windows: never any inset.
         assert_eq!(titlebar_spacer_width(false, false, 10.0), 0.0);
         assert_eq!(titlebar_spacer_width(false, true, 10.0), 0.0);
+    }
+
+    #[test]
+    fn windows_caption_controls_reserve_titlebar_space() {
+        assert_eq!(titlebar_right_padding(true, 16.0), 124.0);
+        assert_eq!(titlebar_right_padding(false, 16.0), 16.0);
     }
 
     #[test]
