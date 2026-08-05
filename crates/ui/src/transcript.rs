@@ -1551,7 +1551,14 @@ impl Transcript {
         } else {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
         };
-        let bottom_pad = if ix + 1 == self.rows.len() { 24.0 } else { 0.0 };
+        // The last row must clear the shell's bottom fade band, or the
+        // timestamp strip (the row's lowest content) renders half-faded
+        // when the transcript is scrolled to the bottom.
+        let bottom_pad = if ix + 1 == self.rows.len() {
+            Theme::TRANSCRIPT_FADE_BAND + 8.0
+        } else {
+            0.0
+        };
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {

@@ -2835,7 +2835,7 @@ impl Shell {
                             .bottom_0()
                             .left_0()
                             .right(px(10.0))
-                            .h(px(40.0))
+                            .h(px(Theme::TRANSCRIPT_FADE_BAND))
                             .bg(gpui::linear_gradient(
                                 0.0,
                                 gpui::linear_color_stop(theme_bg, 0.0),

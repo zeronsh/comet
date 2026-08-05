@@ -318,6 +318,12 @@ impl Theme {
     /// Reserved status strip under the content outlet (comet `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
+    /// Height of the gradient that fades the transcript into the panel
+    /// background at its bottom edge. The transcript's last row must pad
+    /// itself past this band so settled content (message text, the
+    /// hover-revealed timestamp) never sits inside the fade when scrolled
+    /// to the bottom.
+    pub const TRANSCRIPT_FADE_BAND: f32 = 40.0;
     /// Message bubble corner radius.
     pub const BUBBLE_RADIUS: f32 = 16.0;
     /// Panel / card corner radius.
