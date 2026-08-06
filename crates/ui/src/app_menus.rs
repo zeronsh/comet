@@ -91,7 +91,13 @@ fn macos_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        // AppKit fires menu key equivalents in `performKeyEquivalent:`, before
+        // the key reaches any view, so a menu item holding ⌘W would make every
+        // view-level ⌘W binding unreachable. ⌘⇧W leaves the chord free for the
+        // terminal's close-tab, as zed and Safari do. Keep this the action's
+        // only binding: gpui derives the menu equivalent from the keymap, and a
+        // second ⌘W binding could hand the menu back the chord it just gave up.
+        KeyBinding::new("cmd-shift-w", CloseWindow, None),
     ]
 }
 
@@ -264,7 +270,9 @@ mod tests {
         };
         let combo = |source: &str| vec![Keystroke::parse(source).unwrap()];
         assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
-        assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
+        // Not ⌘W: that chord belongs to the terminal's close-tab, and a menu
+        // equivalent would intercept it before any view saw it.
+        assert_eq!(find(CloseWindow.name()), Some(combo("cmd-shift-w")));
         assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
     }
 }

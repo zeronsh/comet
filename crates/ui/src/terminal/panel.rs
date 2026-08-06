@@ -27,7 +27,7 @@ use comet_proto::{TerminalEvent, TerminalSession};
 use comet_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
-use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
+use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT, platform_combo};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -41,9 +41,45 @@ use super::view::{
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
 
-actions!(terminal, [ToggleTerminal]);
+actions!(
+    terminal,
+    [
+        ToggleTerminal,
+        NewTerminalTab,
+        SelectAllTerminal,
+        CloseTerminalTab
+    ]
+);
 
-/// Bind the terminal keymap (global): Cmd+J on macOS, Ctrl+J elsewhere.
+/// Terminal shortcuts that are not user-customizable.
+///
+/// Register these from [`crate::shell::apply_keymap`], never from [`init`]:
+/// that function clears the keymap first and runs after it, so bindings placed
+/// in `init` disappear before the first frame with no error.
+///
+/// Shifted punctuation must be written as the character it produces —
+/// `ctrl-~`, not `ctrl-shift-\``. The platform reports `~` with no shift
+/// modifier, so the second form matches nothing. Letters keep shift as a
+/// modifier (`ctrl-shift-a`).
+///
+/// The `Terminal` scope on select-all and close-tab is load-bearing: gpui ranks
+/// matches by context depth before registration order, so scoping is what lets
+/// these outrank the global bindings on the same chords.
+pub fn fixed_key_bindings() -> Vec<KeyBinding> {
+    vec![
+        // Ctrl even on macOS, matching VS Code and zed.
+        KeyBinding::new("ctrl-~", NewTerminalTab, None),
+        KeyBinding::new(
+            &platform_combo("mod-a"),
+            SelectAllTerminal,
+            Some("Terminal"),
+        ),
+        KeyBinding::new(&platform_combo("mod-w"), CloseTerminalTab, Some("Terminal")),
+    ]
+}
+
+/// Covers the gap between app init and the first shell; `apply_keymap` then
+/// clears this and re-binds the toggle from the user's keymap.
 pub fn init(cx: &mut App) {
     let toggle = if cfg!(target_os = "macos") {
         "cmd-j"
@@ -175,13 +211,8 @@ pub struct GridSnapshot {
     pub cursor: Option<CursorSnapshot>,
 }
 
-/// Where the grid landed this frame, in window coordinates.
-///
-/// Reported by element prepaint because that is the only place the measured
-/// font metrics exist. Mouse events arrive on the wrapping div in window
-/// space, so mapping a pointer to a cell needs the glyph origin and the cell
-/// size the *current* frame used — a stale one puts the selection a row off
-/// after a resize.
+/// Where the grid landed this frame, in window coordinates. Reported from
+/// element prepaint, which is the only place the measured font metrics exist.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridGeometry {
     /// Top-left of the first glyph (bounds origin plus padding).
@@ -192,17 +223,11 @@ pub struct GridGeometry {
     pub rows: u16,
 }
 
-/// An in-flight left-button gesture.
-///
-/// A press alone does not select. It arms this, and only pointer travel past
-/// [`SELECTION_DRAG_THRESHOLD`] promotes it to a real selection — otherwise the
-/// click that focuses the panel would leave a one-cell selection behind
-/// whenever the hand moves a pixel.
 #[derive(Debug, Clone, Copy)]
 struct SelectionDrag {
-    /// Press position, in window space: both the threshold origin and the
-    /// selection's anchor, so the selection starts where the press landed
-    /// rather than where the threshold happened to trip.
+    /// Press position, in window space. Doubles as the threshold origin and the
+    /// selection anchor, so a promoted drag covers the whole gesture rather
+    /// than starting where the threshold happened to trip.
     origin: gpui::Point<Pixels>,
     armed: bool,
 }
@@ -685,9 +710,8 @@ impl TerminalPanel {
             cx.stop_propagation();
             return;
         }
-        // Copy: Cmd+C (macOS) / Ctrl+Shift+C. Only swallowed when it actually
-        // copied — so Ctrl+Shift+C with nothing selected still falls through
-        // to the interrupt, and plain Ctrl+C (no shift) never reaches here.
+        // Swallowed only when it actually copied, so Ctrl+Shift+C with nothing
+        // selected still falls through to the interrupt.
         if ks.key == "c"
             && (mods.platform || (mods.control && mods.shift))
             && self.copy_selection(cx)
@@ -710,9 +734,8 @@ impl TerminalPanel {
     /// Called from element prepaint with the frame's grid placement. Resizes
     /// the emulator immediately; the `ResizeTerminal` RPC debounces 80 ms.
     pub fn on_grid_metrics(&mut self, geometry: GridGeometry, cx: &mut Context<Self>) {
-        // Stash unconditionally, before the early returns below: pointer
-        // mapping needs the placement even on frames where nothing resized,
-        // which is almost all of them.
+        // Before the early returns: pointer mapping needs the placement on
+        // every frame, not just resizing ones.
         self.geometry = Some(geometry);
         let (cols, rows) = (geometry.cols, geometry.rows);
         let Some(chat) = self.selected_chat(cx) else {
@@ -778,7 +801,6 @@ impl TerminalPanel {
 
     // ---- selection ----
 
-    /// Run `f` against the active tab's emulator.
     fn with_active_emulator<R>(
         &mut self,
         cx: &App,
@@ -790,8 +812,7 @@ impl TerminalPanel {
         tabs.tabs.get_mut(active).map(|tab| f(&mut tab.emulator))
     }
 
-    /// Window position → grid point, using this frame's placement. `None`
-    /// before the first prepaint, or when no tab is active.
+    /// `None` before the first prepaint, or with no active tab.
     fn grid_point_at(
         &mut self,
         position: gpui::Point<Pixels>,
@@ -820,8 +841,6 @@ impl TerminalPanel {
         let Some((point, side)) = self.grid_point_at(event.position, cx) else {
             return;
         };
-        // Click count picks the granularity, the same mapping every terminal
-        // uses: drag, word, line.
         let ty = match event.click_count {
             0 => return,
             1 => SelectionType::Simple,
@@ -830,9 +849,6 @@ impl TerminalPanel {
         };
         let shift = event.modifiers.shift;
         if ty == SelectionType::Simple {
-            // Shift+click extends an existing selection instead of replacing
-            // it — the one gesture that reaches text off the bottom of a long
-            // drag without redoing the whole thing.
             let extended = shift
                 && self
                     .with_active_emulator(cx, |emu| {
@@ -851,17 +867,14 @@ impl TerminalPanel {
                 cx.notify();
                 return;
             }
-            // A plain press clears and arms; the selection itself only begins
-            // once the pointer travels far enough to mean it.
             self.with_active_emulator(cx, |emu| emu.clear_selection());
             self.selection_drag = Some(SelectionDrag {
                 origin: event.position,
                 armed: false,
             });
         } else {
-            // Word and line selections are complete on the press, so they need
-            // no threshold — but keep the drag live so the pointer can extend
-            // them at that granularity.
+            // Already complete on the press, so no threshold — but stay armed
+            // so the pointer can extend at this granularity.
             self.with_active_emulator(cx, |emu| emu.start_selection(ty, point, side));
             self.selection_drag = Some(SelectionDrag {
                 origin: event.position,
@@ -889,8 +902,6 @@ impl TerminalPanel {
             if dx.hypot(dy) < SELECTION_DRAG_THRESHOLD {
                 return;
             }
-            // Threshold tripped: anchor at the *press*, not here, so the
-            // selection covers the whole gesture.
             let Some((anchor, side)) = self.grid_point_at(drag.origin, cx) else {
                 return;
             };
@@ -918,8 +929,40 @@ impl TerminalPanel {
         self.selection_drag = None;
     }
 
-    /// Copy the selection. Returns whether anything was copied, so the caller
-    /// can decide whether to swallow the keystroke.
+    pub fn open_new_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(chat) = self.selected_chat(cx) else {
+            return;
+        };
+        self.open_tab(chat, cx);
+    }
+
+    fn on_select_all(
+        &mut self,
+        _: &SelectAllTerminal,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_active_emulator(cx, |emu| emu.select_all());
+        cx.notify();
+    }
+
+    fn on_close_tab(&mut self, _: &CloseTerminalTab, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.selected_chat(cx) else {
+            return;
+        };
+        let Some(key) = self
+            .chats
+            .get(&chat)
+            .and_then(|tabs| tabs.tabs.get(tabs.active))
+            .map(|tab| tab.key)
+        else {
+            return;
+        };
+        self.close_tab(&chat, key, window, cx);
+    }
+
+    /// Returns whether anything was copied, so the caller can decide whether to
+    /// swallow the keystroke.
     fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(text) = self
             .with_active_emulator(cx, |emu| emu.selection_text())
@@ -1309,13 +1352,13 @@ impl Render for TerminalPanel {
                     .min_h_0()
                     .key_context("Terminal")
                     .track_focus(&self.focus_handle)
+                    .on_action(cx.listener(Self::on_select_all))
+                    .on_action(cx.listener(Self::on_close_tab))
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
-                    // Bound on the window, not the element: a drag that ends
-                    // outside the panel still has to end the gesture, or the
-                    // next unrelated pointer move keeps extending a selection
-                    // the user let go of.
+                    // A drag released outside the panel must still end the
+                    // gesture, or later pointer moves keep extending it.
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
@@ -1346,6 +1389,74 @@ mod tests {
         // Tiny windows: min wins over the 55vh cap.
         assert_eq!(clamp_terminal_height(200.0, 100.0), 160.0);
         assert_eq!(clamp_terminal_height(f32::NAN, 900.0), 160.0);
+    }
+
+    /// `KeyBinding::new` panics on an unparseable combo, so building the table
+    /// is itself the parse check.
+    #[test]
+    fn fixed_bindings_parse_and_scope_correctly() {
+        use gpui::Action as _;
+        let bindings = fixed_key_bindings();
+        assert_eq!(bindings.len(), 3);
+
+        let find = |name: &str| {
+            bindings
+                .iter()
+                .find(|binding| binding.action().name() == name)
+                .expect("binding present")
+        };
+        assert_eq!(find(NewTerminalTab.name()).predicate(), None);
+
+        // `ctrl-shift-\`` would parse and build, then never fire: the platform
+        // reports the shifted character and drops the modifier.
+        let strokes = find(NewTerminalTab.name()).keystrokes();
+        assert_eq!(strokes.len(), 1, "new-tab is a single chord");
+        let chord = strokes[0].inner();
+        assert_eq!(chord.key, "~", "bind the shifted character, not shift + `");
+        assert!(
+            chord.modifiers.control,
+            "VS Code and zed both use Ctrl here"
+        );
+        assert!(
+            !chord.modifiers.shift,
+            "shift is folded into '~'; demanding it too matches nothing"
+        );
+        assert!(!chord.modifiers.platform, "not Cmd, even on macOS");
+        for scoped in [SelectAllTerminal.name(), CloseTerminalTab.name()] {
+            assert!(
+                find(scoped).predicate().is_some(),
+                "{scoped} must stay scoped to the Terminal context"
+            );
+        }
+
+        let primary = |name: &str| {
+            let chord = find(name).keystrokes()[0].inner().clone();
+            (chord.key, chord.modifiers)
+        };
+        for name in [SelectAllTerminal.name(), CloseTerminalTab.name()] {
+            let (_, mods) = primary(name);
+            if cfg!(target_os = "macos") {
+                assert!(mods.platform, "{name} should use Cmd on macOS");
+                assert!(!mods.control, "{name} should not also demand Ctrl");
+            } else {
+                assert!(mods.control, "{name} should use Ctrl off macOS");
+                assert!(!mods.platform, "{name} should not demand the super key");
+            }
+        }
+        assert_eq!(primary(SelectAllTerminal.name()).0, "a");
+        assert_eq!(primary(CloseTerminalTab.name()).0, "w");
+    }
+
+    /// `apply_keymap` clears the keymap after `init` runs, so anything `init`
+    /// owns beyond the toggle would be silently dropped.
+    #[test]
+    fn fixed_bindings_are_not_bound_by_init() {
+        use gpui::Action as _;
+        let names: Vec<_> = fixed_key_bindings()
+            .iter()
+            .map(|b| b.action().name().to_string())
+            .collect();
+        assert!(!names.contains(&ToggleTerminal.name().to_string()));
     }
 
     #[test]

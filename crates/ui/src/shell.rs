@@ -44,7 +44,9 @@ use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
     org_name_valid, parse_orgs, sort_memberships,
 };
-use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
+use crate::terminal::panel::{
+    NewTerminalTab, TerminalPanel, ToggleTerminal, clamp_terminal_height,
+};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
 
@@ -136,6 +138,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         // bar); pressing it again dismisses.
         KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
     ]);
+    // The `clear_key_bindings` above drops whatever `terminal::panel::init`
+    // bound at app start, so these have to be re-registered here.
+    cx.bind_keys(crate::terminal::panel::fixed_key_bindings());
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -203,6 +208,15 @@ impl SessionPanels {
         let entry = self.map.entry(key.to_string()).or_default();
         entry.terminal_open = !entry.terminal_open;
         entry.terminal_open
+    }
+
+    /// Returns whether the flag changed, so callers can run the open-only side
+    /// effects exactly once.
+    pub fn open_terminal(&mut self, key: &str) -> bool {
+        let entry = self.map.entry(key.to_string()).or_default();
+        let was_open = entry.terminal_open;
+        entry.terminal_open = true;
+        !was_open
     }
 
     /// Flip the changes flag for `key`; returns the new value.
@@ -989,6 +1003,37 @@ impl Shell {
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    /// Opens the panel when closed, adds a tab when already open: `set_open`
+    /// creates the first tab itself, so doing both would open two.
+    fn new_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // `terminal_target` reads the flag, so sample before flipping it or the
+        // tween starts from its own destination.
+        let from = self.terminal_target(cx);
+        let key = self.panel_key(cx);
+        let opened = self.panels.open_terminal(&key);
+        let panel = self.terminal_panel(cx);
+        if opened {
+            self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
+            panel.update(cx, |panel, cx| panel.set_open(true, cx));
+            self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(
+                        RESIZE.total().mul_f32(motion::speed_scale()) + Duration::from_millis(30),
+                    )
+                    .await;
+                this.update(cx, |shell, cx| {
+                    shell.terminal_tween = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        } else {
+            panel.update(cx, |panel, cx| panel.open_new_tab(cx));
+        }
+        window.focus(&panel.read(cx).focus_handle(), cx);
         cx.notify();
     }
 
@@ -3817,6 +3862,11 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_terminal(window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminalTab, window, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.new_terminal_tab(window, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
