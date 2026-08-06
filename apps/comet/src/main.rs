@@ -234,6 +234,7 @@ fn harness_from_env() -> comet_engine::HarnessId {
         Ok("mock") => comet_engine::HarnessId::Mock,
         Ok("codex") => comet_engine::HarnessId::Codex,
         Ok("cursor") => comet_engine::HarnessId::Cursor,
+        Ok("hermes") => comet_engine::HarnessId::Hermes,
         _ => comet_engine::HarnessId::ClaudeCode,
     }
 }
