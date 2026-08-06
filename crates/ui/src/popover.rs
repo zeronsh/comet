@@ -54,6 +54,124 @@ impl<T> Loadable<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Popup — open/closing/closed lifecycle (exit animations)
+// ---------------------------------------------------------------------------
+
+/// Popup state with an exit phase. gpui unmounts an element the frame its
+/// state drops, so a closing animation needs the state held alive while
+/// [`motion::menu_out`] plays: `open` → `begin_close` (render keeps mounting,
+/// with the out animation and dead hit-testing) → [`reap_popup`]'s timer
+/// `finish_close`es ~[`motion::MENU_OUT`] later. Use [`Self::is_open`] for
+/// logic (a closing popup already reads as closed) and [`Self::get`] /
+/// [`Self::is_closing`] for rendering.
+pub struct Popup<T> {
+    /// `Some((state, closing_since))` while mounted; `closing_since` is the
+    /// exit-phase start.
+    inner: Option<(T, Option<std::time::Instant>)>,
+}
+
+impl<T> Default for Popup<T> {
+    fn default() -> Self {
+        Self { inner: None }
+    }
+}
+
+impl<T> Popup<T> {
+    pub fn open(&mut self, value: T) {
+        self.inner = Some((value, None));
+    }
+
+    /// Open and interactive (not closing).
+    pub fn is_open(&self) -> bool {
+        matches!(self.inner, Some((_, None)))
+    }
+
+    pub fn is_closing(&self) -> bool {
+        matches!(self.inner, Some((_, Some(_))))
+    }
+
+    /// When the exit phase began — what the render path hands to the popover
+    /// wrappers, which derive the eased exit progress from it each frame.
+    pub fn closing_since(&self) -> Option<std::time::Instant> {
+        match &self.inner {
+            Some((_, Some(since))) => Some(*since),
+            _ => None,
+        }
+    }
+
+    /// The state while mounted — open OR playing the exit animation. Render
+    /// paths use this; logic paths use [`Self::as_open`]/[`Self::open_mut`].
+    pub fn get(&self) -> Option<&T> {
+        self.inner.as_ref().map(|(value, _)| value)
+    }
+
+    /// The state only while genuinely open — `None` during the exit phase, so
+    /// event handlers on a dying popup fall through.
+    pub fn as_open(&self) -> Option<&T> {
+        match &self.inner {
+            Some((value, None)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn open_mut(&mut self) -> Option<&mut T> {
+        match &mut self.inner {
+            Some((value, None)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Enter the exit phase. Returns `true` when this call started it (the
+    /// caller then schedules [`reap_popup`]); `false` if already closing or
+    /// closed.
+    pub fn begin_close(&mut self) -> bool {
+        match &mut self.inner {
+            Some((_, closing @ None)) => {
+                *closing = Some(std::time::Instant::now());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop the state if the exit phase has run its course. A popup reopened
+    /// (or re-closed) since the matching [`begin_close`] is left alone — the
+    /// newer phase's own reap handles it.
+    pub fn finish_close(&mut self) {
+        if let Some((_, Some(since))) = &self.inner
+            && since.elapsed() >= motion::MENU_OUT.total().mul_f32(motion::speed_scale())
+        {
+            self.inner = None;
+        }
+    }
+}
+
+/// Schedule the reap for a [`Popup::begin_close`]: after the exit animation's
+/// span, drop the popup state and repaint. `popup` re-borrows the field from
+/// the view (the state can't be captured — the view owns it).
+pub fn reap_popup<V: 'static, T: 'static>(
+    cx: &mut gpui::Context<V>,
+    popup: impl Fn(&mut V) -> &mut Popup<T> + 'static,
+) {
+    cx.spawn(async move |view, cx| {
+        cx.background_executor()
+            .timer(
+                motion::MENU_OUT
+                    .total()
+                    .mul_f32(motion::speed_scale())
+                    .saturating_add(std::time::Duration::from_millis(20)),
+            )
+            .await;
+        view.update(cx, |view, cx| {
+            popup(view).finish_close();
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
+}
+
+// ---------------------------------------------------------------------------
 // Pure reducers
 // ---------------------------------------------------------------------------
 
@@ -183,21 +301,71 @@ fn pinned_layer(layer: AnyElement) -> AnyElement {
         .into_any_element()
 }
 
+/// Eased exit progress (0..=1) for a [`Popup`] closing instant, computed from
+/// the wall clock at render time. Monotonic by construction — unlike the
+/// animation element's own clock, it can never replay from 0 mid-exit.
+fn exit_progress(since: std::time::Instant) -> f32 {
+    let total = motion::MENU_OUT
+        .total()
+        .mul_f32(motion::speed_scale())
+        .as_secs_f32();
+    let raw = if total <= 0.0 {
+        1.0
+    } else {
+        (since.elapsed().as_secs_f32() / total).clamp(0.0, 1.0)
+    };
+    motion::MENU_OUT.progress(raw)
+}
+
+/// The frosted card for a popover layer: full blur while open; while exiting
+/// the blur radius rides the exit progress down to 0 — the `BackdropBlur`
+/// primitive ignores `element_opacity`, so without this the glass slab would
+/// hold full strength through the fade and pop off at unmount.
+fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
+    let blur = 16.0 * (1.0 - exit.unwrap_or(0.0));
+    crate::frost::frosted(12.0, blur, content).into_any_element()
+}
+
+/// Entrance or exit motion for a popover layer. While exiting (the [`Popup`]
+/// closing phase, `exit = Some(progress)`) the content plays
+/// [`motion::menu_out`] under a fresh animation id (same-id reuse would
+/// inherit the entrance's finished clock and snap to the end state) and gets
+/// an occluding overlay on top — the dying menu's rows must not take clicks,
+/// and the overlay also keeps stray clicks from reaching whatever sits
+/// underneath.
+fn menu_motion(id: SharedString, exit: Option<f32>, inner: gpui::Div) -> AnyElement {
+    if let Some(t) = exit {
+        let inner = inner
+            .relative()
+            .child(div().absolute().inset_0().occlude());
+        motion::menu_out(SharedString::from(format!("{id}-out")), t, inner).into_any_element()
+    } else {
+        motion::menu_in(id, inner).into_any_element()
+    }
+}
+
 /// Wrap popover content in a floating anchored layer attached to the trigger:
 /// the caller `.child(anchored_menu(...))`s this from the trigger element while
-/// open. Plays `menu-in` (0.14s fade + 2px drop). Dismissal is the caller's
+/// open. Plays `menu-in` (0.14s fade + 2px drop); `closing` (the [`Popup`]
+/// exit phase) swaps in `menu-out`. Dismissal is the caller's
 /// `.on_mouse_down_out` on the content. The layer `.occlude()`s: hitboxes are
 /// paint-order only in gpui, so without it clicks on menu rows would ALSO fire
 /// whatever clickable sits under the floating layer.
-pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+pub fn anchored_menu(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
                 .anchor(Anchor::TopLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(
-                    id,
+                .child(menu_motion(
+                    id.into(),
+                    exit,
                     div().occlude().pt(px(6.0)).child(content),
                 )),
         )
@@ -206,18 +374,57 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
     )
 }
 
+/// [`anchored_menu`] opening DOWNWARD from the trigger's bottom edge — a
+/// dropdown proper (the sidebar's space filter). The default variant pins to
+/// the trigger's top-left, which reads fine for context-style menus but
+/// covers a button-shaped trigger.
+pub fn anchored_menu_below(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
+                        div().occlude().pt(px(6.0)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
+}
+
 /// [`anchored_menu`] opening UPWARD from the trigger (composer pickers, the
 /// user menu — anything anchored near the window bottom; Radix flips these
 /// automatically, gpui's `anchored` needs the side picked).
-pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+pub fn anchored_menu_above(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
                 .anchor(Anchor::BottomLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(
-                    id,
+                .child(menu_motion(
+                    id.into(),
+                    exit,
                     div().occlude().pb(px(6.0)).child(content),
                 )),
         )
@@ -230,24 +437,30 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
 /// completions, whose natural anchor is the token/caret rather than the input
 /// element's outer edge.
 pub fn anchored_menu_above_at(
-    id: impl Into<ElementId>,
+    id: impl Into<SharedString>,
     position: Point<Pixels>,
     content: AnyElement,
+    closing: Option<std::time::Instant>,
 ) -> AnyElement {
     div()
         .absolute()
         .left(position.x)
         .top(position.y)
         .size_0()
-        .child(anchored_menu_above(id, content))
+        .child(anchored_menu_above(id, content, closing))
         .into_any_element()
 }
 
 /// [`anchored_menu_above`] right-aligned to the trigger's right edge (t3code
 /// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
 /// picker open leftward instead of running off the window).
-pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+pub fn anchored_menu_above_end(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     div()
         .absolute()
         .top_0()
@@ -258,8 +471,9 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
                 gpui::anchored()
                     .anchor(Anchor::BottomRight)
                     .snap_to_window_with_margin(px(8.0))
-                    .child(motion::menu_in(
-                        id,
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
                         div().occlude().pb(px(6.0)).child(content),
                     )),
             )
@@ -272,17 +486,23 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
 /// A floating menu at an explicit window position (context menus). Occludes
 /// like [`anchored_menu`] so row clicks never reach elements underneath.
 pub fn menu_at(
-    id: impl Into<ElementId>,
+    id: impl Into<SharedString>,
     position: Point<Pixels>,
     content: AnyElement,
+    closing: Option<std::time::Instant>,
 ) -> AnyElement {
-    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
     gpui::deferred(
         gpui::anchored()
             .position(position)
             .anchor(Anchor::TopLeft)
             .snap_to_window_with_margin(px(8.0))
-            .child(motion::menu_in(id, div().occlude().child(content))),
+            .child(menu_motion(
+                id.into(),
+                exit,
+                div().occlude().child(content),
+            )),
     )
     .priority(1)
     .into_any_element()
@@ -425,14 +645,6 @@ pub fn menu_separator() -> gpui::Div {
     // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
     // runs border to border (user request).
     div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(hairline(0.07))
-}
-
-/// The trailing check on the selected row (comet `MenuCheck`): 14px,
-/// `text-foreground/70`, pushed to the row end by the caller's flex.
-pub fn menu_check(theme: &Theme) -> impl IntoElement {
-    crate::icons::icon(crate::icons::CHECK)
-        .size(px(14.0))
-        .text_color(theme.text.opacity(0.7))
 }
 
 /// The recessed band tone for a palette/picker header or footer strip — a

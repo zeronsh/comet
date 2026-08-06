@@ -438,27 +438,30 @@ pub struct Shell {
     accounts_page: Option<Entity<AccountsPage>>,
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
-    chat_menu: Option<(String, Point<Pixels>)>,
+    chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// Space-row context menu: (space id, window position).
-    space_menu: Option<(String, Point<Pixels>)>,
+    /// Space-row context menu (dropdown rows): (space id, window position).
+    space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
     /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
-    /// Last selected chat per space (in-memory, like [`SessionPanels`]) — a
-    /// space switch lands back on the tab you left.
-    space_last_chat: std::collections::HashMap<String, String>,
+    /// The sidebar's space-filter dropdown.
+    spaces_menu: popover::Popup<spaces::SpacesMenu>,
+    /// When the dropdown was closed by an outside mouse-down; lets the
+    /// trigger's click tell "toggle closed" apart from "just dismissed by
+    /// this same click" (same guard as `user_menu_dismissed_at`).
+    spaces_menu_dismissed_at: Option<std::time::Instant>,
     /// Session tab currently hovered (close button appears on hover).
     tab_hover: Option<String>,
+    /// Session-tab context menu: (chat id, window position).
+    tab_menu: popover::Popup<(String, Point<Pixels>)>,
     /// Session-tab drag-reorder in flight (see `tabs::TabDragState`).
     tab_drag: Option<tabs::TabDragState>,
-    /// Space-row drag-reorder in flight (see `spaces::SpaceDragState`).
-    space_drag: Option<spaces::SpaceDragState>,
     /// Scroll position of the session tab region (drives the edge fades and
     /// the drop-index math under horizontal overflow).
     tabs_scroll: gpui::ScrollHandle,
@@ -472,7 +475,7 @@ pub struct Shell {
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, comet_proto::SessionStatus>,
-    user_menu_open: bool,
+    user_menu: popover::Popup<()>,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
     user_menu_dismissed_at: Option<std::time::Instant>,
@@ -646,23 +649,24 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             shortcuts_sub: None,
-            chat_menu: None,
+            chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
-            space_menu: None,
+            space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
-            space_last_chat: std::collections::HashMap::new(),
+            spaces_menu: popover::Popup::default(),
+            spaces_menu_dismissed_at: None,
             tab_hover: None,
+            tab_menu: popover::Popup::default(),
             tab_drag: None,
-            space_drag: None,
             tabs_scroll: gpui::ScrollHandle::new(),
             tabs_scrolled_to: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
-            user_menu_open: false,
+            user_menu: popover::Popup::default(),
             user_menu_dismissed_at: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
@@ -779,24 +783,25 @@ impl Shell {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
             }
         }
-        // Track the per-space last chat + persist the selected space.
+        // Persist the selected space (the new-tab fallback under "All").
         {
-            let (selected_space, selected_chat, chat_space) = {
-                let s = state.read(cx);
-                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
-                (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
-                    chat_space,
-                )
-            };
-            if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
-                self.space_last_chat.insert(space, chat);
-            }
+            let selected_space = state.read(cx).selected_space.clone();
             if selected_space != self.settings.last_space_id && selected_space.is_some() {
                 self.settings.last_space_id = selected_space;
                 self.schedule_save(cx);
             }
+        }
+        // Reconcile the device-local tab list (seed on upgrade, prune against
+        // the doc, selected-chat invariant, boot landing).
+        self.sync_open_tabs(cx);
+        // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
+        // fall back to "All" rather than filtering everything out.
+        if state.read(cx).spaces_synced
+            && let Some(filter) = self.settings.space_filter.clone()
+            && state.read(cx).space_row(&filter).is_none()
+        {
+            self.settings.space_filter = None;
+            self.schedule_save(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
@@ -1075,11 +1080,27 @@ impl Shell {
 
     // ---- routes / settings ----
 
+    /// Close the user menu through the exit animation (no-op when closed).
+    fn close_user_menu(&mut self, cx: &mut Context<Self>) {
+        if self.user_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.user_menu);
+            cx.notify();
+        }
+    }
+
+    /// Close the session-row context menu through the exit animation.
+    fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
+        if self.chat_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.chat_menu);
+            cx.notify();
+        }
+    }
+
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
-        self.user_menu_open = false;
-        self.chat_menu = None;
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
         cx.notify();
     }
 
@@ -1119,8 +1140,8 @@ impl Shell {
                 self.route = Route::Settings(section);
             }
         }
-        self.user_menu_open = false;
-        self.chat_menu = None;
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
         cx.notify();
     }
 
@@ -1213,7 +1234,7 @@ impl Shell {
     }
 
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.chat_menu = None;
+        self.close_chat_menu(cx);
         let current = self
             .state
             .read(cx)
@@ -1253,7 +1274,7 @@ impl Shell {
     }
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.chat_menu = None;
+        self.close_chat_menu(cx);
         self.mutate(
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
             cx,
@@ -1276,7 +1297,7 @@ impl Shell {
     }
 
     fn sign_out(&mut self, cx: &mut Context<Self>) {
-        self.user_menu_open = false;
+        self.close_user_menu(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1882,14 +1903,15 @@ impl Shell {
             })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
+            // A sidebar click opens the session as a tab (appends if absent,
+            // focuses if present) — the reopen path for locally closed tabs.
             .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                this.open_chat_tab(select_id.clone(), cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.chat_menu = Some((menu_id.clone(), event.position));
+                    this.chat_menu.open((menu_id.clone(), event.position));
                     cx.notify();
                 }),
             )
@@ -2061,7 +2083,9 @@ impl Shell {
         let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
-        let spaces_section = self.render_spaces_section(theme, cx);
+        // The space filter lives ABOVE the scroll region (fixed) so its
+        // dropdown can float without being clipped by the list's overflow.
+        let filter_row = self.render_spaces_filter(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2070,9 +2094,10 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            // Spaces + the global Active list share one scroll region. On
-            // glass the whole region paints inside an EdgeFade scope — a true
-            // per-glyph gradient at active overflow edges.
+            .child(filter_row)
+            // The (filtered) Sessions list scrolls. On glass the whole region
+            // paints inside an EdgeFade scope — a true per-glyph gradient at
+            // active overflow edges.
             .child(crate::edge_fade::edge_faded(
                 SIDEBAR_GLASS_FADE_BAND,
                 glass && lists_fade_top,
@@ -2090,11 +2115,10 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
-                            .child(spaces_section)
                             .child(
                                 div()
                                     .px(px(Theme::SPACE_SM))
-                                    .pt(px(12.0))
+                                    .pt(px(4.0))
                                     .pb(px(4.0))
                                     .text_size(px(11.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
@@ -2329,7 +2353,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.user_menu_open;
+        let open = self.user_menu.is_open();
         // Bottom-of-sidebar identity (comet user-menu.tsx): avatar circle +
         // name with the plan label underneath, Alpha badge chip on the right.
         let initial: SharedString = user_line
@@ -2368,8 +2392,12 @@ impl Shell {
                 let just_dismissed = this
                     .user_menu_dismissed_at
                     .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.user_menu_open = !this.user_menu_open && !just_dismissed;
                 this.user_menu_dismissed_at = None;
+                if this.user_menu.is_open() {
+                    this.close_user_menu(cx);
+                } else if !just_dismissed {
+                    this.user_menu.open(());
+                }
                 cx.notify();
             }))
             .child(
@@ -2411,7 +2439,8 @@ impl Shell {
                             .child(SharedString::from("Alpha")),
                     ),
             );
-        if open {
+        if self.user_menu.get().is_some() {
+            let closing = self.user_menu.closing_since();
             // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
             // (exactly as wide as the trigger row — sidebar minus its p-2
             // gutters), `flex-col gap-0.5`, then: one small muted email line
@@ -2422,9 +2451,8 @@ impl Shell {
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.user_menu_open = false;
                     this.user_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
+                    this.close_user_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -2465,7 +2493,8 @@ impl Shell {
                         .child(SharedString::from("Sign out")),
                 )
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above("user-menu-popover", menu));
+            trigger =
+                trigger.child(popover::anchored_menu_above("user-menu-popover", menu, closing));
         }
         trigger.into_any_element()
     }
@@ -2481,15 +2510,15 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let mut overlays: Vec<AnyElement> = Vec::new();
 
-        if let Some((chat_id, position)) = self.chat_menu.clone() {
+        if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
+            let chat_menu_closing = self.chat_menu.closing_since();
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.chat_menu = None;
-                    cx.notify();
+                    this.close_chat_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -2521,7 +2550,7 @@ impl Shell {
                         .id("chat-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chat_menu = None;
+                            this.close_chat_menu(cx);
                             this.delete_confirm = Some(delete_id.clone());
                             cx.notify();
                         }))
@@ -2533,7 +2562,12 @@ impl Shell {
                         .child(SharedString::from("Delete…")),
                 )
                 .into_any_element();
-            overlays.push(popover::menu_at("chat-context-menu", position, menu));
+            overlays.push(popover::menu_at(
+                "chat-context-menu",
+                position,
+                menu,
+                chat_menu_closing,
+            ));
         }
 
         if let Some(dialog) = &mut self.rename_dialog {
@@ -2581,6 +2615,9 @@ impl Shell {
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
+        if let Some(menu) = self.render_tab_menu(cx) {
+            overlays.push(menu);
+        }
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);

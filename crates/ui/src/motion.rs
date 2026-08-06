@@ -285,6 +285,9 @@ pub const FADE_IN: MotionSpec = MotionSpec::new(500, EASE_OUT_EXPO);
 pub const FADE_QUICK: MotionSpec = MotionSpec::new(150, EASE);
 /// Popover-in: 0.14s (scale 0.96 approximated, translateY −2).
 pub const MENU_IN: MotionSpec = MotionSpec::new(140, EASE);
+/// Popover-out: 0.1s — quicker than the entrance (exits should get out of the
+/// way; matches the Radix convention of a shorter close than open).
+pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
 /// Dialog-in: 0.18s (scale 0.96→1 approximated).
 pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Boot splash exit: 0.5s fade + 6px lift after a 0.15s hold.
@@ -345,6 +348,22 @@ where
         el.relative()
             .opacity(0.3 + 0.7 * t)
             .top(px(-2.0 * (1.0 - t)))
+    })
+}
+
+/// Popover exit: the reverse of [`menu_in`] — fade to 0 + translateY 0→−2 over
+/// [`MENU_OUT`]. Unlike the entrances, the eased progress `t` comes from the
+/// caller (computed off [`crate::popover::Popup`]'s closing instant at render
+/// time): `with_animation`'s element-id-keyed clock replays from 0 on remount
+/// (the hover-blend comment's warning), and a replay mid-exit is a full-opacity
+/// flash. The wall-clock progress is monotonic by construction; the animation
+/// wrapper here only pumps frames for the exit's span, its own delta unused.
+pub fn menu_out<E>(id: impl Into<ElementId>, t: f32, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, MENU_OUT.animation(), move |el, _| {
+        el.relative().opacity(1.0 - t).top(px(-2.0 * t))
     })
 }
 

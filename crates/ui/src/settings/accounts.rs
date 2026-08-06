@@ -175,7 +175,7 @@ pub struct AccountsPage {
     /// Retargeted by the page-header device switcher (comet parity: the
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
-    device_menu_open: bool,
+    device_menu: popover::Popup<()>,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
     device_menu_dismissed_at: Option<std::time::Instant>,
@@ -204,7 +204,7 @@ impl AccountsPage {
         let mut page = Self {
             state,
             target_device: None,
-            device_menu_open: false,
+            device_menu: popover::Popup::default(),
             device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
             busy_account: None,
@@ -229,8 +229,15 @@ impl AccountsPage {
     /// Retarget the page at another device's logins: every accounts RPC is
     /// relay-forwardable, so the whole page — list, usage probes, switch,
     /// forget, login flows — follows the passthrough.
+    fn close_device_menu(&mut self, cx: &mut Context<Self>) {
+        if self.device_menu.begin_close() {
+            popover::reap_popup(cx, |page: &mut Self| &mut page.device_menu);
+            cx.notify();
+        }
+    }
+
     fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
-        self.device_menu_open = false;
+        self.close_device_menu(cx);
         if self.target_device == target {
             cx.notify();
             return;
@@ -291,7 +298,7 @@ impl AccountsPage {
             .map(|d| d.name.clone().into())
             .unwrap_or_else(|| SharedString::from("This device"));
         let emerald = theme.success;
-        let open = self.device_menu_open;
+        let open = self.device_menu.is_open();
 
         let mut trigger =
             div()
@@ -315,8 +322,12 @@ impl AccountsPage {
                     let just_dismissed = this
                         .device_menu_dismissed_at
                         .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
                     this.device_menu_dismissed_at = None;
+                    if this.device_menu.is_open() {
+                        this.close_device_menu(cx);
+                    } else if !just_dismissed {
+                        this.device_menu.open(());
+                    }
                     cx.notify();
                 }))
                 .child(
@@ -348,13 +359,13 @@ impl AccountsPage {
                         .text_color(theme.text_muted.opacity(if open { 0.9 } else { 0.4 })),
                 );
 
-        if open {
+        if self.device_menu.get().is_some() {
+            let closing = self.device_menu.closing_since();
             let menu = popover::popover_card(theme)
                 .w(px(220.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.device_menu_open = false;
                     this.device_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
+                    this.close_device_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -390,7 +401,6 @@ impl AccountsPage {
                                     .child(SharedString::from("You")),
                             )
                         })
-                        .when(is_active, |el| el.child(popover::menu_check(theme)))
                         .child(
                             div()
                                 .size(px(6.0))
@@ -404,7 +414,7 @@ impl AccountsPage {
                         )
                 }))
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("accounts-device-menu", menu));
+            trigger = trigger.child(popover::anchored_menu("accounts-device-menu", menu, closing));
         }
         trigger.into_any_element()
     }

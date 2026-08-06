@@ -3743,10 +3743,14 @@ impl Composer {
             .input
             .read(cx)
             .visible_point_for_index(token.range.start)?;
+        // No exit phase: the completion popup tracks the token under the
+        // caret — a fade-out on every keystroke-driven dismissal would read
+        // as input lag, not polish.
         Some(crate::popover::anchored_menu_above_at(
             "file-mention-popup",
             anchor,
             card.into_any_element(),
+            None,
         ))
     }
 

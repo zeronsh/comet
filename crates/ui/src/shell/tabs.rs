@@ -1,15 +1,22 @@
-//! The session tab strip — replaces the chat header (feature spec: spaces
-//! overhaul). Every non-archived session of the selected space is a tab:
-//! agent brand icon + title + a trailing slot that shows the status dot at
-//! rest and swaps to a close button on hover. `+` at the end opens the
-//! new-session canvas (the tab materializes on first send). The strip inherits
-//! the old header's titlebar duties: 44px tall, drag region, animated
-//! window-controls inset, and the toggle-changes button (git spaces only).
+//! The session tab strip — replaces the chat header. A tab is a DEVICE-LOCAL
+//! viewport onto a synced session (`UiSettings.open_tabs`, the vec IS the
+//! order): closing one removes it here and nowhere else — the session keeps
+//! running on its host and stays in the sidebar, where a click reopens it.
+//! Archiving is a separate, explicit action (the sidebar row's context menu).
+//! Tabs mix spaces freely; the sidebar's space filter never touches the strip.
+//!
+//! Each tab: agent brand icon + title + a trailing slot that shows the status
+//! dot at rest and swaps to a close button on hover; right-click opens the
+//! close/close-others/close-right/close-left menu. `+` at the end opens the
+//! new-session canvas (the tab materializes on first send) in the sidebar's
+//! filter space — or the last selected space when the filter is "All". The
+//! strip inherits the old header's titlebar duties: 44px tall, drag region,
+//! animated window-controls inset, and the toggle-changes button (git spaces
+//! only).
 //!
 //! Styling and drag-reorder mirror the terminal tab bar
 //! (`terminal/panel.rs::render_tab_bar`) — same fixed-width tabs, drop-index
-//! math, 150ms sibling slide, and drag ghost. The manual order is device-local
-//! (`UiSettings.tab_order`, keyed by space). Overflow scrolls horizontally
+//! math, 150ms sibling slide, and drag ghost. Overflow scrolls horizontally
 //! with edge fades.
 
 use super::*;
@@ -33,9 +40,8 @@ pub(super) struct TabDragState {
     prev_over: usize,
 }
 
-/// The dragged-tab payload (gpui drag-and-drop), space-scoped.
+/// The dragged-tab payload (gpui drag-and-drop).
 struct TabDragPayload {
-    space: String,
     from: usize,
     title: SharedString,
     brand: Option<(&'static str, Option<gpui::Hsla>)>,
@@ -76,23 +82,6 @@ impl Render for TabGhost {
     }
 }
 
-/// Resolve the visual tab order for a space: the manual (drag) order first —
-/// skipping chats that no longer exist — then any new chats appended in
-/// creation order. Pure.
-pub(super) fn resolve_tab_order(created_order: &[String], manual: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = manual
-        .iter()
-        .filter(|id| created_order.contains(id))
-        .cloned()
-        .collect();
-    for id in created_order {
-        if !out.contains(id) {
-            out.push(id.clone());
-        }
-    }
-    out
-}
-
 /// The neighbor to select after closing `closed`: the next tab, else the
 /// previous, else `None` (last tab → new-session canvas). Pure.
 pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String> {
@@ -108,37 +97,180 @@ pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String>
 }
 
 impl Shell {
-    /// The space's tabs in VISUAL order (manual drag order over creation order).
-    fn tab_ids(&self, space_id: &str, cx: &App) -> Vec<String> {
-        let created: Vec<String> = self
-            .state
-            .read(cx)
-            .chats_in_space(space_id)
-            .iter()
-            .map(|c| c.id.clone())
-            .collect();
-        match self.settings.tab_order.get(space_id) {
-            Some(manual) => resolve_tab_order(&created, manual),
-            None => created,
+    /// The open tabs in VISUAL order: `open_tabs` minus ids the doc no longer
+    /// backs with a live (non-archived) chat. The stored vec is pruned
+    /// separately by [`Shell::sync_open_tabs`]; this read-only view just skips
+    /// rows that haven't been reconciled yet.
+    pub(super) fn open_tab_ids(&self, cx: &App) -> Vec<String> {
+        let Some(open) = self.settings.open_tabs.as_ref() else {
+            return Vec::new();
+        };
+        let state = self.state.read(cx);
+        open.iter()
+            .filter(|id| {
+                state
+                    .chats
+                    .iter()
+                    .any(|c| &c.id == *id && !c.archived)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Reconcile the device-local tab list against the synced doc. Runs on
+    /// every state change (cheap set math), but only judges once the first
+    /// chats frame has landed — the pre-sync empty list would prune everything.
+    ///
+    /// - Pre-tabs settings file (`open_tabs: None`): seed from the last
+    ///   selected space's sessions, so the upgrade doesn't blank the strip.
+    /// - Prune archived/deleted chats (the selected chat is exempt: a
+    ///   just-sent new session's row hasn't synced yet).
+    /// - Any selected chat becomes a tab (sidebar clicks, boot restore,
+    ///   fresh sends — one invariant covers every selection path).
+    /// - Boot: with nothing selected yet, land on the first restored tab.
+    pub(super) fn sync_open_tabs(&mut self, cx: &mut Context<Self>) {
+        if !self.state.read(cx).chats_synced {
+            return;
+        }
+        let (selected, live): (Option<String>, std::collections::HashSet<String>) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_chat.clone(),
+                state.visible_chats().map(|c| c.id.clone()).collect(),
+            )
+        };
+        let mut changed = false;
+        if self.settings.open_tabs.is_none() {
+            let seed: Vec<String> = self
+                .settings
+                .last_space_id
+                .as_deref()
+                .map(|space| {
+                    self.state
+                        .read(cx)
+                        .chats_in_space(space)
+                        .iter()
+                        .map(|c| c.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.settings.open_tabs = Some(seed);
+            changed = true;
+        }
+        let tabs = self.settings.open_tabs.as_mut().expect("seeded above");
+        let before = tabs.len();
+        tabs.retain(|id| live.contains(id) || selected.as_deref() == Some(id.as_str()));
+        changed |= tabs.len() != before;
+        if let Some(selected) = &selected
+            && !tabs.contains(selected)
+        {
+            tabs.push(selected.clone());
+            changed = true;
+        }
+        if changed {
+            self.schedule_save(cx);
+        }
+        // Boot landing: the first restored tab (manual selection wins; an
+        // empty strip stays on the new-session canvas).
+        if selected.is_none() && !self.state.read(cx).auto_selected {
+            let first = self
+                .settings
+                .open_tabs
+                .as_ref()
+                .and_then(|tabs| tabs.first().cloned());
+            if let Some(first) = first {
+                self.state.update(cx, |s, cx| s.select_chat(Some(first), cx));
+            }
         }
     }
 
-    /// Close a tab = archive the session. Selection moves to a neighbor; the
-    /// last tab lands on the new-session canvas.
+    /// Close a tab — a purely local act: the session is untouched (it keeps
+    /// running on its host and stays in the sidebar). Selection moves to a
+    /// neighbor; the last tab lands on the new-session canvas.
     pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        let (selected, order) = {
-            let space = self.state.read(cx).selected_space.clone();
-            let order = space
-                .as_deref()
-                .map(|space| self.tab_ids(space, cx))
-                .unwrap_or_default();
-            (self.state.read(cx).selected_chat.clone(), order)
-        };
+        let order = self.open_tab_ids(cx);
+        let selected = self.state.read(cx).selected_chat.clone();
         if selected.as_deref() == Some(chat_id.as_str()) {
             let next = next_after_close(&order, &chat_id);
             self.state.update(cx, |s, cx| s.select_chat(next, cx));
         }
-        self.archive_chat(chat_id, cx);
+        if let Some(tabs) = self.settings.open_tabs.as_mut() {
+            tabs.retain(|id| id != &chat_id);
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Bulk closes (tab context menu). `keep_side`: retain tabs left/right of
+    /// the anchor per the flags. The anchor always survives; if the selected
+    /// tab was closed, selection lands on the anchor.
+    pub(super) fn close_tabs_around(
+        &mut self,
+        anchor: &str,
+        keep_left: bool,
+        keep_right: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.open_tab_ids(cx);
+        let Some(anchor_ix) = order.iter().position(|id| id == anchor) else {
+            return;
+        };
+        let kept: Vec<String> = order
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| match ix.cmp(&anchor_ix) {
+                std::cmp::Ordering::Less => keep_left,
+                std::cmp::Ordering::Equal => true,
+                std::cmp::Ordering::Greater => keep_right,
+            })
+            .map(|(_, id)| id.clone())
+            .collect();
+        let selected = self.state.read(cx).selected_chat.clone();
+        if let Some(selected) = selected
+            && !kept.contains(&selected)
+        {
+            self.state
+                .update(cx, |s, cx| s.select_chat(Some(anchor.to_string()), cx));
+        }
+        self.settings.open_tabs = Some(kept);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Open a session as a tab (sidebar click): append if absent, focus.
+    pub(super) fn open_chat_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        let tabs = self.settings.open_tabs.get_or_insert_with(Vec::new);
+        if !tabs.contains(&chat_id) {
+            tabs.push(chat_id.clone());
+            self.schedule_save(cx);
+        }
+        self.state
+            .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        cx.notify();
+    }
+
+    /// `+`: open the new-session canvas. Its space defaults to the sidebar's
+    /// filter space; under "All", the last selected space (wing's rule) — the
+    /// current space context stands when neither resolves.
+    pub(super) fn new_session_tab(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        let target = {
+            let state = self.state.read(cx);
+            let exists = |id: &String| state.space_row(id).is_some();
+            self.settings
+                .space_filter
+                .clone()
+                .filter(exists)
+                .or_else(|| self.settings.last_space_id.clone().filter(exists))
+        };
+        self.state.update(cx, |s, cx| {
+            if target.is_some() {
+                s.select_space(target, cx);
+            }
+            s.select_chat(None, cx);
+        });
+        cx.notify();
     }
 
     /// Track the drop slot while a tab is dragged over the strip (150ms sibling
@@ -165,12 +297,14 @@ impl Shell {
         }
     }
 
-    /// Commit a drag: persist the new visual order for the space (device-local).
-    fn commit_tab_reorder(&mut self, space: &str, from: usize, to: usize, cx: &mut Context<Self>) {
-        let mut order = self.tab_ids(space, cx);
+    /// Commit a drag: the reordered visual list becomes the stored list
+    /// (device-local; unreconciled ids drop out, which the prune would do
+    /// anyway).
+    fn commit_tab_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let mut order = self.open_tab_ids(cx);
         if from < order.len() {
             reorder_tabs(&mut order, from, to);
-            self.settings.tab_order.insert(space.to_string(), order);
+            self.settings.open_tabs = Some(order);
             self.schedule_save(cx);
         }
         self.tab_drag = None;
@@ -186,11 +320,7 @@ impl Shell {
         if self.tab_drag.is_some() && !cx.has_active_drag() {
             self.tab_drag = None;
         }
-        let space_id = self.state.read(cx).selected_space.clone();
-        let order: Vec<String> = space_id
-            .as_deref()
-            .map(|space| self.tab_ids(space, cx))
-            .unwrap_or_default();
+        let order: Vec<String> = self.open_tab_ids(cx);
         let tabs: Vec<(
             String,
             SharedString,
@@ -228,7 +358,8 @@ impl Shell {
             Some(_) => {}
             None => self.tabs_scrolled_to = None,
         }
-        let has_space = space_id.is_some();
+        // `+` needs at least one space to mint sessions into.
+        let has_space = !self.state.read(cx).spaces.is_empty();
         let git = self.space_git_detected(cx);
         let hovered = self.tab_hover.clone();
         let on_canvas = selected.is_none();
@@ -261,8 +392,8 @@ impl Shell {
                     let select_id = id.clone();
                     let close_id = id.clone();
                     let middle_id = id.clone();
+                    let menu_id = id.clone();
                     let hover_id = id.clone();
-                    let drag_space = space_id.clone().unwrap_or_default();
                     // NB: no `.occlude()` on the close button — the TAB already
                     // occludes (for the titlebar drag region), and an occluding
                     // child would block the tab's own hover hit-test: a flicker
@@ -363,9 +494,17 @@ impl Shell {
                                 this.close_session_tab(middle_id.clone(), cx);
                             }),
                         )
+                        // Right-click: close / close others / close to a side.
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.tab_menu.open((menu_id.clone(), event.position));
+                                cx.notify();
+                            }),
+                        )
                         .on_drag(
                             TabDragPayload {
-                                space: drag_space,
                                 from: ix,
                                 title: title.clone(),
                                 brand,
@@ -446,9 +585,7 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.route = Route::Chat;
-                this.state.update(cx, |s, cx| s.select_chat(None, cx));
-                cx.notify();
+                this.new_session_tab(cx);
             }))
             .child(
                 icon(icons::PLUS)
@@ -467,8 +604,6 @@ impl Shell {
         let fade_right = scrolled < max_scroll - 1.0;
         let glass = theme.is_glass();
         let bar_bg = theme.surface;
-        let drag_move_space = space_id.clone().unwrap_or_default();
-        let drop_space = space_id.clone().unwrap_or_default();
         let scroll_for_drag = self.tabs_scroll.clone();
         let tab_region = div()
             .relative()
@@ -485,11 +620,7 @@ impl Shell {
                     .track_scroll(&self.tabs_scroll)
                     .on_drag_move::<TabDragPayload>(cx.listener(
                         move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
-                            let payload = event.drag(cx);
-                            if payload.space != drag_move_space {
-                                return;
-                            }
-                            let from = payload.from;
+                            let from = event.drag(cx).from;
                             // Drop math runs in CONTENT coordinates: viewport-
                             // relative x plus the scrolled-off width.
                             let rel_x = f32::from(event.event.position.x)
@@ -501,18 +632,12 @@ impl Shell {
                     ))
                     .on_drop::<TabDragPayload>(cx.listener(
                         move |this, payload: &TabDragPayload, _, cx| {
-                            if payload.space != drop_space {
-                                this.tab_drag = None;
-                                cx.notify();
-                                return;
-                            }
                             let to = this
                                 .tab_drag
                                 .as_ref()
                                 .map(|d| d.over)
                                 .unwrap_or(payload.from);
-                            let space = drop_space.clone();
-                            this.commit_tab_reorder(&space, payload.from, to, cx);
+                            this.commit_tab_reorder(payload.from, to, cx);
                         },
                     ))
                     .children(tab_elements),
@@ -594,11 +719,81 @@ impl Shell {
         self.titlebar_drag_region("chat-tabs-titlebar", bar, cx)
             .into_any_element()
     }
+
+    fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
+        if self.tab_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.tab_menu);
+            cx.notify();
+        }
+    }
+
+    /// Tab context menu (right-click): close, plus the bulk closes that apply
+    /// at this tab's position — rows that would close nothing are omitted.
+    pub(super) fn render_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (chat_id, position) = self.tab_menu.get().cloned()?;
+        let closing = self.tab_menu.closing_since();
+        let theme = Theme::of(cx).clone();
+        let order = self.open_tab_ids(cx);
+        let ix = match order.iter().position(|id| id == &chat_id) {
+            Some(ix) => ix,
+            // The tab itself vanished mid-exit ("Close tab") — keep the card
+            // mounted so the fade still plays.
+            None if closing.is_some() => 0,
+            None => return None,
+        };
+        let has_others = order.len() > 1;
+        let has_right = ix + 1 < order.len();
+        let has_left = ix > 0;
+
+        let row = |label: &'static str,
+                   id: &'static str,
+                   keep_left: bool,
+                   keep_right: bool,
+                   cx: &mut Context<Self>| {
+            let target = chat_id.clone();
+            popover::menu_row(&theme, false, format!("{id}-{target}"))
+                .id(id)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_tab_menu(cx);
+                    if keep_left && keep_right {
+                        this.close_session_tab(target.clone(), cx);
+                    } else {
+                        this.close_tabs_around(&target, keep_left, keep_right, cx);
+                    }
+                }))
+                .child(SharedString::from(label))
+        };
+
+        let mut menu = popover::popover_card(&theme)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_tab_menu(cx);
+            }))
+            .flex()
+            .flex_col()
+            // keep_left && keep_right = "just this one" (see `row`).
+            .child(row("Close tab", "tab-menu-close", true, true, cx));
+        if has_others {
+            menu = menu.child(row("Close others", "tab-menu-others", false, false, cx));
+        }
+        if has_right {
+            menu = menu.child(row("Close to the right", "tab-menu-right", true, false, cx));
+        }
+        if has_left {
+            menu = menu.child(row("Close to the left", "tab-menu-left", false, true, cx));
+        }
+        Some(popover::menu_at(
+            "tab-context-menu",
+            position,
+            menu.into_any_element(),
+            closing,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{next_after_close, resolve_tab_order};
+    use super::next_after_close;
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -615,23 +810,5 @@ mod tests {
         assert_eq!(next_after_close(&ids(&["solo"]), "solo"), None);
         // Unknown id: no opinion.
         assert_eq!(next_after_close(&order, "zz"), None);
-    }
-
-    #[test]
-    fn manual_order_wins_and_new_chats_append() {
-        let created = ids(&["a", "b", "c", "d"]);
-        // Manual order covers some chats; "gone" no longer exists.
-        let manual = ids(&["c", "gone", "a"]);
-        assert_eq!(
-            resolve_tab_order(&created, &manual),
-            ids(&["c", "a", "b", "d"])
-        );
-        // No manual order → creation order.
-        assert_eq!(resolve_tab_order(&created, &[]), created);
-        // Manual covers everything → manual order verbatim.
-        assert_eq!(
-            resolve_tab_order(&ids(&["a", "b"]), &ids(&["b", "a"])),
-            ids(&["b", "a"])
-        );
     }
 }
