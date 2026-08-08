@@ -3,7 +3,8 @@
 //!
 //! Every production harness is the shared [`AcpHarness`] with a per-agent
 //! spec: Claude Code via the org-maintained `claude-agent-acp` adapter, Codex
-//! via `codex-acp`, Grok Build natively. Decision record:
+//! via `codex-acp`, Grok Build and Hermes natively, pi via the community
+//! `pi-acp` adapter. Decision record:
 //! docs/research/acp.md (the bespoke stream-json/app-server adapters this
 //! crate used to hold are documented historically in
 //! docs/research/harness.md).

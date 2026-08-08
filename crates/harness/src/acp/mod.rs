@@ -1,7 +1,9 @@
 //! ACP harness: spawns an Agent Client Protocol agent (JSON-RPC 2.0 over
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s. One
 //! implementation covers every ACP agent; [`AcpHarness::grok`] configures it
-//! for xAI's Grok Build (`grok agent stdio`), the first registered agent.
+//! for xAI's Grok Build (`grok agent stdio`), the first registered agent —
+//! [`AcpHarness::hermes`] (Nous Research, `hermes acp`) and [`AcpHarness::pi`]
+//! (pi.dev via `pi-acp`) followed.
 //!
 //! - `initialize` (protocolVersion 1, fs/terminal capabilities declined) →
 //!   `session/new`, or `session/load` with a fresh-session fallback when
@@ -196,6 +198,7 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
     match exe {
         "claude-agent-acp" => || npm_global_bins("claude-agent-acp"),
         "codex-acp" => || npm_global_bins("codex-acp"),
+        "pi-acp" => || npm_global_bins("pi-acp"),
         _ => || Vec::new(),
     }
 }
@@ -262,6 +265,113 @@ fn grok_spec() -> AcpAgentSpec {
     }
 }
 
+fn hermes_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Hermes,
+        display_name: "Hermes",
+        executable: "hermes",
+        env_override: "HERMES_EXECUTABLE",
+        args: &["acp"],
+        // Python/uv install — no npm fallback exists.
+        npx_package: None,
+        extra_paths: || {
+            let mut dirs = Vec::new();
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                dirs.push(home.join(".local").join("bin").join("hermes"));
+                dirs.push(home.join(".hermes").join("bin").join("hermes"));
+            }
+            dirs.push(PathBuf::from("/opt/homebrew/bin/hermes"));
+            dirs.push(PathBuf::from("/usr/local/bin/hermes"));
+            dirs
+        },
+        install_hint: "hermes (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.hermes/bin, /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun \
+             install dirs; install with \
+             `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`, then \
+             `cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'` for the ACP \
+             server; set HERMES_EXECUTABLE to override)",
+        // Hermes derives its model list from the providers the user has
+        // authenticated (`hermes model`); these are the Nous flagships every
+        // portal account gets. Ids the agent doesn't advertise are skipped by
+        // the config-option set, falling back to the agent's own default.
+        models: || {
+            vec![
+                Model {
+                    id: "hermes-4-405b".into(),
+                    label: "Hermes 4 405B".into(),
+                    description: Some("Nous Research's hybrid-reasoning flagship".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "hermes-4-70b".into(),
+                    label: "Hermes 4 70B".into(),
+                    description: Some("Faster Hermes 4 — same post-training, 70B".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        // No `_session/steering` extension: steers deliver at turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Hermes exposes no effort config over ACP today (hybrid reasoning is
+        // model-internal); revisit when the adapter advertises a ladder.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+    }
+}
+
+fn pi_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Pi,
+        display_name: "Pi",
+        executable: "pi-acp",
+        env_override: "PI_ACP_EXECUTABLE",
+        args: &[],
+        npx_package: Some("pi-acp@0.0.33"),
+        extra_paths: npm_global_paths("pi-acp"),
+        install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
+             and fnm/nvm/volta/pnpm/bun install dirs; falls back to `npx -y pi-acp` \
+             when npx is available; install with `npm install -g pi-acp` — requires the \
+             pi CLI itself, `npm install -g --ignore-scripts \
+             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
+        // pi routes models through its own provider config (~/.pi); the picker
+        // advertises the pass-through entry and pi keeps whatever the user set
+        // up. Unknown ids are skipped by the config-option set.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "pi default".into(),
+                description: Some("Runs the model configured in pi (`pi` settings)".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Minimal,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: Vec::new(),
+            }]
+        },
+        // The adapter has no `_session/steering` extension: turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // pi's thinking ladder (minimal→max; its extra "off" tier has no comet
+        // equivalent and is left to the agent default).
+        reasoning_levels: &[
+            ReasoningLevel::Minimal,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+    }
+}
+
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
 /// fake agent with [`AcpHarness::with_executable`].
 pub struct AcpHarness {
@@ -301,6 +411,17 @@ impl AcpHarness {
     /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
     pub fn grok() -> Self {
         Self::with_spec(grok_spec())
+    }
+
+    /// Hermes Agent (`hermes acp`) — Nous Research's native ACP server.
+    pub fn hermes() -> Self {
+        Self::with_spec(hermes_spec())
+    }
+
+    /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
+    /// pi's RPC mode.
+    pub fn pi() -> Self {
+        Self::with_spec(pi_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.

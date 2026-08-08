@@ -10,6 +10,10 @@ pub enum HarnessId {
     Cursor,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
+    /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
+    Hermes,
+    /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
+    Pi,
     /// Test harness; never shown in production pickers.
     Mock,
 }

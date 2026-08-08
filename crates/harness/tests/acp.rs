@@ -265,15 +265,20 @@ async fn question_shaped_requests_bridge_to_the_input_panel() {
 
 #[tokio::test]
 async fn claude_and_codex_specs_drive_the_same_wire() {
-    // The whole point of the conversion: the claude/codex specs run against
-    // the same fake ACP agent with no per-agent protocol code. Model ids in
-    // the fixture are grok-flavored, so config sets simply skip.
+    // The whole point of the conversion: every spec runs against the same
+    // fake ACP agent with no per-agent protocol code. Model ids in the
+    // fixture are grok-flavored, so config sets simply skip.
     for (name, h) in [
         (
             "claude",
             AcpHarness::claude().with_executable(fixture_path()),
         ),
         ("codex", AcpHarness::codex().with_executable(fixture_path())),
+        (
+            "hermes",
+            AcpHarness::hermes().with_executable(fixture_path()),
+        ),
+        ("pi", AcpHarness::pi().with_executable(fixture_path())),
     ] {
         let (controls, _steer, _token) = controls();
         let events = run_to_end(&h, request("scenario:happy"), controls).await;
@@ -602,6 +607,33 @@ fn descriptor_surface_matches_registry_expectations() {
             comet_proto::ReasoningLevel::Low,
             comet_proto::ReasoningLevel::Medium,
             comet_proto::ReasoningLevel::High,
+        ]
+    );
+}
+
+#[test]
+fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
+    let hermes = AcpHarness::hermes();
+    assert_eq!(hermes.id(), HarnessId::Hermes);
+    assert_eq!(hermes.display_name(), "Hermes");
+    assert!(hermes.supports_steering());
+    assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
+    assert!(hermes.reasoning_levels().is_empty());
+
+    let pi = AcpHarness::pi();
+    assert_eq!(pi.id(), HarnessId::Pi);
+    assert_eq!(pi.display_name(), "Pi");
+    assert!(pi.supports_steering());
+    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        pi.reasoning_levels(),
+        &[
+            comet_proto::ReasoningLevel::Minimal,
+            comet_proto::ReasoningLevel::Low,
+            comet_proto::ReasoningLevel::Medium,
+            comet_proto::ReasoningLevel::High,
+            comet_proto::ReasoningLevel::XHigh,
+            comet_proto::ReasoningLevel::Max,
         ]
     );
 }

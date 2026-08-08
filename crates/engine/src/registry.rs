@@ -232,6 +232,40 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
     );
+    // Hermes Agent over ACP (`hermes acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::hermes() exactly. No steering extension
+    // (turn boundaries) and no effort ladder — Hermes exposes no effort
+    // config over ACP today (hybrid reasoning is model-internal).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Hermes,
+            name: "Hermes".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+        },
+        Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
+    );
+    // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
+    // pi's thinking ladder minus its "off" tier.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Pi,
+            name: "Pi".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+        },
+        Box::new(|| Ok(Arc::new(comet_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -280,7 +314,9 @@ mod tests {
                 HarnessId::Mock,
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
-                HarnessId::Grok
+                HarnessId::Grok,
+                HarnessId::Hermes,
+                HarnessId::Pi
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -301,6 +337,27 @@ mod tests {
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High
+            ]
+        );
+        // Hermes and Pi mirror their specs the same way.
+        let hermes = registry.resolve(HarnessId::Hermes).unwrap();
+        assert_eq!(hermes.id(), HarnessId::Hermes);
+        assert_eq!(hermes.display_name(), "Hermes");
+        assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(hermes.reasoning_levels().is_empty());
+        let pi = registry.resolve(HarnessId::Pi).unwrap();
+        assert_eq!(pi.id(), HarnessId::Pi);
+        assert_eq!(pi.display_name(), "Pi");
+        assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            pi.reasoning_levels(),
+            &[
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
             ]
         );
     }

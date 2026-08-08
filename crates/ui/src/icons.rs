@@ -117,6 +117,8 @@ icon_assets![
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
     (GROK_MARK, "grok-mark"),
+    (HERMES_MARK, "hermes-mark"),
+    (PI_MARK, "pi-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — comet keeps it even on the

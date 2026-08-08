@@ -30,6 +30,23 @@
   kinds) and bridges to the input panel; allow/reject-shaped requests
   auto-accept. Per-turn usage comes from the settled prompt response.
 
+- **Hermes + Pi registered** (2026-08-08): `AcpHarness::hermes()` runs Nous
+  Research's native ACP server (`hermes acp`; Python install via
+  `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` plus the
+  `.[acp]` extra — no npm fallback, so resolution is PATH/`~/.local/bin`/
+  `~/.hermes/bin` only, `HERMES_EXECUTABLE` overrides). No
+  `_session/steering` extension and no effort config advertised (Hermes 4's
+  hybrid reasoning is model-internal) → turn-boundary steering, empty ladder;
+  static catalog lists the Nous portal flagships (Hermes 4 405B/70B), real
+  model set derives from the user's authenticated providers and unknown ids
+  skip through the config-option set. `AcpHarness::pi()` runs the pi coding
+  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.33,
+  `npx -y` fallback; requires the pi CLI itself,
+  `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
+  ride pi's own provider config (catalog advertises a `default` pass-through
+  entry); thinking ladder minimal→max maps onto comet's levels via the
+  generic `thought_level` preference ladder ("off" has no comet tier).
+
 ## Protocol surface used (v1)
 - `initialize` (protocolVersion 1; fs/terminal client capabilities declined) →
   `session/new` / `session/load` (fresh-session fallback; replay drained, the
