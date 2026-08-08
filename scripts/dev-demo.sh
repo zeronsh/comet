@@ -17,6 +17,7 @@ DELAY=""
 
 echo "▸ building (first run takes a few minutes)…"
 cargo build -p comet -q
+scripts/target-cache.sh warn || true
 
 echo "▸ starting engine daemon on :$IPC"
 env COMET_DATA_DIR="$DAEMON_DIR" COMET_IPC_PORT=$IPC COMET_HARNESS=mock \
