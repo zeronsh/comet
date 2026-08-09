@@ -85,6 +85,7 @@ fi
 # ── 2. Build the binaries (workspace target is warm in CI/dev) ─────────────────
 echo "build: comet + e2e_driver"
 (cd "$ROOT" && cargo build -q -p comet -p comet-rpc --example e2e_driver)
+"$ROOT/scripts/target-cache.sh" warn || true
 COMET="$ROOT/target/debug/comet"
 DRIVER="$ROOT/target/debug/examples/e2e_driver"
 
