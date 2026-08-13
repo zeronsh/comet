@@ -228,6 +228,85 @@ fn sync_ns_appearance(mode: AppearanceMode) {
 #[cfg(not(target_os = "macos"))]
 fn sync_ns_appearance(_mode: AppearanceMode) {}
 
+/// Restore gpui's behind-window blur on macOS 27.
+///
+/// The pinned gpui fork builds its `BlurredView` with the semantic
+/// `NSVisualEffectMaterialSelection` material. On macOS 27 that material no
+/// longer creates a `CABackdropLayer`; it resolves to an opaque fill instead.
+/// The fork then strips that fill and installs its opaque Mission Control
+/// fallback, leaving the live window looking solid black beneath our frost.
+///
+/// `NSVisualEffectMaterialUnderWindowBackground` is the semantic material for
+/// this exact job and still creates the backdrop/filter hierarchy the fork's
+/// blur tuning expects. Keep the workaround here until the pinned fork changes
+/// its `blurred_view_init_with_frame` material upstream.
+#[cfg(target_os = "macos")]
+fn repair_macos_27_blur_material() {
+    use objc::runtime::{BOOL, Object, YES};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    #[repr(C)]
+    struct OperatingSystemVersion {
+        major: isize,
+        minor: isize,
+        patch: isize,
+    }
+
+    unsafe fn repair_view_tree(view: *mut Object, blurred_view_name: *mut Object) -> usize {
+        unsafe {
+            let class_name: *mut Object = msg_send![view, className];
+            let is_gpui_blur: BOOL = msg_send![class_name, isEqualToString: blurred_view_name];
+            let mut repaired = 0;
+            if is_gpui_blur == YES {
+                // NSVisualEffectMaterialUnderWindowBackground = 21,
+                // NSVisualEffectBlendingModeBehindWindow = 0,
+                // NSVisualEffectStateActive = 1.
+                let _: () = msg_send![view, setMaterial: 21_isize];
+                let _: () = msg_send![view, setBlendingMode: 0_isize];
+                let _: () = msg_send![view, setState: 1_isize];
+                let _: () = msg_send![view, setNeedsDisplay: YES];
+                repaired += 1;
+            }
+
+            let subviews: *mut Object = msg_send![view, subviews];
+            let count: usize = msg_send![subviews, count];
+            for index in 0..count {
+                let child: *mut Object = msg_send![subviews, objectAtIndex: index];
+                repaired += repair_view_tree(child, blurred_view_name);
+            }
+            repaired
+        }
+    }
+
+    unsafe {
+        let process_info: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
+        let version: OperatingSystemVersion = msg_send![process_info, operatingSystemVersion];
+        if version.major < 27 {
+            return;
+        }
+
+        let blurred_view_name: *mut Object = msg_send![
+            class!(NSString),
+            stringWithUTF8String: c"BlurredView".as_ptr()
+        ];
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let windows: *mut Object = msg_send![app, windows];
+        let count: usize = msg_send![windows, count];
+        let mut repaired = 0;
+        for index in 0..count {
+            let window: *mut Object = msg_send![windows, objectAtIndex: index];
+            let content_view: *mut Object = msg_send![window, contentView];
+            if !content_view.is_null() {
+                repaired += repair_view_tree(content_view, blurred_view_name);
+            }
+        }
+        tracing::trace!(repaired, "appearance: repaired macOS 27 blur material");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn repair_macos_27_blur_material() {}
+
 /// Push the theme's window background appearance onto every open window.
 pub fn reapply_window_background(cx: &mut App) {
     let Some(wanted) = cx
@@ -243,6 +322,10 @@ pub fn reapply_window_background(cx: &mut App) {
             })
             .ok();
     }
+    // `set_background_appearance(Blurred)` synchronously inserts gpui's
+    // `BlurredView`, so repair its material only after every window has been
+    // updated. This also covers a view recreated after an opaque theme.
+    repair_macos_27_blur_material();
 }
 
 #[cfg(test)]
