@@ -9,7 +9,9 @@
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
-use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::pickers::{
+    browser_location_breadcrumbs, browser_rows, completion_prefix_len, parent_path,
+};
 use gpui::FocusHandle;
 use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
 
@@ -1485,23 +1487,19 @@ impl Shell {
                     .child(SharedString::from("esc")),
             );
 
-        // ── breadcrumbs ("MacBook Pro / Projects / zeron"): the quiet mono
-        //    path voice, `/` separators. The device crumb stands in for home —
-        //    everything up to the resolved home path folds into it; below
-        //    home the full path shows. Ancestors (device crumb included) are
-        //    clickable.
+        // ── breadcrumbs ("MacBook Pro / Home / Projects / zeron"): the
+        //    quiet mono path voice. The device crumb is the filesystem root,
+        //    so external mounts such as `/Volumes` are always one click away;
+        //    Home is a separate fold for the otherwise noisy `/Users/name`
+        //    prefix. Every ancestor remains clickable.
         let crumbs: AnyElement = match &listing {
             Some(listing) => {
-                let segments = breadcrumbs(&listing.path);
+                let segments = browser_location_breadcrumbs(
+                    &listing.path,
+                    home.as_deref(),
+                    device_name.as_ref(),
+                );
                 let last = segments.len().saturating_sub(1);
-                // Root "/" chip always folds; the home segments fold too when
-                // the browsed path sits at/under home.
-                let at_home = home.as_deref() == Some(listing.path.as_str());
-                let folded = 1 + home
-                    .as_deref()
-                    .filter(|h| listing.path == *h || listing.path.starts_with(&format!("{h}/")))
-                    .map(|h| h.split('/').filter(|s| !s.is_empty()).count())
-                    .unwrap_or(0);
                 div()
                     .flex()
                     .flex_row()
@@ -1512,72 +1510,46 @@ impl Shell {
                     .pb(px(2.0))
                     .text_size(px(11.0))
                     .font_family(theme.font_mono.clone())
-                    .child({
-                        let crumb = div()
-                            .id("add-space-crumb-device")
-                            .px(px(3.0))
-                            .rounded(px(4.0))
-                            .child(device_name.clone());
-                        if at_home {
-                            // Standing at home — the device crumb IS the
-                            // current folder.
-                            crumb
-                                .text_color(theme.text.opacity(0.85))
-                                .into_any_element()
-                        } else {
-                            crumb
-                                .text_color(theme.text_muted.opacity(0.55))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.text))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(flow) = this.add_space.as_mut() {
-                                        flow.browser_repo = false;
-                                    }
-                                    this.load_space_folders(None, cx);
-                                }))
-                                .into_any_element()
-                        }
-                    })
-                    .children(segments.into_iter().enumerate().skip(folded).map(
-                        |(ix, (label, full))| {
-                            let is_last = ix == last;
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .child(
+                    .children(segments.into_iter().enumerate().map(|(ix, (label, full))| {
+                        let is_last = ix == last;
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .when(ix > 0, |el| {
+                                el.child(
                                     div()
                                         .text_color(theme.text_faint.opacity(0.7))
                                         .child(SharedString::from("/")),
                                 )
-                                .child({
-                                    let crumb = div()
-                                        .id(("add-space-crumb", ix))
-                                        .px(px(3.0))
-                                        .rounded(px(4.0))
-                                        .text_color(if is_last {
-                                            theme.text.opacity(0.85)
-                                        } else {
-                                            theme.text_muted.opacity(0.55)
-                                        })
-                                        .child(SharedString::from(label));
-                                    if is_last {
-                                        crumb.into_any_element()
+                            })
+                            .child({
+                                let crumb = div()
+                                    .id(("add-space-crumb", ix))
+                                    .px(px(3.0))
+                                    .rounded(px(4.0))
+                                    .text_color(if is_last {
+                                        theme.text.opacity(0.85)
                                     } else {
-                                        crumb
-                                            .cursor_pointer()
-                                            .hover(|s| s.text_color(theme.text))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(flow) = this.add_space.as_mut() {
-                                                    flow.browser_repo = false;
-                                                }
-                                                this.load_space_folders(Some(full.clone()), cx);
-                                            }))
-                                            .into_any_element()
-                                    }
-                                })
-                        },
-                    ))
+                                        theme.text_muted.opacity(0.55)
+                                    })
+                                    .child(SharedString::from(label));
+                                if is_last {
+                                    crumb.into_any_element()
+                                } else {
+                                    crumb
+                                        .cursor_pointer()
+                                        .hover(|s| s.text_color(theme.text))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(flow) = this.add_space.as_mut() {
+                                                flow.browser_repo = false;
+                                            }
+                                            this.load_space_folders(Some(full.clone()), cx);
+                                        }))
+                                        .into_any_element()
+                                }
+                            })
+                    }))
                     .into_any_element()
             }
             None => div().pt(px(6.0)).into_any_element(),
