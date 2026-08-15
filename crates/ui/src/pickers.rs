@@ -3858,33 +3858,33 @@ mod tests {
         assert_eq!(breadcrumbs("/").len(), 1);
 
         let home = browser_location_breadcrumbs(
-            "/Users/kalan/github/zeron",
-            Some("/Users/kalan"),
+            "/Users/developer/projects/comet",
+            Some("/Users/developer"),
             "MacBook",
         );
         assert_eq!(
             home,
             [
                 ("MacBook".into(), "/".into()),
-                ("Home".into(), "/Users/kalan".into()),
-                ("github".into(), "/Users/kalan/github".into()),
-                ("zeron".into(), "/Users/kalan/github/zeron".into()),
+                ("Home".into(), "/Users/developer".into()),
+                ("projects".into(), "/Users/developer/projects".into()),
+                ("comet".into(), "/Users/developer/projects/comet".into()),
             ]
         );
 
         // External mounts must not disappear into the folded home crumb.
         let volume =
-            browser_location_breadcrumbs("/Volumes/Kalan", Some("/Users/kalan"), "MacBook");
+            browser_location_breadcrumbs("/Volumes/External", Some("/Users/developer"), "MacBook");
         assert_eq!(
             volume,
             [
                 ("MacBook".into(), "/".into()),
                 ("Volumes".into(), "/Volumes".into()),
-                ("Kalan".into(), "/Volumes/Kalan".into()),
+                ("External".into(), "/Volumes/External".into()),
             ]
         );
         assert_eq!(
-            browser_location_breadcrumbs("/", Some("/Users/kalan"), "MacBook"),
+            browser_location_breadcrumbs("/", Some("/Users/developer"), "MacBook"),
             [("MacBook".into(), "/".into())]
         );
     }
