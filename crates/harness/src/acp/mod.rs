@@ -3,8 +3,8 @@
 //! implementation covers every ACP agent; [`AcpHarness::grok`] configures it
 //! for xAI's Grok Build (`grok agent stdio`), the first registered agent —
 //! [`AcpHarness::hermes`] (Nous Research, `hermes acp`), [`AcpHarness::pi`]
-//! (pi.dev via `pi-acp`) and [`AcpHarness::cursor`] (`cursor-agent acp`)
-//! followed.
+//! (pi.dev via `pi-acp`), [`AcpHarness::cursor`] (`cursor-agent acp`) and
+//! [`AcpHarness::opencode`] (`opencode acp`) followed.
 //!
 //! - `initialize` (protocolVersion 1, fs/terminal capabilities declined) →
 //!   `session/new`, or `session/load` with a fresh-session fallback when
@@ -90,6 +90,9 @@ struct AcpAgentSpec {
     /// Transform applied to the initial prompt and every steer — Claude's
     /// Ultrathink is a prompt-prefix convention, not an effort flag.
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
+    /// Whether selecting the model returns a refreshed config-option snapshot
+    /// that must be used for the remaining per-session settings.
+    refresh_config_after_model: bool,
     /// Preference-ordered `thought_level` value ids for the run's reasoning
     /// (per-agent clamping, e.g. Claude xhigh→max off the xhigh family). The
     /// first value the agent actually advertises wins.
@@ -187,6 +190,7 @@ fn claude_spec() -> AcpAgentSpec {
             ReasoningLevel::Max,
         ],
         prompt_transform: crate::claude::catalog::apply_ultrathink,
+        refresh_config_after_model: false,
         effort_values: |reasoning, model| {
             crate::claude::catalog::to_effort(reasoning, model)
                 .into_iter()
@@ -219,6 +223,7 @@ fn codex_spec() -> AcpAgentSpec {
         steering_mode: SteeringMode::StepBoundary,
         reasoning_levels: crate::codex::catalog::REASONING_LEVELS,
         prompt_transform: identity_transform,
+        refresh_config_after_model: false,
         effort_values: |reasoning, _model| {
             crate::codex::catalog::to_effort(reasoning)
                 .into_iter()
@@ -302,6 +307,7 @@ fn grok_spec() -> AcpAgentSpec {
             ReasoningLevel::High,
         ],
         prompt_transform: identity_transform,
+        refresh_config_after_model: false,
         effort_values: default_effort_values,
         ladder_extras: &[],
     }
@@ -360,6 +366,7 @@ fn cursor_spec() -> AcpAgentSpec {
         // that actually advertise effort variants (see `cursor::enrich_models`).
         reasoning_levels: &[],
         prompt_transform: identity_transform,
+        refresh_config_after_model: false,
         // Cursor has no thought_level config option — effort rides the model
         // id. When a collapsed family exposes a Reasoning ladder, these
         // tokens pick the matching sibling via `cursor::pick_model_id`.
@@ -425,6 +432,7 @@ fn hermes_spec() -> AcpAgentSpec {
         // model-internal); revisit when the adapter advertises a ladder.
         reasoning_levels: &[],
         prompt_transform: identity_transform,
+        refresh_config_after_model: false,
         effort_values: default_effort_values,
         ladder_extras: &[],
     }
@@ -478,6 +486,66 @@ fn pi_spec() -> AcpAgentSpec {
             ReasoningLevel::Max,
         ],
         prompt_transform: identity_transform,
+        refresh_config_after_model: false,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+    }
+}
+
+fn opencode_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    for variable in ["OPENCODE_INSTALL_DIR", "XDG_BIN_DIR"] {
+        if let Some(dir) = std::env::var_os(variable).filter(|dir| !dir.is_empty()) {
+            push(PathBuf::from(dir).join("opencode"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        push(home.join("bin").join("opencode"));
+        push(home.join(".opencode").join("bin").join("opencode"));
+        push(home.join(".local").join("bin").join("opencode"));
+    }
+    push(PathBuf::from("/opt/homebrew/bin/opencode"));
+    push(PathBuf::from("/usr/local/bin/opencode"));
+    paths
+}
+
+fn opencode_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::OpenCode,
+        display_name: "OpenCode",
+        executable: "opencode",
+        env_override: "OPENCODE_EXECUTABLE",
+        args: &["acp"],
+        npm_package: None,
+        extra_paths: opencode_install_paths,
+        cli_executable: "opencode",
+        cli_extra_paths: opencode_install_paths,
+        install_hint: "opencode (searched PATH, the login shell's PATH, OPENCODE_INSTALL_DIR, \
+             XDG_BIN_DIR, $HOME/bin, $HOME/.opencode/bin, $HOME/.local/bin, \
+             /opt/homebrew/bin, and /usr/local/bin; install with \
+             `curl -fsSL https://opencode.ai/install | bash` or a supported package \
+             manager; set OPENCODE_EXECUTABLE to override)",
+        // ACP is the source of truth; this is only the conservative fallback
+        // used when a live session cannot advertise configured providers.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "OpenCode default".into(),
+                description: Some("Uses the model configured in OpenCode".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        // OpenCode does not advertise zeron's private steering extension yet.
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        refresh_config_after_model: true,
         effort_values: default_effort_values,
         ladder_extras: &[],
     }
@@ -598,6 +666,11 @@ impl AcpHarness {
     /// pi's RPC mode.
     pub fn pi() -> Self {
         Self::with_spec(pi_spec())
+    }
+
+    /// OpenCode's native ACP server (`opencode acp`).
+    pub fn opencode() -> Self {
+        Self::with_spec(opencode_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -1201,6 +1274,7 @@ impl Harness for AcpHarness {
             agent_name: self.spec.display_name,
             prompt_transform: self.spec.prompt_transform,
             effort_values: self.spec.effort_values,
+            refresh_config_after_model: self.spec.refresh_config_after_model,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
@@ -1229,6 +1303,7 @@ struct Session {
     agent_name: &'static str,
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
+    refresh_config_after_model: bool,
     interrupt_grace: Duration,
     kill_grace: Duration,
     handshake_timeout: Duration,
@@ -1381,6 +1456,7 @@ fn config_option_sets(
     model: Option<&str>,
     efforts: &[&'static str],
     model_options: &serde_json::Map<String, Value>,
+    cursor_model: bool,
 ) -> Vec<(String, Value)> {
     let Some(options) = session_response
         .get("configOptions")
@@ -1415,9 +1491,22 @@ fn config_option_sets(
                 // (`auto-smart[optimize_for=cost]`) still has to match. When
                 // the catalog is still exploded, effort siblings switch via
                 // `pick_model_id`.
-                let requested = model.map(cursor::strip_variant_suffix);
-                requested
-                    .and_then(|m| cursor::pick_model_id(m, efforts, &available))
+                // Other ACP agents, notably OpenCode, advertise their exact
+                // provider/model ids and must not go through Cursor's family
+                // or bracket-suffix transformations.
+                let requested = model.map(|m| {
+                    if cursor_model {
+                        cursor::strip_variant_suffix(m)
+                    } else {
+                        m
+                    }
+                });
+                let cursor_variant = if cursor_model {
+                    requested.and_then(|m| cursor::pick_model_id(m, efforts, &available))
+                } else {
+                    None
+                };
+                cursor_variant
                     .or_else(|| requested.and_then(|m| pick_model_value(m, &available, context_1m)))
                     .or_else(|| model.and_then(|m| pick_model_value(m, &available, context_1m)))
                     .map(Value::String)
@@ -1983,6 +2072,7 @@ async fn run_session(session: Session) {
         agent_name,
         prompt_transform,
         effort_values,
+        refresh_config_after_model,
         interrupt_grace,
         kill_grace,
         handshake_timeout,
@@ -2052,18 +2142,26 @@ async fn run_session(session: Session) {
         // field). Best-effort: a rejected set is logged, never fatal — the
         // agent's default runs.
         //
-        // Cursor parameterized mode only lists parameters for the *current*
-        // model. Set the model first, then apply optimize_for / effort / fast
-        // against the refreshed configOptions in the response.
+        // Cursor parameterized mode and OpenCode's model-dependent effort
+        // ladder only list the remaining parameters for the *current* model.
+        // Set the model first, then apply the remaining settings against the
+        // refreshed configOptions in the response.
         let efforts = effort_values(request.reasoning, request.model.as_deref());
-        let requested_model = request.model.as_deref().map(cursor::strip_variant_suffix);
+        let cursor_model = harness == HarnessId::Cursor;
+        let requested_model = if cursor_model {
+            request.model.as_deref().map(cursor::strip_variant_suffix)
+        } else {
+            request.model.as_deref()
+        };
         let mut options_snapshot = session_response;
-        if harness == HarnessId::Cursor {
+        let model_first = refresh_config_after_model || cursor_model;
+        if model_first {
             let model_sets = config_option_sets(
                 &options_snapshot,
                 requested_model,
                 &[],
                 &serde_json::Map::new(),
+                cursor_model,
             );
             if let Some((_, payload)) = model_sets.iter().find(|(id, _)| id == "model") {
                 let mut params = serde_json::Map::new();
@@ -2100,8 +2198,9 @@ async fn run_session(session: Session) {
             requested_model,
             &efforts,
             &request.model_options,
+            cursor_model,
         ) {
-            if harness == HarnessId::Cursor && config_id == "model" {
+            if model_first && config_id == "model" {
                 continue;
             }
             let mut params = serde_json::Map::new();
@@ -3104,7 +3203,13 @@ mod tests {
         // Model switch + effort preference list; fastMode untouched without a
         // model-option selection.
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["medium"], &no_opts),
+            config_option_sets(
+                &response,
+                Some("claude-opus-5"),
+                &["medium"],
+                &no_opts,
+                false,
+            ),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5" })),
                 ("effort".to_owned(), json!({ "value": "medium" })),
@@ -3112,7 +3217,7 @@ mod tests {
         );
         // Effort preference order: first ADVERTISED candidate wins.
         assert_eq!(
-            config_option_sets(&response, None, &["xhigh", "max"], &no_opts),
+            config_option_sets(&response, None, &["xhigh", "max"], &no_opts, false),
             vec![("effort".to_owned(), json!({ "value": "max" }))]
         );
         // contextWindow=1m composes the [1m] model id; fastMode=on matches the
@@ -3121,7 +3226,7 @@ mod tests {
         opts.insert("contextWindow".into(), json!("1m"));
         opts.insert("fastMode".into(), json!("on"));
         assert_eq!(
-            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts),
+            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts, false),
             vec![
                 ("model".to_owned(), json!({ "value": "claude-opus-5[1m]" })),
                 (
@@ -3132,16 +3237,28 @@ mod tests {
         );
         // Already-current values and unadvertised models set nothing.
         assert_eq!(
-            config_option_sets(&response, Some("claude-sonnet-5"), &["high"], &no_opts),
+            config_option_sets(
+                &response,
+                Some("claude-sonnet-5"),
+                &["high"],
+                &no_opts,
+                false,
+            ),
             Vec::new()
         );
         assert_eq!(
-            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts),
+            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts, false),
             Vec::new()
         );
         // No configOptions advertised → nothing to set.
         assert_eq!(
-            config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
+            config_option_sets(
+                &json!({"sessionId": "s"}),
+                Some("x"),
+                &["high"],
+                &no_opts,
+                false,
+            ),
             Vec::new()
         );
     }
@@ -3538,6 +3655,74 @@ mod tests {
     }
 
     #[test]
+    fn opencode_spec_targets_the_native_acp_server() {
+        let spec = opencode_spec();
+        assert_eq!(spec.id, HarnessId::OpenCode);
+        assert_eq!(spec.display_name, "OpenCode");
+        assert_eq!(spec.executable, "opencode");
+        assert_eq!(spec.env_override, "OPENCODE_EXECUTABLE");
+        assert_eq!(spec.args, &["acp"]);
+        assert!(spec.npm_package.is_none());
+        assert_eq!(spec.cli_executable, "opencode");
+        assert_eq!(spec.steering_mode, SteeringMode::TurnBoundary);
+        assert!(spec.reasoning_levels.is_empty());
+        assert!(spec.refresh_config_after_model);
+        let models = (spec.models)();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "default");
+        assert_eq!(models[0].label, "OpenCode default");
+        assert!(models[0].reasoning_levels.is_empty());
+        assert!(models[0].options.is_empty());
+        assert_eq!(
+            (spec.effort_values)(Some(ReasoningLevel::XHigh), Some("anthropic/model-b")),
+            vec!["xhigh", "x-high", "high"]
+        );
+    }
+
+    #[test]
+    fn opencode_mode_values_keep_the_acp_default_when_unselected() {
+        let response = json!({
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "openai/model-a",
+                    "options": [
+                        { "value": "openai/model-a" },
+                        { "value": "anthropic/model-b" }
+                    ]
+                },
+                {
+                    "id": "effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [{ "value": "low" }, { "value": "medium" }]
+                },
+                {
+                    "id": "mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": "build",
+                    "options": [{ "value": "build" }, { "value": "plan" }]
+                }
+            ]
+        });
+        let sets = config_option_sets(
+            &response,
+            Some("anthropic/model-b"),
+            &["xhigh"],
+            &serde_json::Map::new(),
+            false,
+        );
+        assert_eq!(
+            sets,
+            vec![("model".to_owned(), json!({ "value": "anthropic/model-b" }))]
+        );
+    }
+
+    #[test]
     fn cursor_mode_trait_wins_over_no_prompt_fallback() {
         let cursor = json!({
             "sessionId": "s-1",
@@ -3566,7 +3751,7 @@ mod tests {
         let mut opts = serde_json::Map::new();
         opts.insert("mode".into(), json!("plan"));
         assert_eq!(
-            config_option_sets(&cursor, None, &[], &opts),
+            config_option_sets(&cursor, None, &[], &opts, true),
             vec![("mode".to_owned(), json!({ "value": "plan" }))]
         );
         // Reasoning Low switches the effort family to the -low sibling.
@@ -3575,7 +3760,8 @@ mod tests {
                 &cursor,
                 Some("example[reasoning_effort=high]"),
                 &["low"],
-                &serde_json::Map::new()
+                &serde_json::Map::new(),
+                true,
             ),
             vec![("model".to_owned(), json!({ "value": "example-low[]" }))]
         );
@@ -3623,6 +3809,7 @@ mod tests {
             Some("auto-smart[optimize_for=balanced]"),
             &[],
             &opts,
+            true,
         );
         assert!(
             sets.iter()
@@ -3678,7 +3865,7 @@ mod tests {
         });
         let no_opts = serde_json::Map::new();
         assert_eq!(
-            config_option_sets(&codex, None, &[], &no_opts),
+            config_option_sets(&codex, None, &[], &no_opts, false),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
     }

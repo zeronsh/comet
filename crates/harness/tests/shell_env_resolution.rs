@@ -25,6 +25,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
     write_executable(&shell_bin.join("claude-agent-acp"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("hermes"), "#!/bin/sh\nexit 0\n");
     write_executable(&shell_bin.join("pi-acp"), "#!/bin/sh\nexit 0\n");
+    write_executable(&shell_bin.join("opencode"), "#!/bin/sh\nexit 0\n");
 
     // A $SHELL whose init shapes PATH — the shape resolution must survive.
     let fake_shell = dir.path().join("fake-shell");
@@ -51,6 +52,7 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         std::env::remove_var("CLAUDE_ACP_EXECUTABLE");
         std::env::remove_var("HERMES_EXECUTABLE");
         std::env::remove_var("PI_ACP_EXECUTABLE");
+        std::env::remove_var("OPENCODE_EXECUTABLE");
         std::env::remove_var("ZERON_NO_LOGIN_SHELL");
     }
 
@@ -80,4 +82,16 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         .launch_program()
         .expect("pi-acp resolves via login-shell PATH");
     assert_eq!(pi, shell_bin.join("pi-acp"), "{pi:?}");
+    let opencode = AcpHarness::opencode()
+        .launch_program()
+        .expect("opencode resolves via login-shell PATH");
+    assert_eq!(opencode, shell_bin.join("opencode"), "{opencode:?}");
+
+    let override_path = dir.path().join("opencode-override");
+    write_executable(&override_path, "#!/bin/sh\nexit 0\n");
+    unsafe { std::env::set_var("OPENCODE_EXECUTABLE", &override_path) };
+    assert_eq!(
+        AcpHarness::opencode().launch_program().unwrap(),
+        override_path
+    );
 }

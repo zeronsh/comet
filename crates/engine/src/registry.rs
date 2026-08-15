@@ -454,6 +454,22 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
+    // OpenCode's native ACP server (`opencode acp`), same lazy pattern. Its
+    // configured providers and model-dependent effort ladder come from ACP at
+    // runtime; the static descriptor intentionally carries no fake ladder.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::OpenCode,
+            name: "OpenCode".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -498,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
+    fn default_registry_lists_all_harness_slots_in_order() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
@@ -510,9 +526,11 @@ mod tests {
                 HarnessId::Cursor,
                 HarnessId::Grok,
                 HarnessId::Hermes,
-                HarnessId::Pi
+                HarnessId::Pi,
+                HarnessId::OpenCode,
             ]
         );
+        assert!(!default_enabled().contains(&HarnessId::OpenCode));
         assert!(registry.resolve(HarnessId::Mock).is_ok());
         assert!(registry.resolve(HarnessId::ClaudeCode).is_ok());
         // A codex-configured chat resolves the right harness (construction is
@@ -559,6 +577,11 @@ mod tests {
                 ReasoningLevel::Max
             ]
         );
+        let opencode = registry.resolve(HarnessId::OpenCode).unwrap();
+        assert_eq!(opencode.id(), HarnessId::OpenCode);
+        assert_eq!(opencode.display_name(), "OpenCode");
+        assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(opencode.reasoning_levels().is_empty());
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`
@@ -669,6 +692,26 @@ mod tests {
             .descriptors()
             .into_iter()
             .find(|d| d.id == HarnessId::Codex)
+            .unwrap();
+        assert_eq!(before.name, after.name);
+        assert_eq!(before.supports_steering, after.supports_steering);
+        assert_eq!(before.steering_mode, after.steering_mode);
+        assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    #[test]
+    fn opencode_lazy_descriptor_matches_resolved_harness() {
+        let registry = default_registry();
+        let before = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::OpenCode)
+            .unwrap();
+        registry.resolve(HarnessId::OpenCode).unwrap();
+        let after = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::OpenCode)
             .unwrap();
         assert_eq!(before.name, after.name);
         assert_eq!(before.supports_steering, after.supports_steering);

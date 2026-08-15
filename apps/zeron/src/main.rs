@@ -230,14 +230,41 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
 /// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
 /// config row — `mock` powers the e2e smoke; default `claude-code`.
 fn harness_from_env() -> zeron_engine::HarnessId {
-    match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
-        Ok("mock") => zeron_engine::HarnessId::Mock,
-        Ok("codex") => zeron_engine::HarnessId::Codex,
-        Ok("cursor") => zeron_engine::HarnessId::Cursor,
-        Ok("grok") => zeron_engine::HarnessId::Grok,
-        Ok("hermes") => zeron_engine::HarnessId::Hermes,
-        Ok("pi") => zeron_engine::HarnessId::Pi,
+    harness_from_name(
+        std::env::var("ZERON_HARNESS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+    )
+}
+
+fn harness_from_name(value: Option<&str>) -> zeron_engine::HarnessId {
+    match value {
+        Some("mock") => zeron_engine::HarnessId::Mock,
+        Some("codex") => zeron_engine::HarnessId::Codex,
+        Some("cursor") => zeron_engine::HarnessId::Cursor,
+        Some("grok") => zeron_engine::HarnessId::Grok,
+        Some("hermes") => zeron_engine::HarnessId::Hermes,
+        Some("pi") => zeron_engine::HarnessId::Pi,
+        Some("opencode") => zeron_engine::HarnessId::OpenCode,
         _ => zeron_engine::HarnessId::ClaudeCode,
+    }
+}
+
+#[cfg(test)]
+mod harness_selection_tests {
+    use super::*;
+
+    #[test]
+    fn opencode_environment_name_selects_opencode() {
+        assert_eq!(
+            harness_from_name(Some("opencode")),
+            zeron_engine::HarnessId::OpenCode
+        );
+        assert_eq!(
+            harness_from_name(Some("unknown")),
+            zeron_engine::HarnessId::ClaudeCode
+        );
     }
 }
 

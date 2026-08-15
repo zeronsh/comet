@@ -1,4 +1,4 @@
-# ACP integration: shared harness + Grok Build (2026-08)
+# ACP integration: shared harness + native ACP agents (2026-08)
 
 ## Decision
 - Add an **ACP harness** (`crates/harness/src/acp/`) speaking Agent Client Protocol
@@ -45,6 +45,15 @@
   ride pi's own provider config (catalog advertises a `default` pass-through
   entry); thinking ladder minimal→max maps onto zeron's levels via the
   generic `thought_level` preference ladder ("off" has no zeron tier).
+- **OpenCode registered** (2026-08): `AcpHarness::opencode()` runs the native
+  `opencode acp` server with no custom transport. Provider/model rows come from
+  ACP `configOptions`; selecting a model first refreshes that snapshot before
+  applying its model-dependent effort ladder. The initial integration leaves
+  OpenCode's configured/default session mode untouched and uses turn-boundary
+  steering unless a future handshake advertises zeron's private extension.
+  The discovery probe applies its initial session's effort ladder to the
+  discovered rows; the selected model's refreshed snapshot is authoritative at
+  run time, avoiding an expensive per-model probe in this integration.
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads

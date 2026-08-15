@@ -6,7 +6,7 @@
 //! and missing fields degrade to empty strings rather than errors. Wire shapes
 //! verified against `agent-client-protocol-schema` 1.3.0 (`SessionUpdate` is
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
-//! statuses are snake_case).
+//! statuses are snake_case), including OpenCode's native ACP stream.
 
 use serde_json::Value;
 use zeron_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};

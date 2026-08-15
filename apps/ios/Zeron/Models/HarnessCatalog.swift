@@ -38,6 +38,7 @@ enum HarnessCatalog {
         "hermes": "Hermes",
         "pi": "Pi",
         "cursor": "Cursor",
+        "opencode": "OpenCode",
         "mock": "Mock",
     ]
 
@@ -71,6 +72,12 @@ enum HarnessCatalog {
                 ModelInfo(id: "default", label: "pi default",
                           description: "Runs the model configured in pi (`pi` settings)",
                           reasoningLevels: ["minimal", "low", "medium", "high", "xhigh", "max"]),
+            ]
+        case "opencode":
+            return [
+                ModelInfo(id: "default", label: "OpenCode default",
+                          description: "Uses the model configured in OpenCode",
+                          reasoningLevels: []),
             ]
         case "codex":
             return [

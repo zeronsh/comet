@@ -28,6 +28,19 @@ fn fixture_path() -> PathBuf {
     path
 }
 
+fn opencode_fixture_path() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-opencode-acp.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    path
+}
+
 fn harness() -> AcpHarness {
     AcpHarness::grok().with_executable(fixture_path())
 }
@@ -282,6 +295,10 @@ async fn claude_and_codex_specs_drive_the_same_wire() {
         (
             "cursor",
             AcpHarness::cursor().with_executable(fixture_path()),
+        ),
+        (
+            "opencode",
+            AcpHarness::opencode().with_executable(fixture_path()),
         ),
     ] {
         let (controls, _steer, _token) = controls();
@@ -944,6 +961,56 @@ async fn hung_handshake_errors_instead_of_spinning_forever() {
     );
 }
 
+#[tokio::test]
+async fn opencode_models_preserve_provider_model_ids_from_config_options() {
+    let harness = AcpHarness::opencode().with_executable(opencode_fixture_path());
+    let models = harness.models().await.expect("discovery");
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["openai/model-a", "anthropic/model-b"],
+        "{models:?}"
+    );
+    assert!(models.iter().all(|m| {
+        m.reasoning_levels
+            == vec![
+                zeron_proto::ReasoningLevel::Low,
+                zeron_proto::ReasoningLevel::Medium,
+            ]
+    }));
+}
+
+#[tokio::test]
+async fn opencode_model_selection_refreshes_effort_and_preserves_default_mode() {
+    let (controls, _steer, _token) = controls();
+    let harness = AcpHarness::opencode().with_executable(opencode_fixture_path());
+    let mut req = request("scenario:opencode-config");
+    req.model = Some("anthropic/model-b".into());
+    req.reasoning = Some(zeron_proto::ReasoningLevel::XHigh);
+    let events = run_to_end(&harness, req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "configured".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn opencode_static_fallback_is_a_configured_default_passthrough() {
+    let harness = AcpHarness::opencode().with_executable("/nonexistent/never-an-opencode");
+    let models = harness.models().await.expect("static fallback");
+    assert_eq!(models.len(), 1, "{models:?}");
+    assert_eq!(models[0].id, "default");
+    assert_eq!(models[0].label, "OpenCode default");
+    assert_eq!(
+        models[0].description.as_deref(),
+        Some("Uses the model configured in OpenCode")
+    );
+    assert!(models[0].reasoning_levels.is_empty());
+    assert!(models[0].options.is_empty());
+}
+
 #[test]
 fn cursor_descriptor_surface_matches_registry_expectations() {
     let cursor = AcpHarness::cursor();
@@ -981,6 +1048,13 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             zeron_proto::ReasoningLevel::Max,
         ]
     );
+
+    let opencode = AcpHarness::opencode();
+    assert_eq!(opencode.id(), HarnessId::OpenCode);
+    assert_eq!(opencode.display_name(), "OpenCode");
+    assert!(opencode.supports_steering());
+    assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+    assert!(opencode.reasoning_levels().is_empty());
 }
 
 /// The 2026-08-12 stuck-Working wedge, end to end: a prompt whose turn was
