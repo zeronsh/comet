@@ -343,6 +343,7 @@ mod tests {
         assert_eq!(pin.dir_name(), "pi-acp");
     }
 
+    #[cfg(unix)]
     #[test]
     fn npm_errno_exits_are_decoded() {
         use std::os::unix::process::ExitStatusExt;
