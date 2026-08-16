@@ -68,6 +68,17 @@ enum Lookup {
     },
 }
 
+/// What `get` does once its lock section has ended: either await the
+/// in-flight probe someone else already started, or run its own probe.
+enum NextStep {
+    Wait(broadcast::Receiver<Probed>),
+    /// The `Instant` here is the InFlight entry's own insertion time, taken
+    /// under the lock — not a fresh `Instant::now()` after the lock is
+    /// released. See the comment where this variant is built for why that
+    /// distinction is load-bearing.
+    Probe(Instant),
+}
+
 pub struct CommandCache {
     fresh_ttl: Duration,
     negative_ttl: Duration,
@@ -126,7 +137,7 @@ impl CommandCache {
         // dropped the lock between them, two callers could each classify a
         // cold key as a miss before either had inserted its InFlight slot,
         // and both would then start their own probe — defeating single-flight.
-        let waiter = {
+        let step = {
             let mut slots = self.slots.lock().expect("cache lock");
             let now = Instant::now();
             // The immutable borrow of `slot.entry` this match creates lives
@@ -164,7 +175,7 @@ impl CommandCache {
                     if let Some(slot) = slots.get_mut(&key) {
                         slot.touched = now;
                     }
-                    Some(rx)
+                    NextStep::Wait(rx)
                 }
                 Lookup::Miss { existed } => {
                     let (tx, _) = broadcast::channel(4);
@@ -178,19 +189,30 @@ impl CommandCache {
                     if !existed {
                         self.evict_locked(&mut slots);
                     }
-                    None
+                    // `now` was read under this same lock, before the
+                    // InFlight entry became visible to any other caller — so
+                    // no `note_live` write can have an earlier timestamp and
+                    // still lose to this probe. Reusing it as `started`
+                    // instead of taking a fresh `Instant::now()` after the
+                    // lock is released closes a real TOCTOU window: a
+                    // `note_live` landing in that gap would otherwise carry
+                    // an `at` provably before a freshly-captured `started`,
+                    // so `commit`'s `*at > started` guard would wrongly
+                    // discard the live write and keep the stale probe.
+                    NextStep::Probe(now)
                 }
             }
         };
-        if let Some(mut rx) = waiter {
-            return match rx.recv().await {
+        match step {
+            NextStep::Wait(mut rx) => match rx.recv().await {
                 Ok(result) => result,
                 Err(_) => Err("command discovery was dropped".into()),
-            };
+            },
+            NextStep::Probe(started) => {
+                let result = probe(key.1.clone()).await;
+                self.commit(key, started, result)
+            }
         }
-        let started = Instant::now();
-        let result = probe(key.1.clone()).await;
-        self.commit(key, started, result)
     }
 
     /// A running session's own list. It came from a real session in that cwd,
@@ -389,9 +411,14 @@ mod tests {
         assert_eq!(probes.load(Ordering::SeqCst), 1, "single-flight");
     }
 
-    #[tokio::test]
-    async fn a_live_write_resolves_waiters_and_beats_the_late_probe() {
-        let cache = std::sync::Arc::new(CommandCache::new());
+    // Shared by both runtime flavors below: current-thread can never actually
+    // preempt across the await points here, so it only proves the logic is
+    // right, not that it holds under real thread interleaving. The
+    // multi-thread variant is the one that could catch a regression of the
+    // TOCTOU fix in `get` (the `started` timestamp threaded out of the lock).
+    async fn live_write_resolves_waiters_and_beats_the_late_probe(
+        cache: std::sync::Arc<CommandCache>,
+    ) {
         let reader = {
             let cache = cache.clone();
             tokio::spawn(async move {
@@ -417,6 +444,24 @@ mod tests {
             .await
             .expect("cached");
         assert_eq!(after, vec![cmd("from-session")], "late probe discarded");
+    }
+
+    #[tokio::test]
+    async fn a_live_write_resolves_waiters_and_beats_the_late_probe() {
+        live_write_resolves_waiters_and_beats_the_late_probe(std::sync::Arc::new(
+            CommandCache::new(),
+        ))
+        .await;
+    }
+
+    // Same test, real OS-thread preemption: this is the flavor that could
+    // actually observe the TOCTOU window a current-thread runtime cannot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_live_write_resolves_waiters_and_beats_the_late_probe_multi_thread() {
+        live_write_resolves_waiters_and_beats_the_late_probe(std::sync::Arc::new(
+            CommandCache::new(),
+        ))
+        .await;
     }
 
     #[tokio::test]
