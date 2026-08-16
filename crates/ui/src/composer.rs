@@ -3255,10 +3255,9 @@ fn slash_cwd(chat: Option<&zeron_proto::Chat>, space: Option<&zeron_proto::Space
 }
 
 /// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is filtered locally per keystroke. Every edit still
-/// revalidates via `ListCommands` — no debounce or skeleton churn, because
-/// the engine's own cache (per harness + cwd) decides whether that costs a
-/// probe or just a cache hit.
+/// candidate list is fetched once per popup open (or when the workspace
+/// changes underneath it) via `ListCommands`, and filtered locally on every
+/// other keystroke — no RPC, debounce, or skeleton churn while typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
@@ -4050,6 +4049,9 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         }
+        // Captured before the token below is overwritten: was the popup
+        // closed (no token yet) prior to this edit, i.e. is this the open?
+        let opening = self.slash.token.is_none();
         self.slash.token = token.clone();
         self.slash.key = key.clone();
         self.slash.error = None;
@@ -4064,6 +4066,15 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         };
+        // Fetch only on open or when the workspace (cache key) changes. The
+        // token carries the query, so gating on token equality alone would
+        // issue a `ListCommands` on every keystroke — the list is already
+        // cached and narrowing it to the query is a local, free filter.
+        if !opening && !key_changed {
+            self.slash.loading = false;
+            self.refilter_slash(cx);
+            return;
+        }
         // Stale while revalidate: a cached list renders instantly with no
         // spinner, and the request below refreshes it. The engine owns expiry,
         // so the popup never has to guess when a skill was installed.
