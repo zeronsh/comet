@@ -1030,7 +1030,7 @@ fn finish_segment<'a>(
 }
 
 /// `~` / `~/…` → this host's home directory. Anything else passes through.
-fn expand_home(cwd: &str) -> String {
+pub(crate) fn expand_home(cwd: &str) -> String {
     match cwd.strip_prefix("~") {
         Some("") => crate::repos::home_dir().to_string_lossy().into_owned(),
         Some(rest) if rest.starts_with('/') => crate::repos::home_dir()
