@@ -609,8 +609,14 @@ async fn a_rejected_cwd_retries_once_from_home() {
         .commands(Some("/tmp/reject-cwd"))
         .await
         .expect("discovery falls back instead of failing");
-    // The retry succeeded, so the initialize-advertised list survives.
-    assert_eq!(commands.len(), 2, "{commands:?}");
+    // Only the retry's own session/new response makes the fixture send this
+    // update; the pre-retry error carries no commands. Pinning the exact
+    // list (not just its length) fails if the retry is ever deleted.
+    assert_eq!(
+        commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["home-retry"],
+        "{commands:?}"
+    );
 }
 
 #[tokio::test]

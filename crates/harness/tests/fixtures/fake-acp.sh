@@ -54,6 +54,7 @@ elif has "$line" '"method":"session/new"'; then
     read -r line || exit 1
     has "$line" '"method":"session/new"' || exit 1
     has "$line" '"cwd":"/tmp/reject-cwd"' && exit 1
+    RETRIED=1
   fi
   has "$line" '"mcpServers":[]' || exit 1
   # Advertise config options: model (current differs from the tests' request,
@@ -66,6 +67,12 @@ elif has "$line" '"method":"session/new"'; then
   # window where request_draining used to discard notifications.
   if has "$line" '"cwd":"/tmp/live-commands"'; then
     update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"live","description":"From the session"}]}'
+  fi
+  # The reject-cwd retry succeeded: prove discovery actually consumed the
+  # retried session, not just the pre-retry error, by advertising a command
+  # only the retry's own session/new response can trigger.
+  if [ "$RETRIED" = "1" ]; then
+    update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"home-retry","description":"Answered after the retry from home"}]}'
   fi
 else
   exit 1
