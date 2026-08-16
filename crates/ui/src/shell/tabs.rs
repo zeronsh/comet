@@ -6,6 +6,28 @@
 //! longer read or written.
 
 use super::*;
+use zeron_proto::AgentAccount;
+
+/// The titlebar's account label for a chat's harness. Pure.
+///
+/// Names the login the harness would actually spend — `active` is the one the
+/// CLI currently holds, not merely a saved slot. Identity costs nothing to
+/// read: the engine serves it from `~/.claude/.credentials.json` (or the
+/// Keychain) without touching the network.
+///
+/// `None` when there is nothing worth saying — no live account for this
+/// harness, or a login with no email to name it by (a raw API key).
+pub(super) fn account_label(
+    accounts: &[AgentAccount],
+    harness: zeron_proto::HarnessId,
+) -> Option<SharedString> {
+    let account = accounts.iter().find(|a| a.harness == harness && a.active)?;
+    let who = account.email.clone()?;
+    Some(SharedString::from(match account.organization.as_deref() {
+        Some(org) => format!("{who} ({org})"),
+        None => who,
+    }))
+}
 
 impl Shell {
     /// Boot landing: the most recently active visible chat once the first
@@ -69,10 +91,11 @@ impl Shell {
         // drag region, and buttons. A session appends its target as a muted
         // "project @ device" tag right of the title (the composer footer no
         // longer carries it).
-        let (title, target, harness, on_canvas): (
+        let (title, target, harness, locally_hosted, on_canvas): (
             SharedString,
             Option<SharedString>,
             Option<zeron_proto::HarnessId>,
+            bool,
             bool,
         ) = {
             let state = self.state.read(cx);
@@ -93,10 +116,11 @@ impl Shell {
                         )),
                         Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
+                        state.local_device_id.as_deref() == Some(chat.device_id.as_str()),
                         false,
                     )
                 }
-                None => (SharedString::from(""), None, None, true),
+                None => (SharedString::from(""), None, None, false, true),
             }
         };
 
@@ -122,6 +146,18 @@ impl Shell {
         // click. Closed, it is just the stable open/close toggle. Hidden on
         // the new-session canvas (user request) — nothing to diff yet.
         let takeover = !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
+        // Hidden on the canvas (no session, so no harness to name), in
+        // takeover (the pane header owns the whole band), and for a chat
+        // hosted on ANOTHER device.
+        //
+        // The remote case is a correctness bar, not polish: this list is the
+        // LOCAL device's logins, while a chat on another device runs on that
+        // device's account. Naming the local one there would be confidently
+        // wrong, which is worse than silent.
+        let account = (!on_canvas && !takeover && locally_hosted)
+            .then_some(harness)
+            .flatten()
+            .and_then(|harness| account_label(&self.agent_accounts, harness));
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
         // inset would push the scope dropdown off the pane's own left gutter
@@ -275,6 +311,19 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            // The account sits in the row's slack, right-aligned before the
+            // pane buttons — NOT beside the `folder @ device` tag. Next to the
+            // tag it would be another `flex_none` sibling of the truncating
+            // title, so a long session name would give up characters to make
+            // room for an email. Here it only consumes space the spacer was
+            // already eating.
+            .children(account.map(|account| {
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(account)
+            }))
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
@@ -283,5 +332,122 @@ impl Shell {
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod account_label_tests {
+    use super::*;
+    use zeron_proto::HarnessId;
+
+    fn account(
+        harness: HarnessId,
+        active: bool,
+        email: Option<&str>,
+        org: Option<&str>,
+    ) -> AgentAccount {
+        AgentAccount {
+            id: "slot".into(),
+            harness,
+            email: email.map(Into::into),
+            plan_label: Some("Team".into()),
+            active,
+            usage_windows: Vec::new(),
+            display_name: None,
+            organization: org.map(Into::into),
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    fn label(accounts: &[AgentAccount], harness: HarnessId) -> Option<String> {
+        account_label(accounts, harness).map(|s| s.to_string())
+    }
+
+    #[test]
+    fn names_the_live_login_for_this_chats_harness() {
+        let accounts = vec![
+            account(
+                HarnessId::ClaudeCode,
+                true,
+                Some("dev@example.com"),
+                Some("Example Org"),
+            ),
+            account(HarnessId::Codex, true, Some("other@example.com"), None),
+        ];
+        assert_eq!(
+            label(&accounts, HarnessId::ClaudeCode).as_deref(),
+            Some("dev@example.com (Example Org)")
+        );
+        // A chat on another harness names THAT harness's login, not whichever
+        // account happens to come first.
+        assert_eq!(
+            label(&accounts, HarnessId::Codex).as_deref(),
+            Some("other@example.com")
+        );
+    }
+
+    #[test]
+    fn saved_but_inactive_slots_are_not_the_live_login() {
+        // Several accounts can be saved for one harness; only the one the CLI
+        // currently holds is the one a turn would spend.
+        let accounts = vec![
+            account(
+                HarnessId::ClaudeCode,
+                false,
+                Some("dormant@example.com"),
+                None,
+            ),
+            account(HarnessId::ClaudeCode, true, Some("live@example.com"), None),
+            account(
+                HarnessId::ClaudeCode,
+                false,
+                Some("also-dormant@example.com"),
+                None,
+            ),
+        ];
+        assert_eq!(
+            label(&accounts, HarnessId::ClaudeCode).as_deref(),
+            Some("live@example.com")
+        );
+    }
+
+    #[test]
+    fn a_personal_account_has_no_org_parenthetical() {
+        let solo = account(HarnessId::ClaudeCode, true, Some("solo@example.com"), None);
+        assert_eq!(
+            label(&[solo], HarnessId::ClaudeCode).as_deref(),
+            Some("solo@example.com")
+        );
+    }
+
+    #[test]
+    fn nothing_to_say_renders_nothing() {
+        assert!(account_label(&[], HarnessId::ClaudeCode).is_none());
+        // A login exists, but for a different harness.
+        let other = vec![account(
+            HarnessId::Codex,
+            true,
+            Some("dev@example.com"),
+            None,
+        )];
+        assert!(account_label(&other, HarnessId::ClaudeCode).is_none());
+        // Every slot dormant — no CLI login to name.
+        let dormant = vec![account(
+            HarnessId::ClaudeCode,
+            false,
+            Some("dev@example.com"),
+            None,
+        )];
+        assert!(account_label(&dormant, HarnessId::ClaudeCode).is_none());
+        // A raw API key has no email to name it by.
+        let keyed = vec![account(
+            HarnessId::ClaudeCode,
+            true,
+            None,
+            Some("Example Org"),
+        )];
+        assert!(account_label(&keyed, HarnessId::ClaudeCode).is_none());
     }
 }
