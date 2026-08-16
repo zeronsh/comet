@@ -50,11 +50,28 @@ carry that mismatch, and fixing one alone changes nothing:
    threaded through but the keys unchanged, the first project's list would serve every
    project.
 
-A fourth fact shapes the design. A live session already produces the correct list.
-`acp/mod.rs:2218-2222` emits `AgentEvent::AvailableCommands` from a session started in the
-real cwd. `doc/src/parts.rs:339-343` drops it, and no engine code reads it. The comment
-there claims the event "feeds the engine's per-harness command cache". No such cache
-exists. The comment is stale.
+A fourth fact shapes the design, and it is worse than it first looks. A live session runs in
+the real cwd, so it holds the correct list. Zeron never sees it. Two separate reasons:
+
+1. **The existing emission never fires for Claude.** `acp/mod.rs:2218-2222` emits
+   `AgentEvent::AvailableCommands`, but only from `init_commands`, which
+   `scan_available_commands` reads out of the **initialize** response
+   (`acp/mod.rs:2004`). Initialize runs before `session/new`, so that list is not
+   cwd-scoped, and for `claude-agent-acp` it is empty. Measured: driving the adapter by
+   hand, initialize and the `session/new` response both carry no commands. All 110 arrive
+   in one `available_commands_update` notification after `session/new`.
+2. **That notification is dropped.** Every run sends `session/new` through
+   `request_draining` (`acp/mod.rs:2036`, and `2010`/`2018` for the resume paths). That
+   helper answers server requests and discards notifications (`Some(_) => {}`,
+   `acp/mod.rs:1895`); its post-response flush handles only `Incoming::Request`
+   (`acp/mod.rs:1907-1911`). The update lands inside exactly that window.
+
+Only a mid-session update, sent after the handshake, reaches the main loop and
+`normalize.rs:365-368`.
+
+Then `doc/src/parts.rs:339-343` drops whatever does get through, and no engine code reads
+it. The comment there claims the event "feeds the engine's per-harness command cache". No
+such cache exists. The comment is stale.
 
 ## Design
 
@@ -77,6 +94,22 @@ composer popup ── ListCommands{harness, cwd} ── engine CommandCache ─�
 Two sources feed one cache. The probe serves cold projects and chats that never started.
 The live event corrects any chat that is running.
 
+### Making the live event real
+
+The live leg does not work today, for the two reasons in Why. It needs one contained change
+in the harness, in the run path:
+
+- `request_draining` gains an out-parameter for `available_commands_update`. It keeps
+  discarding every other notification, which is the behavior its doc comment describes and
+  the reason it exists (a replayed `session/load` must not re-enter the doc).
+- After the handshake, the run emits `AgentEvent::AvailableCommands` from the captured
+  update when there is one, and from `init_commands` otherwise. The gate at
+  `acp/mod.rs:2218` stops being "initialize said something" and becomes "we have a list".
+
+This is about fifteen lines. It is not free, as first assumed, but it is the only way the
+running-session correction exists at all, and it also fixes a silent hole: an agent that
+advertises its commands only after `session/new` is invisible to Zeron today.
+
 ### The harness probe
 
 `Harness::commands` stops caching and becomes a plain probe:
@@ -86,9 +119,19 @@ async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, Harness
 ```
 
 - The `OnceCell` at `acp/mod.rs:548` is deleted.
-- `discover_commands` passes the cwd to both `spawn_agent` and `session/new`.
+- `discover_commands` passes the cwd to `session/new` only. It does **not** set the child
+  process directory. `spawn_agent` calls `current_dir` (`acp/mod.rs:734-736`), and a
+  missing directory then fails the spawn with `ErrorKind::NotFound`, which maps to
+  `HarnessError::NotInstalled` (`acp/mod.rs:741-744`). A deleted worktree would report
+  "adapter not installed" and never reach the retry below. The adapter resolves skills from
+  the session cwd, so the child's own directory buys nothing.
+- With a `cwd` supplied, the probe always opens a session. Today it skips `session/new`
+  whenever initialize advertised commands (`acp/mod.rs:780-781`). That shortcut would make
+  the new cwd dead for any agent that answers initialize, and would fill every cwd key with
+  one identical list.
 - `cwd: None` means `$HOME`. That is today's behavior, kept for callers with no workspace.
-- The trait default still returns an empty list for non-ACP harnesses.
+- The trait default still returns an empty list for non-ACP harnesses. `MockHarness` and
+  `AcpHarness` are the only implementors, so the signature change is contained.
 
 `discover_models` keeps its own `OnceCell` and its `$HOME` cwd. Models are not treated as
 workspace-scoped in this spec. See Non-goals.
@@ -111,17 +154,18 @@ cache in the engine is fed by both, and the harness stays a thin protocol client
 | Concurrency | single-flight per key; waiters subscribe to the in-flight probe |
 | Live write | `AvailableCommands` overwrites `(harness, run_cwd)` and resets its TTL |
 
-Key normalization reuses `expand_home` (`sessions.rs:1032-1042`) and trims trailing
-separators. The engine runs on the host device, so it expands `~` with the right home.
-This matters for the live write: `run_cwd` is `request.cwd`, which can still hold `~`
-(`sessions.rs:1072`). Both writers must produce the same key, or a running chat would fill
-one entry while the popup reads another.
+Key normalization reuses `expand_home` and trims trailing separators. `expand_home` is
+private to `sessions.rs:1032-1042` today, so it moves or becomes `pub(crate)`.
 
-The live write keys by the **request** cwd, not by the cwd on the `SessionStarted` event.
-The rule next door is the opposite: `sessions.rs:1577` scopes a stored session id by the
-event's own cwd, because that is where the harness really created the session. The command
-cache needs the other one. The popup looks up by `chat.cwd`, which is the request cwd, so
-keying by the event would fill an entry that nothing ever reads.
+Only the RPC side needs the expansion. The run path already expands at
+`sessions.rs:298` ("expand it here, on the host, where the run spawns") before `drive_run`
+captures `run_cwd` (`sessions.rs:1072`), so the live write always carries an absolute path.
+The popup can still send `~` for a project-less chat. Both writers must land on one key.
+
+The live write keys by `run_cwd`. For the ACP harness this is not a real fork in the road:
+`SessionStarted` carries `request.cwd` verbatim (`acp/mod.rs:2208`), so the event's cwd and
+the request's cwd are the same value. The contrasting rule at `sessions.rs:1577`, which
+scopes a stored session id by the event's own cwd, does not apply here.
 
 Entry states are explicit, which makes single-flight testable:
 
@@ -129,31 +173,55 @@ Entry states are explicit, which makes single-flight testable:
 - `Failed { error, at }`
 - `InFlight { subscribers }`
 
-A read that finds `InFlight` waits on it. A read that finds a stale entry treats it as a
-miss and probes. The engine never answers with a stale list, because it has no way to push
-a correction afterwards. Freshness on the wire keeps the UI's own stale-while-revalidate
-render honest.
+Read rules:
+
+- `InFlight` waits on the in-flight probe.
+- A stale entry counts as a miss and probes. The engine never answers with a stale list,
+  because it has no way to push a correction afterwards. Freshness on the wire keeps the
+  UI's own stale-while-revalidate render honest.
+
+Write and eviction rules, because these are the cases the unit tests exist to pin:
+
+- A live write onto `InFlight` resolves the waiters with the live list and marks the entry
+  `Fresh`. The live list came from a real session in that cwd, so it is at least as good as
+  the probe's.
+- A probe result that lands on an entry already made `Fresh` by a later live write is
+  discarded. Newest write wins, compared by timestamp, never by arrival order.
+- LRU eviction skips `InFlight` entries. Evicting one would orphan its waiters.
+- The cache lock is never held across an await. A read takes the lock, decides, and drops
+  it before probing or waiting.
 
 ### The RPC
 
 `ListCommands` gets its own params struct instead of borrowing `ListModelsParams`:
 
 ```rust
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListCommandsParams {
     harness: HarnessId,
     cwd: Option<String>,
-    target_device_id: Option<String>,
 }
 ```
+
+The struct carries no `targetDeviceId`. Forwarding reads that field from the raw params
+before any parse (`rpc.rs:986-992`), and `LIST_COMMANDS` is already forwardable
+(`rpc.rs:766-772`), so the new `cwd` rides to the host device with no routing work.
 
 `cwd` is optional. An engine on an older device ignores the unknown field and answers with
 its `$HOME` list, so version skew degrades to today's behavior instead of failing.
 
 ### The composer
 
-`slash_cache` is keyed by `(HarnessId, String)`. The cwd resolves when the popup opens:
+`slash_cache` is keyed by `(HarnessId, Option<DeviceId>, String)`. The device belongs in the
+key because the popup already targets a device (`composer.rs:4032-4044`), and two devices
+share the same path string for every project-less chat. Without it, one device's list
+renders for a chat hosted on another.
 
-- selected chat: `chat.cwd`
+The cwd resolves when the popup opens:
+
+- selected chat: `chat.cwd`, or `~` when it is `None` (the field is optional,
+  `composer.rs:4414-4418`)
 - new chat: the space path, or `~` when project-less
 - the checkout plan is ignored
 
@@ -208,20 +276,31 @@ The clean fix belongs upstream: a capabilities handshake that lists commands wit
 - key normalization: `~`, trailing separator, two spellings of one path
 - a stale entry is treated as a miss, not served
 - TTL expiry and negative TTL
-- LRU bound at 16 entries
+- LRU bound at 16 entries, and eviction skipping `InFlight`
 - single-flight: two concurrent reads of one cold key produce one probe
+- a live write onto `InFlight` resolves the waiters, and the late probe result is discarded
 
-**Harness, extending `crates/harness/tests/acp.rs:580`**
-- the mock agent asserts `session/new` receives the requested cwd
+**Harness, in `crates/harness/tests/acp.rs`**
+- the `fake-acp.sh` fixture asserts `session/new` receives the requested cwd
 - a rejected cwd triggers exactly one `$HOME` retry
+- a fixture that sends `available_commands_update` immediately after the `session/new`
+  response produces one `AgentEvent::AvailableCommands` in the run's event stream. This is
+  the regression test for the dropped notification, and it fails against today's code.
+- the existing `commands_discovery_scans_the_initialize_response` (line 580) asserts that a
+  second call is served from cache. Deleting the `OnceCell` invalidates that assertion, so
+  the test loses its caching half. The caching contract moves to the engine unit tests.
 
 **Engine**
 - an `AvailableCommands` event during a run writes `(harness, run_cwd)`
 - a later `ListCommands` for that cwd returns it with no probe
 
 **UI**
-- cwd resolution for the three cases: chat row, space row, project-less
-- switching the project picker changes the cache key
+The ui crate has no `TestAppContext` or `gpui::test` coverage today, so a test that drives
+the popup is not writable against the current infrastructure. Rather than add a gpui test
+harness for this change, cwd resolution is factored into a pure function that takes the
+selected chat row, the selected space row, and the device id, and returns the cache key.
+The tests cover that function, next to the existing pure-function tests at
+`composer.rs:5648`. Anything beyond it is covered by the manual E2E below.
 
 **Manual E2E**
 - open a project with installed project skills, type `/`, confirm they appear
