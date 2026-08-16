@@ -35,6 +35,8 @@ struct HomeView: View {
             .contentMargins(.top, 2, for: .scrollContent)
             .scrollContentBackground(.hidden)
             .scrollEdgeEffectStyle(.soft, for: .top)
+            // The list now scrolls under the bottom bar's glass.
+            .scrollEdgeEffectStyle(.soft, for: .bottom)
             .background(Theme.surface.ignoresSafeArea())
             .navigationTitle("Zeron")  // feeds the back menu; not displayed
             .navigationBarTitleDisplayMode(.inline)
@@ -73,9 +75,6 @@ struct HomeView: View {
                 }
                 .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
-                    newButton
-                }
-                ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         if model.demo != nil {
                             Text("Demo mode")
@@ -84,6 +83,13 @@ struct HomeView: View {
                     } label: {
                         Image(systemName: "person.circle")
                     }
+                }
+                // "+" lives on the bottom bar, in thumb reach. Bottom-bar
+                // items lay out from the leading edge, so a flexible spacer
+                // ahead of it does the trailing alignment.
+                ToolbarSpacer(.flexible, placement: .bottomBar)
+                ToolbarItem(placement: .bottomBar) {
+                    newButton
                 }
             }
             .sheet(isPresented: $showNewSpace) {
