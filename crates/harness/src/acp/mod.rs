@@ -544,8 +544,6 @@ pub struct AcpHarness {
     /// Bound on the initialize → session handshake; a hang past it errors the
     /// run instead of spinning "Working" forever.
     handshake_timeout: Duration,
-    /// Discovery result cache: the advertised commands survive across calls.
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
@@ -562,7 +560,6 @@ impl AcpHarness {
             // (session/load replays from disk), so a hang past this is a
             // wedged agent, not a slow one.
             handshake_timeout: Duration::from_secs(120),
-            commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
         }
     }
@@ -759,12 +756,19 @@ impl AcpHarness {
         Ok((child, stderr_tail))
     }
 
-    /// Short-lived discovery run for [`Harness::commands`]: initialize, scan
-    /// the response, then try one unauthenticated `session/new` and wait
-    /// briefly for `available_commands_update`. Best-effort — an agent that
-    /// refuses sessions before login still surfaces whatever the handshake
-    /// advertised.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Short-lived discovery run: initialize, scan the response, then open one
+    /// session in `cwd` and wait briefly for `available_commands_update`.
+    /// Best-effort — an agent that refuses sessions before login still
+    /// surfaces whatever the handshake advertised.
+    ///
+    /// The cwd rides `session/new` only. Setting it as the CHILD's working
+    /// directory would turn a deleted worktree into a spawn `NotFound`, which
+    /// this module reports as `NotInstalled` ("adapter missing") — a lie the
+    /// user cannot act on.
+    async fn discover_commands(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (mut child, _stderr) = self.spawn_agent(None, false).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -778,11 +782,22 @@ impl AcpHarness {
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
             let mut commands = scan_available_commands(&init);
-            if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-                let session = client
-                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            let home = || std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            // With a workspace asked for, ALWAYS open a session: the initialize
+            // list is not cwd-scoped, so trusting it would make the workspace
+            // moot for every agent that answers initialize.
+            if cwd.is_some() || commands.is_empty() {
+                let requested = cwd.map(str::to_string).unwrap_or_else(home);
+                let mut session = client
+                    .request("session/new", json!({ "cwd": requested, "mcpServers": [] }))
                     .await;
+                if session.is_err() && cwd.is_some() {
+                    // A path that no longer exists (deleted worktree): one retry
+                    // from home, so the popup still shows the built-ins.
+                    session = client
+                        .request("session/new", json!({ "cwd": home(), "mcpServers": [] }))
+                        .await;
+                }
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
                     // session response; 2s bounds a quiet agent.
@@ -1167,11 +1182,8 @@ impl Harness for AcpHarness {
         }
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
-            .await
-            .cloned()
+    async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.discover_commands(cwd).await
     }
 
     async fn run(

@@ -67,9 +67,12 @@ pub trait Harness: Send + Sync {
         true
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
-    /// Slash commands the agent advertises (ACP `availableCommands`); empty
-    /// for harnesses without them. May spawn a short-lived discovery process.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Slash commands the agent advertises for one workspace (ACP
+    /// `availableCommands`); empty for harnesses without them. `cwd` is a path
+    /// on THIS device; `None` means the host's home directory. May spawn a
+    /// short-lived discovery process — callers are expected to cache.
+    async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let _ = cwd;
         Ok(Vec::new())
     }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.

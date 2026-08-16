@@ -1030,7 +1030,7 @@ impl RpcService for EngineRpc {
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
-                    .commands()
+                    .commands(None)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)

@@ -47,6 +47,14 @@ if has "$line" '"method":"session/load"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{}}"
   fi
 elif has "$line" '"method":"session/new"'; then
+  # Reject one marker cwd once, then require the retry to use a different
+  # directory. Exercises the deleted-worktree path.
+  if has "$line" '"cwd":"/tmp/reject-cwd"'; then
+    emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32602,\"message\":\"bad cwd\"}}"
+    read -r line || exit 1
+    has "$line" '"method":"session/new"' || exit 1
+    has "$line" '"cwd":"/tmp/reject-cwd"' && exit 1
+  fi
   has "$line" '"mcpServers":[]' || exit 1
   # Advertise config options: model (current differs from the tests' request,
   # forcing a set) and thought_level (current high). The model config option

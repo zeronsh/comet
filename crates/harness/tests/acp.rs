@@ -579,14 +579,38 @@ async fn failed_load_falls_back_to_a_fresh_session() {
 #[tokio::test]
 async fn commands_discovery_scans_the_initialize_response() {
     let harness = harness();
-    let commands = harness.commands().await.expect("discovery");
+    let commands = harness.commands(None).await.expect("discovery");
     assert_eq!(commands.len(), 2, "{commands:?}");
     assert_eq!(commands[0].name, "compact");
     assert_eq!(commands[1].name, "goal");
     assert_eq!(commands[1].input_hint.as_deref(), Some("the goal"));
-    // Cached: a second call must not respawn (same result, instant).
-    let again = harness.commands().await.expect("cached");
-    assert_eq!(again, commands);
+}
+
+#[tokio::test]
+async fn commands_discovery_opens_a_session_in_the_requested_cwd() {
+    let harness = harness();
+    let commands = harness
+        .commands(Some("/tmp/live-commands"))
+        .await
+        .expect("discovery");
+    // The session's list replaces the initialize list, even though initialize
+    // advertised two commands: only the session knows the workspace.
+    assert_eq!(
+        commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["live"],
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_cwd_retries_once_from_home() {
+    let harness = harness();
+    let commands = harness
+        .commands(Some("/tmp/reject-cwd"))
+        .await
+        .expect("discovery falls back instead of failing");
+    // The retry succeeded, so the initialize-advertised list survives.
+    assert_eq!(commands.len(), 2, "{commands:?}");
 }
 
 #[tokio::test]
