@@ -323,7 +323,12 @@ exit 1
             let shell = fake_shell(
                 dir.path(),
                 &format!(
-                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/zeron-test/fallback/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
+                    // `/usr/bin` must stay on the fixture's PATH: the probe
+                    // script runs `env`, which lives only at /usr/bin/env on
+                    // macOS. Without it the shell finds no `env`, prints the
+                    // markers with nothing between them, and the fallback looks
+                    // like a failure that only reproduces off Linux.
+                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/zeron-test/fallback/bin:/usr/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
                 ),
             );
             let start = Instant::now();
