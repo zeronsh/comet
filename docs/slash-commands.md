@@ -1,6 +1,6 @@
 # Slash commands: per-workspace discovery
 
-Status: PLANNED · 2026-08-16 investigation (project skills missing from the composer popup).
+Status: IMPLEMENTED on `slash-commands-per-workspace`, not yet merged · 2026-08-16 investigation (project skills missing from the composer popup).
 
 ## Why
 
