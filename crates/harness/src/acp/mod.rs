@@ -1877,12 +1877,14 @@ fn cursor_answer_outcome(asked: &[CursorQuestion], answers: &[UserInputAnswer]) 
 /// Await a setup request while draining incoming messages, so a `session/load`
 /// whose replay outruns the incoming channel's capacity can't deadlock the
 /// reader. Replayed `session/update`s are dropped (the doc already holds the
-/// history); server requests are answered.
+/// history) except `available_commands_update`, which is captured (see
+/// [`capture_available_commands`]); server requests are answered.
 async fn request_draining(
     client: &RpcClient,
     incoming: &mut mpsc::Receiver<Incoming>,
     method: &'static str,
     params: Value,
+    captured: &mut Option<Vec<SlashCommand>>,
 ) -> Result<Value, HarnessError> {
     let mut fut = prompt_like_request(client.clone(), method, params);
     let res = loop {
@@ -1891,6 +1893,9 @@ async fn request_draining(
             inc = incoming.recv() => match inc {
                 Some(Incoming::Request { id, method, params }) => {
                     handle_server_request(client, id, &method, &params);
+                }
+                Some(Incoming::Notification { method, params }) => {
+                    capture_available_commands(&method, &params, captured);
                 }
                 Some(_) => {}
                 None => {
@@ -1905,11 +1910,37 @@ async fn request_draining(
     // replay updates the reader forwarded BEFORE the response line may still
     // sit in the buffer — flush them now or they'd leak into the live turn.
     while let Ok(inc) = incoming.try_recv() {
-        if let Incoming::Request { id, method, params } = inc {
-            handle_server_request(client, id, &method, &params);
+        match inc {
+            Incoming::Request { id, method, params } => {
+                handle_server_request(client, id, &method, &params);
+            }
+            Incoming::Notification { method, params } => {
+                capture_available_commands(&method, &params, captured);
+            }
+            _ => {}
         }
     }
     res
+}
+
+/// The one notification the setup window must not drop: agents that advertise
+/// their commands only after `session/new` (claude-agent-acp) send it here, and
+/// the list is cwd-scoped, which is the whole point of per-workspace discovery.
+/// Every other replayed update stays dropped — the doc already holds that history.
+fn capture_available_commands(method: &str, params: &Value, out: &mut Option<Vec<SlashCommand>>) {
+    if method != "session/update" {
+        return;
+    }
+    let Some(update) = params.get("update") else {
+        return;
+    };
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("available_commands_update") {
+        return;
+    }
+    let commands = parse_commands(update.get("availableCommands"));
+    if !commands.is_empty() {
+        *out = Some(commands);
+    }
 }
 
 fn prompt_like_request(
@@ -2002,12 +2033,24 @@ async fn run_session(session: Session) {
             .await?;
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
+        // The session's own advertisement is cwd-scoped, unlike the
+        // initialize list; captured here so claude-agent-acp's post-session/new
+        // `available_commands_update` (never seen at initialize) is not lost.
+        let mut session_commands: Option<Vec<SlashCommand>> = None;
 
         let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
-            match request_draining(&client, &mut incoming, "session/load", load).await {
+            match request_draining(
+                &client,
+                &mut incoming,
+                "session/load",
+                load,
+                &mut session_commands,
+            )
+            .await
+            {
                 Ok(resp) => (resume.clone(), resp),
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
@@ -2020,6 +2063,7 @@ async fn run_session(session: Session) {
                         &mut incoming,
                         "session/new",
                         session_params.clone(),
+                        &mut session_commands,
                     )
                     .await?;
                     (
@@ -2032,8 +2076,14 @@ async fn run_session(session: Session) {
                 }
             }
         } else {
-            let new =
-                request_draining(&client, &mut incoming, "session/new", session_params).await?;
+            let new = request_draining(
+                &client,
+                &mut incoming,
+                "session/new",
+                session_params,
+                &mut session_commands,
+            )
+            .await?;
             (
                 new.get("sessionId")
                     .and_then(Value::as_str)
@@ -2079,6 +2129,7 @@ async fn run_session(session: Session) {
                     &mut incoming,
                     "session/set_config_option",
                     Value::Object(params),
+                    &mut session_commands,
                 )
                 .await
                 {
@@ -2117,6 +2168,7 @@ async fn run_session(session: Session) {
                 &mut incoming,
                 "session/set_config_option",
                 Value::Object(params),
+                &mut session_commands,
             )
             .await
             {
@@ -2126,13 +2178,14 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
+        Ok::<(String, bool, Vec<SlashCommand>, Option<Vec<SlashCommand>>), HarnessError>((
             session_id,
             steer_ext,
             init_commands,
+            session_commands,
         ))
     };
-    let (session_id, steer_ext, init_commands) = tokio::select! {
+    let (session_id, steer_ext, init_commands, session_commands) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -2215,11 +2268,13 @@ async fn run_session(session: Session) {
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
-    if !init_commands.is_empty()
+    // The session's own list wins: it is cwd-scoped, the initialize list is not.
+    let advertised = session_commands.unwrap_or(init_commands);
+    if !advertised.is_empty()
         && !send(
             &event_tx,
             AgentEvent::AvailableCommands {
-                commands: init_commands,
+                commands: advertised,
             },
         )
         .await

@@ -53,6 +53,12 @@ elif has "$line" '"method":"session/new"'; then
   # feeds discovery first; the first-class `models` state (SessionModelState)
   # is the legacy fallback — codex-acp enumerates model × effort there.
   emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+  # Marker cwd: advertise commands the way claude-agent-acp does — as an
+  # update sent right after the session/new response, inside the handshake
+  # window where request_draining used to discard notifications.
+  if has "$line" '"cwd":"/tmp/live-commands"'; then
+    update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"live","description":"From the session"}]}'
+  fi
 else
   exit 1
 fi

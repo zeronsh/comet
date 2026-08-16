@@ -590,6 +590,44 @@ async fn commands_discovery_scans_the_initialize_response() {
 }
 
 #[tokio::test]
+async fn available_commands_update_in_the_handshake_reaches_the_run_stream() {
+    let harness = harness();
+    // An inert scenario: `scenario:happy` also advertises `deep-research`
+    // mid-turn, which would always postdate (and shadow) the handshake
+    // capture, defeating the last-write-wins assertion below.
+    let mut req = request("scenario:resumed");
+    req.cwd = "/tmp/live-commands".into();
+    // spawn_agent sets this cwd as the child process's real working
+    // directory (not just a session/new field), so the marker path must
+    // exist on disk for the spawn to succeed.
+    std::fs::create_dir_all(&req.cwd).expect("create marker cwd");
+    let (controls, _steer, _cancel) = controls();
+    let stream = harness.run(req, controls).await.expect("run starts");
+    let events: Vec<AgentEvent> = stream.filter_map(|e| async { e.ok() }).collect().await;
+    // Assert on the LAST such event, not on the flattened set. This fixture
+    // also advertises `compact`/`goal` at initialize, and whether the update is
+    // caught by the handshake capture or by the main loop depends on a read
+    // race, so the stream may legitimately carry two events. Last write wins
+    // in production too: `note_live` overwrites the cache entry.
+    let advertised = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AvailableCommands { commands } => Some(commands.clone()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or_default();
+    assert_eq!(
+        advertised
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["live"],
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn missing_binary_surfaces_not_installed_with_install_hint() {
     let harness = AcpHarness::grok().with_executable("/nonexistent/definitely-not-grok");
     let err = harness
