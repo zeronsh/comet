@@ -88,6 +88,16 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListCommandsParams {
+    harness: HarnessId,
+    /// A path on the HOST device. Absent means the host's home directory,
+    /// which is what an engine older than this field always answered.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
@@ -1021,18 +1031,25 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
-                // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery. Non-ACP harnesses return
-                // an empty list from the trait default.
-                let p: ListModelsParams = parse_params(params)?;
+                // Commands are per workspace, not per harness: project skills
+                // exist only for a session opened in the project. The cache
+                // absorbs the cost — a probe spawns an agent process.
+                let p: ListCommandsParams = parse_params(params)?;
                 let harness = self
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let commands = harness
-                    .commands(None)
+                let commands = self
+                    .sessions
+                    .command_cache()
+                    .get(p.harness, p.cwd.as_deref(), |cwd| async move {
+                        harness
+                            .commands(Some(&cwd))
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
                     .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    .map_err(RpcError::Failed)?;
                 RpcReply::value(&commands)
             }
             methods::QUEUE_COMMAND => {

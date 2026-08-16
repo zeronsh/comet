@@ -98,6 +98,9 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    /// Slash commands per workspace. Fed by discovery probes (via the RPC) and
+    /// by any running session's own `AvailableCommands`.
+    commands: Arc<crate::commands::CommandCache>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -148,6 +151,7 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
+                commands: Arc::new(crate::commands::CommandCache::new()),
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -169,6 +173,11 @@ impl SessionsEngine {
         if slot.is_none() {
             *slot = Some(host);
         }
+    }
+
+    /// Shared with the RPC surface: `ListCommands` reads it, runs write it.
+    pub fn command_cache(&self) -> Arc<crate::commands::CommandCache> {
+        self.inner.commands.clone()
     }
 
     /// Sever the doc-host back-edge (runtime retirement; the doc host's
@@ -1591,6 +1600,14 @@ async fn drive_run(
             }
             AgentEvent::InputResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
+            }
+            AgentEvent::AvailableCommands { commands } => {
+                // `run_cwd` is already home-expanded (dispatch does it at the
+                // top), which is the same normalization the cache applies to a
+                // `ListCommands` cwd — so both writers land on one key.
+                inner
+                    .commands
+                    .note_live(harness_id, &run_cwd, commands.clone());
             }
             _ => {}
         }

@@ -336,8 +336,8 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        // AvailableCommands feeds the engine's per-harness command cache, not
-        // the transcript.
+        // AvailableCommands feeds the engine's per-workspace command cache
+        // (`engine::commands`), not the transcript.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::AvailableCommands { .. } => {}
