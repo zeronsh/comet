@@ -3218,17 +3218,55 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// Cache identity for one command list. The device belongs in the key because
+/// every project-less chat, on every device, shares the path `~`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SlashCacheKey {
+    harness: HarnessId,
+    device: Option<String>,
+    cwd: String,
+}
+
+fn slash_cache_key(harness: HarnessId, device: Option<&str>, cwd: &str) -> SlashCacheKey {
+    SlashCacheKey {
+        harness,
+        device: device.map(str::to_string),
+        cwd: cwd.to_string(),
+    }
+}
+
+/// Where the popup's commands come from: the chat's own directory, else the
+/// picked project's folder, else the host's home. Mirrors the send path's rule
+/// (`queue_send`), minus the checkout plan — a fresh worktree has no directory
+/// yet when the popup opens, and a worktree of the same repo carries the same
+/// tracked skills anyway.
+fn slash_cwd(chat: Option<&zeron_proto::Chat>, space: Option<&zeron_proto::Space>) -> String {
+    if let Some(chat) = chat {
+        return chat
+            .cwd
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "~".to_string());
+    }
+    space
+        .map(|s| s.path.clone())
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "~".to_string())
+}
+
 /// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// candidate list is filtered locally per keystroke. Every edit still
+/// revalidates via `ListCommands` — no debounce or skeleton churn, because
+/// the engine's own cache (per harness + cwd) decides whether that costs a
+/// probe or just a cache hit.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
     active: Option<usize>,
-    /// Harness the popup is showing commands for (cache key).
-    harness: Option<HarnessId>,
+    /// Harness + device + cwd the popup is showing commands for (cache key).
+    key: Option<SlashCacheKey>,
     request: u64,
     loading: bool,
     error: Option<SharedString>,
@@ -3309,9 +3347,10 @@ pub struct Composer {
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash: SlashState,
-    /// Advertised commands per harness (one `ListCommands` per harness per
-    /// composer lifetime; the engine caches discovery on its side too).
-    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    /// Advertised commands per (harness, device, cwd): stale-while-revalidate,
+    /// no TTL of its own — the engine owns expiry and decides whether a
+    /// `ListCommands` costs a real probe.
+    slash_cache: HashMap<SlashCacheKey, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
@@ -3996,13 +4035,23 @@ impl Composer {
         }
         self.slash.dismissed = None;
         let harness = self.pickers.read(cx).resolved(cx).harness;
-        let harness_changed = self.slash.harness != harness;
-        if token == self.slash.token && !harness_changed {
+        let (cwd, device) = {
+            let state = self.state.read(cx);
+            let chat = state.selected_chat_row();
+            let space = state.selected_space_row();
+            let device = chat
+                .map(|c| c.device_id.clone())
+                .or_else(|| space.map(|s| s.device_id.clone()));
+            (slash_cwd(chat, space), device)
+        };
+        let key = harness.map(|h| slash_cache_key(h, device.as_deref(), &cwd));
+        let key_changed = self.slash.key != key;
+        if token == self.slash.token && !key_changed {
             self.refilter_slash(cx);
             return;
         }
         self.slash.token = token.clone();
-        self.slash.harness = harness;
+        self.slash.key = key.clone();
         self.slash.error = None;
         if token.is_none() {
             self.slash.active = None;
@@ -4010,36 +4059,26 @@ impl Composer {
             return;
         }
         // No resolved harness (catalog still loading): empty popup, no fetch.
-        let Some(harness) = harness else {
+        let Some(key) = key else {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
-            self.slash.loading = false;
-            self.refilter_slash(cx);
-            return;
-        }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
+        // Stale while revalidate: a cached list renders instantly with no
+        // spinner, and the request below refreshes it. The engine owns expiry,
+        // so the popup never has to guess when a skill was installed.
+        let cached = self.slash_cache.contains_key(&key);
         self.slash.request = self.slash.request.wrapping_add(1);
-        self.slash.loading = true;
+        self.slash.loading = !cached;
         self.refilter_slash(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.slash.loading = false;
             return;
         };
-        let target = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
-        };
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+            let mut params = serde_json::json!({ "harness": key.harness, "cwd": key.cwd });
+            if let (Some(target), Some(object)) = (&key.device, params.as_object_mut()) {
                 object.insert("targetDeviceId".into(), target.clone().into());
             }
             let result = engine.client().call(methods::LIST_COMMANDS, params).await;
@@ -4051,7 +4090,7 @@ impl Composer {
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
+                            composer.slash_cache.insert(key.clone(), commands);
                         }
                         Err(err) => tracing::warn!(%err, "slash command decode failed"),
                     },
@@ -4077,8 +4116,9 @@ impl Composer {
             .unwrap_or_default();
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|k| self.slash_cache.get(k))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
@@ -4117,8 +4157,9 @@ impl Composer {
             .and_then(|active| self.slash.filtered.get(active))
             .and_then(|&ix| {
                 self.slash
-                    .harness
-                    .and_then(|h| self.slash_cache.get(&h))
+                    .key
+                    .as_ref()
+                    .and_then(|k| self.slash_cache.get(k))
                     .and_then(|c| c.get(ix))
             })
             .cloned()
@@ -4139,7 +4180,7 @@ impl Composer {
         self.slash = SlashState {
             request,
             dismissed,
-            harness: self.slash.harness,
+            key: self.slash.key.clone(),
             ..SlashState::default()
         };
         self.sync_mention_controls(cx);
@@ -4153,8 +4194,9 @@ impl Composer {
         let token = self.slash.token.as_ref()?;
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|k| self.slash_cache.get(k))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut card = crate::popover::popover_card(theme)
@@ -6413,5 +6455,68 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    // `Chat` and `Space` derive no Default, so these build full literals.
+    fn chat_row(cwd: Option<&str>) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: "c1".into(),
+            device_id: "dev-a".into(),
+            title: None,
+            archived: false,
+            cwd: cwd.map(str::to_string),
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    fn space_row(path: &str) -> zeron_proto::Space {
+        zeron_proto::Space {
+            id: "s1".into(),
+            device_id: "dev-a".into(),
+            path: path.into(),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn slash_cwd_prefers_the_chats_own_directory() {
+        assert_eq!(slash_cwd(Some(&chat_row(Some("/repo"))), None), "/repo");
+    }
+
+    #[test]
+    fn slash_cwd_falls_back_to_home_when_the_chat_has_none() {
+        // `Chat::cwd` is optional; a project-less chat runs from the host home.
+        assert_eq!(slash_cwd(Some(&chat_row(None)), None), "~");
+    }
+
+    #[test]
+    fn slash_cwd_uses_the_space_for_a_new_chat() {
+        assert_eq!(slash_cwd(None, Some(&space_row("/space"))), "/space");
+    }
+
+    #[test]
+    fn slash_cwd_is_home_without_a_chat_or_a_space() {
+        assert_eq!(slash_cwd(None, None), "~");
+    }
+
+    #[test]
+    fn the_cache_key_separates_devices_sharing_one_path() {
+        let a = slash_cache_key(HarnessId::ClaudeCode, Some("dev-a"), "~");
+        let b = slash_cache_key(HarnessId::ClaudeCode, Some("dev-b"), "~");
+        assert_ne!(a, b, "every project-less chat shares the path `~`");
     }
 }
