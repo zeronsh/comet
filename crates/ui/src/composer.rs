@@ -4070,8 +4070,11 @@ impl Composer {
         // token carries the query, so gating on token equality alone would
         // issue a `ListCommands` on every keystroke — the list is already
         // cached and narrowing it to the query is a local, free filter.
+        // `loading` is untouched here: with a fetch in flight it is already
+        // `true` and belongs to that request's own completion handler, which
+        // clears it when the response lands; without one it is already
+        // `false` from the `!cached` computation below.
         if !opening && !key_changed {
-            self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         }
