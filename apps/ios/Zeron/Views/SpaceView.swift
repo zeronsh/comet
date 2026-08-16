@@ -43,6 +43,8 @@ struct SpaceView: View {
         .environment(\.defaultMinListRowHeight, 10)
         .scrollContentBackground(.hidden)
         .scrollEdgeEffectStyle(.soft, for: .top)
+        // The list now scrolls under the bottom bar's glass.
+        .scrollEdgeEffectStyle(.soft, for: .bottom)
         .background(Theme.surface.ignoresSafeArea())
         .navigationTitle(space?.displayName ?? "Space")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
@@ -66,7 +68,10 @@ struct SpaceView: View {
                     }
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            // Same placement as Home's "+": bottom bar, trailing side, behind
+            // a flexible spacer (bottom-bar items lay out leading-first).
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
                 Button {
                     path.append(.newSession(spaceId: spaceId))
                 } label: {
