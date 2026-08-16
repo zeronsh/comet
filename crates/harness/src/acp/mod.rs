@@ -813,7 +813,14 @@ impl AcpHarness {
                                     if update.get("sessionUpdate").and_then(Value::as_str)
                                         == Some("available_commands_update")
                                     {
-                                        commands = parse_commands(update.get("availableCommands"));
+                                        // Mirrors `capture_available_commands` on the run
+                                        // path: an empty update (skill-less project) must
+                                        // not erase the built-ins the initialize list
+                                        // already gave us.
+                                        let parsed = parse_commands(update.get("availableCommands"));
+                                        if !parsed.is_empty() {
+                                            commands = parsed;
+                                        }
                                         break;
                                     }
                                 }
