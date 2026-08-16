@@ -4054,14 +4054,16 @@ impl Composer {
         let opening = self.slash.token.is_none();
         self.slash.token = token.clone();
         self.slash.key = key.clone();
-        self.slash.error = None;
         if token.is_none() {
             self.slash.active = None;
             self.sync_mention_controls(cx);
             return;
         }
         // No resolved harness (catalog still loading): empty popup, no fetch.
+        // Clear a stale error here too — an unresolved harness must not show
+        // the previous workspace's failure message.
         let Some(key) = key else {
+            self.slash.error = None;
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
@@ -4081,6 +4083,12 @@ impl Composer {
         // Stale while revalidate: a cached list renders instantly with no
         // spinner, and the request below refreshes it. The engine owns expiry,
         // so the popup never has to guess when a skill was installed.
+        // `error` clears here, not on every token change: a fetch is about to
+        // be issued, so a previous failure is either about to be superseded
+        // or about to be reissued — either way it must not linger through
+        // keystrokes that don't refetch and silently downgrade to "no
+        // commands".
+        self.slash.error = None;
         let cached = self.slash_cache.contains_key(&key);
         self.slash.request = self.slash.request.wrapping_add(1);
         self.slash.loading = !cached;
