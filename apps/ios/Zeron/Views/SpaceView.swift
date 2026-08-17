@@ -78,7 +78,7 @@ struct SpaceView: View {
                     Label("New session", systemImage: "plus")
                 }
                 // Same violet "create" disc as Home's "+".
-                .tint(Theme.violet)
+                .tint(Theme.violetStrong)
                 .buttonStyle(.borderedProminent)
             }
         }

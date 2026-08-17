@@ -33,8 +33,12 @@ enum Theme {
     // ---- paint: accents ----
     static let accent = oklch(0.673, 0.182, 276.935)        // indigo-400
     static let accentStrong = oklch(0.585, 0.233, 277.117)  // indigo-500
-    /// violet-400 — the create/compose hue (the "+" glass, inline code's wash).
+    /// violet-400 — the create/compose hue, as paint: inline code's wash.
     static let violet = oklch(0.702, 0.183, 293.541)
+    /// violet-500 — the same hue as a FILL under a white glyph. violet-400 only
+    /// reaches 2.5:1 there, under the 3:1 floor for a control; this clears it at
+    /// 4.4:1. Same 400/500 split as accent/accentStrong above.
+    static let violetStrong = oklch(0.606, 0.250, 292.717)
     static let danger = oklch(0.704, 0.191, 22.216)         // red-400
     static let dangerSoft = oklch(0.808, 0.114, 19.571)     // red-300
     static let warning = oklch(0.828, 0.189, 84.429)        // amber-400
