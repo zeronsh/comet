@@ -83,6 +83,22 @@ struct AcpAgentSpec {
     /// Search summary + install hint for the NotInstalled error.
     install_hint: &'static str,
     models: fn() -> Vec<Model>,
+    /// Budget for the model-discovery probe (`initialize` → `session/new`).
+    /// `None` → 10s. Wire-first harnesses with no static catalog (opencode)
+    /// NEED a generous budget: their ACP server is a cold Node boot, and the
+    /// app prefetches every offered harness's models in parallel at boot —
+    /// measured ~13s for opencode under that 4-way contention on a
+    /// mid-2010s laptop, blowing the old 10s default and silently leaving
+    /// the picker empty (user report: "opencode doesn't show models").
+    model_discovery_timeout: Option<Duration>,
+    /// Per-harness quiet-settle window for the dropped-reply recovery in
+    /// `run_session`. `None` → the blanket 30s default. A harness whose
+    /// agents go radio-silent on the wire for long reasoning stretches
+    /// (opencode's Zen models measured ~2m of quiet mid-thought before a
+    /// false Done, 2026-08-15) sets a generous window — the settle stays
+    /// armed as a net for genuinely lost replies, just slower to trip.
+    /// `ZERON_ACP_QUIET_SETTLE_MS` still overrides (0 disables).
+    quiet_settle_timeout: Option<Duration>,
     steering_mode: SteeringMode,
     /// Effort ladder surfaced in the picker; applied per session via the
     /// `thought_level` config option (must mirror the registry descriptor).
@@ -176,6 +192,8 @@ fn claude_spec() -> AcpAgentSpec {
              `npm install -g @agentclientprotocol/claude-agent-acp`, or set \
              CLAUDE_ACP_EXECUTABLE to override)",
         models: crate::claude::catalog::static_models,
+        model_discovery_timeout: None,
+        quiet_settle_timeout: None,
         // `_session/steering` advertised by the adapter: priority-`now`
         // injection, pre-empting the current generation.
         steering_mode: SteeringMode::StepBoundary,
@@ -216,6 +234,8 @@ fn codex_spec() -> AcpAgentSpec {
              `npm install -g @agentclientprotocol/codex-acp`, or set \
              CODEX_ACP_EXECUTABLE to override)",
         models: crate::codex::catalog::static_models,
+        model_discovery_timeout: None,
+        quiet_settle_timeout: None,
         steering_mode: SteeringMode::StepBoundary,
         reasoning_levels: crate::codex::catalog::REASONING_LEVELS,
         prompt_transform: identity_transform,
@@ -279,6 +299,8 @@ fn grok_spec() -> AcpAgentSpec {
              fnm/nvm/volta/pnpm/bun install dirs; install with \
              `curl -fsSL https://x.ai/cli/install.sh | bash` or \
              `npm install -g @xai-official/grok`; set GROK_EXECUTABLE to override)",
+        model_discovery_timeout: None,
+        quiet_settle_timeout: None,
         models: || {
             vec![Model {
                 id: "grok-4.5".into(),
@@ -336,6 +358,8 @@ fn cursor_spec() -> AcpAgentSpec {
              set CURSOR_EXECUTABLE to override)",
         // Fallback only: `session/new` advertises the account's models and
         // the wire always wins. Keep this list to well-known public ids.
+        model_discovery_timeout: None,
+        quiet_settle_timeout: None,
         models: || {
             vec![
                 Model {
@@ -401,6 +425,8 @@ fn hermes_spec() -> AcpAgentSpec {
         // authenticated (`hermes model`); these are the Nous flagships every
         // portal account gets. Ids the agent doesn't advertise are skipped by
         // the config-option set, falling back to the agent's own default.
+        model_discovery_timeout: None,
+        quiet_settle_timeout: None,
         models: || {
             vec![
                 Model {
@@ -449,6 +475,8 @@ fn pi_spec() -> AcpAgentSpec {
         // pi routes models through its own provider config (~/.pi); the picker
         // advertises the pass-through entry and pi keeps whatever the user set
         // up. Unknown ids are skipped by the config-option set.
+        model_discovery_timeout: None,
+        quiet_settle_timeout: None,
         models: || {
             vec![Model {
                 id: "default".into(),
@@ -477,6 +505,66 @@ fn pi_spec() -> AcpAgentSpec {
             ReasoningLevel::XHigh,
             ReasoningLevel::Max,
         ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+    }
+}
+
+fn opencode_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        // The official installer's launcher location (`opencode upgrade` self-
+        // updates it). Also the npm global dirs for `npm i -g opencode-ai`.
+        dirs.push(home.join(".opencode").join("bin").join("opencode"));
+        dirs.push(home.join(".local").join("bin").join("opencode"));
+        dirs.push(home.join(".npm-global").join("bin").join("opencode"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/opencode"));
+    dirs.push(PathBuf::from("/usr/local/bin/opencode"));
+    dirs
+}
+
+fn opencode_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::OpenCode,
+        display_name: "OpenCode",
+        executable: "opencode",
+        env_override: "OPENCODE_EXECUTABLE",
+        // Native ACP server — no adapter package in between.
+        args: &["acp"],
+        npm_package: None,
+        extra_paths: opencode_install_paths,
+        cli_executable: "opencode",
+        cli_extra_paths: opencode_install_paths,
+        install_hint: "opencode (searched PATH, the login shell's PATH, ~/.opencode/bin, \
+             ~/.local/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `curl -fsSL https://opencode.ai/install | bash` or `npm install -g \
+             opencode-ai`; set OPENCODE_EXECUTABLE to override)",
+        // Wire-first: `session/new` advertises the account's OpenCode Zen
+        // models (plus any provider the user configured) through configOptions
+        // and the wire always wins. No static fallback catalog — so the probe
+        // budget is generous (a cold Node boot measured ~13s under the app's
+        // concurrent boot prefetch; the 10s default silently left the picker
+        // empty) and a probe FAILURE surfaces as an error (Retry row) instead
+        // of a fabricated empty list (see `models`).
+        models: || Vec::new(),
+        model_discovery_timeout: Some(Duration::from_secs(30)),
+        // Long silent reasoning stretches: opencode's Zen models go
+        // radio-silent on the wire mid-thought (no ReasoningDelta/notify), so
+        // the 30s blanket quiet-settle falsely settled live turns with a
+        // premature Done — "Musing… 2m 4s" then cut (2026-08-15 user report),
+        // same shape as the Claude exemption but not structural. A generous
+        // window keeps the dropped-reply net armed (slower to trip, no
+        // cost-frame equivalent); `ZERON_ACP_QUIET_SETTLE_MS=0` fully disables
+        // for verification.
+        quiet_settle_timeout: Some(Duration::from_secs(120)),
+        // No `_session/steering` extension: steers deliver at turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // opencode advertises no effort (`thought_level`) config option — the
+        // ladder stays empty and reasoning rides the model's own behavior.
+        reasoning_levels: &[],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
@@ -531,7 +619,6 @@ enum Launch {
         args: Vec<String>,
     },
 }
-
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
 /// fake agent with [`AcpHarness::with_executable`].
 pub struct AcpHarness {
@@ -598,6 +685,11 @@ impl AcpHarness {
     /// pi's RPC mode.
     pub fn pi() -> Self {
         Self::with_spec(pi_spec())
+    }
+
+    /// opencode (`opencode acp`) — opencode's native ACP server.
+    pub fn opencode() -> Self {
+        Self::with_spec(opencode_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -864,7 +956,11 @@ impl AcpHarness {
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        let result = tokio::time::timeout(
+            self.spec.model_discovery_timeout.unwrap_or(Duration::from_secs(10)),
+            discovery,
+        )
+        .await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -1152,7 +1248,12 @@ impl Harness for AcpHarness {
     /// ACP is the source of truth: a short-lived probe reads the agent's
     /// advertised model list (cached on success). The spec's static catalog
     /// answers when the agent advertises nothing or the probe fails — and an
-    /// absent binary still surfaces as NotInstalled, like before.
+    /// absent binary still surfaces as NotInstalled, like before. Wire-first
+    /// harnesses (opencode, `models: || Vec::new()`) have NO fallback: a
+    /// probe failure there propagates as an error so the picker shows a
+    /// Retry row — a silent empty list read as an eternal loading skeleton
+    /// (user report: "opencode doesn't show models, the picker seems
+    /// frozen").
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
         if let Some(models) = self.models_cache.get() {
@@ -1163,7 +1264,12 @@ impl Harness for AcpHarness {
                 let _ = self.models_cache.set(models.clone());
                 Ok(self.models_cache.get().cloned().unwrap_or(models))
             }
-            Ok(_) | Err(_) => Ok((self.spec.models)()),
+            // The wire advertised nothing: the static catalog names the pick.
+            Ok(_) => Ok((self.spec.models)()),
+            // Probe failed: a non-empty static catalog is the fallback; with
+            // no catalog the failure itself is the honest answer.
+            Err(err) if (self.spec.models)().is_empty() => Err(err),
+            Err(_) => Ok((self.spec.models)()),
         }
     }
 
@@ -1199,6 +1305,7 @@ impl Harness for AcpHarness {
             request,
             harness: self.spec.id,
             agent_name: self.spec.display_name,
+            quiet_settle_timeout: self.spec.quiet_settle_timeout,
             prompt_transform: self.spec.prompt_transform,
             effort_values: self.spec.effort_values,
             interrupt_grace: self.interrupt_grace,
@@ -1227,6 +1334,9 @@ struct Session {
     request: RunRequest,
     harness: HarnessId,
     agent_name: &'static str,
+    /// Per-harness quiet-settle window from `AcpAgentSpec`, carried into the
+    /// session loop (`run_session`'s blanket dropped-reply settle).
+    quiet_settle_timeout: Option<Duration>,
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     interrupt_grace: Duration,
@@ -1530,7 +1640,33 @@ fn stop_outcome(
             // partial output is already in the doc.
             _ => (DoneStatus::Completed, None),
         },
-        Err(e) => (DoneStatus::Errored, Some(e.to_string())),
+        Err(e) => (DoneStatus::Errored, Some(friendly_prompt_error(e))),
+    }
+}
+
+/// Turn a provider-side prompt failure into a message the user can act on.
+/// opencode (and the other ACP agents) surface provider errors verbatim — a
+/// credit exhaustion or rate limit reads like a transport failure. Classify
+/// the known families into an actionable note; anything else keeps the raw
+/// protocol detail for debugging.
+fn friendly_prompt_error(err: &HarnessError) -> String {
+    let raw = err.to_string();
+    let lower = raw.to_lowercase();
+    let credit = [
+        "credit", "quota", "insufficient balance", "billing", "payment", "top up",
+        "out of credits", "balance", "402",
+    ];
+    let rate = [
+        "rate limit", "too many requests", "throttl", "try again later", "retry after",
+        "429",
+    ];
+    if credit.iter().any(|k| lower.contains(k)) {
+        "Out of credits for this model — top up the provider account or switch to another model."
+            .to_owned()
+    } else if rate.iter().any(|k| lower.contains(k)) {
+        "Rate limited by the model provider — wait a moment and try again.".to_owned()
+    } else {
+        raw
     }
 }
 
@@ -1981,6 +2117,7 @@ async fn run_session(session: Session) {
         request,
         harness,
         agent_name,
+        quiet_settle_timeout,
         prompt_transform,
         effort_values,
         interrupt_grace,
@@ -2299,6 +2436,13 @@ async fn run_session(session: Session) {
     // genuinely dropped replies already settle deterministically (the
     // cost-frame hint above, `noRunningTurn` steering evidence); the
     // engine watchdog backstops anything left.
+    //
+    // opencode keeps the settle (its drops have no cost-frame equivalent)
+    // but at a generous per-harness window: Zen models go radio-silent on
+    // the wire for long reasoning stretches, so the 30s blanket falsely
+    // settled live turns mid-thought with a premature Done ("Musing… 2m 4s"
+    // then cut, 2026-08-15 user report). `quiet_settle_timeout` calibrates
+    // the window per spec.
     // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
     let quiet_settle: Option<Duration> = if cost_hint_enabled {
         None
@@ -2309,7 +2453,7 @@ async fn run_session(session: Session) {
         {
             Some(0) => None,
             Some(ms) => Some(Duration::from_millis(ms)),
-            None => Some(Duration::from_secs(30)),
+            None => Some(quiet_settle_timeout.unwrap_or(Duration::from_secs(30))),
         }
     };
     let mut last_update_at = tokio::time::Instant::now();
@@ -3048,6 +3192,70 @@ async fn run_session(session: Session) {
 mod tests {
     use super::*;
     use zeron_proto::{TodoItem, ToolCall};
+
+    #[test]
+    fn opencode_gets_a_generous_model_discovery_budget() {
+        // Wire-only (no static catalog): a cold `opencode acp` Node boot
+        // measured ~13s under the app's concurrent boot prefetch on a
+        // mid-2010s laptop — the 10s default silently left the picker empty.
+        // Every catalog-backed spec keeps the 10s default.
+        assert_eq!(
+            opencode_spec().model_discovery_timeout,
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(claude_spec().model_discovery_timeout, None);
+        assert_eq!(codex_spec().model_discovery_timeout, None);
+        assert_eq!(grok_spec().model_discovery_timeout, None);
+        assert_eq!(cursor_spec().model_discovery_timeout, None);
+        assert_eq!(hermes_spec().model_discovery_timeout, None);
+        assert_eq!(pi_spec().model_discovery_timeout, None);
+    }
+
+    #[test]
+    fn opencode_gets_a_generous_quiet_settle_window() {
+        // Zen models go radio-silent on the wire mid-reasoning with no
+        // ReasoningDelta/notify traffic — the 30s blanket quiet-settle
+        // falsely closed live turns ("Musing… 2m 4s" then cut, 2026-08-15
+        // user report). Every other catalog-backed ACP spec keeps the 30s
+        // default (`None` here means "use the 30s fallback", checked against
+        // the runtime default separately in the acp integration tests).
+        assert_eq!(
+            opencode_spec().quiet_settle_timeout,
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(claude_spec().quiet_settle_timeout, None);
+        assert_eq!(codex_spec().quiet_settle_timeout, None);
+        assert_eq!(grok_spec().quiet_settle_timeout, None);
+        assert_eq!(cursor_spec().quiet_settle_timeout, None);
+        assert_eq!(hermes_spec().quiet_settle_timeout, None);
+        assert_eq!(pi_spec().quiet_settle_timeout, None);
+    }
+
+    #[test]
+    fn prompt_failures_classify_credit_and_rate_limit_families() {
+        // Provider-side failures surface as `session/prompt: <message>`; the
+        // known families must read as actionable notes, not transport errors.
+        let cases = [
+            ("session/prompt: rate limit exceeded, please try again later", "Rate limited"),
+            ("session/prompt: too many requests (429)", "Rate limited"),
+            ("session/prompt: insufficient credits, please top up", "Out of credits"),
+            ("session/prompt: quota exceeded for the free tier", "Out of credits"),
+            ("session/prompt: payment required (402)", "Out of credits"),
+            ("session/prompt: you are out of credits", "Out of credits"),
+        ];
+        for (raw, expected_prefix) in cases {
+            let friendly = friendly_prompt_error(&HarnessError::Protocol(raw.into()));
+            assert!(
+                friendly.starts_with(expected_prefix),
+                "{raw:?} -> {friendly:?} should start with {expected_prefix:?}"
+            );
+        }
+        // Anything else keeps the raw protocol detail.
+        let other = friendly_prompt_error(&HarnessError::Protocol(
+            "session/prompt: agent child exited early".into(),
+        ));
+        assert!(other.contains("session/prompt: agent child exited early"));
+    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {

@@ -2984,6 +2984,17 @@ impl Pickers {
                         cx,
                     )]
                 }
+                // A list that LOADED but is empty (wire-only harnesses like
+                // opencode after a successful probe, or a stale catalog) is
+                // a real empty state — an eternal loading skeleton made the
+                // picker look frozen (user report: "opencode doesn't show
+                // models, the picker seems stuck").
+                Some(Loadable::Ready(models)) if models.is_empty() => {
+                    vec![empty_list_note(
+                        &theme,
+                        "No models available for this agent",
+                    )]
+                }
                 _ => vec![popover::skeleton_rows(
                     "model-skeleton",
                     &theme,
@@ -3292,6 +3303,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Grok => (crate::icons::GROK_MARK, None),
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
+        // opencode's mark, monochrome like OpenAI's.
+        HarnessId::OpenCode => (crate::icons::OPENCODE_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
     }
 }

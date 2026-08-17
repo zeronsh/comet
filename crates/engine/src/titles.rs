@@ -155,7 +155,16 @@ impl TitleGenerator {
                 return None;
             }
         };
-        let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
+        let cheap = match self.inner.registry.models(harness_id).await {
+            Ok(models) => cheapest_model(&models),
+            Err(err) => {
+                tracing::debug!(error = %err, "titling harness unavailable");
+                return None;
+            }
+        };
+        if cheap.is_none() {
+            tracing::debug!(harness = ?harness_id, "titling harness advertised no models");
+        }
         let title_prompt = format!(
             "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
              for a coding session that begins with this request:\n\n{prompt}"

@@ -32,6 +32,38 @@ fn harness() -> AcpHarness {
     AcpHarness::grok().with_executable(fixture_path())
 }
 
+fn opencode_fixture_path() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-opencode-acp.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    path
+}
+
+fn opencode_harness() -> AcpHarness {
+    AcpHarness::opencode().with_executable(opencode_fixture_path())
+}
+
+fn request_opencode(prompt: &str, model: Option<&str>) -> RunRequest {
+    RunRequest {
+        prompt: prompt.into(),
+        harness: None,
+        model: model.map(str::to_owned),
+        reasoning: None,
+        model_options: serde_json::Map::new(),
+        cwd: "/tmp".into(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        attachments: Vec::new(),
+        resume: None,
+    }
+}
+
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
@@ -1558,6 +1590,146 @@ async fn autonomous_turn_ended_extension_settles_between_prompts() {
         .expect("self-continued output surfaces: {events:?}");
     assert!(
         first_done < background && background < last_done,
+        "{events:?}"
+    );
+}
+
+#[test]
+fn opencode_descriptor_surface_matches_registry_expectations() {
+    let opencode = AcpHarness::opencode();
+    assert_eq!(opencode.id(), HarnessId::OpenCode);
+    assert_eq!(opencode.display_name(), "OpenCode");
+    // opencode has no `_session/steering` extension; steers are delivered as
+    // plain session/prompts at turn boundaries (the no-extension path).
+    assert!(opencode.supports_steering());
+    assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+    // opencode exposes no thought_level config option — no effort ladder.
+    assert!(opencode.reasoning_levels().is_empty());
+}
+
+#[tokio::test]
+async fn opencode_models_come_from_the_wire_with_empty_ladder() {
+    // opencode's advertised `model` select is the source of truth: the ids
+    // come off the wire, and the session advertises no thought_level, so the
+    // reasoning ladder stays empty (no static catalog entry to fill it).
+    let harness = opencode_harness();
+    let models = harness.models().await.expect("discovery");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["opencode/big-pickle", "opencode/smol"], "{models:?}");
+    assert!(
+        models
+            .iter()
+            .all(|m| m.reasoning_levels.is_empty()),
+        "{models:?}"
+    );
+    assert_eq!(models[0].description, None, "{models:?}");
+    let again = harness.models().await.expect("cached");
+    assert_eq!(again, models);
+}
+
+#[tokio::test]
+async fn opencode_probe_failure_surfaces_as_an_error() {
+    // opencode ships no static catalog — the wire is the only source. A
+    // failed probe must ERROR (the picker shows a Retry row) rather than
+    // silently read as an empty list (which rendered an eternal loading
+    // skeleton — user report: "opencode doesn't show models, the picker
+    // seems frozen"). Catalog-backed harnesses still fall back to their
+    // static list (covered by the catalog harnesses' own tests).
+    let harness = AcpHarness::opencode().with_executable("/nonexistent/never-an-opencode-acp");
+    let err = harness.models().await.expect_err("wire-only probe failure errors");
+    assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn catalog_harness_failed_probe_still_falls_back_to_static_models() {
+    // The error-propagation rule is wire-only: a catalog-backed harness
+    // (cursor here) keeps the static fallback on a failed probe.
+    let harness = AcpHarness::cursor().with_executable("/nonexistent/never-a-cursor-agent");
+    let models = harness.models().await.expect("static fallback");
+    assert!(!models.is_empty(), "{models:?}");
+}
+
+#[tokio::test]
+async fn opencode_launches_with_acp_args_and_runs_the_happy_path() {
+    // The fixture refuses any launch without the `acp` argument, proving the
+    // spec's args land on the wire. Model ids are opencode-flavored, so the
+    // run carries no model set and the chat settles.
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&opencode_harness(), request_opencode("scenario:happy", None), controls).await;
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "Hello from opencode".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn opencode_sets_only_the_requested_model() {
+    // The requested model differs from the session's currentValue, so the
+    // harness sends one `session/set_config_option` for it; the fixture
+    // answers "configured" only when that set (and no thought_level set,
+    // which opencode has no option for) arrived.
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(
+        &opencode_harness(),
+        request_opencode("scenario:config", Some("opencode/smol")),
+        controls,
+    )
+    .await;
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "configured".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn opencode_steering_delivers_at_turn_boundary() {
+    // No `_session/steering` extension on opencode's wire: a steer must never
+    // ride `_session/steering` (the fixture would refuse it). It settles the
+    // current turn and is promoted to a fresh session/prompt — the fixture
+    // answers "boundary" for that plain prompt.
+    let (controls, steer, _token) = controls();
+    let harness = opencode_harness();
+    let stream = harness
+        .run(
+            request_opencode("scenario:steer-tb", Some("opencode/big-pickle")),
+            controls,
+        )
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "first") {
+                steer
+                    .send(SteerMessage {
+                        prompt: "redirect please".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("steer sent");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    // Two settled turns: the initial prompt, then the promoted steer.
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "boundary".into()
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. })),
         "{events:?}"
     );
 }

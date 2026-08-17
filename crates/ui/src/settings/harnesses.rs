@@ -38,6 +38,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Cursor => "Cursor's coding agent, driven through the cursor-agent CLI.",
         HarnessId::Grok => "xAI's Grok Build agent (grok CLI).",
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
+        HarnessId::OpenCode => "The opencode coding agent, driven through the opencode CLI.",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Mock => "Scripted test harness.",
     }
@@ -51,6 +52,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Cursor => "cursor-agent",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
+        HarnessId::OpenCode => "opencode",
         HarnessId::Pi => "pi",
         HarnessId::Mock => "mock",
     }

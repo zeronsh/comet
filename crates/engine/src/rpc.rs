@@ -1010,12 +1010,12 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                let harness = self
+                // Stale-while-revalidate off the persistent cache: a fresh
+                // entry serves instantly (no cold agent boot per picker
+                // open), refreshing in the background.
+                let models = self
                     .registry
-                    .resolve(p.harness)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
-                    .models()
+                    .models(p.harness)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)

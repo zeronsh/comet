@@ -11,6 +11,8 @@
 //! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
 //!   ports of zeron's `icons.tsx`. gpui tints SVGs with the text color, so the
 //!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
+//! - `opencode-mark` is the official opencode brand mark, sourced from the
+//!   LobeHub icons set (lobehub.com/icons, `@lobehub/icons-static-svg`).
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -137,6 +139,7 @@ icon_assets![
     (CURSOR_MARK, "cursor-mark"),
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
+    (OPENCODE_MARK, "opencode-mark"),
     (PI_MARK, "pi-mark"),
 ];
 
