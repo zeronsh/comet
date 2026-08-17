@@ -26,8 +26,8 @@ use tokio_util::task::TaskTracker;
 
 use zeron_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
+    MessagePart, MessageRole, MessageStatus, QueuedMessage, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
 use zeron_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
@@ -201,12 +201,37 @@ pub struct DocHost {
     inner: Arc<DocHostInner>,
 }
 
+/// How a taken queue row reaches the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueSend {
+    /// Nothing is running: start a turn with it.
+    NextTurn,
+    /// Something is running and can take input mid-turn: steer it in.
+    Steer,
+    /// The user said now: stop what is running first.
+    Interrupt,
+}
+
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
 pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    /// Pending-message queue watch (WatchQueue). Cheap to rebuild — a handful
+    /// of short rows — so unlike the transcript mirror it publishes on every
+    /// change without a dirty flag.
+    queue_tx: watch::Sender<Vec<QueuedMessage>>,
+    /// Serializes everything that TAKES from the queue. Both the doc-change
+    /// task and the turn-end status watcher call `drain_queue`, and nothing
+    /// keeps those two apart: without this they interleave across the
+    /// `dispatch` await, each taking a different head and each sending, so a
+    /// queue meant to release one message releases all of them.
+    ///
+    /// It also covers the gap a send-now's interrupt opens — between stopping
+    /// the turn and starting its own the chat reads Idle, and an idle chat with
+    /// a queue is exactly what the flush drains.
+    drain_lock: tokio::sync::Mutex<()>,
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
@@ -281,6 +306,32 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         rx
+    }
+
+    /// Queue watch — the composer's held messages, re-sent on every doc change.
+    pub fn watch_queue(&self) -> watch::Receiver<Vec<QueuedMessage>> {
+        self.touch();
+        let rx = self.queue_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
+    fn publish_queue(&self) {
+        match self.doc.read_queue() {
+            Ok(items) => {
+                self.queue_tx.send_if_modified(|slot| {
+                    if *slot == items {
+                        false
+                    } else {
+                        *slot = items;
+                        true
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(chat = %self.chat_id, error = %err, "queue read failed");
+            }
+        }
     }
 
     fn touch(&self) {
@@ -440,6 +491,7 @@ impl DocHost {
 
     /// Wire the sessions engine (engine assembly; see `SessionsEngine::set_doc_host`).
     pub fn set_sessions(&self, sessions: SessionsEngine) {
+        let statuses = sessions.watch_sessions();
         {
             // First set wins (the OnceLock contract this slot replaced).
             let mut slot = lock(&self.inner.sessions);
@@ -451,8 +503,29 @@ impl DocHost {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             let host = self.clone();
-            self.spawn_worker(async move { host.drain_commands(&handle).await });
+            self.spawn_worker(async move {
+                host.drain_commands(&handle).await;
+                host.drain_queue(&handle).await;
+            });
         }
+        self.spawn_queue_flush_watcher(statuses);
+    }
+
+    /// The turn-end hook for held messages. Doc changes drive `drain_queue` for
+    /// everything else, but a turn ENDING is not a doc change the queue can
+    /// see — so watch session status instead and re-drain every warm chat.
+    /// `drain_queue` is a cheap no-op for empty queues and busy agents, which
+    /// is why this can afford to be indiscriminate.
+    fn spawn_queue_flush_watcher(&self, mut statuses: watch::Receiver<Vec<zeron_proto::Session>>) {
+        let host = self.clone();
+        self.spawn_worker(async move {
+            while statuses.changed().await.is_ok() {
+                let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
+                for handle in handles {
+                    host.drain_queue(&handle).await;
+                }
+            }
+        });
     }
 
     /// Retire this host's workers (runtime replacement, e.g. sign-out): cancel
@@ -814,12 +887,15 @@ impl DocHost {
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
         let (messages_tx, _) = watch::channel(Vec::new());
+        let (queue_tx, _) = watch::channel(doc.read_queue().unwrap_or_default());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
             doc: doc.clone(),
             messages_tx,
+            queue_tx,
+            drain_lock: tokio::sync::Mutex::new(()),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
@@ -1704,16 +1780,7 @@ impl DocHost {
         // again, so the LWW row flips back to active on every device. Best-
         // effort — the command itself is durable regardless.
         if is_message {
-            if let Some(workspace) = self.workspace() {
-                match workspace.chat(chat_id) {
-                    Ok(Some(chat)) if chat.archived => {
-                        if let Err(err) = workspace.set_chat_archived(chat_id, false) {
-                            tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            self.unarchive_on_send(chat_id);
         }
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
@@ -1721,6 +1788,221 @@ impl DocHost {
         // for any other reason still executes it).
         self.nudge_remote_host(chat_id);
         Ok(id)
+    }
+
+    /// A send revives an archived chat on every device (best-effort).
+    fn unarchive_on_send(&self, chat_id: &str) {
+        let Some(workspace) = self.workspace() else {
+            return;
+        };
+        match workspace.chat(chat_id) {
+            Ok(Some(chat)) if chat.archived => {
+                if let Err(err) = workspace.set_chat_archived(chat_id, false) {
+                    tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Hold a message for later: append it to the doc's queue. Any device may
+    /// write here (unlike `messages`), and the change subscription kicks
+    /// [`Self::drain_queue`], so a queue that lands while the agent is already
+    /// idle goes straight out instead of waiting for a turn that never comes.
+    pub fn queue_message(
+        &self,
+        chat_id: &str,
+        text: &str,
+        attachments: Vec<String>,
+    ) -> Result<String, EngineError> {
+        let handle = self.open(chat_id)?;
+        let id = new_id();
+        handle.doc.push_queued(&QueuedMessage {
+            id: id.clone(),
+            text: text.to_string(),
+            attachments,
+            issued_by: self.inner.config.device_id.clone(),
+            issued_at: now_ms(),
+            edited_at: None,
+        })?;
+        handle.publish_queue();
+        // Same reasoning as a command: the user is acting in this chat again.
+        self.unarchive_on_send(chat_id);
+        self.nudge_remote_host(chat_id);
+        Ok(id)
+    }
+
+    /// Retype a queued message. Empty text deletes the row — emptying the box
+    /// is how you say "drop it". `false` when the row is already gone.
+    pub fn update_queued_message(
+        &self,
+        chat_id: &str,
+        id: &str,
+        text: &str,
+    ) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        let changed = handle.doc.set_queued_text(id, text, now_ms())?;
+        if changed {
+            handle.publish_queue();
+        }
+        Ok(changed)
+    }
+
+    /// Reorder a queued message (drag, or the up/down buttons).
+    pub fn move_queued_message(
+        &self,
+        chat_id: &str,
+        id: &str,
+        to_index: usize,
+    ) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        let changed = handle.doc.move_queued(id, to_index)?;
+        if changed {
+            handle.publish_queue();
+        }
+        Ok(changed)
+    }
+
+    pub fn remove_queued_message(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        let removed = handle.doc.remove_queued(id)?;
+        if removed {
+            handle.publish_queue();
+        }
+        Ok(removed)
+    }
+
+    /// "Send this one now": take it out of the queue and put it in front of the
+    /// agent, interrupting whatever is running. Deliberately blunt — it is the
+    /// explicit override, including the empty-composer Enter that pops the
+    /// head. `false` when another device already took the row.
+    pub async fn send_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        // Sending one now sends ONE: the lock keeps the flush out of the idle
+        // window the interrupt opens, and out of the take itself.
+        let _drain = handle.drain_lock.lock().await;
+        let Some(item) = handle.doc.take_queued(id)? else {
+            return Ok(false);
+        };
+        handle.publish_queue();
+        if let Err(err) = self
+            .dispatch_queued(&handle, &item, QueueSend::Interrupt)
+            .await
+        {
+            // Put it back rather than swallowing what the user typed — at the
+            // head, because the user just said this one was the urgent one.
+            let _ = handle.doc.insert_queued(0, &item);
+            handle.publish_queue();
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Host-only: hand queued messages to the agent when there is somewhere to
+    /// put them.
+    ///
+    /// - Idle: send the head as the next turn (and loop — the agent is free).
+    /// - Working, agent takes mid-turn input: steer it in.
+    /// - Working, anything else: hold. The turn-end watcher comes back for it.
+    ///
+    /// One at a time by design: each send changes the status this reads.
+    pub async fn drain_queue(&self, handle: &Arc<ChatDocHandle>) {
+        let Some(sessions) = self.sessions() else {
+            return; // executor not wired yet; the set_sessions kick re-drains
+        };
+        if !self.is_host(&handle.chat_id) {
+            return;
+        }
+        // One drain at a time per chat. Waiters are cheap: whoever takes the
+        // lock next re-reads the queue and the status, so a drain that became
+        // unnecessary while it waited simply finds nothing to do.
+        let _drain = handle.drain_lock.lock().await;
+        loop {
+            let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
+                return;
+            };
+            // In flight, not just Working: an agent parked on a question owns
+            // the turn too, and the composer queues on the same reading. Taking
+            // `AwaitingInput` for idle would send the follow-up as a fresh turn
+            // and abandon the question.
+            let busy = sessions.turn_in_flight(&handle.chat_id);
+            let send = if busy {
+                // Attachments never steer: the steer path carries a prompt and
+                // nothing else, so a message with files must wait for a turn
+                // that can inline them rather than lose them.
+                let steer_now = head.attachments.is_empty()
+                    && sessions.steers_mid_turn(self.harness_for(&handle.chat_id));
+                if !steer_now {
+                    return; // held until the turn ends
+                }
+                QueueSend::Steer
+            } else {
+                QueueSend::NextTurn
+            };
+            // Take it only once we know it is going out — a row that stays in
+            // the queue on a failed send is recoverable; a vanished one is not.
+            let Ok(Some(item)) = handle.doc.take_queued(&head.id) else {
+                return;
+            };
+            handle.publish_queue();
+            if let Err(err) = self.dispatch_queued(handle, &item, send).await {
+                tracing::warn!(chat = %handle.chat_id, error = %err, "queued send failed");
+                // Back to the head it came from: a failed send must not reorder
+                // the queue behind the user's back.
+                let _ = handle.doc.insert_queued(0, &item);
+                handle.publish_queue();
+                return;
+            }
+            if busy {
+                return; // steered into a live turn; the rest waits for its end
+            }
+        }
+    }
+
+    /// Send one taken queue row.
+    async fn dispatch_queued(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        item: &QueuedMessage,
+        send: QueueSend,
+    ) -> Result<(), EngineError> {
+        let Some(sessions) = self.sessions() else {
+            return Err(EngineError::Other("sessions engine not wired".into()));
+        };
+        let chat_id = &handle.chat_id;
+        let message_id = new_id();
+        if send == QueueSend::Steer {
+            match sessions
+                .steer(chat_id, &item.text, Some(message_id.clone()))
+                .await?
+            {
+                SteerOutcome::Accepted => return Ok(()),
+                // The run died under us between the status read and the send;
+                // fall through and start a fresh turn with it.
+                SteerOutcome::NotSteerable => {}
+            }
+        }
+        // Same reading of "busy" as the drain: a turn parked on a question is
+        // still a turn, and it has to be stopped before this one starts.
+        if send == QueueSend::Interrupt && sessions.turn_in_flight(chat_id) {
+            sessions.interrupt(chat_id).await?;
+        }
+        let request = sessions
+            .last_request(chat_id)
+            .or_else(|| self.request_from_chat_row(chat_id, &item.text));
+        let Some(mut request) = request else {
+            return Err(EngineError::Other(
+                "no live run and no prior run config".into(),
+            ));
+        };
+        request.prompt = item.text.clone();
+        request.resume = None; // dispatch re-derives the harness session
+        request.attachments = item.attachments.clone();
+        let harness = self.harness_for_request(chat_id, &request);
+        sessions
+            .dispatch(chat_id, harness, request, Some(message_id))
+            .await?;
+        Ok(())
     }
 
     /// POST `{edge}/device/{host}/nudge {chatId}` when the chat's workspace row names
@@ -2050,41 +2332,8 @@ impl DocHost {
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
-                match sessions.steer(chat_id, prompt, message_id.clone()).await? {
-                    SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
-                    SteerOutcome::NotSteerable => {
-                        // No live steerable run: the durable command still delivers —
-                        // run it as the next turn (zeron's fallback, executor-side).
-                        // After an engine restart `last_request` is empty too, so
-                        // rebuild the run config from the chat's workspace row
-                        // (zeron derived dispatch config from the chat row the
-                        // same way — sessions.ts:601-620); dispatch's engine-owned
-                        // resume then reattaches the prior harness conversation.
-                        let request = sessions
-                            .last_request(chat_id)
-                            .or_else(|| self.request_from_chat_row(chat_id, prompt));
-                        let Some(mut request) = request else {
-                            return Ok((
-                                SessionCommandStatus::Rejected,
-                                Some("no live run and no prior run config".into()),
-                            ));
-                        };
-                        request.prompt = prompt.clone();
-                        request.resume = None; // dispatch re-derives the harness session
-                        // A reused config must not re-inline the PREVIOUS
-                        // turn's images; this steer's own refs (if any) already
-                        // ride the prompt text.
-                        request.attachments = Vec::new();
-                        let harness = self.harness_for_request(chat_id, &request);
-                        sessions
-                            .dispatch(chat_id, harness, request, message_id.clone())
-                            .await?;
-                        Ok((
-                            SessionCommandStatus::Applied,
-                            Some("queued as new turn".into()),
-                        ))
-                    }
-                }
+                self.deliver_prompt(sessions, chat_id, prompt, message_id.clone())
+                    .await
             }
             SessionCommandPayload::Interrupt {} => {
                 sessions.interrupt(chat_id).await?;
@@ -2157,6 +2406,100 @@ impl DocHost {
                 ))
             }
         }
+    }
+
+    /// Put a typed prompt in front of a live agent: steer it in, or — with no
+    /// live steerable run — deliver the durable command as the next turn.
+    /// After an engine restart `last_request` is empty too, so rebuild the run
+    /// config from the chat's workspace row (zeron derived dispatch config from
+    /// the chat row the same way — sessions.ts:601-620); dispatch's engine-owned
+    /// resume then reattaches the prior harness conversation.
+    ///
+    /// A working agent that only takes prompts at a turn boundary is the
+    /// exception: see [`Self::held_until_turn_end`].
+    async fn deliver_prompt(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<String>,
+    ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
+        if self.held_until_turn_end(sessions, chat_id, prompt, message_id.as_deref())? {
+            return Ok((
+                SessionCommandStatus::Applied,
+                Some("held until the turn ends".into()),
+            ));
+        }
+        match sessions.steer(chat_id, prompt, message_id.clone()).await? {
+            SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
+            SteerOutcome::NotSteerable => {
+                let request = sessions
+                    .last_request(chat_id)
+                    .or_else(|| self.request_from_chat_row(chat_id, prompt));
+                let Some(mut request) = request else {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("no live run and no prior run config".into()),
+                    ));
+                };
+                request.prompt = prompt.to_string();
+                request.resume = None; // dispatch re-derives the harness session
+                // A reused config must not re-inline the PREVIOUS turn's
+                // images; this prompt's own refs (if any) ride its text.
+                request.attachments = Vec::new();
+                let harness = self.harness_for_request(chat_id, &request);
+                sessions
+                    .dispatch(chat_id, harness, request, message_id)
+                    .await?;
+                Ok((
+                    SessionCommandStatus::Applied,
+                    Some("queued as new turn".into()),
+                ))
+            }
+        }
+    }
+
+    /// Put `prompt` in the pending-message queue instead of a run mailbox when
+    /// the agent is working and takes prompts only between turns. `true` when it
+    /// was queued.
+    ///
+    /// A turn-boundary agent has no mid-turn mailbox: what it has is a next
+    /// prompt. Posting into the run's mailbox anyway made delivery depend on how
+    /// the turn ended — a turn that was interrupted or errored discarded the
+    /// mailbox, and the message sat in the transcript looking sent, unread. The
+    /// queue is the honest home: shown as pending rather than sent, editable,
+    /// and flushed by the turn-end watcher, which is where [`Self::drain_queue`]
+    /// already sends a typed message for exactly this agent. `steers_mid_turn`
+    /// is a catalog lookup — no spawn, no probe.
+    fn held_until_turn_end(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+        prompt: &str,
+        message_id: Option<&str>,
+    ) -> Result<bool, EngineError> {
+        // A persistent session parked BETWEEN turns DOES take the next prompt
+        // through its mailbox (the warm-child fast path), so the question is
+        // whether a turn is in flight — including one parked on a question,
+        // which is the state a question's own follow-up arrives in. An empty
+        // prompt is no message to queue.
+        if !sessions.turn_in_flight(chat_id)
+            || prompt.trim().is_empty()
+            || sessions.steers_mid_turn(self.harness_for(chat_id))
+        {
+            return Ok(false);
+        }
+        let handle = self.open(chat_id)?;
+        handle.doc.push_queued(&QueuedMessage {
+            id: message_id.map(str::to_string).unwrap_or_else(new_id),
+            text: prompt.to_string(),
+            attachments: Vec::new(),
+            issued_by: self.inner.config.device_id.clone(),
+            issued_at: now_ms(),
+            edited_at: None,
+        })?;
+        handle.publish_queue();
+        Ok(true)
     }
 
     /// A steer-turned-run with no in-process `last_request` (engine restarted
@@ -2307,6 +2650,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
     {
         let Some(handle) = weak.upgrade() else { return };
         host.drain_commands(&handle).await;
+        host.drain_queue(&handle).await;
     }
     let mut save_deadline: Option<tokio::time::Instant> = None;
     loop {
@@ -2318,7 +2662,9 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 }
                 let Some(handle) = weak.upgrade() else { break };
                 handle.publish_messages_if_watched();
+                handle.publish_queue();
                 host.drain_commands(&handle).await;
+                host.drain_queue(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(
                         tokio::time::Instant::now()

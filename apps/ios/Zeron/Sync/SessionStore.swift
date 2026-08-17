@@ -42,6 +42,10 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
+    /// Messages typed while the agent was busy, in the order they will be sent
+    /// (crates/doc/src/queue.rs). Shared with every other device on the chat:
+    /// what the Mac queued shows up here, and reordering here reorders there.
+    private(set) var queue: [QueuedMessage] = []
 
     let doc = LoroDoc()
     /// The chat2 room cursor — the last server row seq folded into `doc`.
@@ -77,17 +81,25 @@ final class SessionStore {
 
     @ObservationIgnored private var hostRelay: (deviceId: String, client: DeviceRelayClient)?
 
+    /// This device's id — what its own doc writes are stamped with.
+    var deviceId: String { config.deviceId }
+
+    /// The shared relay to the chat's host device (uploads, sending a queued
+    /// message now). Nil while the chat has no host to ask.
+    func hostRelayClient() -> DeviceRelayClient? {
+        guard let hostDeviceId else { return nil }
+        if let hostRelay, hostRelay.deviceId == hostDeviceId {
+            return hostRelay.client
+        }
+        let relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
+        hostRelay = (hostDeviceId, relay)
+        return relay
+    }
+
     /// Chunked upload of one staged image to the host device; returns the
     /// durable absolute path on that device (what the refs trailer carries).
     func uploadAttachment(name: String, data: Data) async throws -> String {
-        guard let hostDeviceId else { throw RelayError.hostOffline }
-        let relay: DeviceRelayClient
-        if let hostRelay, hostRelay.deviceId == hostDeviceId {
-            relay = hostRelay.client
-        } else {
-            relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
-            hostRelay = (hostDeviceId, relay)
-        }
+        guard let relay = hostRelayClient() else { throw RelayError.hostOffline }
         return try await uploadAttachmentChunked(relay: relay, name: name, data: data)
     }
 
@@ -324,7 +336,7 @@ final class SessionStore {
             guard let self else { return }
             self.projecting = false
             if let decoded {
-                self.apply(decoded)
+                self.apply(decoded.entries, queue: decoded.queue)
             }
             if self.projectPending {
                 self.projectPending = false
@@ -333,8 +345,9 @@ final class SessionStore {
         }
     }
 
-    private func apply(_ decoded: [MessageEntry]) {
+    private func apply(_ decoded: [MessageEntry], queue decodedQueue: [QueuedMessage] = []) {
         entries = decoded
+        if decodedQueue != queue { queue = decodedQueue }
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
@@ -346,10 +359,13 @@ final class SessionStore {
 
     /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
     /// previous projection standing rather than blanking a live transcript.
-    nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
+    nonisolated static func decodeEntries(
+        from doc: LoroDoc
+    ) -> (entries: [MessageEntry], queue: [QueuedMessage])? {
         guard let root = doc.getDeepValue().mapValue else { return nil }
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
-        return joinContinuations(raw)
+        let queue = (root["queue"]?.listValue ?? []).compactMap(queuedFrom)
+        return (joinContinuations(raw), queue)
     }
 
     nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
@@ -522,11 +538,19 @@ final class SessionStore {
     /// Durable-nudge the host device so a cold host opens the doc and drains
     /// (doc_host.rs nudge_remote_host). Fire-and-forget; the command is
     /// durable in the doc regardless.
-    private func nudgeHost() {
+    func nudgeHost() {
         guard let hostDeviceId else { return }
         Task { [config, chatId] in
             await config.nudge(deviceId: hostDeviceId, chatId: chatId)
         }
+    }
+
+    /// Re-read the queue after a local write, without waiting for the coalesced
+    /// whole-doc projection: dragging a row must move it this frame.
+    func refreshQueue() {
+        let next = (doc.getDeepValue().mapValue?["queue"]?.listValue ?? [])
+            .compactMap(Self.queuedFrom)
+        if next != queue { queue = next }
     }
 }
 

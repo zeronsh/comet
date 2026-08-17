@@ -601,6 +601,10 @@ pub struct AppState {
     pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// The selected chat's pending-message queue — what was typed while the
+    /// agent was busy, in the order it will be sent. Device-agnostic: the
+    /// chat's doc holds them (every device sees the same queue).
+    pub queue: Vec<zeron_doc::QueuedMessage>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -620,6 +624,7 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    queue_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -643,6 +648,7 @@ impl AppState {
             selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
+            queue: Vec::new(),
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             diff_comments: HashMap::new(),
@@ -652,6 +658,7 @@ impl AppState {
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
+            queue_task: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -709,6 +716,8 @@ impl AppState {
             self.selected_chat = None;
             self.transcript.clear();
             self.transcript_task = None;
+            self.queue.clear();
+            self.queue_task = None;
         }
     }
 
@@ -1200,7 +1209,9 @@ impl AppState {
         self.connection = ConnectionStatus::Ready;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
         }
         cx.notify();
     }
@@ -1221,6 +1232,8 @@ impl AppState {
         self.auto_selected = true;
         self.transcript.clear();
         self.transcript_task = None;
+        self.queue.clear();
+        self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) keeps the current project pick.
@@ -1239,7 +1252,9 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
         }
         cx.notify();
     }
@@ -1533,6 +1548,66 @@ fn spawn_transcript_watch(
             // Stream ended: engine restart, RPC drop, or chat purge. Retry;
             // the purge case is cleaned up by apply_chats dropping this task.
             tracing::debug!(%chat_id, "transcript stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+/// The selected chat's pending-message queue, straight off its doc. Whole-list
+/// frames (the queue is a handful of rows at most), retried like the transcript
+/// watch — a queue that silently stopped updating would show messages the host
+/// has already sent.
+fn spawn_queue_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    #[derive(serde::Deserialize)]
+    struct QueueFrame {
+        #[serde(default)]
+        items: Vec<zeron_doc::QueuedMessage>,
+    }
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_QUEUE, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::debug!(%chat_id, error = %err, "queue watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: QueueFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed queue frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    // Guard against a stale pump racing a newer selection.
+                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        state.queue = frame.items;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
             if this.update(cx, |_, _| {}).is_err() {
                 return;
             }

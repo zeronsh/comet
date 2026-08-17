@@ -102,6 +102,28 @@ struct QueueCommandParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct QueueMessageParams {
+    chat_id: String,
+    text: String,
+    #[serde(default)]
+    attachments: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedMessageParams {
+    chat_id: String,
+    id: String,
+    /// Present for UpdateQueuedMessage only; empty text deletes the row.
+    #[serde(default)]
+    text: String,
+    /// Present for MoveQueuedMessage only.
+    #[serde(default)]
+    to_index: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
@@ -772,6 +794,14 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
+            // The queue lives on the chat doc, and only its host may send from
+            // it — same addressing as the command ledger next door.
+            | methods::WATCH_QUEUE
+            | methods::QUEUE_MESSAGE
+            | methods::UPDATE_QUEUED_MESSAGE
+            | methods::MOVE_QUEUED_MESSAGE
+            | methods::REMOVE_QUEUED_MESSAGE
+            | methods::SEND_QUEUED_MESSAGE_NOW
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -821,6 +851,7 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_QUEUE
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
@@ -1052,6 +1083,66 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                 )))
+            }
+            methods::WATCH_QUEUE => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let rx = handle.watch_queue();
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
+                        if !first {
+                            rx.changed().await.ok()?;
+                        }
+                        let items = rx.borrow_and_update().clone();
+                        let value = serde_json::json!({ "items": items });
+                        Some((value, (rx, false)))
+                    })
+                    .boxed(),
+                ))
+            }
+            methods::QUEUE_MESSAGE => {
+                let p: QueueMessageParams = parse_params(params)?;
+                let id = self
+                    .doc_host
+                    .queue_message(&p.chat_id, &p.text, p.attachments)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "id": id }))
+            }
+            methods::UPDATE_QUEUED_MESSAGE => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let changed = self
+                    .doc_host
+                    .update_queued_message(&p.chat_id, &p.id, &p.text)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "changed": changed }))
+            }
+            methods::MOVE_QUEUED_MESSAGE => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let changed = self
+                    .doc_host
+                    .move_queued_message(&p.chat_id, &p.id, p.to_index)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "changed": changed }))
+            }
+            methods::REMOVE_QUEUED_MESSAGE => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let removed = self
+                    .doc_host
+                    .remove_queued_message(&p.chat_id, &p.id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "removed": removed }))
+            }
+            methods::SEND_QUEUED_MESSAGE_NOW => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let sent = self
+                    .doc_host
+                    .send_queued_now(&p.chat_id, &p.id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "sent": sent }))
             }
             methods::PROBE_SYNC => {
                 self.workspace.probe();

@@ -17,6 +17,10 @@ struct ComposerShell<Chips: View>: View {
     @Binding var draft: String
     var placeholder = "Message"
     var sendEnabled: Bool
+    /// Treat an empty box as sendable. Only the queue-edit path wants this:
+    /// emptying a queued message is how you throw it away, so the button has
+    /// to stay live with nothing typed.
+    var allowEmptySend = false
     var showStop: Bool
     var busy = false
     /// New-session composers stay expanded — the picker chips ARE the page.
@@ -156,7 +160,8 @@ struct ComposerShell<Chips: View>: View {
 
     /// Attachments count as content: an image-only send is a send, never a stop.
     private var hasContent: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+        allowEmptySend || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !attachments.isEmpty
     }
 
     private var actionButton: some View {
@@ -219,6 +224,10 @@ struct ComposerView: View {
     @State private var showTraitPicker = false
     /// Live catalog for the chat's harness from its space's device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    /// The queued row being retyped in the box, if any.
+    @State private var editingQueuedId: String?
+    /// Whatever was half-typed when that edit started, put back afterwards.
+    @State private var stashedDraft: String?
 
     private var harness: String { chat.config?.harness ?? "claude-code" }
 
@@ -246,9 +255,21 @@ struct ComposerView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // What is waiting to be sent, stacked directly above the box it
+            // was typed in.
+            if !store.queue.isEmpty {
+                QueuePanel(store: store,
+                           editingId: editingQueuedId,
+                           onEdit: beginQueueEdit,
+                           onCancelEdit: cancelQueueEdit)
+            }
             ComposerShell(
                 draft: $text,
+                placeholder: editingQueuedId == nil ? "Message" : "Edit queued message",
+                // Saving an edit down to nothing is how a queued message is
+                // thrown away, so the button stays live on an empty box.
                 sendEnabled: true,
+                allowEmptySend: editingQueuedId != nil,
                 showStop: runLive,
                 busy: uploading,
                 keepExpanded: showModelPicker || showTraitPicker,
@@ -345,7 +366,37 @@ struct ComposerView: View {
         }
     }
 
+    /// Retype a queued message in the composer. Whatever was already in the box
+    /// steps aside rather than being lost.
+    private func beginQueueEdit(_ item: QueuedMessage) {
+        if editingQueuedId == nil { stashedDraft = text }
+        editingQueuedId = item.id
+        text = item.text
+    }
+
+    private func cancelQueueEdit() {
+        guard editingQueuedId != nil else { return }
+        editingQueuedId = nil
+        text = stashedDraft ?? ""
+        stashedDraft = nil
+    }
+
+    /// Save the retyped row. Saving it empty is how a queued message is thrown
+    /// away — nothing to send is a decision, not an error.
+    private func commitQueueEdit(_ id: String) {
+        store.updateQueued(id: id, text: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        editingQueuedId = nil
+        text = stashedDraft ?? ""
+        stashedDraft = nil
+    }
+
     private func send() {
+        // Editing a queued row: the button saves that row rather than sending
+        // anything new.
+        if let editingQueuedId {
+            commitQueueEdit(editingQueuedId)
+            return
+        }
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let staged = attachments
         guard !prompt.isEmpty || !staged.isEmpty else { return }
@@ -382,8 +433,12 @@ struct ComposerView: View {
     }
 
     private func deliver(content: String, paths: [String]) {
+        // Mid-turn, the message joins the queue rather than racing the turn:
+        // whether it then steers into this turn or waits for the next one is
+        // the host's call (DocHost::drain_queue). It sits in the panel above
+        // meanwhile, editable, which beats a bubble that looks sent.
         if runLive {
-            store.sendSteer(prompt: content)
+            store.enqueueMessage(text: content, attachments: paths)
         } else {
             store.sendRun(prompt: content, chat: chat, attachments: paths)
         }
