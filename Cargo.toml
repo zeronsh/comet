@@ -9,11 +9,12 @@ members = [
     "crates/rpc",
     "crates/update",
     "crates/ui",
+    "crates/syntax",
     "apps/zeron",
 ]
 
 [workspace.package]
-version = "0.1.62"
+version = "0.2.3"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -27,6 +28,7 @@ zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
 zeron-update = { path = "crates/update" }
 zeron-ui = { path = "crates/ui" }
+zeron-syntax = { path = "crates/syntax" }
 
 # CRDT
 loro = "1.13"
@@ -36,7 +38,8 @@ loro = "1.13"
 loro-protocol = "0.3"
 
 # gpui — the wingleeio/zed fork: upstream f14fea9 + commits on
-# `comet/line-wrap-closing-punctuation` (rebase that branch when bumping the
+# `comet/edge-fade-horizontal` (tip of `comet/line-wrap-closing-punctuation`
+# + 5d1f83d horizontal per-pixel EdgeFade for quads/images; rebase when bumping the
 # upstream rev): a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
 # line_layout's shaped-text duplicate); 14baea0 adds the EdgeFade primitive
 # (Window::with_edge_fade — per-primitive scroll-edge fades for the glass
@@ -52,14 +55,14 @@ loro-protocol = "0.3"
 # object-fit Cover cropping via atlas-tile UVs so image corner radii hold;
 # 8a8954c switches the macOS blurred view to UnderWindowBackground (macOS 26
 # stopped vending CABackdropLayer for Selection — window blur went dead).
-gpui = { git = "https://github.com/wingleeio/zed", rev = "8a8954c7234f2261d13b72568ff09e4a5136d39f" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "8a8954c7234f2261d13b72568ff09e4a5136d39f", features = [
+gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "8a8954c7234f2261d13b72568ff09e4a5136d39f" }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d" }
 
 # diffs
 similar = "2"

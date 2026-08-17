@@ -9,8 +9,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use zeron_engine::{
-    EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
-    capture_turn_diff, merge_base, snapshot_tree,
+    EngineCore, HarnessRegistry, Repos, Terminals, capture_commit_diff, capture_diff,
+    capture_diff_against, capture_turn_diff, merge_base, read_diff_file_text, snapshot_tree,
+    working_diff_base,
 };
 use zeron_proto::{GitHistoryRefKind, TerminalEvent};
 use zeron_rpc::methods;
@@ -179,9 +180,17 @@ async fn repos_round_trip_add_branches_worktrees() {
         by_name("main").current,
         "main is the main checkout: {refs:?}"
     );
+    // macOS exposes /var through the /private/var symlink, while Git reports
+    // the canonical worktree path. Compare canonical paths so the assertion
+    // is stable across platforms and temporary-directory roots.
+    let listed_worktree_path = by_name(&worktree.branch)
+        .worktree_path
+        .as_deref()
+        .map(Path::new)
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    let expected_worktree_path = std::fs::canonicalize(&worktree.path).ok();
     assert_eq!(
-        by_name(&worktree.branch).worktree_path.as_deref(),
-        Some(worktree.path.as_str()),
+        listed_worktree_path, expected_worktree_path,
         "worktree branch maps to its path: {refs:?}"
     );
     let plain_ref = by_name("feature/x");
@@ -518,6 +527,78 @@ async fn diff_capture_against_merge_base_shows_branch_changes() {
 }
 
 #[tokio::test]
+async fn diff_file_text_returns_both_checked_sources() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+    std::fs::write(repo_dir.join("a.txt"), "one\nchanged\n").expect("edit a.txt");
+
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "a.txt")
+        .unwrap();
+    let base = working_diff_base(&repo_dir).await.expect("base");
+    let pair = read_diff_file_text(&repo_dir, &base, file)
+        .await
+        .expect("source pair");
+    assert_eq!(pair.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(pair.new_text.as_deref(), Some("one\nchanged\n"));
+    assert!(pair.old_content_hash.is_some());
+    assert!(pair.new_content_hash.is_some());
+    assert!(!pair.binary);
+    assert!(!pair.truncated);
+
+    let escape = zeron_proto::DiffFileSummary {
+        path: "../outside.txt".into(),
+        old_path: None,
+        status: "modified".into(),
+        additions: 1,
+        deletions: 1,
+        binary: false,
+    };
+    assert!(
+        read_diff_file_text(&repo_dir, &base, &escape)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn commit_diff_captures_one_commit_and_roots_diff_the_empty_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+
+    // A second commit plus an uncommitted edit on top.
+    std::fs::write(repo_dir.join("c.txt"), "second commit\n").expect("write c.txt");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "second"]).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nuncommitted\n").expect("edit a.txt");
+
+    let head = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
+    let snapshot = capture_commit_diff(&repos, &repo_dir, &head)
+        .await
+        .expect("commit capture");
+    // Only the commit's own change — never the working tree on top.
+    assert!(snapshot.patch.contains("+second commit"));
+    assert!(!snapshot.patch.contains("uncommitted"));
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].path, "c.txt");
+    assert_eq!(snapshot.head_sha.as_deref(), Some(head.as_str()));
+
+    // The root commit diffs against the empty tree instead of erroring.
+    let root = git_stdout(&repo_dir, &["rev-list", "--max-parents=0", "HEAD"]).await;
+    let root_snapshot = capture_commit_diff(&repos, &repo_dir, &root)
+        .await
+        .expect("root capture");
+    assert!(root_snapshot.files.iter().any(|f| f.path == "a.txt"));
+}
+
+#[tokio::test]
 async fn turn_diff_captures_only_changes_since_snapshot() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");
@@ -756,6 +837,97 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
             .expect("watcher-driven publish before timeout")
             .expect("watch alive");
     }
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo edited\n").expect("dirty tree");
+
+    let core = assemble(&tmp.path().join("data"));
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("diff snapshot");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "mode": "working",
+                "diffChecksum": snapshot.checksum,
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: zeron_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));
+    assert!(!response.stale);
+
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\ncommitted change\n").expect("commit content");
+    git(&repo_dir, &["add", "a.txt"]).await;
+    git(&repo_dir, &["commit", "-m", "second"]).await;
+    let sha = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
+
+    // A live edit must not affect the immutable History diff source pair.
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nworking tree edit\n")
+        .expect("working tree content");
+
+    let core = assemble(&tmp.path().join("data"));
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_commit_diff(&core.repos, &repo_dir, &sha)
+        .await
+        .expect("commit snapshot");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "mode": "commit",
+                "commitSha": sha,
+                "diffChecksum": snapshot.checksum,
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: zeron_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(
+        response.new_text.as_deref(),
+        Some("one\ntwo\ncommitted change\n")
+    );
+    assert!(!response.stale);
+
     core.shutdown().await;
 }
 

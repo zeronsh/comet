@@ -93,6 +93,10 @@ pub mod methods {
     pub const LIST_ORGS: &str = "ListOrgs";
     pub const CREATE_ORG: &str = "CreateOrg";
     pub const SELECT_ORG: &str = "SelectOrg";
+    /// One-time local→synced profile import: what's importable (unary).
+    pub const LOCAL_IMPORT_STATUS: &str = "LocalImportStatus";
+    /// One-time local→synced profile import: run it (stream of progress items).
+    pub const IMPORT_LOCAL_WORKSPACE: &str = "ImportLocalWorkspace";
     // Repos / worktrees / folders (ControlRpc, relay-forwardable).
     pub const LIST_REPOS: &str = "ListRepos";
     pub const ADD_REPO: &str = "AddRepo";
@@ -119,6 +123,7 @@ pub mod methods {
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
+    pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
     pub const ACTIVATE_AGENT_ACCOUNT: &str = "ActivateAgentAccount";
@@ -305,6 +310,34 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn handshake_with_origin_header_is_rejected() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+
+        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
+        // the server must refuse the handshake before serving any RPC.
+        let mut req = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("origin", "https://evil.example".parse().unwrap());
+        let result = tokio_tungstenite::connect_async(req).await;
+        assert!(
+            result.is_err(),
+            "handshake carrying an Origin header must be rejected"
+        );
+
+        // A native viewport (no Origin) still connects and can call RPC — the
+        // reject must not be a blanket denial.
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
+        assert_eq!(echoed, serde_json::json!("ok"));
     }
 
     #[tokio::test]

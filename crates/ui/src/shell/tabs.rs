@@ -99,7 +99,6 @@ impl Shell {
                 None => (SharedString::from(""), None, None, true),
             }
         };
-        let git = self.space_git_detected(cx);
 
         // The new-session `+` renders in the WINDOW-CONTROL CLUSTER while the
         // sidebar is collapsed (`render_titlebar_cluster`) — this row only
@@ -122,7 +121,7 @@ impl Shell {
         // the pane itself would sit under the drag region and never see a
         // click. Closed, it is just the stable open/close toggle. Hidden on
         // the new-session canvas (user request) — nothing to diff yet.
-        let takeover = git && !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
+        let takeover = !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
         // inset would push the scope dropdown off the pane's own left gutter
@@ -133,22 +132,25 @@ impl Shell {
         // strip doesn't want (it brings its own 8px pad), and doubling up
         // read as a hole after the `+` (user report).
         let row_left = if takeover {
-            // The scope dropdown should sit at the cluster's own 2px button
-            // rhythm off the `+` — anything more read as a hole in the button
-            // row (user report). Between `row_left` and the trigger box sit
-            // 16px of chrome (the row's 8px child gap + the strip's 8px pad),
-            // and `title_bar_content_start` adds a 10px text margin: land the
-            // box at cluster end + 2 ⇒ −(10 + 16 − 2).
+            // The surface tabs must LEFT-ALIGN with the pane's own rows (the
+            // diff options and stats strip carry an 8px box gutter off the
+            // seam — user report: rows started at different insets). The
+            // strip's width is capped to `avail`, which subtracts the row's
+            // 8px child gap — pulling row_left 8 LEFT of the seam cancels
+            // that, so the uncapped strip starts exactly at the seam and its
+            // own 8px pad lands the first chip on the pane gutter. The
+            // window-control cluster still wins while the sidebar is
+            // collapsed (the chips clear it instead of underlapping).
             let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
-            sidebar_now.max(cluster_end)
+            (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
         };
-        let trailing: Option<gpui::AnyElement> = if !git || on_canvas {
+        let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
         } else if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
+            let pr = self.titlebar_right_pad(Theme::SPACE_LG);
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
             // edge (flex_none never shrinks) — cap to the available width. The
@@ -158,9 +160,10 @@ impl Shell {
             // the buttons slide right on expand (user report).
             let gap_budget = if takeover { 8.0 } else { 16.0 };
             let avail = self.viewport_width - row_left - pr - gap_budget;
-            let controls = self
-                .changes_pane(cx)
-                .update(cx, |changes, cx| changes.render_header_controls(cx));
+            // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
+            // options that used to live here moved into the pane's own
+            // second row; expand/close stay in this band (user request).
+            let controls = self.render_right_tab_strip(cx);
             Some(
                 div()
                     .flex_none()
@@ -221,10 +224,7 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
             .pl(px(row_left))
-            .pr(px(titlebar_right_padding(
-                cfg!(target_os = "windows"),
-                Theme::SPACE_LG,
-            )))
+            .pr(px(self.titlebar_right_pad(Theme::SPACE_LG)))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.

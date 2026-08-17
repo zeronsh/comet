@@ -18,17 +18,18 @@ A ground-up native rewrite of [zeron](../zeron) — a multi-device controller fo
 ```
 gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══ engine B ─ RPC ─ gpui UI
                     │       optional edge Worker: auth, rooms, R2        │
-                    └── optional Loro sync ─ SessionRoom DO (per chat) ──┘
+                    └── optional chat2 sync ──  ChatRoom DO (per chat) ──┘
                                           └─ Workspace registry room ────┘
 ```
 
 - **Engine = backend** (was `@zeron/backend`): runs agents, owns auth, terminals, repos/worktrees,
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **spaces** — (device, folder) pairs, local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable spaces dropdown ("All spaces" included) that also hosts space management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-space): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last selected space); new sessions are minted onto the picked space's device via relay-forwardable RPCs.
-- **Edge (TypeScript, ported from zeron `apps/edge`)**: Worker + SessionRoom DO (per chat) +
-  DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth. Absorbs the old `apps/server`
-  responsibilities (WorkOS code exchange/refresh, orgs) so **Postgres, the Hono server, and
-  the WebRTC/signaling stack are all gone**.
+- **Edge (TypeScript, ported from zeron `apps/edge`)**: Worker + ChatRoom DO (per chat, the
+  chat2 row protocol; the legacy SessionRoom DO remains deployed only for pre-cutover clients —
+  no current client dials it) + DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth.
+  Absorbs the old `apps/server` responsibilities (WorkOS code exchange/refresh, orgs) so
+  **Postgres, the Hono server, and the WebRTC/signaling stack are all gone**.
 
 ### Headed / headless
 Single binary `zeron`:
@@ -84,7 +85,7 @@ The following product work is intentionally deferred:
 
 ## 2. Data model — all Loro
 
-Two persistent doc kinds. When sync is enabled they share one loro-protocol room protocol over WebSocket; local-only profiles persist the same docs without joining rooms:
+Two persistent doc kinds. When sync is enabled, session docs ride the chat2 row protocol (loro updates as append-only rows + Range-resumable checkpoints, ChatRoom DO) and the registry rides its own row-frame protocol; local-only profiles persist the same docs without joining rooms:
 
 1. **Session doc** (per chat) — the transcript + durable command queue. Schema is a Rust port of
    `packages/session-doc` (same container names/shapes so the edge's tail materializer keeps

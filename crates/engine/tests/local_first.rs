@@ -349,6 +349,15 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
         .await
         .unwrap();
 
+    // Revocation is detected by the background session probe — assembly no
+    // longer blocks on the network round trip — so the SignedOut transition
+    // lands shortly after assembly, not during it.
+    for _ in 0..200 {
+        if auth.state() == AuthState::SignedOut {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert!(auth.loaded_workos_session());
     assert_eq!(runtime.workspace_scope(), WorkspaceScope::Synced);
@@ -559,7 +568,7 @@ async fn headless_sign_out_closes_joined_edge_rooms_and_stops_daemon() {
 
 /// Replacing a synced/online runtime must be a real ownership boundary: after
 /// `shutdown()` returns, no worker may send another Edge request (updater,
-/// attachment mirror, room joins), and dropping the runtime must actually free
+/// room joins), and dropping the runtime must actually free
 /// the engine graph — the sessions ⇄ doc-host cycle and the strong-`self`
 /// worker loops previously kept a replaced runtime alive and polling forever.
 #[tokio::test]
@@ -573,25 +582,12 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
         .unwrap()
         .expect("development profile is ready");
 
-    // Seed one durable mirror intent so the outbox drain has retrying work in
-    // flight across the shutdown (the edge 401s every attempt).
-    let uploads_root = profile.uploads_root().to_path_buf();
-    let outbox = uploads_root.join("mirror-outbox");
-    std::fs::create_dir_all(&outbox).unwrap();
-    std::fs::write(uploads_root.join("note.txt"), b"mirror me").unwrap();
-    let sha = "1bdcacd1a420e97dc81f23acfcfa151ad547607db903a39cd2b9d8e68fb08e5e";
-    std::fs::write(
-        outbox.join(format!("{sha}.pending")),
-        r#"{"file_name":"note.txt"}"#,
-    )
-    .unwrap();
-
     let runtime = Engine::assemble_runtime(&config, auth, profile)
         .await
         .unwrap();
     let retired = runtime.core().doc_host.retirement_probe();
 
-    // Live traffic proof: the mirror drain (and the woken release checker) must
+    // Live traffic proof: the woken release checker (and the room joins) must
     // be hitting the counting edge before the boundary is exercised.
     if let Some(updater) = runtime.core().updater() {
         updater.check_now();
@@ -613,8 +609,8 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
         "engine graph still reachable after shutdown + drop",
     )
     .await;
-    // Longer than two mirror retry periods: a surviving drain loop would land
-    // another PUT in this window.
+    // Long enough to cover a couple of worker retry periods: a surviving
+    // Edge worker loop would land another request in this window.
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
     assert_eq!(
         requests.load(Ordering::SeqCst),

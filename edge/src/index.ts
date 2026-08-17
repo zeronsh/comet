@@ -27,9 +27,6 @@
  *   GET  /device/:deviceId/sidecar/:name
  *   POST /device/:deviceId/sidecar/:name
  *   GET  /device/:deviceId/status
- *   PUT  /attachments/:sha256         — content-addressed upload
- *   GET  /attachments/:sha256
- *   HEAD /attachments/:sha256
  *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
  *   GET  /blob/:chatId/:partId
  *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
@@ -60,11 +57,9 @@ const safeDecode = (segment: string): string | undefined => {
     return undefined;
   }
 };
-const SHA256_RE = /^[a-f0-9]{64}$/;
 /** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
  * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
 const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
-const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024; // mirrors today's upload cap
 const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
@@ -88,6 +83,12 @@ const forward = (
   url.pathname = path;
   if (search !== undefined) url.search = search;
   const headers = new Headers(request.headers);
+  // room-kind is a Worker-controlled signal (the DO relaxes owner gating for
+  // workspace rooms): clear any inbound value so only the explicit set below —
+  // reached solely on workspace forwards, after the org-membership check —
+  // can assert it. Do not drop this line; passthrough would let a caller
+  // choose their own room kind.
+  headers.delete(ROOM_KIND_HEADER);
   headers.set(AUTH_USER_HEADER, userId);
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
@@ -363,7 +364,7 @@ export default {
     //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps
     //    only a one-line summary + this key. Straight R2, no DO involvement —
     //    the doc stays thin whether or not these uploads land. Per-user
-    //    prefix = owner auth (same trust shape as /attachments). ────────────
+    //    prefix = owner auth. ─────────────────────────────────────────────
     if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1])) {
       // Percent-decode the part segment before validating: PART_RE allows
       // `#` (`m1#c1`-style harness ids), which HTTP clients cannot send raw
@@ -401,34 +402,10 @@ export default {
       }
     }
 
-    // ── R2 attachments (§1.2): content-addressed, per-user prefix ──────────
-    if (parts[0] === "attachments" && parts[1] && SHA256_RE.test(parts[1])) {
-      const key = `att/${auth.userId}/${parts[1]}`;
-      if (request.method === "PUT") {
-        const body = await request.arrayBuffer();
-        if (body.byteLength > MAX_ATTACHMENT_BYTES) return json({ error: "too_large" }, 413);
-        const digest = await crypto.subtle.digest("SHA-256", body);
-        const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-        if (hex !== parts[1]) return json({ error: "hash_mismatch" }, 400);
-        await env.BLOBS.put(key, body, {
-          httpMetadata: {
-            contentType: request.headers.get("content-type") ?? "application/octet-stream"
-          }
-        });
-        return json({ ok: true, hash: hex, bytes: body.byteLength });
-      }
-      if (request.method === "GET" || request.method === "HEAD") {
-        const object =
-          request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
-        if (!object) return json({ error: "not_found" }, 404);
-        const headers = new Headers();
-        object.writeHttpMetadata(headers);
-        headers.set("etag", object.httpEtag);
-        headers.set("cache-control", "private, max-age=31536000, immutable");
-        const body =
-          request.method === "GET" && "body" in object ? (object as R2ObjectBody).body : null;
-        return new Response(body, { headers });
-      }
+    // ── retired attachment mirror (clients ≤0.1.62): acknowledge and discard
+    //    so old outboxes drain once instead of retrying the PUT forever ──────
+    if (parts[0] === "attachments" && parts[1] && request.method === "PUT") {
+      return json({ ok: true });
     }
 
     return json({ error: "not_found" }, 404);

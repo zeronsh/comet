@@ -416,7 +416,7 @@ async fn claude_login_flow_is_pkce_paste_code() {
 #[tokio::test]
 async fn uploads_chunk_commit_readback_and_jail() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let uploads = Uploads::new(tmp.path(), None);
+    let uploads = Uploads::new(tmp.path());
 
     // 100KB of pseudo-random bytes, staged as three positional base64 chunks
     // (out of order, with one retried) — chunk boundaries are multiples of 3

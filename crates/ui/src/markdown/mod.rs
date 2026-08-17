@@ -1,6 +1,6 @@
 //! Our own markdown stack — pulldown-cmark parse into a [`parser::BlockTree`],
 //! block-level incremental reparse for streaming, gpui rendering, and a
-//! lightweight paint-only syntax highlighter. No zed GPL crates.
+//! Tree-sitter paint-only syntax highlighting. No zed GPL crates.
 //!
 //! Design (docs/research/mugen-pretext.md §2):
 //! - the parse is block-granular and append-incremental: streaming reparses only
@@ -14,7 +14,6 @@
 //!   reflow already-painted text; the canonical parse settles honestly on
 //!   completion.
 
-pub mod highlight;
 pub mod mend;
 pub mod parser;
 pub mod render;

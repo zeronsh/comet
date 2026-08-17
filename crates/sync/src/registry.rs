@@ -27,7 +27,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use zeron_doc::{PendingBatch, RegistryDoc, RegistryRow, StateOutcome};
 
-use crate::room::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
+use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
 
 /// Text `"ping"` keepalive interval (answered by the DO auto-response pair
 /// without waking it — transport liveness only).
@@ -155,7 +155,7 @@ impl TextConnector for WsTextConnector {
         let provider = self.url.clone();
         Box::pin(async move {
             let url = provider.url().await?;
-            let (ws, _) = tokio_tungstenite::connect_async(&url)
+            let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
             let (out_tx, out_rx) = mpsc::channel(64);
@@ -294,7 +294,7 @@ impl RegistryClient {
     /// Connect with a per-dial URL provider (fresh `?token=` every attempt).
     /// Resolves once the initial hello/state handshake lands; a first-attempt
     /// failure is returned as `Err` (callers own the initial-join retry, same
-    /// contract as `RoomClient`). After that the client reconnects itself.
+    /// contract as `ChatClient`). After that the client reconnects itself.
     pub async fn connect_via(
         provider: Arc<dyn UrlProvider>,
         doc: Arc<Mutex<RegistryDoc>>,
@@ -453,10 +453,23 @@ enum SessionEnd {
     Stop,
 }
 
+/// How a backoff wait ended.
+enum Waited {
+    Elapsed,
+    /// System wake or a sibling dial succeeded: redial NOW on fresh backoff.
+    Woke,
+    Shutdown,
+}
+
 impl Actor {
     async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
+        // Suspend/resume and sibling-dial successes are EVENTS that end a
+        // backoff wait immediately (see room.rs) — without them a recovered
+        // network still waited out the full accumulated delay.
+        let mut wake = crate::wake::subscribe();
+        let mut online = crate::wake::subscribe_online();
         loop {
             if *self.shutdown.borrow() {
                 return;
@@ -470,10 +483,11 @@ impl Actor {
                         return; // first join failed: caller owns the retry
                     }
                     tracing::warn!(error = %err, "registry dial failed; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
+                    match self.wait_backoff(&mut wake, &mut online, backoff).await {
+                        Waited::Shutdown => return,
+                        Waited::Woke => backoff = BACKOFF_BASE,
+                        Waited::Elapsed => backoff = (backoff * 2).min(BACKOFF_CAP),
                     }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
                     continue;
                 }
                 Err(_) => {
@@ -482,10 +496,11 @@ impl Actor {
                         return;
                     }
                     tracing::warn!("registry dial timed out; backing off");
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
+                    match self.wait_backoff(&mut wake, &mut online, backoff).await {
+                        Waited::Shutdown => return,
+                        Waited::Woke => backoff = BACKOFF_BASE,
+                        Waited::Elapsed => backoff = (backoff * 2).min(BACKOFF_CAP),
                     }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
                     continue;
                 }
             };
@@ -494,9 +509,13 @@ impl Actor {
                 SessionEnd::Stop => return,
                 SessionEnd::Reconnect => {
                     lock(&self.doc).mark_disconnected();
-                    self.stats
+                    // A session that had joined resets the backoff — without
+                    // this, ~7 flaps pinned every future reconnect at the cap
+                    // for the life of the client.
+                    let joined = self
+                        .stats
                         .connected
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                        .swap(false, std::sync::atomic::Ordering::Relaxed);
                     self.stats
                         .disconnects
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -509,20 +528,42 @@ impl Actor {
                         }
                         return;
                     }
-                    if self.sleep_or_shutdown(backoff).await {
-                        return;
+                    if joined {
+                        backoff = BACKOFF_BASE;
                     }
-                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                    match self.wait_backoff(&mut wake, &mut online, backoff).await {
+                        Waited::Shutdown => return,
+                        Waited::Woke => backoff = BACKOFF_BASE,
+                        Waited::Elapsed => backoff = (backoff * 2).min(BACKOFF_CAP),
+                    }
                 }
             }
         }
     }
 
-    /// True = shutdown observed.
-    async fn sleep_or_shutdown(&mut self, wait: Duration) -> bool {
+    /// Sleep out one backoff, cut short by system wake, a sibling dial
+    /// success, or shutdown.
+    async fn wait_backoff(
+        &mut self,
+        wake: &mut tokio::sync::broadcast::Receiver<()>,
+        online: &mut tokio::sync::broadcast::Receiver<()>,
+        wait: Duration,
+    ) -> Waited {
+        // Drain stale events: only wakes/successes DURING this wait count,
+        // or our own last dial would cut every wait to zero.
+        while wake.try_recv().is_ok() {}
+        while online.try_recv().is_ok() {}
         tokio::select! {
-            _ = tokio::time::sleep(wait) => false,
-            _ = self.shutdown.changed() => *self.shutdown.borrow(),
+            _ = tokio::time::sleep(wait) => Waited::Elapsed,
+            _ = wake.recv() => Waited::Woke,
+            _ = online.recv() => Waited::Woke,
+            _ = self.shutdown.changed() => {
+                if *self.shutdown.borrow() {
+                    Waited::Shutdown
+                } else {
+                    Waited::Elapsed
+                }
+            }
         }
     }
 

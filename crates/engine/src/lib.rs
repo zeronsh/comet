@@ -21,6 +21,7 @@ pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod local_import;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -36,8 +37,9 @@ pub mod workspace_host;
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffSidecar, DiffSnapshot, TurnSnapshot, capture_diff, capture_diff_against,
-    capture_turn_diff, merge_base, snapshot_tree,
+    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
+    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
+    read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -116,6 +118,8 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    /// Local→synced profile import (account-scoped runtimes only).
+    pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -193,6 +197,7 @@ impl EngineCore {
         // engine data dir — per-device, like the CLI installs it gates.
         registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
+        let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
         let doc_host = DocHost::new(
@@ -228,8 +233,28 @@ impl EngineCore {
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
-            edge.clone(),
         );
+        // A recorded local→synced import grants this account the local
+        // profile's uploads root read-only — transcripts imported earlier
+        // embed absolute paths under it (same shape as the legacy adoption).
+        if profile.scope() != WorkspaceScope::Local
+            && let Some(root) =
+                local_import::marker_grants_read_root(data_dir, profile.org_id(), profile.user_id())
+        {
+            uploads.add_read_only_root(&root);
+        }
+        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+            local_import::LocalImporter::new(
+                data_dir,
+                &device_id,
+                profile.org_id(),
+                profile.user_id(),
+                store_for_import.clone(),
+                profile.store_root().join("journals"),
+                workspace.clone(),
+                uploads.clone(),
+            )
+        });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
@@ -255,6 +280,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            local_import,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -388,6 +414,9 @@ impl EngineCore {
         if let Some(updater) = self.updater() {
             rpc = rpc.with_updater(updater);
         }
+        if let Some(importer) = self.local_import.clone() {
+            rpc = rpc.with_local_import(importer);
+        }
         Arc::new(rpc)
     }
 
@@ -429,7 +458,6 @@ impl EngineCore {
         if let Some(updater) = updater {
             updater.shutdown().await;
         }
-        self.uploads.shutdown().await;
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
@@ -645,10 +673,16 @@ impl Engine {
         let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
             WorkspaceScope::Synced => {
-                // Validate a persisted session once so definitive revocation
-                // still transitions auth to SignedOut. A transient failure
-                // must not gate construction of the recovery supervisors.
-                let _ = auth.access_token().await;
+                // Validate the persisted session in the BACKGROUND: the probe
+                // still transitions auth to SignedOut on definitive revocation
+                // (and warms the single-flight refresh every first dial waits
+                // on), but assembly — and the viewport blocked on it — no
+                // longer stalls on a WorkOS round trip that can take seconds
+                // on a bad link. Everything shown at boot is local anyway.
+                let auth_probe = auth.clone();
+                tokio::spawn(async move {
+                    let _ = auth_probe.access_token().await;
+                });
                 true
             }
             // Dev Auth always exposes `dev_user_id` as its synthetic access
@@ -703,6 +737,10 @@ impl Engine {
             core.set_updater(updater);
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
+        // Managed ACP adapters install in the background at boot (agents
+        // whose CLI is present but whose adapter isn't yet), so a first chat
+        // never waits on — or dies inside — an npm run.
+        zeron_harness::acp::prewarm_managed_adapters();
 
         let host_relay = edge.as_ref().map(|edge| {
             let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(

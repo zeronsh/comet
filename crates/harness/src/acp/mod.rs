@@ -65,9 +65,11 @@ struct AcpAgentSpec {
     env_override: &'static str,
     /// Arguments that put the binary in ACP-serving mode.
     args: &'static [&'static str],
-    /// `npx -y <package>` fallback when the binary isn't installed — pinned
-    /// so a cold launch is reproducible (npx caches after the first run).
-    npx_package: Option<&'static str>,
+    /// Pinned npm package (`name@version`) installed ONCE into the managed
+    /// adapters dir when the binary isn't already present — the launch then
+    /// spawns `node <entry>` directly, keeping npm (and every way a user's
+    /// npm state can break) out of chat turns. See [`crate::adapter_install`].
+    npm_package: Option<&'static str>,
     /// Extra install locations to probe after PATH.
     extra_paths: fn() -> Vec<PathBuf>,
     /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
@@ -103,7 +105,7 @@ fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String 
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
-fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
@@ -156,7 +158,7 @@ fn claude_spec() -> AcpAgentSpec {
         executable: "claude-agent-acp",
         env_override: "CLAUDE_ACP_EXECUTABLE",
         args: &[],
-        npx_package: Some("@agentclientprotocol/claude-agent-acp@0.66.0"),
+        npm_package: Some("@agentclientprotocol/claude-agent-acp@0.66.0"),
         extra_paths: npm_global_paths("claude-agent-acp"),
         cli_executable: "claude",
         cli_extra_paths: || {
@@ -168,10 +170,11 @@ fn claude_spec() -> AcpAgentSpec {
             dirs
         },
         install_hint: "claude-agent-acp (searched PATH, the login shell's PATH, npm \
-             global bins, and fnm/nvm/volta/pnpm/bun install dirs; falls back to \
-             `npx -y @agentclientprotocol/claude-agent-acp` when npx is available; \
-             install with `npm install -g @agentclientprotocol/claude-agent-acp`; \
-             set CLAUDE_ACP_EXECUTABLE to override)",
+             global bins, and fnm/nvm/volta/pnpm/bun install dirs; zeron installs \
+             the pinned @agentclientprotocol/claude-agent-acp automatically when \
+             npm is available; install npm/node, or \
+             `npm install -g @agentclientprotocol/claude-agent-acp`, or set \
+             CLAUDE_ACP_EXECUTABLE to override)",
         models: crate::claude::catalog::static_models,
         // `_session/steering` advertised by the adapter: priority-`now`
         // injection, pre-empting the current generation.
@@ -202,14 +205,15 @@ fn codex_spec() -> AcpAgentSpec {
         executable: "codex-acp",
         env_override: "CODEX_ACP_EXECUTABLE",
         args: &[],
-        npx_package: Some("@agentclientprotocol/codex-acp@1.1.14"),
+        npm_package: Some("@agentclientprotocol/codex-acp@1.1.14"),
         extra_paths: npm_global_paths("codex-acp"),
         cli_executable: "codex",
         cli_extra_paths: || npm_global_bins("codex"),
         install_hint: "codex-acp (searched PATH, the login shell's PATH, npm global \
-             bins, and fnm/nvm/volta/pnpm/bun install dirs; falls back to \
-             `npx -y @agentclientprotocol/codex-acp` when npx is available; install \
-             with `npm install -g @agentclientprotocol/codex-acp`; set \
+             bins, and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the \
+             pinned @agentclientprotocol/codex-acp automatically when npm is \
+             available; install npm/node, or \
+             `npm install -g @agentclientprotocol/codex-acp`, or set \
              CODEX_ACP_EXECUTABLE to override)",
         models: crate::codex::catalog::static_models,
         steering_mode: SteeringMode::StepBoundary,
@@ -266,7 +270,7 @@ fn grok_spec() -> AcpAgentSpec {
         executable: "grok",
         env_override: "GROK_EXECUTABLE",
         args: &["agent", "stdio"],
-        npx_package: Some("@xai-official/grok@1.0.0"),
+        npm_package: Some("@xai-official/grok@1.0.0"),
         extra_paths: grok_install_paths,
         cli_executable: "grok",
         cli_extra_paths: grok_install_paths,
@@ -322,7 +326,7 @@ fn cursor_spec() -> AcpAgentSpec {
         env_override: "CURSOR_EXECUTABLE",
         // Native ACP server — no adapter package in between.
         args: &["acp"],
-        npx_package: None,
+        npm_package: None,
         extra_paths: cursor_install_paths,
         cli_executable: "cursor-agent",
         cli_extra_paths: cursor_install_paths,
@@ -383,7 +387,7 @@ fn hermes_spec() -> AcpAgentSpec {
         env_override: "HERMES_EXECUTABLE",
         args: &["acp"],
         // Python/uv install — no npm fallback exists.
-        npx_package: None,
+        npm_package: None,
         extra_paths: hermes_install_paths,
         cli_executable: "hermes",
         cli_extra_paths: hermes_install_paths,
@@ -433,14 +437,14 @@ fn pi_spec() -> AcpAgentSpec {
         executable: "pi-acp",
         env_override: "PI_ACP_EXECUTABLE",
         args: &[],
-        npx_package: Some("pi-acp@0.0.33"),
+        npm_package: Some("pi-acp@0.0.33"),
         extra_paths: npm_global_paths("pi-acp"),
         cli_executable: "pi",
         cli_extra_paths: || npm_global_bins("pi"),
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; falls back to `npx -y pi-acp` \
-             when npx is available; install with `npm install -g pi-acp` — requires the \
-             pi CLI itself, `npm install -g --ignore-scripts \
+             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
+             pi-acp automatically when npm is available — the pi CLI itself is \
+             still required, `npm install -g --ignore-scripts \
              @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
         // pi routes models through its own provider config (~/.pi); the picker
         // advertises the pass-through entry and pi keeps whatever the user set
@@ -479,6 +483,55 @@ fn pi_spec() -> AcpAgentSpec {
     }
 }
 
+/// Background-install managed npm adapters for agents whose CLI is present
+/// on this device, so a first chat never pays (or trips over) an npm run.
+/// Skips agents whose adapter is already resolvable; failures are logged and
+/// retried on the next daemon start or blocking launch. A no-op outside a
+/// tokio runtime.
+pub fn prewarm_managed_adapters() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    for spec in [claude_spec(), codex_spec(), grok_spec(), pi_spec()] {
+        let Some(pkg) = spec.npm_package else {
+            continue;
+        };
+        let pin = crate::adapter_install::NpmPin::parse(pkg);
+        if find_on_paths(spec.executable, (spec.extra_paths)()).is_some()
+            || crate::adapter_install::installed_entry(&pin, spec.executable).is_some()
+            || find_on_paths(spec.cli_executable, (spec.cli_extra_paths)()).is_none()
+            || crate::adapter_install::find_npm().is_none()
+        {
+            continue;
+        }
+        let (bin_name, display_name) = (spec.executable, spec.display_name);
+        handle.spawn(async move {
+            match crate::adapter_install::ensure_installed(pin, bin_name, display_name).await {
+                Ok(entry) => tracing::info!(
+                    target: "zeron_harness::adapter_install",
+                    adapter = %entry.display(),
+                    "prewarmed {display_name} ACP adapter"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "zeron_harness::adapter_install",
+                    "prewarm of the {display_name} ACP adapter failed: {e}"
+                ),
+            }
+        });
+    }
+}
+
+/// A resolved launch: a concrete program, or a managed npm adapter that may
+/// still need installing (see [`AcpHarness::resolve_program`]).
+enum Launch {
+    Program(PathBuf, Vec<String>),
+    Managed {
+        pin: crate::adapter_install::NpmPin,
+        bin_name: &'static str,
+        args: Vec<String>,
+    },
+}
+
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
 /// fake agent with [`AcpHarness::with_executable`].
 pub struct AcpHarness {
@@ -488,6 +541,9 @@ pub struct AcpHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
+    /// Bound on the initialize → session handshake; a hang past it errors the
+    /// run instead of spinning "Working" forever.
+    handshake_timeout: Duration,
     /// Discovery result cache: the advertised commands survive across calls.
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: only a successful, non-empty probe is cached,
@@ -502,6 +558,10 @@ impl AcpHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            // Generous: the handshake is local work for every agent
+            // (session/load replays from disk), so a hang past this is a
+            // wedged agent, not a slow one.
+            handshake_timeout: Duration::from_secs(120),
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
         }
@@ -553,41 +613,121 @@ impl AcpHarness {
         self
     }
 
-    /// Test seam: the program `run` would spawn (the adapter binary, or npx
-    /// for the pinned-package fallback).
-    #[doc(hidden)]
-    pub fn launch_program(&self) -> Result<PathBuf, HarnessError> {
-        self.resolve_launch().map(|(program, _)| program)
+    /// Tune the handshake bound (tests shrink it; default 120s).
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
-    /// Resolve what to spawn: the adapter binary itself, or `npx -y <pinned>`
-    /// when the binary isn't installed but npx is. Returns the program plus
-    /// the full argument list (npx package prefix + the spec's ACP args).
-    fn resolve_launch(&self) -> Result<(PathBuf, Vec<String>), HarnessError> {
+    /// Test seam: the program `run` would spawn (the adapter binary, or —
+    /// for a managed npm adapter — its installed entry, else npm as the
+    /// installer that would run first).
+    #[doc(hidden)]
+    pub fn launch_program(&self) -> Result<PathBuf, HarnessError> {
+        match self.resolve_launch()? {
+            Launch::Program(program, _) => Ok(program),
+            Launch::Managed { pin, bin_name, .. } => {
+                match crate::adapter_install::installed_entry(&pin, bin_name) {
+                    Some(entry) => Ok(entry),
+                    None => crate::adapter_install::find_npm()
+                        .ok_or_else(|| HarnessError::NotInstalled(self.spec.install_hint.into())),
+                }
+            }
+        }
+    }
+
+    /// Resolve what to spawn: an explicit/installed adapter binary, or the
+    /// managed install of the spec's pinned npm package. `NotInstalled` only
+    /// when neither the binary nor the machinery to install it (npm) exists.
+    fn resolve_launch(&self) -> Result<Launch, HarnessError> {
         let spec_args: Vec<String> = self.spec.args.iter().map(|a| a.to_string()).collect();
         if let Some(p) = &self.executable {
-            return Ok((p.clone(), spec_args));
+            return Ok(Launch::Program(p.clone(), spec_args));
         }
         if let Some(p) = std::env::var_os(self.spec.env_override)
             && !p.is_empty()
         {
-            return Ok((PathBuf::from(p), spec_args));
+            return Ok(Launch::Program(PathBuf::from(p), spec_args));
         }
         if let Some(found) = find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
-            return Ok((found, spec_args));
+            return Ok(Launch::Program(found, spec_args));
         }
-        if let Some(pkg) = self.spec.npx_package
-            && let Some(npx) = find_on_paths("npx", Vec::new())
-        {
-            let mut args = vec!["-y".to_string(), pkg.to_string()];
-            args.extend(spec_args);
-            return Ok((npx, args));
+        if let Some(pkg) = self.spec.npm_package {
+            let pin = crate::adapter_install::NpmPin::parse(pkg);
+            if crate::adapter_install::installed_entry(&pin, self.spec.executable).is_some()
+                || crate::adapter_install::find_npm().is_some()
+            {
+                return Ok(Launch::Managed {
+                    pin,
+                    bin_name: self.spec.executable,
+                    args: spec_args,
+                });
+            }
         }
         Err(HarnessError::NotInstalled(self.spec.install_hint.into()))
     }
 
-    fn spawn_agent(&self, cwd: Option<&str>) -> Result<(Child, crate::StderrTail), HarnessError> {
-        let (exe, args) = self.resolve_launch()?;
+    /// Resolve to a concrete (program, args), running the managed install if
+    /// it hasn't completed yet. `block_on_install: false` (discovery paths)
+    /// never waits on npm: it kicks the install in the background and errors
+    /// out, so a picker open falls back to the static catalog instead of
+    /// stalling for however long a 500MB dependency tree takes to land.
+    async fn resolve_program(
+        &self,
+        block_on_install: bool,
+    ) -> Result<(PathBuf, Vec<String>), HarnessError> {
+        match self.resolve_launch()? {
+            Launch::Program(program, args) => Ok((program, args)),
+            Launch::Managed {
+                pin,
+                bin_name,
+                args,
+            } => {
+                let entry = match crate::adapter_install::installed_entry(&pin, bin_name) {
+                    Some(entry) => entry,
+                    None if block_on_install => {
+                        crate::adapter_install::ensure_installed(
+                            pin,
+                            bin_name,
+                            self.spec.display_name,
+                        )
+                        .await?
+                    }
+                    None => {
+                        let display_name = self.spec.display_name;
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::adapter_install::ensure_installed(
+                                pin,
+                                bin_name,
+                                display_name,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    target: "zeron_harness::adapter_install",
+                                    "background adapter install failed: {e}"
+                                );
+                            }
+                        });
+                        return Err(HarnessError::Protocol(format!(
+                            "{} adapter is installing in the background",
+                            self.spec.display_name
+                        )));
+                    }
+                };
+                let (program, mut node_args) = crate::adapter_install::launch_for_entry(&entry)?;
+                node_args.extend(args);
+                Ok((program, node_args))
+            }
+        }
+    }
+
+    async fn spawn_agent(
+        &self,
+        cwd: Option<&str>,
+        block_on_install: bool,
+    ) -> Result<(Child, crate::StderrTail), HarnessError> {
+        let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         crate::compose_child_path(&mut cmd, &exe);
@@ -625,7 +765,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None)?;
+        let (mut child, _stderr) = self.spawn_agent(None, false).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -689,7 +829,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None)?;
+        let (mut child, _stderr) = self.spawn_agent(None, false).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1039,7 +1179,7 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(Some(&request.cwd))?;
+        let (mut child, stderr_tail) = self.spawn_agent(Some(&request.cwd), true).await?;
         let stdin = child
             .stdin
             .take()
@@ -1063,6 +1203,7 @@ impl Harness for AcpHarness {
             effort_values: self.spec.effort_values,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            handshake_timeout: self.handshake_timeout,
             stderr_tail,
         }));
 
@@ -1090,6 +1231,7 @@ struct Session {
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    handshake_timeout: Duration,
     stderr_tail: crate::StderrTail,
 }
 
@@ -1843,6 +1985,7 @@ async fn run_session(session: Session) {
         effort_values,
         interrupt_grace,
         kill_grace,
+        handshake_timeout,
         stderr_tail,
     } = session;
     let RunControls {
@@ -1990,37 +2133,55 @@ async fn run_session(session: Session) {
         ))
     };
     let (session_id, steer_ext, init_commands) = tokio::select! {
-        res = setup => match res {
-            Ok(v) => v,
-            Err(e) => {
-                // A child that dies before the handshake used to surface only
-                // the RPC-side symptom ("transport closed") — its exit status
-                // and stderr, both already in hand, were dropped, leaving
-                // startup crashes undiagnosable (user report). When the child
-                // is already gone, give the reader task a beat to drain the
-                // pipe, then append the crash text; the Done carrying it is
-                // journaled, so the cause survives for later inspection.
-                let error = match child.try_wait() {
-                    Ok(Some(status)) => {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        format!(
-                            "{e}; {}",
-                            crate::crash_message(agent_name, Some(status), &stderr_tail)
-                        )
-                    }
-                    _ => e.to_string(),
-                };
-                tracing::warn!(target: "zeron_harness::acp", %error, "agent setup failed");
-                let _ = event_tx
-                    .send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Errored,
-                        result: None,
-                        error: Some(error),
-                        session_id: None,
-                    }))
-                    .await;
-                shutdown_child(&mut child, kill_grace).await;
-                return;
+        res = tokio::time::timeout(handshake_timeout, setup) => {
+            let res = res.unwrap_or_else(|_| {
+                // A hung handshake (agent waiting on a login it can never
+                // get, a wedged adapter) used to spin "Working" forever —
+                // the false "thinking for 2+ minutes then nothing" class of
+                // report. Bound it and say what was reached.
+                Err(HarnessError::Protocol(format!(
+                    "{agent_name} did not complete the ACP handshake within {}s \
+                     (the agent may be waiting for a login — try running it once \
+                     in a terminal)",
+                    handshake_timeout.as_secs()
+                )))
+            });
+            match res {
+                Ok(v) => v,
+                Err(e) => {
+                    // A child that dies before the handshake used to surface only
+                    // the RPC-side symptom ("transport closed") — its exit status
+                    // and stderr, both already in hand, were dropped, leaving
+                    // startup crashes undiagnosable (user report). When the child
+                    // is already gone, give the reader task a beat to drain the
+                    // pipe, then append the crash text; the Done carrying it is
+                    // journaled, so the cause survives for later inspection. A
+                    // still-live child (the timeout) contributes its stderr tail.
+                    let error = match child.try_wait() {
+                        Ok(Some(status)) => {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            format!(
+                                "{e}; {}",
+                                crate::crash_message(agent_name, Some(status), &stderr_tail)
+                            )
+                        }
+                        _ => match stderr_tail.snapshot() {
+                            Some(tail) => format!("{e}; stderr: {tail}"),
+                            None => e.to_string(),
+                        },
+                    };
+                    tracing::warn!(target: "zeron_harness::acp", %error, "agent setup failed");
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(error),
+                            session_id: None,
+                        }))
+                        .await;
+                    shutdown_child(&mut child, kill_grace).await;
+                    return;
+                }
             }
         },
         _ = interrupt.cancelled() => {
@@ -3348,7 +3509,7 @@ mod tests {
         assert_eq!(spec.display_name, "Cursor");
         assert_eq!(spec.executable, "cursor-agent");
         assert_eq!(spec.args, &["acp"]);
-        assert!(spec.npx_package.is_none());
+        assert!(spec.npm_package.is_none());
         assert_eq!(spec.steering_mode, SteeringMode::TurnBoundary);
         assert!(spec.reasoning_levels.is_empty());
         assert!(

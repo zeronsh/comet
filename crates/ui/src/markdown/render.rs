@@ -19,10 +19,10 @@ use gpui::{
     StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
     size,
 };
+use zeron_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
 use crate::theme::Theme;
 
-use super::highlight::{Token, TokenClass};
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
@@ -158,7 +158,7 @@ impl RenderCache {
 }
 
 /// Per-line highlight tokens for a code block, or `None` while pending.
-pub type CodeHighlight<'a> = Option<&'a [Vec<Token>]>;
+pub type CodeHighlight<'a> = Option<&'a [Vec<HighlightSpan>]>;
 
 /// Render a whole tree stacked with the md block gap. `highlight` resolves
 /// tokens for a top-level block index (code blocks only).
@@ -167,14 +167,14 @@ pub fn render_tree(
     opts: &RenderOptions,
     theme: &Theme,
     window: &Window,
-    highlight: &dyn Fn(usize) -> Option<std::sync::Arc<Vec<Vec<Token>>>>,
+    highlight: &dyn Fn(usize) -> Option<std::sync::Arc<HighlightedDocument>>,
 ) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
-            let lines = highlight(ix);
+            let document = highlight(ix);
             render_block(
                 &top.block,
                 ix,
@@ -182,7 +182,9 @@ pub fn render_tree(
                 opts,
                 theme,
                 window,
-                lines.as_deref().map(|l| &l[..]),
+                document
+                    .as_deref()
+                    .map(|document| document.lines.as_slice()),
             )
         }))
         .into_any_element()
@@ -1014,13 +1016,13 @@ fn render_code_block(
             .split('\n')
             .enumerate()
             .map(|(li, line)| {
-                let tokens = highlight
+                let spans = highlight
                     .and_then(|h| h.get(li))
                     .map(|t| &t[..])
                     .unwrap_or(&[]);
                 (
                     SharedString::from(line.to_string()),
-                    runs_for_code_line(line, tokens, &mono, theme),
+                    runs_for_syntax_line(line, spans, &mono, theme),
                 )
             })
             .collect();
@@ -1154,36 +1156,28 @@ fn render_code_block(
 /// Paint color for a token class — the soft syntax palette (round 9: the
 /// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
 /// asked for color; these are the diff pane's hues, now shared by both).
-pub fn token_color(class: TokenClass, theme: &Theme) -> Hsla {
-    match class {
-        TokenClass::Keyword => theme.syntax_keyword, // soft rose
-        TokenClass::StringLit => theme.syntax_string, // soft green
-        TokenClass::Number => theme.syntax_number,   // soft amber
-        TokenClass::Comment => theme.text_faint,
-    }
+pub fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
+    theme.syntax.color(kind)
 }
 
 /// Build the exact-cover `TextRun` list for one code line from its tokens.
 /// Same font everywhere — recoloring can never change layout.
-pub fn runs_for_code_line(
+/// Build paint-only runs from the neutral Tree-sitter contract.
+pub fn runs_for_syntax_line(
     line: &str,
-    tokens: &[Token],
+    spans: &[HighlightSpan],
     mono: &gpui::Font,
     theme: &Theme,
 ) -> Vec<TextRun> {
-    runs_with_palette(line, tokens, mono, theme.text, |class| {
-        token_color(class, theme)
-    })
+    runs_for_syntax_line_with_plain(line, spans, mono, theme.text, theme)
 }
 
-/// [`runs_for_code_line`] with a caller-supplied palette (the diff pane keys
-/// its plain color differently; the hues are shared via [`token_color`]).
-pub fn runs_with_palette(
+pub fn runs_for_syntax_line_with_plain(
     line: &str,
-    tokens: &[Token],
+    spans: &[HighlightSpan],
     mono: &gpui::Font,
     plain_color: Hsla,
-    color_for: impl Fn(TokenClass) -> Hsla,
+    theme: &Theme,
 ) -> Vec<TextRun> {
     let plain = |len: usize| TextRun {
         len,
@@ -1195,26 +1189,25 @@ pub fn runs_with_palette(
     };
     let mut runs = Vec::new();
     let mut at = 0usize;
-    for token in tokens {
-        if token.range.start > at {
-            runs.push(plain(token.range.start - at));
+    for span in spans {
+        if span.range.start > at {
+            runs.push(plain(span.range.start - at));
         }
-        let mut run = plain(token.range.len());
-        run.color = color_for(token.class);
+        let mut run = plain(span.range.len());
+        run.color = token_color(span.kind, theme);
         runs.push(run);
-        at = token.range.end;
+        at = span.range.end;
     }
     if at < line.len() {
         runs.push(plain(line.len() - at));
     }
-    runs.retain(|r| r.len > 0);
+    runs.retain(|run| run.len > 0);
     runs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::highlight::{Lang, tokenize_line};
     use crate::markdown::parser::InlineStyle;
 
     #[test]
@@ -1222,8 +1215,13 @@ mod tests {
         let theme = Theme::dark();
         let mono = font(theme.font_mono.clone());
         let line = r#"let x = "hi"; // done"#;
-        let (tokens, _) = tokenize_line(Lang::Rust, line, Default::default());
-        let runs = runs_for_code_line(line, &tokens, &mono, &theme);
+        let document = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+            source: line,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let runs = runs_for_syntax_line(line, &document.lines[0], &mono, &theme);
         let total: usize = runs.iter().map(|r| r.len).sum();
         assert_eq!(total, line.len());
         assert!(
@@ -1235,10 +1233,30 @@ mod tests {
     }
 
     #[test]
+    fn tree_sitter_runs_are_rich_and_paint_only() {
+        let theme = Theme::dark();
+        let mono = font(theme.font_mono.clone());
+        let line = "let widget = build!(42);";
+        let document = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+            source: line,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let runs = runs_for_syntax_line(line, &document.lines[0], &mono, &theme);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), line.len());
+        assert!(runs.iter().all(|run| run.font == mono));
+        let colors = runs.iter().map(|run| run.color).collect::<Vec<_>>();
+        assert!(colors.contains(&theme.syntax.keyword));
+        assert!(colors.contains(&theme.syntax.macro_name));
+        assert!(colors.contains(&theme.syntax.number));
+    }
+
+    #[test]
     fn code_line_runs_with_no_tokens_are_one_plain_run() {
         let theme = Theme::dark();
         let mono = font(theme.font_mono.clone());
-        let runs = runs_for_code_line("plain text", &[], &mono, &theme);
+        let runs = runs_for_syntax_line("plain text", &[], &mono, &theme);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, 10);
     }
@@ -1282,12 +1300,12 @@ mod tests {
         // Round 9: transcript code blocks paint the soft hues (rose keyword,
         // green string, amber number); comments stay faint neutral.
         let theme = Theme::dark();
-        assert_ne!(token_color(TokenClass::Keyword, &theme), theme.text);
+        assert_ne!(token_color(HighlightKind::Keyword, &theme), theme.text);
         assert_ne!(
-            token_color(TokenClass::StringLit, &theme),
-            token_color(TokenClass::Keyword, &theme)
+            token_color(HighlightKind::String, &theme),
+            token_color(HighlightKind::Keyword, &theme)
         );
-        assert_eq!(token_color(TokenClass::Comment, &theme), theme.text_faint);
+        assert_ne!(token_color(HighlightKind::Comment, &theme), theme.text);
     }
 
     #[test]

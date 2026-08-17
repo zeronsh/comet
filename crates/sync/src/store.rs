@@ -136,6 +136,44 @@ impl DocsStore {
         Ok(())
     }
 
+    /// Whether a snapshot row exists for `doc_id` — presence only, no blob read.
+    pub fn has_snapshot(&self, doc_id: &str) -> Result<bool, StoreError> {
+        let hit = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM snapshots WHERE doc_id = ?1",
+                params![doc_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// The full command ledger — profile-import reads the source's claims so
+    /// imported pending commands can never re-execute under the new profile.
+    pub fn processed_commands(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT command_id, processed_at FROM processed_commands")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Merge foreign ledger claims (profile import). Existing claims win;
+    /// returns how many rows were newly inserted.
+    pub fn import_processed_commands(&self, rows: &[(String, i64)]) -> Result<usize, StoreError> {
+        let mut inserted = 0;
+        let conn = self.conn();
+        for (command_id, processed_at) in rows {
+            inserted += conn.execute(
+                "INSERT OR IGNORE INTO processed_commands (command_id, processed_at) VALUES (?1, ?2)",
+                params![command_id, processed_at],
+            )?;
+        }
+        Ok(inserted)
+    }
+
     /// Whether `command_id` has already been claimed for execution.
     pub fn is_processed(&self, command_id: &str) -> Result<bool, StoreError> {
         let hit = self

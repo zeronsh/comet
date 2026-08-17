@@ -263,6 +263,7 @@ impl HostRelay {
     ) -> Self {
         let task = tokio::spawn(async move {
             let mut wake = zeron_sync::wake::subscribe();
+            let mut online = zeron_sync::wake::subscribe_online();
             let mut token_changes = config.token.subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
@@ -320,10 +321,15 @@ impl HostRelay {
                     // Signed out: poll for credentials at the configured pace.
                     delay = config.retry;
                 }
+                // Drain stale events (our own dial success notifies too) so
+                // only wakes/successes DURING this wait cut it short.
+                while online.try_recv().is_ok() {}
                 tokio::select! {
                     _ = tokio::time::sleep(delay + jitter()) => {}
                     // Wake = redial NOW (the old socket died with the suspend).
                     _ = wake.recv() => { delay = HOST_REJOIN_MIN; }
+                    // A sibling dial succeeded = the network is back.
+                    _ = online.recv() => { delay = HOST_REJOIN_MIN; }
                     _ = token_changed(&mut token_changes) => { delay = HOST_REJOIN_MIN; }
                 }
             }
@@ -400,7 +406,7 @@ async fn host_session(
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
 ) -> Result<(), RpcError> {
-    let (ws, _) = tokio_tungstenite::connect_async(url)
+    let ws = zeron_sync::dial::connect_ws(url)
         .await
         .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
     tracing::info!("device-room: host connected");
@@ -528,7 +534,7 @@ pub struct DeviceLink {
 
 impl DeviceLink {
     pub async fn connect(url: &str) -> Result<Self, RpcError> {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
+        let ws = zeron_sync::dial::connect_ws(url)
             .await
             .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
         let (mut sink, mut stream) = ws.split();

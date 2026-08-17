@@ -472,7 +472,11 @@ pub struct TerminalPrepaint {
     /// it has to tint a cell's own background rather than replace it, and it
     /// must not wash out the text it is highlighting.
     sel_quads: Vec<PaintQuad>,
-    lines: Vec<ShapedLine>,
+    /// Per row, the shaped segments and the grid COLUMN each one starts at.
+    /// Not one line per row: see [`shape_row`].
+    lines: Vec<Vec<(usize, ShapedLine)>>,
+    /// Grid cell advance, so paint can place segments by column.
+    cell_w: Pixels,
     cursor: Option<PaintQuad>,
 }
 
@@ -518,7 +522,21 @@ impl gpui::Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let theme = Theme::of(cx).clone();
-        let mono = font(theme.font_mono.clone());
+        // Ligatures OFF. A terminal is a fixed grid: the shaper must emit one
+        // cell-width advance per character, and a contextual substitution
+        // (Geist Mono ligates `--`, `->`, …) collapses several cells into
+        // fewer glyphs, so the row renders SHORT while the cursor — a quad at
+        // `cell_w * col` — stays on the true column. That is the `codex
+        // --yolo` → `codex--yolo` report: the space is in the grid and went
+        // to the pty (the command runs), only the painted run lost a cell.
+        // The landing page disables the same three features on its ASCII art
+        // for the same reason.
+        let mut mono = font(theme.font_mono.clone());
+        mono.features = gpui::FontFeatures(std::sync::Arc::new(vec![
+            ("liga".into(), 0),
+            ("calt".into(), 0),
+            ("dlig".into(), 0),
+        ]));
         // Font probe: measure the actual advance of the resolved mono font so
         // cols/rows track real glyph metrics, not a guessed aspect ratio.
         let font_size = px(TERM_FONT_SIZE);
@@ -558,6 +576,7 @@ impl gpui::Element for TerminalElement {
                 bg_quads: Vec::new(),
                 sel_quads: Vec::new(),
                 lines: Vec::new(),
+                cell_w,
                 cursor: None,
             };
         };
@@ -638,6 +657,7 @@ impl gpui::Element for TerminalElement {
             bg_quads,
             sel_quads,
             lines,
+            cell_w,
             cursor,
         }
     }
@@ -664,15 +684,19 @@ impl gpui::Element for TerminalElement {
             for quad in prepaint.sel_quads.drain(..) {
                 window.paint_quad(quad);
             }
-            for (ix, line) in prepaint.lines.iter().enumerate() {
-                let _ = line.paint(
-                    point(origin.x, origin.y + line_h * ix as f32),
-                    line_h,
-                    gpui::TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
+            let cell_w = prepaint.cell_w;
+            for (ix, segments) in prepaint.lines.iter().enumerate() {
+                let y = origin.y + line_h * ix as f32;
+                for (col, line) in segments {
+                    let _ = line.paint(
+                        point(origin.x + cell_w * *col as f32, y),
+                        line_h,
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
             }
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
@@ -681,22 +705,76 @@ impl gpui::Element for TerminalElement {
     }
 }
 
-/// Shape one grid row: wide-char spacers are skipped (the wide glyph covers
-/// both columns), attributes map to font weight/style, colors to run colors.
+/// Shape one grid row into COLUMN-PINNED segments.
+///
+/// A terminal is a fixed grid, but a shaped line places glyphs by their font
+/// advances. Those agree only while every glyph is monospace-width — the row's
+/// `cell_w` IS the mono font's em advance. The moment a glyph resolves through
+/// FONT FALLBACK (box drawing `│─╭`, arrows `→`, emoji, CJK) its advance is
+/// whatever that other font uses, and the whole rest of the line slides out of
+/// the grid: box borders land a few pixels off (user report: "one of the pipes
+/// is broken"), and a double-width glyph whose fallback advances only one cell
+/// swallows the column after it (user report: `codex --yolo` rendering as
+/// `codex--yolo`). Backgrounds, selection and the cursor never drifted because
+/// those are quads placed at `cell_w * col`.
+///
+/// So: runs of ASCII shape together (guaranteed cell-width in a mono font),
+/// and every other glyph is its own segment pinned at its own column. Wide
+/// spacers are still skipped — the wide glyph covers both columns, and the
+/// NEXT segment re-pins regardless.
 fn shape_row(
     row: &[CellSnapshot],
     theme: &Theme,
     mono: &gpui::Font,
     font_size: Pixels,
     window: &Window,
-) -> ShapedLine {
+) -> Vec<(usize, ShapedLine)> {
+    fn flush(
+        segments: &mut Vec<(usize, ShapedLine)>,
+        text: &mut String,
+        runs: &mut Vec<TextRun>,
+        seg_col: usize,
+        font_size: Pixels,
+        window: &Window,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let shaped = window.text_system().shape_line(
+            SharedString::from(std::mem::take(text)),
+            font_size,
+            runs,
+            None,
+        );
+        segments.push((seg_col, shaped));
+        runs.clear();
+    }
+
+    let mut segments: Vec<(usize, ShapedLine)> = Vec::new();
     let mut text = String::with_capacity(row.len());
     let mut runs: Vec<TextRun> = Vec::new();
-    for cell in row {
+    let mut seg_col = 0usize;
+
+    for (col, cell) in row.iter().enumerate() {
         if cell.wide_spacer {
             continue;
         }
         let ch = if cell.hidden { ' ' } else { cell.ch };
+        // Anything that can leave the mono font gets its own pinned segment.
+        let pinned = !ch.is_ascii() || cell.wide;
+        if pinned {
+            flush(
+                &mut segments,
+                &mut text,
+                &mut runs,
+                seg_col,
+                font_size,
+                window,
+            );
+        }
+        if text.is_empty() {
+            seg_col = col;
+        }
         let (fg, _) = cell.display_colors();
         let mut color = resolve_color(fg, theme);
         if cell.dim {
@@ -735,10 +813,26 @@ fn shape_row(
                 strikethrough: None,
             }),
         }
+        if pinned {
+            flush(
+                &mut segments,
+                &mut text,
+                &mut runs,
+                seg_col,
+                font_size,
+                window,
+            );
+        }
     }
-    window
-        .text_system()
-        .shape_line(SharedString::from(text), font_size, &runs, None)
+    flush(
+        &mut segments,
+        &mut text,
+        &mut runs,
+        seg_col,
+        font_size,
+        window,
+    );
+    segments
 }
 
 #[cfg(test)]

@@ -210,6 +210,13 @@ pub fn attachment_strip_height(count: usize, inner_width: f32) -> f32 {
     STRIP_PAD_TOP + rows as f32 * STRIP_THUMB + (rows - 1) as f32 * STRIP_GAP
 }
 
+pub fn comment_strip_height(count: usize) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    STRIP_PAD_TOP + crate::badges::BADGE_HEIGHT
+}
+
 /// Compact↔expanded flip morph (round 9): the flip used to snap between the
 /// two pill layouts. The original has no height transition (its shell carries
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
@@ -368,6 +375,13 @@ pub enum SendButtonMode {
     Steer,
     /// Live run, nothing typed: red stop square.
     Stop,
+}
+
+/// What the composer holds that a send could carry. A staged image or diff
+/// comment counts: both synthesize their own prompt body, so either alone is
+/// a legal send — and during a live run has to read as Steer, not Stop.
+pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
+    !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
@@ -3565,8 +3579,44 @@ impl Composer {
 
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
-    pub fn purge_chat(&mut self, chat_id: &str) {
+    pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
+        self.state.update(cx, |state, _| {
+            state.purge_diff_comments(chat_id);
+        });
+    }
+
+    /// Staged in `AppState` because the changes pane writes them.
+    fn staged_comments(&self, cx: &App) -> Vec<crate::comments::DiffComment> {
+        self.state
+            .read(cx)
+            .diff_comments(&self.current_key)
+            .to_vec()
+    }
+
+    fn render_comments_chip(&self, theme: &Theme, cx: &App) -> Option<gpui::Div> {
+        let count = self.staged_comments(cx).len();
+        if count == 0 {
+            return None;
+        }
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .px(px(STRIP_PAD_X))
+                .pt(px(STRIP_PAD_TOP))
+                .child(crate::badges::render(
+                    "composer-comments",
+                    &crate::badges::MessageBadge {
+                        icon: crate::icons::CHAT_ROUND_LINE,
+                        label: crate::comments::chip_label(count).into(),
+                        // The staged set is already on screen in the changes
+                        // pane, so a hover card would only repeat it.
+                        details: Vec::new(),
+                    },
+                    theme,
+                )),
+        )
     }
 
     /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
@@ -4372,9 +4422,11 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
-        // A staged image counts as content: image-only sends are legal
-        // (the prompt body becomes "See the attached image(s).").
-        let has_text = !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty();
+        let has_text = composer_has_content(
+            self.input.read(cx).text(),
+            self.staged().len(),
+            self.staged_comments(cx).len(),
+        );
         send_button_mode(self.run_live(cx), has_text)
     }
 
@@ -4394,17 +4446,19 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
+        let no_content =
+            !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
         // Empty box with a queue behind it: Enter sends the top message now,
         // which stops the turn to do it. This outranks Stop — hitting Enter on
         // an empty composer while messages wait is asking for the next one,
         // not just for silence.
-        if text.is_empty() && self.staged().is_empty() && !self.state.read(cx).queue.is_empty() {
+        if no_content && !self.state.read(cx).queue.is_empty() {
             self.queue_pop_head(cx);
             return;
         }
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
-            _ if text.is_empty() && self.staged().is_empty() => {}
+            _ if no_content => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
             // Busy: the message joins the queue rather than racing the turn.
@@ -4487,6 +4541,19 @@ impl Composer {
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
+        // `typed` keeps the user's own words for the failure hand-back below:
+        // restoring the folded prompt would paste the comment block into the
+        // input as literal text.
+        let key = self.current_key.clone();
+        let comments = self.state.update(cx, |state, cx| {
+            let taken = state.take_diff_comments(&key);
+            if !taken.is_empty() {
+                cx.notify();
+            }
+            taken
+        });
+        let typed = text.clone();
+        let text = crate::comments::with_comments(&text, &comments);
         self.preview = None;
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
@@ -4553,7 +4620,7 @@ impl Composer {
         });
         cx.notify();
 
-        let restore_text = text.clone();
+        let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
@@ -4781,6 +4848,12 @@ impl Composer {
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.end_pending_send(&err_chat_id, &err_message_id);
+                        // Re-staged under the chat's key: a new chat's send has
+                        // already re-keyed the composer to the minted id by
+                        // now, exactly like the staged files below.
+                        for comment in &comments {
+                            s.add_diff_comment(&err_chat_id, comment.clone());
+                        }
                         cx.notify();
                     });
                     composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
@@ -5481,12 +5554,13 @@ impl Render for Composer {
         let staged_count = self.staged().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
+        let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if expanded {
             composer_total_height(content_height)
         } else {
             COMPACT_TOTAL_HEIGHT
         };
-        let target_height = base_height + strip_h;
+        let target_height = base_height + strip_h + comment_strip_h;
         let (pill_height, morph_t, morphing) = match self.flip_morph {
             Some(m) if !m.done(now_ms) => {
                 (m.height(target_height, now_ms), m.progress(now_ms), true)
@@ -5532,6 +5606,7 @@ impl Render for Composer {
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
+        let comments_chip = self.render_comments_chip(&theme, cx);
 
         // The pill chrome (zeron composer.tsx): `rounded-[26px] border
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
@@ -5569,6 +5644,7 @@ impl Render for Composer {
                 .relative()
                 .flex()
                 .flex_col()
+                .children(comments_chip)
                 .children(strip)
                 .child(
                     div()
@@ -5621,6 +5697,7 @@ impl Render for Composer {
                 .flex()
                 .flex_col()
                 .justify_end()
+                .children(comments_chip)
                 .children(strip)
                 .child(
                     div()
@@ -6288,6 +6365,30 @@ mod tests {
         assert_eq!(m.progress(180.0), 1.0);
         let mid = m.progress(90.0);
         assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn staged_comments_alone_are_content() {
+        assert!(!composer_has_content("   ", 0, 0));
+        assert!(composer_has_content("hi", 0, 0));
+        assert!(composer_has_content("", 1, 0));
+        assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn a_comment_only_stage_steers_a_live_run_instead_of_stopping_it() {
+        let live = true;
+        let comment_only = composer_has_content("", 0, 2);
+        assert_eq!(
+            send_button_mode(live, comment_only),
+            SendButtonMode::Steer,
+            "comment-only submit must steer, not interrupt the run"
+        );
+        // Nothing staged at all is still the stop square.
+        assert_eq!(
+            send_button_mode(live, composer_has_content("", 0, 0)),
+            SendButtonMode::Stop
+        );
     }
 
     #[test]

@@ -866,6 +866,19 @@ impl WorkspaceHost {
         Ok(true)
     }
 
+    /// Upsert a chat row copied verbatim from another profile (local→synced
+    /// import). Same write path as every live mutation, so the row persists
+    /// and pushes like any other; the caller fixes `room_gen` beforehand.
+    pub fn import_chat_row(&self, chat: &Chat) -> Result<(), EngineError> {
+        Ok(self.mutate(|doc| doc.upsert_chat(chat))?)
+    }
+
+    /// Upsert a space row copied verbatim from another profile (local→synced
+    /// import).
+    pub fn import_space_row(&self, space: &Space) -> Result<(), EngineError> {
+        Ok(self.mutate(|doc| doc.upsert_space(space))?)
+    }
+
     /// Flip the chat's sync room generation (docs/chat2-sync.md M2) — the
     /// host calls this in the same breath as seeding the chat2 checkpoint.
     pub fn set_chat_room_gen(&self, chat_id: &str, room_gen: u32) -> Result<bool, EngineError> {

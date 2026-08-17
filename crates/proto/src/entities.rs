@@ -334,6 +334,44 @@ pub struct CheckoutDiff {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetCheckoutFileDiffTextRequest {
+    pub checkout_id: String,
+    pub cwd: String,
+    pub path: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    /// Pinned commit for History's per-commit diff scope. When present, the
+    /// source pair is read from the commit parent and this commit, never from
+    /// the live working tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    pub diff_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutFileDiffText {
+    pub diff_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_content_hash: Option<String>,
+    pub binary: bool,
+    pub truncated: bool,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UserProfile {
     pub id: String,
     pub email: String,
@@ -472,4 +510,31 @@ pub enum TerminalEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signal: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkout_file_diff_text_contract_is_camel_case() {
+        let request = GetCheckoutFileDiffTextRequest {
+            checkout_id: "checkout".into(),
+            cwd: "/repo".into(),
+            path: "src/lib.rs".into(),
+            mode: "branch".into(),
+            base_ref: Some("main".into()),
+            chat_id: None,
+            commit_sha: Some("deadbeef".into()),
+            diff_checksum: "abc".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["checkoutId"], "checkout");
+        assert_eq!(value["diffChecksum"], "abc");
+        assert_eq!(value["commitSha"], "deadbeef");
+        assert_eq!(
+            serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
+            request
+        );
+    }
 }

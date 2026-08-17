@@ -25,6 +25,7 @@ pub fn edge_faded(band: f32, top: bool, bottom: bool, child: impl IntoElement) -
         left: false,
         right: false,
         scroll_y: None,
+        scroll_x: None,
         child: child.into_any_element(),
     }
 }
@@ -39,6 +40,7 @@ pub struct EdgeFaded {
     left: bool,
     right: bool,
     scroll_y: Option<ScrollHandle>,
+    scroll_x: Option<ScrollHandle>,
     child: AnyElement,
 }
 
@@ -76,6 +78,14 @@ impl EdgeFaded {
     /// enables; the handle decides per frame.
     pub fn fade_overflow_y(mut self, handle: &ScrollHandle) -> Self {
         self.scroll_y = Some(handle.clone());
+        self
+    }
+
+    /// [`Self::fade_overflow_y`] for the HORIZONTAL edges — gates
+    /// [`Self::fade_left`]/[`Self::fade_right`] on the handle's x overflow at
+    /// paint time (the right-pane surface-tab strip).
+    pub fn fade_overflow_x(mut self, handle: &ScrollHandle) -> Self {
+        self.scroll_x = Some(handle.clone());
         self
     }
 
@@ -140,7 +150,14 @@ impl Element for EdgeFaded {
             top &= scrolled > 1.0;
             bottom &= scrolled < max_scroll - 1.0;
         }
-        let fade = (top || bottom || self.left || self.right).then(|| {
+        let (mut left, mut right) = (self.left, self.right);
+        if let Some(scroll) = &self.scroll_x {
+            let scrolled = -f32::from(scroll.offset().x);
+            let max_scroll = f32::from(scroll.max_offset().x);
+            left &= scrolled > 1.0;
+            right &= scrolled < max_scroll - 1.0;
+        }
+        let fade = (top || bottom || left || right).then(|| {
             let mut bounds = bounds;
             bounds.origin.y += px(self.inset_top);
             bounds.size.height -= px(self.inset_top);
@@ -151,8 +168,8 @@ impl Element for EdgeFaded {
                 band_bottom: self.band_bottom.map(px),
                 top,
                 bottom,
-                left: self.left,
-                right: self.right,
+                left,
+                right,
             }
         });
         window.with_edge_fade(fade, |window| self.child.paint(window, cx));

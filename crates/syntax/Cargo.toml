@@ -1,0 +1,36 @@
+[package]
+name = "zeron-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tree-sitter = "=0.26.11"
+tree-sitter-highlight = "=0.26.11"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-go = "=0.25.0"
+tree-sitter-json = "=0.24.8"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-md = "=0.5.3"
+tree-sitter-html = "=0.23.2"
+tree-sitter-css = "=0.25.0"
+tree-sitter-yaml = "=0.7.2"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-c-sharp = "=0.23.5"
+tree-sitter-java = "=0.23.5"
+tree-sitter-kotlin-ng = "=1.1.0"
+tree-sitter-swift = "=0.7.3"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-php = "=0.24.2"
+tree-sitter-sequel = "=0.3.11"
+tree-sitter-lua = "=0.5.0"
+tree-sitter-nix = "=0.3.0"
+tree-sitter-make = "=1.1.1"
+tree-sitter-containerfile = "=0.9.2"

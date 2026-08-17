@@ -27,6 +27,7 @@ const TICK: Duration = Duration::from_secs(1);
 const JUMP_THRESHOLD: Duration = Duration::from_secs(5);
 
 static CHANNEL: OnceLock<broadcast::Sender<()>> = OnceLock::new();
+static ONLINE: OnceLock<broadcast::Sender<()>> = OnceLock::new();
 
 /// Subscribe to system-wake events (the detector spawns on first call).
 pub fn subscribe() -> broadcast::Receiver<()> {
@@ -60,4 +61,26 @@ pub fn subscribe() -> broadcast::Receiver<()> {
             tx
         })
         .subscribe()
+}
+
+fn online_channel() -> &'static broadcast::Sender<()> {
+    ONLINE.get_or_init(|| broadcast::channel(4).0)
+}
+
+/// Subscribe to connectivity-regained events. There is no cross-platform OS
+/// hook for "the wifi came back", so the signal is empirical: ANY successful
+/// WebSocket dial in this process ([`crate::dial::connect_ws`]) broadcasts
+/// here, and every socket waiting out a reconnect backoff treats it as
+/// "redial now with fresh backoff". One recovered socket un-parks the whole
+/// fleet instead of each one sleeping out its own (up to 30s) delay — the
+/// network-flap sibling of the suspend/resume event above. Waiters should
+/// `try_recv`-drain stale events before arming, so only successes that happen
+/// DURING their wait cut it short.
+pub fn subscribe_online() -> broadcast::Receiver<()> {
+    online_channel().subscribe()
+}
+
+/// Broadcast that a dial just succeeded (see [`subscribe_online`]).
+pub fn notify_online() {
+    let _ = online_channel().send(());
 }

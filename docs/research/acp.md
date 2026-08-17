@@ -16,7 +16,7 @@
 - **claude/codex converted to ACP too** (2026-08-08, wing's call: "keep things
   clean"): `AcpHarness::claude()` via `@agentclientprotocol/claude-agent-acp`
   (pinned 0.66.0) and `AcpHarness::codex()` via `@agentclientprotocol/codex-acp`
-  (pinned 1.1.14), resolved from PATH or launched through `npx -y <pinned>`.
+  (pinned 1.1.14), resolved from PATH or via the managed install (below).
   The bespoke stream-json/app-server adapters (~4,300 lines) are deleted; the
   catalogs (models, effort clamping, Ultrathink prefix) survive as spec inputs.
   Accepted deltas: Claude steering is now priority-`now` pre-emption (adapter
@@ -40,7 +40,7 @@
   the model list is discovered over ACP (below), with the Nous flagships as
   the static fallback. `AcpHarness::pi()` runs the pi coding
   agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.33,
-  `npx -y` fallback; requires the pi CLI itself,
+  managed-install fallback; requires the pi CLI itself,
   `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
   ride pi's own provider config (catalog advertises a `default` pass-through
   entry); thinking ladder minimal→max maps onto zeron's levels via the
@@ -120,6 +120,23 @@
   render-parts.ts/control-types.ts) → expandable transcript chips
   (`tool_detail_lines`: `similar` line diff, context collapsed to `⋯`, 12-line
   cap, analytic heights).
+
+## Managed adapter installs (2026-08-15)
+- The `npx -y <pinned>` fallback put every user's npm state in the chat hot
+  path and was the root of the "harness protocol error … exit code 254" class
+  of report (zeronsh/comet#95): npm encodes fatal fs errors as `256 - errno`
+  exits (254 = ENOENT, 243 = EACCES — npm/cli#4838), often with no stderr,
+  and a cold `npx` could also stall a first chat for minutes while it
+  downloaded the adapter's dependency tree (claude-agent-acp's is ~570MB).
+- Replaced by `adapter_install`: pinned packages install ONCE into
+  `~/.zeron/adapters/<pkg>/<version>` (`$ZERON_ADAPTERS_DIR` overrides) with
+  a zeron-owned npm cache beside them, atomically (tmp dir + bin-entry
+  verification + `.zeron-install-ok` marker + rename), then every launch is
+  `node <entry>` directly. Discovery probes never block on npm (background
+  install + static-catalog fallback); `run()` blocks, and install failures
+  carry npm's full output plus the decoded errno. The engine prewarms
+  adapters for present CLIs at boot. Handshake additionally bounded at 120s
+  (a hung agent used to spin "Working" forever).
 
 ## Citations
 agentclientprotocol.com (v1 spec + schema), agentclientprotocol org repos

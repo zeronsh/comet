@@ -17,7 +17,7 @@
 import { LoroDoc } from "loro-crdt";
 import { LoroWebsocketClient } from "loro-websocket";
 import { LoroAdaptor, LoroEphemeralAdaptor } from "loro-adaptors/loro";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 const base = process.argv[2] ?? "http://127.0.0.1:27640";
 const wsBase = base.replace(/^http/, "ws");
@@ -299,28 +299,6 @@ await new Promise((r) => setTimeout(r, 100));
   );
   ok("nudge queued offline and replayed on host join");
   host2.close();
-}
-
-// ── attachments ───────────────────────────────────────────────────────────
-{
-  const bytes = new TextEncoder().encode(`attachment-${chatId}`);
-  const hash = createHash("sha256").update(bytes).digest("hex");
-  const put = await fetch(`${base}/attachments/${hash}?token=${token}`, {
-    method: "PUT",
-    headers: { "content-type": "image/png" },
-    body: bytes
-  });
-  if (put.status !== 200) fail(`attachment put ${put.status}: ${await put.text()}`);
-  const get = await fetch(`${base}/attachments/${hash}?token=${token}`);
-  if (get.status !== 200) fail(`attachment get ${get.status}`);
-  const round = new Uint8Array(await get.arrayBuffer());
-  if (new TextDecoder().decode(round) !== `attachment-${chatId}`) fail("attachment bytes");
-  const bad = await fetch(`${base}/attachments/${"0".repeat(64)}?token=${token}`, {
-    method: "PUT",
-    body: bytes
-  });
-  if (bad.status !== 400) fail(`hash mismatch expected 400, got ${bad.status}`);
-  ok("R2 attachments (hash-verified put/get)");
 }
 
 // ── absorbed auth routes ──────────────────────────────────────────────────

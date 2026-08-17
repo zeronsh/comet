@@ -30,7 +30,7 @@ not built yet).
 | ListHarnesses / ListModels | done | Relay-forwardable. |
 | Run/Subscribe/Interrupt/Steer/RespondInput RPCs | done (changed shape) | Deliberate redesign: these ride the durable doc command queue (`QueueCommand {run|steer|interrupt|respondInput}`) instead of device-addressed RPCs — same capability, offline-tolerant. |
 | Repos/folders/worktrees RPCs | done | All eight methods, relay-forwardable. |
-| Uploads / ReadAttachmentChunk | done | Chunked staging → durable file; path-jailed reads; R2 mirror. |
+| Uploads / ReadAttachmentChunk | done | Chunked staging → durable file; path-jailed reads; attachments live only on the host device. |
 | Terminals RPCs | done | Open/Subscribe/Write/Resize/Close, forwardable. |
 | Agent-account RPCs | done | Full login/activate/forget/poll surface, forwardable. |
 | LocalDevice | done | `{deviceId}`; IPC-only (never forwarded). |
@@ -76,7 +76,7 @@ not built yet).
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| Worker routes | done | health, session ws/tail/stats/diff/snapshot/append, workspace rooms, device ws/sidecar/status/nudge, attachments (content-addressed R2, hash-verified). |
+| Worker routes | done | health, session ws/tail/stats/diff/snapshot/append, workspace rooms, device ws/sidecar/status/nudge. |
 | Auth at edge | done | WorkOS JWKS verify; dev mode `user@org` bearers; DOs see Worker-stamped identity; claim-on-first-join ownership. |
 | SessionRoom DO | done | Hibernatable WS, update log + snapshot, lazy tail, two-level compaction, daily alarm checkpoint/trim/R2 backup, VV backfill, fragment reassembly. |
 | DeviceRoom DO | done | Byte-pipe frames, single host socket + supersede, relay control frames, durable nudges (replay on join, cap), sidecar slots. |

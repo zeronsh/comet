@@ -1,26 +1,26 @@
-//! zeron-sync — Loro room client (loro-protocol over WebSocket against the TS edge),
-//! ephemeral presence, and the local `DocsStore` (SQLite snapshots + processed-command ledger).
+//! zeron-sync — the edge room clients (registry rows + chat2 row protocol over
+//! WebSocket against the TS edge) and the local `DocsStore` (SQLite snapshots +
+//! processed-command ledger).
 //!
-//! - [`RoomClient`]: joins a SessionRoom DO room (`wss://…/session/{chatId}/ws?token=`),
-//!   backfills via version-vector diff, pushes local commits, imports remote updates,
-//!   reassembles/produces fragments, relays `%EPH` presence, and reconnects with
-//!   exponential backoff. Wire format is the official `loro-protocol` crate — byte-identical
-//!   to the npm package the edge imports.
+//! - [`ChatClient`]: joins a ChatRoom DO (`wss://…/chat2/{chatId}/ws?token=`),
+//!   catches up via checkpoint + row backfill, pushes local loro updates as
+//!   rows, and reconnects with exponential backoff.
+//! - [`RegistryClient`]: the per-profile workspace registry room (sidebar rows,
+//!   presence).
 //! - [`DocsStore`]: snapshot persistence (the doc IS the outbox — commands + user entries
 //!   flush immediately) and the processed-command ledger with mark-BEFORE-execute semantics.
 
 pub mod chat_client;
 pub mod chat_frames;
+pub mod dial;
 pub mod registry;
-mod room;
 mod store;
+mod types;
 pub mod wake;
 
 pub use chat_client::{
     ChatClient, ChatDocSink, ChatEvent, ChatStatsSnapshot, ChatTuning, CheckpointFetcher,
 };
 pub use registry::{RegistryClient, RegistryEvent, RegistryTuning};
-pub use room::{
-    RoomClient, RoomEvent, RoomStatsSnapshot, RoomTuning, StaticUrl, SyncError, UrlProvider,
-};
 pub use store::{DocsStore, StoreError};
+pub use types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};

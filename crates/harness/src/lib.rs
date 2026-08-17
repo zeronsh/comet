@@ -25,6 +25,10 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
+    /// A managed adapter install (npm) failed; carries npm's own output so
+    /// the cause is diagnosable from the chat error alone.
+    #[error("adapter install failed: {0}")]
+    Install(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -77,6 +81,7 @@ pub trait Harness: Send + Sync {
 }
 
 pub mod acp;
+pub(crate) mod adapter_install;
 pub mod claude;
 pub mod codex;
 pub(crate) mod jsonrpc;

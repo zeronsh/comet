@@ -31,7 +31,7 @@ use zeron_doc::{
     join_continuation_entries,
 };
 use zeron_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
-use zeron_sync::{DocsStore, RoomClient};
+use zeron_sync::DocsStore;
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
@@ -239,13 +239,14 @@ pub struct ChatDocHandle {
     last_access: AtomicI64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
-    room: Mutex<Option<RoomClient>>,
     /// The sync generation this handle was BUILT for (1 = legacy s2,
-    /// 2 = chat2). The staleness checks compare this against the registry —
-    /// inferring mode from `chat2_local_sub` misread edge-less chat2
-    /// handles (no subscription is ever installed offline) as stale s2 and
-    /// retired them on every open, dropping the doc out from under live
-    /// runs.
+    /// 2 = chat2). Gen-1 handles no longer join any room (the s2 client is
+    /// gone); they serve the local fat doc read-only until the host's seed
+    /// flips the chat to chat2. The staleness checks compare this against
+    /// the registry — inferring mode from `chat2_local_sub` misread
+    /// edge-less chat2 handles (no subscription is ever installed offline)
+    /// as stale s2 and retired them on every open, dropping the doc out
+    /// from under live runs.
     room_gen: u32,
     /// A threshold checkpoint POST is in flight (review H1: the quiesce
     /// tick must not stack concurrent full-snapshot uploads).
@@ -256,8 +257,8 @@ pub struct ChatDocHandle {
     /// thin lineage exists on disk at all; `save_snapshot` double-checks, so
     /// a doc that was never seeded can't lose its only copy).
     retired: AtomicBool,
-    /// chat2 relay client (docs/chat2-sync.md C3) — populated instead of
-    /// `room` when the registry names roomGen 2 for this chat.
+    /// chat2 relay client (docs/chat2-sync.md C3) — populated once the
+    /// registry names roomGen 2 for this chat and the join resolves.
     chat2: Mutex<Option<zeron_sync::ChatClient>>,
     /// Local commits made before the relay connects (the dial can take up
     /// to a minute; offline, forever): buffered here by the subscription
@@ -294,9 +295,6 @@ impl ChatDocHandle {
         // (a doc-wedged DO keeps answering pings while delivering nothing,
         // and the background probe cadence can be hours out). Coalescing
         // no-op on a healthy or recently-active room.
-        if let Some(room) = lock(&self.room).as_ref() {
-            room.probe();
-        }
         if let Some(chat2) = lock(&self.chat2).as_ref() {
             chat2.probe();
         }
@@ -341,7 +339,7 @@ impl ChatDocHandle {
     }
 
     pub fn connected(&self) -> bool {
-        lock(&self.room).is_some()
+        lock(&self.chat2).is_some()
     }
 
     /// Write a complete user message entry, idempotent by id (the client-minted message
@@ -901,7 +899,6 @@ impl DocHost {
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
-            room: Mutex::new(None),
             room_gen,
             retired: AtomicBool::new(false),
             checkpointing: Arc::new(AtomicBool::new(false)),
@@ -918,7 +915,7 @@ impl DocHost {
             handles.insert(chat_id.to_string(), handle.clone());
         }
 
-        // Edge room join — offline-tolerant AND supervised. `RoomClient` only
+        // Edge room join — offline-tolerant AND supervised. `ChatClient` only
         // self-reconnects AFTER a first successful join; a one-shot attempt
         // here (the pre-LRU design) left the doc silently local-only until
         // app restart whenever the dial hit a transient gap — a post-wake
@@ -990,10 +987,10 @@ impl DocHost {
                 }
                 self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
             } else {
-                // Host-side lazy migration (M1/M2): seeding runs in the
-                // background; THIS open stays on s2. Once the seed flips the
-                // registry, the next open (every device) takes the chat2
-                // branch above — and pre-chat2 readers adopt.
+                // Straggler gen-1 chat (the s2 client is gone — post-cutover,
+                // no device reads or writes an s2 room). The local fat doc
+                // serves reads as-is; if we host the chat, seed it onto chat2
+                // in the background and the flip converges every device.
                 let is_host = chat_row
                     .as_ref()
                     .is_some_and(|c| c.device_id == self.inner.config.device_id);
@@ -1001,17 +998,8 @@ impl DocHost {
                     // Quiescent-only (review B1): a seed under a live run or
                     // watched transcript would strand everything written
                     // after the rebuild instant in a retired fat lineage.
-                    // Deferred until the s2 room has JOINED and the doc has
-                    // gone quiet: seeding straight from open() rebuilt from
-                    // the host's LOCAL doc before the room backfill landed —
-                    // rows contributed by other devices (a queued command, a
-                    // phone steer) forked away into the retired lineage, and
-                    // a nudge-triggered open seeded+dropped the handle out
-                    // from under the very command it was opened to execute
-                    // (e2e smoke, 2026-08-10).
                     self.spawn_chat2_seed_when_quiet(edge.clone(), chat_id, &handle);
                 }
-                self.spawn_s2_join(edge, chat_id, &doc, &handle);
             }
         }
         self.spawn_worker(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
@@ -1019,109 +1007,10 @@ impl DocHost {
         Ok(handle)
     }
 
-    /// The legacy s2 loro-room join loop (extracted verbatim from `open`).
-    fn spawn_s2_join(
-        &self,
-        edge: &EdgeConfig,
-        chat_id: &str,
-        doc: &Arc<SessionDoc>,
-        handle: &Arc<ChatDocHandle>,
-    ) {
-        {
-            let url = edge.room_url(format!("/session/{chat_id}/ws"));
-            let room_doc = doc.doc().clone();
-            let chat = chat_id.to_string();
-            let weak = Arc::downgrade(handle);
-            let edge = edge.clone();
-            let mut token_changes = edge.token_changes();
-            self.spawn_worker(async move {
-                let mut wake = zeron_sync::wake::subscribe();
-                let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
-                loop {
-                    if weak.upgrade().is_none() {
-                        return; // evicted or purged while dialing
-                    }
-                    // Deadline on the WHOLE dial, including the token
-                    // provider: on 2026-08-10 an engine instance sat inside
-                    // a hung first dial for over an hour — no error, no
-                    // retry, no log line — while every transcript it was
-                    // asked to open rendered black. A hang must become a
-                    // logged, retried failure.
-                    let dial = tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        RoomClient::connect_via(url.clone(), &chat, room_doc.clone()),
-                    )
-                    .await;
-                    match dial {
-                        Ok(Ok(client)) => {
-                            if edge.bearer().await.is_none() {
-                                return;
-                            }
-                            let mut events = client.events();
-                            let Some(handle) = weak.upgrade() else {
-                                return; // evicted mid-dial: drop leaves the room
-                            };
-                            *lock(&handle.room) = Some(client);
-                            tracing::info!(chat = %chat, "session room joined");
-                            drop(handle);
-                            if token_changes.is_none() {
-                                return;
-                            }
-                            loop {
-                                tokio::select! {
-                                    event = events.recv() => match event {
-                                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                                    },
-                                    _ = crate::workspace_host::token_changed(&mut token_changes) => {
-                                        if edge.bearer().await.is_none() {
-                                            if let Some(handle) = weak.upgrade() {
-                                                lock(&handle.room).take();
-                                            }
-                                            tracing::info!(chat = %chat,
-                                                "session credentials removed; leaving room");
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            tracing::warn!(
-                                chat = %chat,
-                                error = %err,
-                                backoff_ms = backoff.as_millis() as u64,
-                                "session room join failed; retrying"
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                chat = %chat,
-                                backoff_ms = backoff.as_millis() as u64,
-                                "session room join timed out (hung dial); retrying"
-                            );
-                        }
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
-                            backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
-                        }
-                        _ = wake.recv() => {
-                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
-                        }
-                        _ = crate::workspace_host::token_changed(&mut token_changes) => {
-                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-    /// chat2 relay join (docs/chat2-sync.md C3): supervised like the s2
-    /// loop — deadline on every dial, capped jittered backoff, wake redial —
-    /// but the client resolves only after full catch-up (checkpoint + rows),
-    /// so "joined" here means "transcript converged".
+    /// chat2 relay join (docs/chat2-sync.md C3): deadline on every dial,
+    /// capped jittered backoff, wake redial — and the client resolves only
+    /// after full catch-up (checkpoint + rows), so "joined" here means
+    /// "transcript converged".
     fn spawn_chat2_join(&self, edge: EdgeConfig, handle: &Arc<ChatDocHandle>, cursor: u64) {
         let chat = handle.chat_id.clone();
         let doc = handle.doc.clone();
@@ -1312,7 +1201,6 @@ impl DocHost {
         handle: &Arc<ChatDocHandle>,
     ) {
         const TICK: std::time::Duration = std::time::Duration::from_millis(500);
-        const JOIN_WAIT_TICKS: u32 = 120; // ≤60s for the room; offline stays s2
         const QUIET_TICKS: u32 = 4; // 2s of frontier silence
         if !lock(&self.inner.seed_waiting).insert(chat_id.to_string()) {
             return; // a quiet-waiter is already armed for this chat
@@ -1322,24 +1210,11 @@ impl DocHost {
         let weak = Arc::downgrade(handle);
         self.spawn_worker(async move {
             async {
-                let mut ticks = 0u32;
-                loop {
-                    {
-                        let Some(handle) = weak.upgrade() else { return };
-                        if handle.retired.load(Ordering::Relaxed) {
-                            return; // another path already seeded
-                        }
-                        if lock(&handle.room).is_some() {
-                            break;
-                        }
-                    }
-                    ticks += 1;
-                    if ticks >= JOIN_WAIT_TICKS {
-                        tracing::debug!(chat = %chat, "chat2 seed skipped: s2 room never joined");
-                        return;
-                    }
-                    tokio::time::sleep(TICK).await;
-                }
+                // The old join-wait gate (seed only after the s2 room had
+                // backfilled) is gone with the s2 client: no device writes
+                // an s2 room anymore, so the host's local doc IS the
+                // authority for a straggler gen-1 chat. Only the quiet gate
+                // remains (no seed under a moving frontier).
                 let mut quiet = 0u32;
                 let mut last_vv: Option<Vec<u8>> = None;
                 loop {
@@ -1558,13 +1433,12 @@ impl DocHost {
         {
             return Ok(()); // transcript present — nothing lost
         }
-        // Fat source 1: the M3 adopt's rollback copy on disk.
+        // Fat source: the M3 adopt's rollback copy on disk. (The other
+        // source — the legacy s2 room — went away with the s2 client; any
+        // transcript that existed only there was salvaged by earlier
+        // releases or is reachable in the room's storage server-side.)
         let rollback_id = format!("{chat_id}.pre-chat2");
-        let mut fat_bytes = self.inner.store.load_snapshot(&rollback_id).ok().flatten();
-        // Fat source 2: the legacy s2 room.
-        if fat_bytes.is_none() {
-            fat_bytes = self.fetch_s2_room_doc(chat_id).await;
-        }
+        let fat_bytes = self.inner.store.load_snapshot(&rollback_id).ok().flatten();
         let Some(bytes) = fat_bytes else {
             return Ok(()); // no fat lineage anywhere — genuinely empty chat
         };
@@ -1601,43 +1475,6 @@ impl DocHost {
         tracing::info!(chat = %chat_id, entries = entries.len(),
             "transcript salvaged into chat2 lineage");
         Ok(())
-    }
-
-    /// Join the legacy s2 room with a throwaway doc, wait for the backfill to
-    /// quiesce, and export what it holds. `None` = no edge, unreachable, or
-    /// the room is empty.
-    async fn fetch_s2_room_doc(&self, chat_id: &str) -> Option<Vec<u8>> {
-        let edge = self.inner.config.edge.clone()?;
-        let url = edge.room_url(format!("/session/{chat_id}/ws"));
-        let doc = loro::LoroDoc::new();
-        let client = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            RoomClient::connect_via(url, chat_id, doc.clone()),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        let mut last = doc.oplog_vv().encode();
-        let mut quiet = 0u32;
-        for _ in 0..30u32 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let vv = doc.oplog_vv().encode();
-            if vv == last {
-                quiet += 1;
-                if quiet >= 3 {
-                    break;
-                }
-            } else {
-                quiet = 0;
-                last = vv;
-            }
-        }
-        drop(client);
-        let fat = SessionDoc::from_doc(doc);
-        if fat.read_entries().ok()?.is_empty() {
-            return None; // empty or never-materialized room
-        }
-        fat.export_snapshot().ok()
     }
 
     /// chat2 host duties on the doc-quiesce tick (docs/chat2-sync.md C3):
@@ -1872,10 +1709,7 @@ impl DocHost {
         let handles: Vec<Arc<ChatDocHandle>> =
             lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
-            if let Some(room) = lock(&handle.room).as_ref() {
-                room.probe();
-            }
-            // chat2 rooms verify liveness on the same user signals — a
+            // chat2 rooms verify liveness on user signals — a
             // deaf-but-ponging DO otherwise freezes a watched transcript
             // for the whole background probe quiet window.
             if let Some(chat2) = lock(&handle.chat2).as_ref() {
@@ -1886,15 +1720,15 @@ impl DocHost {
 
     /// Per-open-chat room introspection for SyncStatus / `zeron sync`.
     /// `None` room = still dialing (join retry loop) or edge-less.
-    pub fn sync_statuses(&self) -> Vec<(String, Option<zeron_sync::RoomStatsSnapshot>)> {
+    pub fn sync_statuses(&self) -> Vec<(String, Option<zeron_sync::ChatStatsSnapshot>)> {
         let handles: Vec<Arc<ChatDocHandle>> =
             lock(&self.inner.handles).values().cloned().collect();
-        let mut rows: Vec<(String, Option<zeron_sync::RoomStatsSnapshot>)> = handles
+        let mut rows: Vec<(String, Option<zeron_sync::ChatStatsSnapshot>)> = handles
             .iter()
             .map(|h| {
                 (
                     h.chat_id.clone(),
-                    lock(&h.room).as_ref().map(RoomClient::stats),
+                    lock(&h.chat2).as_ref().map(|client| client.stats()),
                 )
             })
             .collect();
@@ -2749,7 +2583,6 @@ impl DocHost {
     pub fn disconnect_edge(&self) {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
-            lock(&handle.room).take();
             lock(&handle.chat2).take();
             lock(&handle.chat2_local_sub).take();
         }

@@ -59,6 +59,11 @@ final class SessionStore {
     /// the registry never walks a chat back to s2.
     @ObservationIgnored private var roomGen = 1
     @ObservationIgnored private var started = false
+    /// Preload holds the dial (AppModel staggers the release) so a cold
+    /// launch doesn't stampede N TLS handshakes against the registry dial
+    /// on a thin link. The disk snapshot still hydrates immediately —
+    /// only the socket waits its turn.
+    @ObservationIgnored private var holdDial = false
 
     /// Demo mode: no room, entries driven externally.
     private let offline: Bool
@@ -107,9 +112,10 @@ final class SessionStore {
 
     @ObservationIgnored private var saver: DocSaver?
 
-    func start() {
+    func start(holdDial: Bool = false) {
         guard !started, !offline else { return }
         started = true
+        self.holdDial = holdDial
         // Local-first: the last-synced chat2 snapshot renders instantly (even
         // when the host device is offline); the join backfills incrementally
         // from its cursor.
@@ -154,8 +160,16 @@ final class SessionStore {
         connectIfReady()
     }
 
+    /// End a preload dial-hold: an open view (or the stagger timer) wants
+    /// live sync now.
+    func releaseDial() {
+        guard holdDial else { return }
+        holdDial = false
+        connectIfReady()
+    }
+
     private func connectIfReady() {
-        guard started, !offline, chatRoom == nil, roomGen >= 2 else { return }
+        guard started, !offline, !holdDial, chatRoom == nil, roomGen >= 2 else { return }
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
@@ -264,6 +278,7 @@ final class SessionStore {
     /// ChatRoomClient.kick). Also the catch-all re-check for a roomGen flip
     /// that landed while this store had no open view.
     func kickRoom() {
+        holdDial = false  // a kick is a user/foreground signal: dial now
         connectIfReady()
         guard let chatRoom else { return }
         Task { await chatRoom.kick() }

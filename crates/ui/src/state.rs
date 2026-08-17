@@ -27,6 +27,7 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
+use crate::comments::DiffComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
@@ -610,6 +611,8 @@ pub struct AppState {
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// Written by the changes pane, read by the composer.
+    diff_comments: HashMap<String, Vec<DiffComment>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -648,6 +651,7 @@ impl AppState {
             queue: Vec::new(),
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            diff_comments: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -659,6 +663,44 @@ impl AppState {
             chats_synced: false,
             spaces_synced: false,
         }
+    }
+
+    /// The selected chat, or `""` on the new-chat canvas. Identical to the
+    /// composer's own attachment/draft key, so a comment written before the
+    /// first send survives the chat being minted.
+    pub fn composer_key(&self) -> String {
+        self.selected_chat.clone().unwrap_or_default()
+    }
+
+    pub fn diff_comments(&self, key: &str) -> &[DiffComment] {
+        self.diff_comments
+            .get(key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn add_diff_comment(&mut self, key: &str, comment: DiffComment) {
+        self.diff_comments
+            .entry(key.to_string())
+            .or_default()
+            .push(comment);
+    }
+
+    pub fn remove_diff_comment(&mut self, key: &str, id: &str) {
+        if let Some(list) = self.diff_comments.get_mut(key) {
+            list.retain(|c| c.id != id);
+            if list.is_empty() {
+                self.diff_comments.remove(key);
+            }
+        }
+    }
+
+    pub fn take_diff_comments(&mut self, key: &str) -> Vec<DiffComment> {
+        self.diff_comments.remove(key).unwrap_or_default()
+    }
+
+    pub fn purge_diff_comments(&mut self, key: &str) {
+        self.diff_comments.remove(key);
     }
 
     // ---- reducers (pure) ----

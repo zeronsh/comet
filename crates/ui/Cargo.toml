@@ -13,6 +13,7 @@ zeron-engine.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
 zeron-update.workspace = true
+zeron-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
@@ -29,6 +30,7 @@ uuid.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+sha2.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

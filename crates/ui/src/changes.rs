@@ -32,17 +32,18 @@ use gpui::{
     SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
-use zeron_proto::{Chat, CheckoutDiff};
+use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
 use zeron_rpc::methods;
 
+use crate::comments::{self, CommentSide, DiffComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
-use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+use zeron_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -80,6 +81,68 @@ pub struct DiffLine {
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceSide {
+    Old,
+    New,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceLineRef {
+    pub side: SourceSide,
+    /// One-based source line number.
+    pub line_number: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffHighlights {
+    pub old: Option<Arc<zeron_syntax::HighlightedDocument>>,
+    pub new: Option<Arc<zeron_syntax::HighlightedDocument>>,
+}
+
+impl DiffHighlights {
+    pub fn source_ref(&self, line: &DiffLine) -> Option<SourceLineRef> {
+        match line.kind {
+            LineKind::Del => line.old_no.map(|line_number| SourceLineRef {
+                side: SourceSide::Old,
+                line_number,
+            }),
+            LineKind::Add => line.new_no.map(|line_number| SourceLineRef {
+                side: SourceSide::New,
+                line_number,
+            }),
+            LineKind::Context => line
+                .new_no
+                .filter(|_| self.new.is_some())
+                .map(|line_number| SourceLineRef {
+                    side: SourceSide::New,
+                    line_number,
+                })
+                .or_else(|| {
+                    line.old_no.map(|line_number| SourceLineRef {
+                        side: SourceSide::Old,
+                        line_number,
+                    })
+                }),
+            LineKind::Meta => None,
+        }
+    }
+
+    pub fn spans(&self, line: &DiffLine) -> &[zeron_syntax::HighlightSpan] {
+        let Some(source_ref) = self.source_ref(line) else {
+            return &[];
+        };
+        let document = match source_ref.side {
+            SourceSide::Old => self.old.as_deref(),
+            SourceSide::New => self.new.as_deref(),
+        };
+        document
+            .and_then(|document| document.lines.get(source_ref.line_number as usize - 1))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,10 +443,28 @@ pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
 /// Analytic expanded-body height — drives the 180 ms fold tween without
 /// measurement.
 pub fn body_height(file: &FileDiff) -> f32 {
-    let notices = file_notices(file).len() as f32 * NOTICE_HEIGHT;
-    let hunks = file.hunks.len() as f32 * HUNK_HEADER_HEIGHT;
-    let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
-    notices + hunks + lines as f32 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
+    body_height_with(file, &[], None)
+}
+
+pub fn body_height_with(
+    file: &FileDiff,
+    comments: &[DiffComment],
+    draft: Option<(CommentSide, u32)>,
+) -> f32 {
+    body_rows(0, file, comments, draft)
+        .iter()
+        .map(|row| row.height(comments))
+        .sum()
+}
+
+/// A deletion only exists in the pre-change file; everything else is cited
+/// against the post-change file, which is what the agent edits.
+pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
+    match line.kind {
+        LineKind::Meta => None,
+        LineKind::Del => line.old_no.map(|no| (CommentSide::Old, no)),
+        _ => line.new_no.map(|no| (CommentSide::New, no)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +525,10 @@ pub enum DiffScope {
     LatestTurn,
     /// Repository commit graph. Hosted here until the right pane becomes tabs.
     History,
+    /// One commit's own changes (parent vs commit) — the per-commit tab a
+    /// History row click opens. Never listed in the scope menu
+    /// ([`Self::ALL`]); a commit-pinned pane is born this way and stays.
+    Commit,
 }
 
 impl DiffScope {
@@ -460,6 +545,7 @@ impl DiffScope {
             Self::Branch => "Branch changes",
             Self::LatestTurn => "Latest turn",
             Self::History => "History",
+            Self::Commit => "Commit",
         }
     }
 
@@ -470,6 +556,7 @@ impl DiffScope {
             Self::Branch => "branch",
             Self::LatestTurn => "turn",
             Self::History => "history",
+            Self::Commit => "commit",
         }
     }
 }
@@ -485,6 +572,7 @@ pub fn scope_label(scope: DiffScope, count: usize, base: Option<&str>) -> String
         },
         DiffScope::LatestTurn => format!("{count} Changed {files} this turn"),
         DiffScope::History => "History".to_string(),
+        DiffScope::Commit => format!("{count} Changed {files} in this commit"),
     }
 }
 
@@ -519,6 +607,7 @@ pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
         },
         DiffScope::LatestTurn => "No changes this turn".to_string(),
         DiffScope::History => "No commits found".to_string(),
+        DiffScope::Commit => "Empty commit".to_string(),
     }
 }
 
@@ -553,10 +642,13 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
     }
 }
 
-/// Language for a file path's extension (drives per-line highlighting).
-pub fn lang_for_path(path: &str) -> Option<Lang> {
-    let ext = path.rsplit('/').next()?.rsplit('.').next()?;
-    lang_for_tag(ext)
+fn comment_state_key(comments: &[DiffComment], draft: Option<&(String, CommentSide, u32)>) -> u64 {
+    let mut parts: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+    if let Some((path, side, line)) = draft {
+        parts.push(format!("draft:{path}:{}:{line}", side.tag()));
+    }
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    hash64(&refs)
 }
 
 fn hash64(parts: &[&str]) -> u64 {
@@ -565,6 +657,154 @@ fn hash64(parts: &[&str]) -> u64 {
         p.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+const MAX_EXCERPT_SOURCE_LINES: usize = 200_000;
+
+fn excerpt_side(
+    file: &FileDiff,
+    side: SourceSide,
+    language: Lang,
+    path: &str,
+) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
+    let max_line = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter_map(|line| match side {
+            SourceSide::Old => line.old_no,
+            SourceSide::New => line.new_no,
+        })
+        .max()
+        .unwrap_or(0) as usize;
+    if max_line > MAX_EXCERPT_SOURCE_LINES {
+        return None;
+    }
+    let mut lines = vec![Vec::new(); max_line];
+    for hunk in &file.hunks {
+        let visible = hunk
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let number = match side {
+                    SourceSide::Old => line.old_no,
+                    SourceSide::New => line.new_no,
+                }?;
+                (line.kind != LineKind::Meta).then_some((number, line.text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            continue;
+        }
+        let source = visible
+            .iter()
+            .map(|(_, text)| *text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+            source: &source,
+            path: Some(path),
+            fence_tag: None,
+        })
+        .ok()?;
+        for ((number, _), spans) in visible.into_iter().zip(document.lines) {
+            lines[number as usize - 1] = spans;
+        }
+    }
+    Some(Arc::new(zeron_syntax::HighlightedDocument {
+        language,
+        lines,
+    }))
+}
+
+fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights> {
+    if !zeron_syntax::supports_language(language) {
+        return None;
+    }
+    let old = if file.status == FileStatus::Added {
+        None
+    } else {
+        Some(excerpt_side(
+            file,
+            SourceSide::Old,
+            language,
+            file.old_path.as_deref().unwrap_or(&file.path),
+        )?)
+    };
+    let new = if file.status == FileStatus::Deleted {
+        None
+    } else {
+        Some(excerpt_side(file, SourceSide::New, language, &file.path)?)
+    };
+    Some(DiffHighlights { old, new })
+}
+
+fn sources_match_patch(file: &FileDiff, response: &zeron_proto::CheckoutFileDiffText) -> bool {
+    let old = response
+        .old_text
+        .as_deref()
+        .map(|source| source.lines().collect::<Vec<_>>());
+    let new = response
+        .new_text
+        .as_deref()
+        .map(|source| source.lines().collect::<Vec<_>>());
+    file.hunks.iter().flat_map(|hunk| &hunk.lines).all(|line| {
+        let actual = match line.kind {
+            LineKind::Del => line
+                .old_no
+                .and_then(|number| old.as_ref()?.get(number as usize - 1).copied()),
+            LineKind::Add => line
+                .new_no
+                .and_then(|number| new.as_ref()?.get(number as usize - 1).copied()),
+            LineKind::Context => line
+                .new_no
+                .and_then(|number| new.as_ref()?.get(number as usize - 1).copied())
+                .or_else(|| {
+                    line.old_no
+                        .and_then(|number| old.as_ref()?.get(number as usize - 1).copied())
+                }),
+            LineKind::Meta => return true,
+        };
+        actual == Some(line.text.as_str())
+    })
+}
+
+fn full_highlights(
+    file: &FileDiff,
+    language: Lang,
+    response: &zeron_proto::CheckoutFileDiffText,
+) -> Option<DiffHighlights> {
+    if response.stale
+        || response.binary
+        || response.truncated
+        || !sources_match_patch(file, response)
+    {
+        return None;
+    }
+    let parse = |source: &str, path: &str| {
+        zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+            source,
+            path: Some(path),
+            fence_tag: None,
+        })
+        .ok()
+        .map(Arc::new)
+    };
+    let old = match response.old_text.as_deref() {
+        Some(source) => Some(parse(
+            source,
+            file.old_path.as_deref().unwrap_or(&file.path),
+        )?),
+        None => None,
+    };
+    let new = match response.new_text.as_deref() {
+        Some(source) => Some(parse(source, &file.path)?),
+        None => None,
+    };
+    if old.is_none() && new.is_none() && zeron_syntax::supports_language(language) {
+        return None;
+    }
+    Some(DiffHighlights { old, new })
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +850,14 @@ pub enum DiffRow {
         /// Flat index across the file's hunks — keys into the highlight slot.
         flat: u32,
     },
+    /// `card` indexes the file's own staged-comment slice, in staged order.
+    CommentCard {
+        file: u32,
+        card: u32,
+    },
+    CommentDraft {
+        file: u32,
+    },
     /// Trailing pad closing an expanded body ([`BODY_BOTTOM_PAD`]).
     BodyPad {
         file: u32,
@@ -622,14 +870,60 @@ pub enum DiffRow {
     },
 }
 
-/// Rows an expanded body contributes (notices + hunk headers + lines + pad).
+impl DiffRow {
+    /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
+    /// height sum.
+    fn height(self, comments: &[DiffComment]) -> f32 {
+        match self {
+            DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
+            DiffRow::Notice { .. } => NOTICE_HEIGHT,
+            DiffRow::HunkHeader { .. } => HUNK_HEADER_HEIGHT,
+            DiffRow::Line { .. } => DIFF_LINE_HEIGHT,
+            DiffRow::CommentCard { card, .. } => comments
+                .get(card as usize)
+                .map(|comment| comments::card_height(&comment.body))
+                .unwrap_or(0.0),
+            DiffRow::CommentDraft { .. } => comments::DRAFT_CARD_HEIGHT,
+            DiffRow::BodyPad { .. } => BODY_BOTTOM_PAD,
+            DiffRow::FoldingBody { .. } => 0.0,
+        }
+    }
+}
+
+/// Capacity hint only — comment cards are not counted.
 pub fn body_row_count(file: &FileDiff) -> usize {
     let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
     file_notices(file).len() + file.hunks.len() + lines + 1
 }
 
-/// The steady-state body rows of one expanded file.
-pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
+pub fn body_rows(
+    file_ix: u32,
+    file: &FileDiff,
+    comments: &[DiffComment],
+    draft: Option<(CommentSide, u32)>,
+) -> Vec<DiffRow> {
+    fn push_cards(
+        rows: &mut Vec<DiffRow>,
+        file_ix: u32,
+        comments: &[DiffComment],
+        draft: Option<(CommentSide, u32)>,
+        anchors: &[Option<(CommentSide, u32)>],
+    ) {
+        for anchor in anchors.iter().flatten() {
+            for (ix, comment) in comments.iter().enumerate() {
+                if comment.anchor() == *anchor {
+                    rows.push(DiffRow::CommentCard {
+                        file: file_ix,
+                        card: ix as u32,
+                    });
+                }
+            }
+            if draft == Some(*anchor) {
+                rows.push(DiffRow::CommentDraft { file: file_ix });
+            }
+        }
+    }
+
     let mut rows = Vec::with_capacity(body_row_count(file));
     for notice in 0..file_notices(file).len() {
         rows.push(DiffRow::Notice {
@@ -637,21 +931,22 @@ pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
             notice: notice as u32,
         });
     }
-    let mut flat = 0u32;
+    let mut hunk_flat = 0u32;
     for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
         rows.push(DiffRow::HunkHeader {
             file: file_ix,
             hunk: hunk_ix as u32,
         });
-        for line_ix in 0..hunk.lines.len() {
+        for (line_ix, line) in hunk.lines.iter().enumerate() {
             rows.push(DiffRow::Line {
                 file: file_ix,
                 hunk: hunk_ix as u32,
                 line: line_ix as u32,
-                flat,
+                flat: hunk_flat + line_ix as u32,
             });
-            flat += 1;
+            push_cards(&mut rows, file_ix, comments, draft, &[line_anchor(line)]);
         }
+        hunk_flat += hunk.lines.len() as u32;
     }
     rows.push(DiffRow::BodyPad { file: file_ix });
     rows
@@ -659,9 +954,12 @@ pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
 
 /// Flatten all files into rows + each file's row span (header at
 /// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
-/// its header.
+/// its header. `comments` is the whole staged set; each file takes its own
+/// path's slice.
 pub fn flatten_rows(
     files: &[FileDiff],
+    comments: &[DiffComment],
+    draft: Option<(&str, CommentSide, u32)>,
     mut collapsed: impl FnMut(usize) -> bool,
 ) -> (Vec<DiffRow>, Vec<std::ops::Range<usize>>) {
     let mut rows = Vec::new();
@@ -670,7 +968,15 @@ pub fn flatten_rows(
         let start = rows.len();
         rows.push(DiffRow::FileHeader { file: ix as u32 });
         if !collapsed(ix) {
-            rows.extend(body_rows(ix as u32, file));
+            let file_comments: Vec<DiffComment> = comments
+                .iter()
+                .filter(|comment| comment.path == file.path)
+                .cloned()
+                .collect();
+            let file_draft = draft
+                .filter(|(path, _, _)| *path == file.path)
+                .map(|(_, side, line)| (side, line));
+            rows.extend(body_rows(ix as u32, file, &file_comments, file_draft));
         }
         ranges.push(start..rows.len());
     }
@@ -711,8 +1017,16 @@ impl FileFold {
 
 struct HighlightSlot {
     fingerprint: u64,
-    lines: Option<Arc<Vec<Vec<Token>>>>,
-    _task: Option<Task<()>>,
+    state: DiffHighlightState,
+    _excerpt_task: Option<Task<()>>,
+    _fetch_task: Option<Task<()>>,
+}
+
+enum DiffHighlightState {
+    Pending,
+    Ready(Arc<DiffHighlights>),
+    Excerpt(Arc<DiffHighlights>),
+    Plain,
 }
 
 /// The open base-ref dropdown — the same searchable-menu recipe as the
@@ -730,18 +1044,26 @@ struct RefMenu {
     _search_events: Subscription,
 }
 
-async fn yield_now() {
-    let mut yielded = false;
-    futures::future::poll_fn(move |cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoverRow {
+    path: String,
+    side: CommentSide,
+    line: u32,
+}
+
+struct CommentDraft {
+    /// Composer the note will stage onto, captured when the card opened. A
+    /// draft belongs to the checkout it was written over, so it must not
+    /// follow the user onto whatever chat is selected by commit time.
+    key: String,
+    path: String,
+    /// The file's pre-rename path, when it moved — carried onto the comment so
+    /// an `Old`-side citation names the file that line lives in.
+    old_path: Option<String>,
+    side: CommentSide,
+    line: u32,
+    input: Entity<ComposerInput>,
+    _events: Subscription,
 }
 
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
@@ -786,12 +1108,28 @@ pub struct Changes {
     scoped_task: Option<Task<()>>,
     scope_menu: Popup<()>,
     ref_menu: Popup<RefMenu>,
+    /// Only ever one: a second `+` moves the card rather than stacking two
+    /// half-written notes.
+    draft: Option<CommentDraft>,
+    hover: Option<HoverRow>,
+    comment_key: u64,
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
     history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
     history_events: Option<Subscription>,
+    /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
+    /// the fetch and the surface-tab title).
+    commit: Option<GitHistoryCommit>,
     _observe: Subscription,
 }
+
+/// Events the host (the right pane's surface strip) listens for.
+pub enum ChangesEvent {
+    /// A History row was clicked — open this commit as its own diff tab.
+    OpenCommit(GitHistoryCommit),
+}
+
+impl gpui::EventEmitter<ChangesEvent> for Changes {}
 
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -825,12 +1163,42 @@ impl Changes {
             scoped_task: None,
             scope_menu: Popup::default(),
             ref_menu: Popup::default(),
+            draft: None,
+            hover: None,
+            comment_key: 0,
             history: None,
             history_count: None,
             history_fetch_button: None,
             history_events: None,
+            commit: None,
             _observe: observe,
         }
+    }
+
+    /// A pane pinned to one commit's diff (a History row click) — fetches
+    /// `parent vs commit` once and never offers the scope menu.
+    pub fn for_commit(
+        state: Entity<AppState>,
+        commit: GitHistoryCommit,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.scope = DiffScope::Commit;
+        changes.commit = Some(commit);
+        changes
+    }
+
+    /// The surface-tab title (contextual, user request): the pinned commit's
+    /// subject (short sha for subject-less commits), else the scope's label.
+    pub fn tab_title(&self) -> gpui::SharedString {
+        if let Some(commit) = &self.commit {
+            let subject = commit.subject.trim();
+            if !subject.is_empty() {
+                return subject.to_string().into();
+            }
+            return commit.sha.chars().take(7).collect::<String>().into();
+        }
+        gpui::SharedString::from(self.scope.label())
     }
 
     /// The selected chat's host device when it differs from the connected
@@ -951,7 +1319,7 @@ impl Changes {
     fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
         match self.scope {
             DiffScope::WorkingTree => self.resolved(cx),
-            DiffScope::Branch | DiffScope::LatestTurn => self.scoped.clone(),
+            DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
             DiffScope::History => None,
         }
     }
@@ -964,6 +1332,10 @@ impl Changes {
             DiffScope::Branch => format!("br:{}", self.base_ref.as_deref().unwrap_or("")),
             DiffScope::LatestTurn => "turn".to_string(),
             DiffScope::History => "history".to_string(),
+            DiffScope::Commit => format!(
+                "commit:{}",
+                self.commit.as_ref().map(|c| c.sha.as_str()).unwrap_or("")
+            ),
         }
     }
 
@@ -1067,14 +1439,22 @@ impl Changes {
             },
             _ => None,
         };
+        let commit_sha = match self.scope {
+            DiffScope::Commit => match &self.commit {
+                Some(commit) => Some(commit.sha.clone()),
+                None => return, // a commit pane without its pin never fetches
+            },
+            _ => None,
+        };
         let target = self.desired_target(cx);
         let context = format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             target.as_deref().unwrap_or("local"),
             chat_id,
             cwd,
             self.scope.mode(),
-            base.as_deref().unwrap_or("")
+            base.as_deref().unwrap_or(""),
+            commit_sha.as_deref().unwrap_or("")
         );
         let watch_sum = self.resolved(cx).map(|d| d.checksum).unwrap_or_default();
         let key = format!("{context}|{watch_sum}");
@@ -1103,6 +1483,9 @@ impl Changes {
             params.insert("chatId".into(), serde_json::Value::String(chat_id));
             if let Some(base) = base {
                 params.insert("baseRef".into(), serde_json::Value::String(base));
+            }
+            if let Some(sha) = commit_sha {
+                params.insert("commitSha".into(), serde_json::Value::String(sha));
             }
             if let Some(target) = target {
                 params.insert("targetDeviceId".into(), serde_json::Value::String(target));
@@ -1160,6 +1543,10 @@ impl Changes {
         self.history_events =
             Some(
                 cx.subscribe(&history, |this: &mut Self, _, event, cx| match event {
+                    GitHistoryEvent::OpenCommit(commit) => {
+                        // Bubble to the host — the surface strip opens the tab.
+                        cx.emit(ChangesEvent::OpenCommit(commit.clone()));
+                    }
                     GitHistoryEvent::FetchSucceeded => {
                         // Remote refs affect branch choices and every scoped diff
                         // based on a ref. Force fresh reads after the engine has
@@ -1208,8 +1595,16 @@ impl Changes {
         cx.notify();
     }
 
+    /// Everything the pane needs kicked when (re)shown: the watch plus the
+    /// scope-specific loads (branches, scoped/commit capture, history) — the
+    /// shell's hook for freshly-mounted surface tabs.
+    pub fn ensure_content(&mut self, cx: &mut Context<Self>) {
+        self.sync(cx);
+    }
+
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.discard_stale_draft(cx);
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
@@ -1218,7 +1613,9 @@ impl Changes {
                 .update(cx, |history, cx| history.ensure_loaded(cx));
             return;
         }
-        self.ensure_branches(cx);
+        if self.scope != DiffScope::Commit {
+            self.ensure_branches(cx);
+        }
         self.ensure_scoped(cx);
         let Some(diff) = self.active_diff(cx) else {
             if self.parsed.take().is_some() {
@@ -1233,6 +1630,7 @@ impl Changes {
         };
         let key = self.parse_key(&diff);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
+            self.sync_comment_rows(cx);
             return;
         }
         // Parse off the render path — patches run to megabytes.
@@ -1259,7 +1657,17 @@ impl Changes {
                 };
                 changes.folds.clear();
                 changes.highlights.clear();
-                let (rows, ranges) = flatten_rows(&files, |_| false);
+                let staged = changes.staged_comments(cx);
+                let draft = changes.draft_anchor();
+                let (rows, ranges) = flatten_rows(
+                    &files,
+                    &staged,
+                    draft
+                        .as_ref()
+                        .map(|(path, side, line)| (path.as_str(), *side, *line)),
+                    |_| false,
+                );
+                changes.comment_key = comment_state_key(&staged, draft.as_ref());
                 // The uniform hint keeps offsets for never-rendered rows
                 // sane (most rows ARE lines); real heights land as rows
                 // render.
@@ -1292,8 +1700,31 @@ impl Changes {
         };
         let body = range.start + 1..range.end;
         let delta = new_body.len() as isize - body.len() as isize;
-        self.list.splice(body.clone(), new_body.len());
-        self.rows.splice(body, new_body);
+        // Only splice the rows that moved: `ListState::splice` clamps the
+        // scroll anchor to the range start when the anchored row is inside it,
+        // so replacing a whole body jumped the pane to the top of the file.
+        let (prefix, suffix) = {
+            let old = &self.rows[body.clone()];
+            let prefix = old
+                .iter()
+                .zip(&new_body)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix = old[prefix..]
+                .iter()
+                .rev()
+                .zip(new_body[prefix..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (prefix, suffix)
+        };
+        if delta == 0 && prefix + suffix >= body.len() {
+            return;
+        }
+        let changed = body.start + prefix..body.end - suffix;
+        let mid: Vec<DiffRow> = new_body[prefix..new_body.len() - suffix].to_vec();
+        self.list.splice(changed.clone(), mid.len());
+        self.rows.splice(changed, mid);
         self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
         for r in &mut self.row_ranges[file_ix + 1..] {
             *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
@@ -1307,7 +1738,11 @@ impl Changes {
         let Some(file) = parsed.files.get(file_ix) else {
             return;
         };
-        let expanded_height = body_height(file);
+        let expanded_height = body_height_with(
+            file,
+            &self.comments_for(&file.path, cx),
+            self.draft_anchor_in(&file.path),
+        );
         let fold = self.folds.entry(file.path.clone()).or_default();
         let currently_collapsed = fold.collapsed;
         fold.from = if currently_collapsed {
@@ -1384,7 +1819,12 @@ impl Changes {
             let body = if fold.collapsed {
                 Vec::new()
             } else {
-                body_rows(file_ix as u32, file)
+                body_rows(
+                    file_ix as u32,
+                    file,
+                    &self.comments_for(&file.path, cx),
+                    self.draft_anchor_in(&file.path),
+                )
             };
             self.replace_file_body(file_ix, body);
         }
@@ -1422,21 +1862,238 @@ impl Changes {
             fold.collapsed = collapse;
             fold.toggled_at = None;
         }
+        let staged = self.staged_comments(cx);
+        let draft = self.draft_anchor();
         for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
             let range = &self.row_ranges[file_ix];
             let body = range.start + 1..range.end;
             let new_len = if collapse {
                 0
             } else {
-                body_row_count(&files[file_ix])
+                let file = &files[file_ix];
+                let comments: Vec<DiffComment> = staged
+                    .iter()
+                    .filter(|comment| comment.path == file.path)
+                    .cloned()
+                    .collect();
+                body_rows(
+                    file_ix as u32,
+                    file,
+                    &comments,
+                    self.draft_anchor_in(&file.path),
+                )
+                .len()
             };
             if body.len() != new_len {
                 self.list.splice(body, new_len);
             }
         }
-        let (rows, ranges) = flatten_rows(&files, |_| collapse);
+        let (rows, ranges) = flatten_rows(
+            &files,
+            &staged,
+            draft
+                .as_ref()
+                .map(|(path, side, line)| (path.as_str(), *side, *line)),
+            |_| collapse,
+        );
         self.rows = rows;
         self.row_ranges = ranges;
+        cx.notify();
+    }
+
+    /// Cloned because rendering borrows `self` mutably a moment later.
+    fn staged_comments(&self, cx: &App) -> Vec<DiffComment> {
+        let state = self.state.read(cx);
+        state.diff_comments(&state.composer_key()).to_vec()
+    }
+
+    fn comments_for(&self, path: &str, cx: &App) -> Vec<DiffComment> {
+        self.staged_comments(cx)
+            .into_iter()
+            .filter(|comment| comment.path == path)
+            .collect()
+    }
+
+    /// The parsed diff's pre-rename path for `path`, when the file moved.
+    fn old_path_of(&self, path: &str) -> Option<String> {
+        self.parsed
+            .as_ref()?
+            .files
+            .iter()
+            .find(|file| file.path == path)?
+            .old_path
+            .clone()
+    }
+
+    /// A draft belongs to the checkout it was opened over. Chat navigation
+    /// swaps both the diff under it and the composer it would stage onto, so
+    /// the half-written note is dropped rather than following the user across.
+    fn discard_stale_draft(&mut self, cx: &mut Context<Self>) {
+        let key = self.state.read(cx).composer_key();
+        if self.draft.as_ref().is_some_and(|draft| draft.key != key) {
+            self.draft = None;
+            self.sync_comment_rows(cx);
+            cx.notify();
+        }
+    }
+
+    fn draft_anchor(&self) -> Option<(String, CommentSide, u32)> {
+        self.draft
+            .as_ref()
+            .map(|draft| (draft.path.clone(), draft.side, draft.line))
+    }
+
+    fn draft_anchor_in(&self, path: &str) -> Option<(CommentSide, u32)> {
+        self.draft
+            .as_ref()
+            .filter(|draft| draft.path == path)
+            .map(|draft| (draft.side, draft.line))
+    }
+
+    fn sync_comment_rows(&mut self, cx: &mut Context<Self>) {
+        if self.parsed.is_none() {
+            return;
+        }
+        let staged = self.staged_comments(cx);
+        let draft = self.draft_anchor();
+        let key = comment_state_key(&staged, draft.as_ref());
+        if key == self.comment_key {
+            return;
+        }
+        self.comment_key = key;
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let files = parsed.files.clone();
+        for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
+            let file = &files[file_ix];
+            // A mid-tween stand-in is the settle sweep's to replace.
+            if self
+                .folds
+                .get(&file.path)
+                .is_some_and(|fold| fold.collapsed)
+            {
+                continue;
+            }
+            let range = &self.row_ranges[file_ix];
+            if self.rows.get(range.start + 1)
+                == Some(&DiffRow::FoldingBody {
+                    file: file_ix as u32,
+                })
+            {
+                continue;
+            }
+            let comments: Vec<DiffComment> = staged
+                .iter()
+                .filter(|comment| comment.path == file.path)
+                .cloned()
+                .collect();
+            let body = body_rows(
+                file_ix as u32,
+                file,
+                &comments,
+                self.draft_anchor_in(&file.path),
+            );
+            self.replace_file_body(file_ix, body);
+        }
+        cx.notify();
+    }
+
+    fn set_hover(
+        &mut self,
+        path: &str,
+        anchor: Option<(CommentSide, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = anchor.map(|(side, line)| HoverRow {
+            path: path.to_string(),
+            side,
+            line,
+        });
+        if next != self.hover {
+            self.hover = next;
+            cx.notify();
+        }
+    }
+
+    fn clear_hover_at(&mut self, path: &str, side: CommentSide, line: u32, cx: &mut Context<Self>) {
+        if self
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.path == path && hover.side == side && hover.line == line)
+        {
+            self.hover = None;
+            cx.notify();
+        }
+    }
+
+    fn open_draft(
+        &mut self,
+        path: String,
+        side: CommentSide,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| ComposerInput::new("Request a change…", cx));
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Submitted => this.commit_draft(cx),
+            ComposerInputEvent::Edited => cx.notify(),
+            _ => {}
+        });
+        let handle = input.read(cx).focus_handle(cx);
+        let key = self.state.read(cx).composer_key();
+        let old_path = self.old_path_of(&path);
+        self.draft = Some(CommentDraft {
+            key,
+            path,
+            old_path,
+            side,
+            line,
+            input,
+            _events: events,
+        });
+        window.focus(&handle, cx);
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn cancel_draft(&mut self, cx: &mut Context<Self>) {
+        self.draft = None;
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn commit_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        let body = draft.input.read(cx).text().trim().to_string();
+        if body.is_empty() {
+            self.sync_comment_rows(cx);
+            cx.notify();
+            return;
+        }
+        let comment =
+            DiffComment::new(draft.path, draft.side, draft.line, body).renamed_from(draft.old_path);
+        // `draft.key`, not the live one: the note stages onto the composer it
+        // was written against even if the selection moved under it.
+        let key = draft.key;
+        self.state.update(cx, |state, cx| {
+            state.add_diff_comment(&key, comment);
+            cx.notify();
+        });
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn remove_comment(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let key = state.composer_key();
+            state.remove_diff_comment(&key, id);
+            cx.notify();
+        });
+        self.sync_comment_rows(cx);
         cx.notify();
     }
 
@@ -1534,62 +2191,135 @@ impl Changes {
         }
     }
 
-    /// Tokens for a file's diff lines (paint-only). Kicks a time-sliced
-    /// background tokenize when missing; returns the current best.
+    /// Start excerpt parsing and a lazy full-source fetch for an expanded file.
     fn request_highlight(
         &mut self,
         file: &FileDiff,
         parsed_key: &str,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<Vec<Vec<Token>>>> {
-        let lang = lang_for_path(&file.path)?;
+    ) -> Option<Arc<DiffHighlights>> {
+        let lang = zeron_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
         {
-            return slot.lines.clone();
+            return match &slot.state {
+                DiffHighlightState::Ready(highlights) | DiffHighlightState::Excerpt(highlights) => {
+                    Some(highlights.clone())
+                }
+                DiffHighlightState::Pending | DiffHighlightState::Plain => None,
+            };
         }
-        let texts: Vec<(LineKind, String)> = file
-            .hunks
-            .iter()
-            .flat_map(|h| h.lines.iter().map(|l| (l.kind, l.text.clone())))
-            .collect();
+        if !zeron_syntax::supports_language(lang) {
+            self.highlights.insert(
+                file.path.clone(),
+                HighlightSlot {
+                    fingerprint,
+                    state: DiffHighlightState::Plain,
+                    _excerpt_task: None,
+                    _fetch_task: None,
+                },
+            );
+            return None;
+        }
         let path = file.path.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let lines = cx
+        let excerpt_file = file.clone();
+        let excerpt_path = path.clone();
+        let excerpt_task = cx.spawn(async move |this, cx| {
+            let highlights = cx
                 .background_executor()
-                .spawn(async move {
-                    let mut out = Vec::with_capacity(texts.len());
-                    for (ix, (kind, text)) in texts.iter().enumerate() {
-                        // Diff lines are fragments — no carry across lines.
-                        let tokens = match kind {
-                            LineKind::Meta => Vec::new(),
-                            _ => tokenize_line(lang, text, LineCarry::None).0,
-                        };
-                        out.push(tokens);
-                        if ix % 128 == 127 {
-                            yield_now().await;
-                        }
-                    }
-                    out
-                })
+                .spawn(async move { excerpt_highlights(&excerpt_file, lang).map(Arc::new) })
                 .await;
             this.update(cx, |changes, cx| {
-                if let Some(slot) = changes.highlights.get_mut(&path)
+                if let Some(slot) = changes.highlights.get_mut(&excerpt_path)
                     && slot.fingerprint == fingerprint
+                    && matches!(slot.state, DiffHighlightState::Pending)
                 {
-                    slot.lines = Some(Arc::new(lines));
+                    slot.state = match highlights {
+                        Some(highlights) => DiffHighlightState::Excerpt(highlights),
+                        None => DiffHighlightState::Plain,
+                    };
                     cx.notify();
                 }
             })
             .ok();
         });
+
+        let active = self.active_diff(cx);
+        let engine = self.state.read(cx).engine().cloned();
+        let target = self.desired_target(cx);
+        let chat_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.id.clone());
+        let mode = self.scope.mode().to_string();
+        let base_ref = self.base_ref.clone();
+        let commit_sha = (self.scope == DiffScope::Commit)
+            .then(|| self.commit.as_ref().map(|commit| commit.sha.clone()))
+            .flatten();
+        let fetch_file = file.clone();
+        let fetch_path = path.clone();
+        let fetch_task = match (active, engine) {
+            (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
+                let request = zeron_proto::GetCheckoutFileDiffTextRequest {
+                    checkout_id: diff.checkout_id,
+                    cwd: diff.cwd,
+                    path: fetch_path.clone(),
+                    mode,
+                    base_ref,
+                    chat_id,
+                    commit_sha,
+                    diff_checksum: diff.checksum,
+                };
+                let mut params = serde_json::to_value(request)
+                    .ok()
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                if let Some(target) = target {
+                    params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+                }
+                let response = engine
+                    .client()
+                    .call(
+                        methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+                        serde_json::Value::Object(params),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value).ok()
+                    });
+                let highlights = match response {
+                    Some(response) => {
+                        cx.background_executor()
+                            .spawn(async move {
+                                full_highlights(&fetch_file, lang, &response).map(Arc::new)
+                            })
+                            .await
+                    }
+                    None => None,
+                };
+                this.update(cx, |changes, cx| {
+                    if let Some(slot) = changes.highlights.get_mut(&fetch_path)
+                        && slot.fingerprint == fingerprint
+                        && let Some(highlights) = highlights
+                    {
+                        slot.state = DiffHighlightState::Ready(highlights);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })),
+            _ => None,
+        };
         self.highlights.insert(
             file.path.clone(),
             HighlightSlot {
                 fingerprint,
-                lines: None,
-                _task: Some(task),
+                state: DiffHighlightState::Pending,
+                _excerpt_task: Some(excerpt_task),
+                _fetch_task: fetch_task,
             },
         );
         None
@@ -1634,7 +2364,7 @@ impl Changes {
                 file,
                 hunk,
                 line,
-                flat,
+                flat: _,
             } => {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
@@ -1647,12 +2377,72 @@ impl Changes {
                 else {
                     return gpui::Empty.into_any_element();
                 };
-                let tokens = highlight
-                    .as_ref()
-                    .and_then(|lines| lines.get(flat as usize))
-                    .map(|t| t.as_slice())
+                let spans = highlight
+                    .as_deref()
+                    .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                diff_line_row(line, tokens, &theme, gutter_width(file_diff))
+                let gutter_px = gutter_width(file_diff);
+                let row = diff_line_row(line, spans, &theme, gutter_px);
+                let Some((side, line_no)) = line_anchor(line) else {
+                    return row;
+                };
+                let path = file_diff.path.clone();
+                let hovered = self.hover.as_ref().is_some_and(|hover| {
+                    hover.path == path && hover.side == side && hover.line == line_no
+                });
+                let move_path = path.clone();
+                let leave_path = path.clone();
+                div()
+                    .id(("diff-line", ix))
+                    .w_full()
+                    .relative()
+                    .child(row)
+                    .when(hovered, |el| {
+                        el.child(positioned_adder(
+                            comment_adder_left(side, gutter_px),
+                            render_comment_adder(&path, side, line_no, &theme, cx),
+                        ))
+                    })
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        this.set_hover(&move_path, Some((side, line_no)), cx);
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            this.clear_hover_at(&leave_path, side, line_no, cx);
+                        }
+                    }))
+                    .into_any_element()
+            }
+            DiffRow::CommentCard { file, card } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let comments = self.comments_for(&file_diff.path, cx);
+                match comments.get(card as usize) {
+                    Some(comment) => render_comment_card(comment, &theme, cx),
+                    None => gpui::Empty.into_any_element(),
+                }
+            }
+            DiffRow::CommentDraft { file } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                match self
+                    .draft
+                    .as_ref()
+                    .filter(|draft| draft.path == file_diff.path)
+                {
+                    // Header cites the same path the staged card and the
+                    // prompt bullet will.
+                    Some(draft) => render_comment_draft(
+                        draft_cite_path(draft),
+                        draft.line,
+                        draft.input.clone(),
+                        &theme,
+                        cx,
+                    ),
+                    None => gpui::Empty.into_any_element(),
+                }
             }
             DiffRow::BodyPad { .. } => div().w_full().h(px(BODY_BOTTOM_PAD)).into_any_element(),
             DiffRow::FoldingBody { file } => {
@@ -1833,6 +2623,49 @@ impl Changes {
     /// alongside, shell-owned (they mutate shell state).
     pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        // Commit-pinned pane: the pin never changes, so a fixed identity
+        // chip (mono short sha + subject) replaces the scope dropdown;
+        // fold-all still trails.
+        if let Some(commit) = self.commit.clone() {
+            let short: String = commit.sha.chars().take(7).collect();
+            return div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(22.0))
+                        .px(px(6.0))
+                        .rounded(px(5.0))
+                        .flex()
+                        .items_center()
+                        .bg(crate::theme::ink(0.05))
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(10.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(short)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(commit.subject.clone())),
+                )
+                .child(
+                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_collapse_all(cx);
+                        })),
+                )
+                .into_any_element();
+        }
         let scope = self.scope;
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
         let history_fetch_button =
@@ -2236,12 +3069,6 @@ fn del_color(theme: &Theme) -> gpui::Hsla {
     theme.diff_del // red-400
 }
 
-/// Diff syntax palette — since round 9 the transcript's code blocks share the
-/// same soft hues, so this simply delegates to [`render::token_color`].
-fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme) -> gpui::Hsla {
-    render::token_color(class, theme)
-}
-
 /// One notice row ("New file", "Binary file — contents not shown", …).
 fn notice_row(notice: String, theme: &Theme) -> AnyElement {
     div()
@@ -2277,7 +3104,12 @@ fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
 /// One +/−/context/meta diff line: coloured accent bar, dual line-number
 /// gutters (`gutter_px` wide — see [`gutter_width`]), marker column, and
 /// paint-only syntax runs.
-fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f32) -> AnyElement {
+fn diff_line_row(
+    line: &DiffLine,
+    spans: &[zeron_syntax::HighlightSpan],
+    theme: &Theme,
+    gutter_px: f32,
+) -> AnyElement {
     if line.kind == LineKind::Meta {
         return div()
             .h(px(DIFF_LINE_HEIGHT))
@@ -2337,12 +3169,12 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
             ))
     };
     let mono = font(theme.font_mono.clone());
-    let runs = render::runs_with_palette(
+    let runs = render::runs_for_syntax_line_with_plain(
         &line.text,
-        tokens,
+        spans,
         &mono,
         theme.text.opacity(0.92),
-        |class| diff_token_color(class, theme),
+        theme,
     );
     div()
         .h(px(DIFF_LINE_HEIGHT))
@@ -2402,6 +3234,262 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
         .into_any_element()
 }
 
+pub const COMMENT_ADDER_SIZE: f32 = 16.0;
+
+/// A row carries both gutters side by side, and a deletion numbers in the
+/// first.
+pub fn comment_adder_left(side: CommentSide, gutter_px: f32) -> f32 {
+    let column = match side {
+        CommentSide::Old => 0.0,
+        CommentSide::New => gutter_px,
+    };
+    ACCENT_BAR_WIDTH + column + (gutter_px - COMMENT_ADDER_SIZE) / 2.0
+}
+
+fn positioned_adder(left: f32, adder: AnyElement) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(0.0))
+        .h_full()
+        .flex()
+        .items_center()
+        .child(adder)
+}
+
+fn render_comment_adder(
+    path: &str,
+    side: CommentSide,
+    line: u32,
+    theme: &Theme,
+    cx: &Context<Changes>,
+) -> AnyElement {
+    let target = path.to_string();
+    div()
+        .id(SharedString::from(format!(
+            "cmt-add-{path}-{}-{line}",
+            side.tag()
+        )))
+        .size(px(COMMENT_ADDER_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .bg(theme.solid)
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_draft(target.clone(), side, line, window, cx);
+        }))
+        .child(
+            crate::icons::icon(crate::icons::PLUS)
+                .size(px(11.0))
+                .text_color(theme.on_solid),
+        )
+        .into_any_element()
+}
+
+fn render_comment_card(comment: &DiffComment, theme: &Theme, cx: &Context<Changes>) -> AnyElement {
+    let group: SharedString = format!("cmt-card-{}", comment.id).into();
+    let id = comment.id.clone();
+    div()
+        .group(group.clone())
+        .h(px(comments::card_height(&comment.body)))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .bg(crate::theme::ink(0.05))
+        // A bar, not a border: it must match ACCENT_BAR_WIDTH exactly or the
+        // card's edge steps in and out of the column.
+        .child(comment_accent_bar(theme.solid.opacity(0.35)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .px(px(Theme::SPACE_LG))
+                .py(px(comments::CARD_PAD_V / 2.0))
+                .child(
+                    div()
+                        .h(px(comments::CARD_HEADER_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                                .size(px(12.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(comment.location())),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("cmt-remove-{}", comment.id)))
+                                .flex_none()
+                                .size(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .opacity(0.0)
+                                .group_hover(group, |s| s.opacity(1.0))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.remove_comment(&id, cx)),
+                                )
+                                .child(
+                                    crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        // Height is analytic, so an over-long body clips
+                        // inside the card rather than past the fold height.
+                        .overflow_hidden()
+                        .text_size(px(12.0))
+                        .line_height(px(comments::CARD_LINE_HEIGHT))
+                        .text_color(theme.text_dim)
+                        .child(SharedString::from(comment.body.clone())),
+                ),
+        )
+        .into_any_element()
+}
+
+fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
+    div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
+}
+
+/// Mirrors [`DiffComment::cite_path`] for the not-yet-staged note.
+fn draft_cite_path(draft: &CommentDraft) -> &str {
+    match draft.side {
+        CommentSide::Old => draft.old_path.as_deref().unwrap_or(&draft.path),
+        CommentSide::New => &draft.path,
+    }
+}
+
+/// Fixed height, so an open draft never fights the fold tween.
+fn render_comment_draft(
+    path: &str,
+    line: u32,
+    input: Entity<ComposerInput>,
+    theme: &Theme,
+    cx: &Context<Changes>,
+) -> AnyElement {
+    div()
+        .h(px(comments::DRAFT_CARD_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .bg(crate::theme::ink(0.08))
+        .child(comment_accent_bar(theme.solid.opacity(0.7)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .px(px(Theme::SPACE_LG))
+                .py(px(10.0))
+                .child(
+                    div()
+                        .h(px(comments::CARD_HEADER_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                                .size(px(12.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("{path}:{line}"))),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(46.0))
+                        .flex_none()
+                        .overflow_hidden()
+                        .text_size(px(12.0))
+                        .child(input.into_any_element()),
+                )
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(6.0))
+                        .child(
+                            comment_action("cmt-cancel", "Cancel", false, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_draft(cx))),
+                        )
+                        .child(
+                            comment_action("cmt-commit", "Comment", true, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.commit_draft(cx))),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+fn comment_action(
+    id: &'static str,
+    label: &'static str,
+    primary: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(22.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .rounded(px(6.0))
+        .text_size(px(11.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .when(primary, |el| el.bg(theme.solid).text_color(theme.on_solid))
+        .when(!primary, |el| {
+            el.text_color(motion::hover_blend(id, theme.text_muted, theme.text))
+                .bg(motion::hover_blend(
+                    id,
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                ))
+                .on_hover(motion::hover_listener(id))
+        })
+        .child(SharedString::from(label))
+}
+
 /// The expanded body of one file section: notices, hunk headers, +/-/context
 /// lines with a coloured accent bar, dual line-number gutters, a marker
 /// column, and paint-only syntax runs (zeron checkout-diff-sidebar).
@@ -2409,25 +3497,45 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
 /// renders a checkout diff section and an inline ACP tool diff. (The changes
 /// pane itself virtualizes these rows individually; this stacked form serves
 /// the transcript and the fold tween's clipped stand-in.)
-pub(crate) fn render_file_body(
+/// Full-document old/new highlighting for tool and checkout diffs.
+pub(crate) fn render_file_body_with_syntax(
     file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    highlights: Option<Arc<DiffHighlights>>,
     theme: &Theme,
 ) -> AnyElement {
-    render_file_body_upto(file, highlight, theme, f32::INFINITY)
+    let mut children: Vec<AnyElement> = Vec::new();
+    let gutter_px = gutter_width(file);
+    for notice in file_notices(file) {
+        children.push(notice_row(notice, theme));
+    }
+    for hunk in &file.hunks {
+        children.push(hunk_header_row(&hunk.header, theme));
+        for line in &hunk.lines {
+            let spans = highlights
+                .as_deref()
+                .map(|highlights| highlights.spans(line))
+                .unwrap_or(&[]);
+            children.push(diff_line_row(line, spans, theme, gutter_px));
+        }
+    }
+    div()
+        .flex()
+        .flex_col()
+        .pb(px(BODY_BOTTOM_PAD))
+        .children(children)
+        .into_any_element()
 }
 
-/// [`render_file_body`], building only rows that start above `max_px` — the
-/// fold tween's stand-in never materializes lines its clip cannot reveal.
+/// Build only rows that start above `max_px` so the fold tween's stand-in
+/// never materializes lines its clip cannot reveal.
 fn render_file_body_upto(
     file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    highlight: Option<Arc<DiffHighlights>>,
     theme: &Theme,
     max_px: f32,
 ) -> AnyElement {
     let mut children: Vec<AnyElement> = Vec::new();
     let mut y = 0.0f32;
-    let mut line_ix = 0usize;
     let gutter_px = gutter_width(file);
 
     'build: {
@@ -2448,14 +3556,12 @@ fn render_file_body_upto(
                 if y >= max_px {
                     break 'build;
                 }
-                let tokens = highlight
-                    .as_ref()
-                    .and_then(|lines| lines.get(line_ix))
-                    .map(|t| t.as_slice())
+                let spans = highlight
+                    .as_deref()
+                    .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                children.push(diff_line_row(line, tokens, theme, gutter_px));
+                children.push(diff_line_row(line, spans, theme, gutter_px));
                 y += DIFF_LINE_HEIGHT;
-                line_ix += 1;
             }
         }
     }
@@ -2758,7 +3864,7 @@ rename to new_name.rs
     #[test]
     fn rows_flatten_to_line_granularity() {
         let files = parse_patch(PATCH);
-        let (rows, ranges) = flatten_rows(&files, |_| false);
+        let (rows, ranges) = flatten_rows(&files, &[], None, |_| false);
         assert_eq!(ranges.len(), files.len());
         // Every file's span starts with its header…
         for (ix, range) in ranges.iter().enumerate() {
@@ -2785,7 +3891,7 @@ rename to new_name.rs
         assert_eq!(*main_rows.last().unwrap(), DiffRow::BodyPad { file: 0 });
 
         // A collapsed file contributes its header row only.
-        let (rows, ranges) = flatten_rows(&files, |ix| ix == 0);
+        let (rows, ranges) = flatten_rows(&files, &[], None, |ix| ix == 0);
         assert_eq!(ranges[0].len(), 1);
         assert_eq!(rows[ranges[1].start], DiffRow::FileHeader { file: 1 });
 
@@ -3085,12 +4191,174 @@ rename to new_name.rs
     }
 
     #[test]
-    fn langs_resolve_from_paths() {
-        assert_eq!(lang_for_path("src/main.rs"), Some(Lang::Rust));
-        assert_eq!(lang_for_path("a/b/app.tsx"), Some(Lang::Js));
-        assert_eq!(lang_for_path("Cargo.toml"), Some(Lang::Toml));
-        assert_eq!(lang_for_path("script.sh"), Some(Lang::Bash));
-        assert_eq!(lang_for_path("README"), None);
-        assert_eq!(lang_for_path("img.png"), None);
+    fn full_diff_highlights_map_old_new_and_context_by_source_line() {
+        let old_source = "fn old() {\n    let value = 1;\n}\n";
+        let new_source = "fn new() {\n    let value = 2;\n}\n";
+        let parse = |source| {
+            Arc::new(
+                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                    source,
+                    path: Some("src/lib.rs"),
+                    fence_tag: None,
+                })
+                .unwrap(),
+            )
+        };
+        let highlights = DiffHighlights {
+            old: Some(parse(old_source)),
+            new: Some(parse(new_source)),
+        };
+        let deleted = DiffLine {
+            kind: LineKind::Del,
+            old_no: Some(1),
+            new_no: None,
+            text: "fn old() {".into(),
+        };
+        let added = DiffLine {
+            kind: LineKind::Add,
+            old_no: None,
+            new_no: Some(1),
+            text: "fn new() {".into(),
+        };
+        let context = DiffLine {
+            kind: LineKind::Context,
+            old_no: Some(2),
+            new_no: Some(2),
+            text: "    let value = 2;".into(),
+        };
+        assert_eq!(
+            highlights.source_ref(&deleted),
+            Some(SourceLineRef {
+                side: SourceSide::Old,
+                line_number: 1
+            })
+        );
+        assert_eq!(
+            highlights.source_ref(&added),
+            Some(SourceLineRef {
+                side: SourceSide::New,
+                line_number: 1
+            })
+        );
+        assert_eq!(
+            highlights.source_ref(&context),
+            Some(SourceLineRef {
+                side: SourceSide::New,
+                line_number: 2
+            })
+        );
+        assert!(
+            highlights
+                .spans(&deleted)
+                .iter()
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
+        );
+        assert!(
+            highlights
+                .spans(&added)
+                .iter()
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
+        );
+    }
+
+    #[test]
+    fn excerpt_parses_old_and_new_hunks_as_separate_documents() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1,3 +1,3 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(1),
+                        new_no: Some(1),
+                        text: "/* start".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(2),
+                        new_no: None,
+                        text: "old body".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(2),
+                        text: "new body".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(3),
+                        new_no: Some(3),
+                        text: "end */".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 3,
+        };
+        let highlights = excerpt_highlights(&file, Lang::Rust).expect("excerpt");
+        let deleted = &file.hunks[0].lines[1];
+        let added = &file.hunks[0].lines[2];
+        assert!(
+            highlights
+                .spans(deleted)
+                .iter()
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
+        );
+        assert!(
+            highlights
+                .spans(added)
+                .iter()
+                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
+        );
+    }
+
+    #[test]
+    fn mismatched_full_sources_are_rejected_atomically() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(1),
+                        new_no: None,
+                        text: "let old = 1;".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "let new = 2;".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 1,
+        };
+        let response = zeron_proto::CheckoutFileDiffText {
+            diff_checksum: "sum".into(),
+            old_text: Some("let old = 1;\n".into()),
+            new_text: Some("different snapshot\n".into()),
+            old_content_hash: None,
+            new_content_hash: None,
+            binary: false,
+            truncated: false,
+            stale: false,
+        };
+        assert!(!sources_match_patch(&file, &response));
+        assert!(full_highlights(&file, Lang::Rust, &response).is_none());
     }
 }

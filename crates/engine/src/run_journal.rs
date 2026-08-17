@@ -242,6 +242,17 @@ fn scan_tail(path: &Path) -> Result<(u64, bool), JournalError> {
     Ok((next_seq, needs_newline))
 }
 
+/// Journal (`.jsonl`) and resume-budget (`.resume`) paths for `chat_id` under an
+/// arbitrary journals directory — profile import copies these files between
+/// profiles without opening a `RunJournal`.
+pub fn journal_paths(dir: &Path, chat_id: &str) -> (PathBuf, PathBuf) {
+    let stem = sanitize_id(chat_id);
+    (
+        dir.join(format!("{stem}.jsonl")),
+        dir.join(format!("{stem}.resume")),
+    )
+}
+
 /// Chat ids become file names; anything outside a conservative set is replaced so a
 /// hostile id cannot traverse paths. (Ids are uuids in practice.)
 fn sanitize_id(chat_id: &str) -> String {
