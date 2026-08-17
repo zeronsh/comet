@@ -101,7 +101,7 @@ struct HomeView: View {
                     // menuIndicator(.hidden) and Label-vs-Image all no-op
                     // here. Only dropping the Menu makes it a circle.
                     newButton
-                        .tint(Theme.violet)
+                        .tint(Theme.violetStrong)
                         .buttonStyle(.borderedProminent)
                         .menuStyle(.button)
                 }
