@@ -75,9 +75,11 @@ struct SpaceView: View {
                 Button {
                     path.append(.newSession(spaceId: spaceId))
                 } label: {
-                    Image(systemName: "plus")
+                    Label("New session", systemImage: "plus")
                 }
-                .accessibilityLabel("New session")
+                // Same violet "create" disc as Home's "+".
+                .tint(Theme.violet)
+                .buttonStyle(.borderedProminent)
             }
         }
         .onAppear {

@@ -33,6 +33,8 @@ enum Theme {
     // ---- paint: accents ----
     static let accent = oklch(0.673, 0.182, 276.935)        // indigo-400
     static let accentStrong = oklch(0.585, 0.233, 277.117)  // indigo-500
+    /// violet-400 — the create/compose hue (the "+" glass, inline code's wash).
+    static let violet = oklch(0.702, 0.183, 293.541)
     static let danger = oklch(0.704, 0.191, 22.216)         // red-400
     static let dangerSoft = oklch(0.808, 0.114, 19.571)     // red-300
     static let warning = oklch(0.828, 0.189, 84.429)        // amber-400
@@ -45,7 +47,7 @@ enum Theme {
 
     // ---- paint: markdown inline code (violet family) ----
     static let inlineCodeText = oklch(0.811, 0.111, 293.571)  // violet-300
-    static let inlineCodeWash = oklch(0.702, 0.183, 293.541).opacity(0.12) // violet-400 @ 0.12
+    static let inlineCodeWash = violet.opacity(0.12)          // violet-400 @ 0.12
 
     // ---- paint: syntax tokens (soft, paint-only) ----
     static let tokenKeyword = oklch(0.709, 0.129, 20.0)   // soft rose
