@@ -33,12 +33,14 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
 
 ### Headed / headless
 Single binary `zeron`:
-- `zeron` — headed. If a local engine daemon is already listening on the IPC port, connect to it;
-  otherwise run the engine **in-process** (RPC over an in-memory duplex — same protocol, zero
-  serialization shortcuts, so the boundary stays honest) **and serve that same engine on the IPC
-  port**. The embedded engine is not private: any other viewport can attach to the running app
-  without it first being restarted as a daemon. Binding is best-effort — if the port is taken the
-  window still opens, having lost only the ability to host peers.
+- `zeron` — headed. If a local engine daemon is already listening on the IPC port, connect to it.
+  If the background service is installed, it owns startup: wait for its IPC listener rather than
+  competing for the data directory. Without an installed service, run the engine **in-process**
+  (RPC over an in-memory duplex — same protocol, zero serialization shortcuts, so the boundary
+  stays honest) **and serve that same engine on the IPC port**. The embedded engine is not private:
+  any other viewport can attach to the running app without it first being restarted as a daemon.
+  Binding is best-effort — if the port is taken the window still opens, having lost only the ability
+  to host peers. Uninstalling the background service returns startup ownership to the headed app.
 - `zeron headless` — engine only. A clean installation immediately serves its local profile over localhost IPC; when a saved account selects the synced profile at startup and a bearer is available, it also hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
 
 ### Local-first workspace profiles

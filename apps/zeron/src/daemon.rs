@@ -113,6 +113,15 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether an installed macOS LaunchAgent owns headed engine startup.
+pub fn owns_headed_startup() -> anyhow::Result<bool> {
+    if cfg!(target_os = "macos") {
+        Ok(launchd_plist_path()?.exists())
+    } else {
+        Ok(false)
+    }
+}
+
 pub fn start() -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let plist = launchd_plist_path()?;

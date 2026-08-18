@@ -83,8 +83,10 @@ pub use zeron_proto::HarnessId;
 pub struct UiConfig {
     /// Data directory — engine stores + `ui-settings.json`.
     pub data_dir: PathBuf,
-    /// Localhost IPC port: connect if an engine daemon is listening, embed if not.
+    /// Localhost IPC port to connect to or serve.
     pub ipc_port: u16,
+    /// Wait for the installed background service instead of embedding an engine.
+    pub managed_daemon: bool,
     /// Edge base URL for the embedded engine.
     pub edge_url: String,
     /// Edge bearer; `None` runs offline.
@@ -103,6 +105,7 @@ impl UiConfig {
         EngineBootConfig {
             data_dir: self.data_dir.clone(),
             ipc_port: self.ipc_port,
+            managed_daemon: self.managed_daemon,
             edge_url: self.edge_url.clone(),
             edge_token: self.edge_token.clone(),
             org_id: self.org_id.clone(),
@@ -121,9 +124,9 @@ struct ReopenState {
 
 impl gpui::Global for ReopenState {}
 
-/// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
-/// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
-/// root view, boot splash overlaid until the engine reports ready.
+/// Run the headed app: tokio bridge up, engine bootstrap kicked off, 1320×880
+/// window (min 900×600) with [`shell::Shell`] as the root view, boot splash
+/// overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
     let app = gpui_platform::application().with_assets(icons::Assets);
     // Dock-icon click with no window (⌘W closed it): rebuild the main window

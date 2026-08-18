@@ -4,9 +4,10 @@
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
 //! daemon (ARCHITECTURE §1). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port, mirroring zeron: if an engine is listening it connects over WebSocket
-//! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
-//! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
+//! port: if an engine is listening it connects over WebSocket ([`RemoteEngine`]);
+//! if an installed service owns startup it waits for that listener; otherwise it
+//! embeds one via [`EngineCore::assemble`] and an in-memory RPC transport
+//! ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
 //! ## Async bridging
 //! `bootstrap` runs on tokio via `gpui_tokio::Tokio::spawn`. Once an [`RpcClient`]
@@ -46,6 +47,8 @@ pub struct EngineBootConfig {
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
+    /// Wait for the installed background service instead of embedding an engine.
+    pub managed_daemon: bool,
     /// Edge base URL for the embedded engine.
     pub edge_url: String,
     /// Bearer for edge room joins; `None` runs offline.
@@ -216,19 +219,24 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
-    /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
-    /// tokio tasks.
+    /// Reach the engine over IPC, waiting for an installed daemon or embedding
+    /// one when this process owns startup. Must run on the tokio runtime
+    /// (`Tokio::spawn`): both transports spawn tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
-        // Invariant: at most one bootstrap in this process runs probe+embed at
-        // a time. The winner binds the deferred IPC listener before releasing
-        // the gate, so a concurrent viewport's probe finds it and attaches as
-        // Remote instead of racing it for the data dir.
+        // Invariant: at most one bootstrap in this process decides engine
+        // ownership at a time. An embedding winner binds the deferred IPC
+        // listener before releasing the gate, so a concurrent viewport finds
+        // it instead of racing for the data dir.
         static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _gate = BOOTSTRAP_GATE.lock().await;
+        let gate = BOOTSTRAP_GATE.lock().await;
 
         if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
             return Ok(handle);
+        }
+
+        if config.managed_daemon {
+            drop(gate);
+            return Ok(Self::wait_for_managed_daemon(config.ipc_port).await);
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -374,9 +382,23 @@ impl EngineHandle {
         Ok(handle)
     }
 
+    async fn wait_for_managed_daemon(ipc_port: u16) -> EngineHandle {
+        tracing::info!(ipc_port, "managed engine daemon not ready; waiting");
+        let mut retry_delay = std::time::Duration::from_millis(100);
+        loop {
+            tokio::time::sleep(retry_delay).await;
+            if let Some(handle) = Self::attach_to_daemon(ipc_port).await {
+                return handle;
+            }
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_secs(1));
+        }
+    }
+
     /// Probe the IPC port and, if a live engine answers, attach as a remote
-    /// viewport. `None` means embed: nothing listening, a non-engine listener,
-    /// or a listener without an identity.
+    /// viewport. `None` means nothing listening, a non-engine listener, or a
+    /// listener without an identity.
     async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
         let url = format!("ws://127.0.0.1:{ipc_port}");
         let probe = tokio::time::timeout(
@@ -427,16 +449,15 @@ impl EngineHandle {
                     tracing::warn!(
                         %url,
                         error = %err,
-                        "listener did not provide engine identity; embedding instead"
+                        "listener did not provide engine identity"
                     );
                     None
                 }
             },
             // Something is on the port but it is not an engine (or it is
-            // wedged). Fall through and embed: a stranger holding 27654
-            // should cost other viewports, not this window.
+            // wedged). The caller decides whether to retry or embed.
             Err(err) => {
-                tracing::warn!(%url, error = %err, "not an engine; embedding instead");
+                tracing::warn!(%url, error = %err, "not an engine");
                 None
             }
         }
@@ -1743,6 +1764,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
@@ -1773,6 +1795,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             org_id: None,
@@ -1801,6 +1824,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_wait_does_not_claim_local_engine_ownership() {
+        let managed_dir = tempfile::tempdir().unwrap();
+        let managed_port = free_port().await;
+        let (start_daemon_tx, start_daemon_rx) = tokio::sync::oneshot::channel();
+        let (lock_available_tx, lock_available_rx) = tokio::sync::oneshot::channel();
+        let daemon_dir = managed_dir.path().to_path_buf();
+        let daemon = tokio::spawn(async move {
+            let _ = start_daemon_rx.await;
+            let lock = InstanceLock::acquire(&daemon_dir);
+            let _ = lock_available_tx.send(lock.is_ok());
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", managed_port))
+                .await
+                .unwrap();
+            zeron_rpc::serve_ws_listener(listener, Arc::new(LegacyIdentityRpc)).await;
+        });
+        let managed_wait = tokio::spawn(EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: managed_dir.path().to_path_buf(),
+            ipc_port: managed_port,
+            managed_daemon: true,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_boot = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            EngineHandle::bootstrap(EngineBootConfig {
+                data_dir: local_dir.path().to_path_buf(),
+                ipc_port: free_port().await,
+                managed_daemon: false,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: HarnessId::Mock,
+            }),
+        )
+        .await;
+        let _ = start_daemon_tx.send(());
+
+        let managed = tokio::time::timeout(std::time::Duration::from_secs(3), managed_wait)
+            .await
+            .expect("managed viewport attaches when its daemon becomes ready")
+            .expect("managed bootstrap task completes")
+            .expect("managed daemon bootstrap succeeds");
+        let lock_available = lock_available_rx.await.unwrap();
+        let managed_is_remote = matches!(managed.mode(), EngineMode::Remote { .. });
+        managed.shutdown().await;
+        daemon.abort();
+
+        let local = local_boot
+            .expect("a passive managed wait must not hold the bootstrap gate")
+            .expect("unmanaged bootstrap succeeds");
+        assert_eq!(local.mode(), EngineMode::InProcess);
+        local.shutdown().await;
+        assert!(
+            lock_available,
+            "the waiting viewport must leave the engine lock to the daemon"
+        );
+        assert!(managed_is_remote);
+    }
+
+    #[tokio::test]
     async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
         let dir = tempfile::tempdir().unwrap();
         zeron_engine::EngineProfile::local(dir.path()).unwrap();
@@ -1811,6 +1901,7 @@ mod tests {
         let error = match EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
@@ -1866,6 +1957,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
@@ -1904,6 +1996,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             org_id: None,
@@ -1946,6 +2039,7 @@ mod tests {
         let config = EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             org_id: None,
@@ -2006,6 +2100,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
@@ -2033,6 +2128,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
@@ -2084,6 +2180,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: free_port().await,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
@@ -2142,6 +2239,7 @@ mod tests {
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: ui_dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
