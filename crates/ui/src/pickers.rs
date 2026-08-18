@@ -322,6 +322,40 @@ pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Breadcrumbs for the folder browser's location bar. The device label is the
+/// filesystem root, while a distinct `Home` crumb folds the usually-noisy
+/// home prefix. Paths outside home (notably macOS `/Volumes`) stay fully
+/// visible and reachable from the always-present device/root crumb.
+pub fn browser_location_breadcrumbs(
+    path: &str,
+    home: Option<&str>,
+    device_label: &str,
+) -> Vec<(String, String)> {
+    let path = if path.is_empty() { "/" } else { path };
+    let mut out = vec![(device_label.to_string(), "/".to_string())];
+    if path == "/" {
+        return out;
+    }
+
+    let home = home
+        .map(|home| home.trim_end_matches('/'))
+        .filter(|h| !h.is_empty());
+    let inside_home = home.filter(|home| path == *home || path.starts_with(&format!("{home}/")));
+    if let Some(home) = inside_home {
+        out.push(("Home".to_string(), home.to_string()));
+        let mut full = home.to_string();
+        for segment in path[home.len()..].split('/').filter(|s| !s.is_empty()) {
+            full.push('/');
+            full.push_str(segment);
+            out.push((segment.to_string(), full.clone()));
+        }
+        return out;
+    }
+
+    out.extend(breadcrumbs(path).into_iter().skip(1));
+    out
+}
+
 /// Directory rows of a listing (files never render in the browser).
 pub fn browser_rows(listing: &FolderListing) -> Vec<&zeron_proto::FolderEntry> {
     listing.entries.iter().filter(|e| e.is_dir).collect()
@@ -3822,6 +3856,37 @@ mod tests {
         assert_eq!(labels, ["/", "home", "w", "dev"]);
         assert_eq!(crumbs[2].1, "/home/w");
         assert_eq!(breadcrumbs("/").len(), 1);
+
+        let home = browser_location_breadcrumbs(
+            "/Users/developer/projects/comet",
+            Some("/Users/developer"),
+            "MacBook",
+        );
+        assert_eq!(
+            home,
+            [
+                ("MacBook".into(), "/".into()),
+                ("Home".into(), "/Users/developer".into()),
+                ("projects".into(), "/Users/developer/projects".into()),
+                ("comet".into(), "/Users/developer/projects/comet".into()),
+            ]
+        );
+
+        // External mounts must not disappear into the folded home crumb.
+        let volume =
+            browser_location_breadcrumbs("/Volumes/External", Some("/Users/developer"), "MacBook");
+        assert_eq!(
+            volume,
+            [
+                ("MacBook".into(), "/".into()),
+                ("Volumes".into(), "/Volumes".into()),
+                ("External".into(), "/Volumes/External".into()),
+            ]
+        );
+        assert_eq!(
+            browser_location_breadcrumbs("/", Some("/Users/developer"), "MacBook"),
+            [("MacBook".into(), "/".into())]
+        );
     }
 
     #[test]
