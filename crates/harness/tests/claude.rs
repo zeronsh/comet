@@ -635,11 +635,46 @@ async fn commands_come_from_the_initialize_control_request() {
     assert_eq!(commands[1].name, "compact");
     assert_eq!(commands[1].input_hint, None, "empty hint reads as None");
 
-    // Cached: the second call reuses the first probe's result (the fake has
-    // exited; a re-probe against a dead binary path would still work here,
-    // but object identity of the cached list is the cheap assertion).
-    let again = h.commands(None).await.expect("cache hit");
-    assert_eq!(again, commands);
+    // No cwd asked for, so the marker project's extra command cannot appear.
+    assert!(
+        !commands.iter().any(|c| c.name == "project-skill"),
+        "{commands:?}"
+    );
+}
+
+/// The probe must RUN in the requested workspace: the claude CLI resolves
+/// `<cwd>/.claude/skills` relative to its own working directory, and has no
+/// protocol field to carry a cwd instead.
+#[tokio::test]
+async fn commands_discovery_runs_in_the_requested_cwd() {
+    let dir = std::env::temp_dir().join("zeron-marker-project");
+    std::fs::create_dir_all(&dir).expect("create marker project");
+    let h = harness();
+    let commands = h
+        .commands(Some(dir.to_str().expect("utf8 path")))
+        .await
+        .expect("discovery");
+    // Pinned by name, not by count: a bare length assertion would still pass
+    // if the fixture were run from the wrong directory and happened to grow.
+    assert!(
+        commands.iter().any(|c| c.name == "project-skill"),
+        "the marker project's command is missing, so the child ran elsewhere: {commands:?}"
+    );
+    // The workspace adds to the built-ins, it does not replace them.
+    assert!(commands.iter().any(|c| c.name == "review"), "{commands:?}");
+}
+
+/// A deleted worktree must not read as "claude is not installed". `spawn` with
+/// a missing `current_dir` fails `NotFound`, which the driver otherwise maps to
+/// `NotInstalled` — so the probe drops an absent directory and still answers.
+#[tokio::test]
+async fn a_missing_cwd_falls_back_instead_of_reporting_a_missing_cli() {
+    let h = harness();
+    let commands = h
+        .commands(Some("/tmp/zeron-deleted-worktree-does-not-exist"))
+        .await
+        .expect("a deleted worktree still lists the built-ins");
+    assert!(commands.iter().any(|c| c.name == "review"), "{commands:?}");
 }
 
 /// Live smoke against the real CLI: `cargo test -p zeron-harness --test

@@ -119,9 +119,6 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
 }
 
 impl Default for ClaudeHarness {
@@ -130,7 +127,6 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -250,10 +246,30 @@ impl ClaudeHarness {
     /// control_response. No user message is ever written, so no turn (and no
     /// API call) happens; the child is torn down as soon as the response
     /// lands.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    ///
+    /// Unlike the ACP path, the workspace here IS the child's working
+    /// directory: the CLI resolves `<cwd>/.claude/skills` and the project's
+    /// own commands relative to where it runs, and it has no `session/new`
+    /// field to carry a cwd instead. Measured on 2.1.228 against a project
+    /// holding two marker skills: 81 commands from the project, 79 from a bare
+    /// directory, and the two markers are the difference.
+    ///
+    /// A directory that no longer exists (a deleted worktree) is dropped
+    /// rather than passed on. `spawn` would fail it with `NotFound`, which the
+    /// arm below reports as `NotInstalled` — "claude is not installed", a lie
+    /// the user cannot act on. Falling back to the engine's own directory
+    /// costs the project's commands and keeps the built-ins, which is the same
+    /// trade the ACP probe makes when a cwd is rejected.
+    async fn discover_commands(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         crate::compose_child_path(&mut cmd, &exe);
+        if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            cmd.current_dir(dir);
+        }
         cmd.args([
             "--print",
             "--input-format",
@@ -400,19 +416,16 @@ impl Harness for ClaudeHarness {
     /// Slash commands from the CLI's `initialize` control-request handshake —
     /// the same channel the Claude Agent SDK's `query()` opens. The response
     /// carries every command with description + argument hint and involves no
-    /// model turn (verified live, 2.1.228: the control_response is the first
-    /// stdout line, well before any API traffic). Cached on success.
+    /// model turn (verified live, 2.1.228: the control_response arrives on
+    /// stdout well before any API traffic), scoped to `cwd` — see
+    /// [`Self::discover_commands`].
     ///
-    /// The `cwd` this fork's trait carries is accepted and ignored here. Wiring
-    /// project-scoped discovery into the native drivers is a feature, not a
-    /// merge resolution — the ACP path is the only one that scopes per
-    /// workspace today.
+    /// No cache lives here. #160 kept a per-harness `OnceCell`, which would now
+    /// pin whichever workspace probed first and serve its list to every other
+    /// one. The engine's `(harness, cwd)` cache owns the caching contract
+    /// instead: TTL, negative TTL, and single-flight, same as the ACP path.
     async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, HarnessError> {
-        let _ = cwd;
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
-            .await
-            .cloned()
+        self.discover_commands(cwd).await
     }
 
     async fn run(
