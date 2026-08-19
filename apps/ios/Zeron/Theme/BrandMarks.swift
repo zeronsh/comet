@@ -52,7 +52,8 @@ enum BrandMark {
         case "cursor": return .cursor
         case "grok": return .grok
         case "hermes": return .hermes
-        case "pi": return .pi
+        case "pi", "oh-my-pi": return .pi
+
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }
     }

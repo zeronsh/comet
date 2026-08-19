@@ -2,14 +2,15 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`) and
-//! opencode ([`AcpHarness::opencode`], `opencode acp`) — plus pi
+//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`),
+//! opencode ([`AcpHarness::opencode`], `opencode acp`) and Oh My Pi
+//! ([`AcpHarness::oh_my_pi`], `omp acp`) — plus pi
 //! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
 //! driver exists. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
-//!
+
 //! - `initialize` (protocolVersion 1, fs/terminal capabilities declined) →
 //!   `session/new`, or `session/load` with a fresh-session fallback when
 //!   resuming; replayed history during a load is dropped (the doc already
@@ -200,6 +201,11 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     dirs.push(PathBuf::from("/usr/local/bin").join(exe));
     dirs
 }
+
+fn oh_my_pi_install_paths() -> Vec<PathBuf> {
+    npm_global_bins("omp")
+}
+
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -494,6 +500,62 @@ fn opencode_spec() -> AcpAgentSpec {
     }
 }
 
+fn oh_my_pi_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::OhMyPi,
+        display_name: "Oh My Pi",
+        executable: "omp",
+        env_override: "OMP_EXECUTABLE",
+        args: &["acp"],
+        npm_package: None,
+        extra_paths: oh_my_pi_install_paths,
+        cli_executable: "omp",
+        cli_extra_paths: oh_my_pi_install_paths,
+        install_hint: "omp (searched PATH, the login shell's PATH, npm global bins, \
+             and fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `curl -fsSL https://omp.sh/install | sh`; set OMP_EXECUTABLE to override)",
+        // Models come from the agent's own provider config (`~/.omp`);
+        // the picker advertises a pass-through entry and the agent keeps whatever
+        // the user set up. Unknown ids are skipped by the config-option set.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "omp default".into(),
+                description: Some("Runs the model configured in omp settings".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Minimal,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: Vec::new(),
+            }]
+        },
+        // Native `omp acp` does not advertise `_session/steering`:
+        // turn boundaries. Thinking ladder is minimal→max ("off" has no zeron
+        // tier and is left to the agent default).
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[
+            ReasoningLevel::Minimal,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
+        http_sidecar: false,
+    }
+}
+
+
 /// Background-install managed npm adapters for agents whose CLI is present
 /// on this device, so a first chat never pays (or trips over) an npm run.
 /// Skips agents whose adapter is already resolvable; failures are logged and
@@ -602,6 +664,12 @@ impl AcpHarness {
     pub fn opencode() -> Self {
         Self::with_spec(opencode_spec())
     }
+
+    /// Oh My Pi over ACP — native `omp acp`. A different product from Pi.
+    pub fn oh_my_pi() -> Self {
+        Self::with_spec(oh_my_pi_spec())
+    }
+
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {

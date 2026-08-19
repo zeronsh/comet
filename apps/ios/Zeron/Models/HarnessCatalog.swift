@@ -37,8 +37,11 @@ enum HarnessCatalog {
         "grok": "Grok",
         "hermes": "Hermes",
         "pi": "Pi",
+        "oh-my-pi": "Oh My Pi",
+        "opencode": "OpenCode",
         "cursor": "Cursor",
         "mock": "Mock",
+
     ]
 
     static func label(for harness: String) -> String {

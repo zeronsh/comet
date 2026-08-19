@@ -45,6 +45,9 @@
   ride pi's own provider config (catalog advertises a `default` pass-through
   entry); thinking ladder minimal→max maps onto zeron's levels via the
   generic `thought_level` preference ladder ("off" has no zeron tier).
+  `AcpHarness::oh_my_pi()` is a separate product (`omp acp`, native ACP,
+  `OMP_EXECUTABLE` overrides); it must not share Pi's slot.
+
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads
