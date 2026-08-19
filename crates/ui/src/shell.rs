@@ -855,8 +855,9 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
-    /// Inline thread-search query (t3code SidebarV2). Empty = no filter.
-    sidebar_search: SharedString,
+    /// Inline thread-search input (t3code SidebarV2).
+    sidebar_search: Entity<ComposerInput>,
+    _sidebar_search_events: Subscription,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -974,6 +975,16 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        let sidebar_search_input = cx.new(|cx| ComposerInput::new("Search sessions…", cx));
+        let sidebar_search_events = cx.subscribe(
+            &sidebar_search_input,
+            |this: &mut Shell, _input, event, cx| match event {
+                ComposerInputEvent::Edited => {
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
@@ -1111,8 +1122,9 @@ impl Shell {
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
+            sidebar_search: sidebar_search_input,
+            _sidebar_search_events: sidebar_search_events,
             spaces_menu: popover::Popup::default(),
-            sidebar_search: SharedString::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
@@ -3897,35 +3909,55 @@ impl Shell {
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
 
-        // Inline thread-search (t3code SidebarV2): placeholder row.
-        // Full keyboard-input search requires a ComposerInput entity;
-        // for now this is a visual placeholder. Future: wire to a real
-        // input entity.
-        let search_query = self.sidebar_search.clone();
+        // Inline thread-search (t3code SidebarV2): ComposerInput row.
+        let search_query = self.sidebar_search.read(cx).text().to_string();
         let searching = !search_query.is_empty();
         let search_row = div()
             .flex_none()
-            .h(px(32.0))
-            .px(px(10.0))
+            .px(px(8.0))
             .mb(px(2.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(6.0))
+            .rounded(px(8.0))
+            .bg(theme.glass_hover().opacity(0.25))
             .child(
                 crate::icons::icon(crate::icons::MAGNIFER)
                     .size(px(13.0))
                     .flex_none()
-                    .text_color(theme.text_muted.opacity(0.4)),
+                    .ml(px(4.0))
+                    .text_color(if searching {
+                        theme.text
+                    } else {
+                        theme.text_muted.opacity(0.45)
+                    }),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.4))
-                    .child(SharedString::from("Search sessions…")),
-            );
+                div().flex_1().min_w_0().child(self.sidebar_search.clone()),
+            )
+            .when(searching, |el| {
+                let input = self.sidebar_search.clone();
+                el.child(
+                    div()
+                        .flex_none()
+                        .mr(px(4.0))
+                        .cursor_pointer()
+                        .rounded(px(4.0))
+                        .px(px(4.0))
+                        .py(px(2.0))
+                        .hover(|s| s.bg(theme.glass_hover()))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |_shell: &mut Shell, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Shell>| {
+                                input.update(cx, |input, cx| {
+                                    input.set_text("", cx);
+                                });
+                            }),
+                        )
+                        .child(SharedString::from("✕")),
+                )
+            });
 
         // "Active" section header (t3code SidebarV2): label + hairline.
         // Only shows when there are active rows OR the archived section

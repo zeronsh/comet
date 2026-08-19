@@ -606,7 +606,7 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let search = self.sidebar_search.clone();
+        let search = self.sidebar_search.read(cx).text().to_string();
         let searching = !search.is_empty();
         let rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
@@ -716,7 +716,7 @@ impl Shell {
         const PAGE: usize = 25;
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let search = self.sidebar_search.clone();
+        let search = self.sidebar_search.read(cx).text().to_string();
         let searching = !search.is_empty();
         let rows: Vec<zeron_proto::Chat> = {
             let state = self.state.read(cx);
