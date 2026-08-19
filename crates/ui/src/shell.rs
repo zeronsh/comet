@@ -855,6 +855,8 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
+    /// Inline thread-search query (t3code SidebarV2). Empty = no filter.
+    sidebar_search: SharedString,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -1110,6 +1112,7 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             spaces_menu: popover::Popup::default(),
+            sidebar_search: SharedString::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
@@ -3878,6 +3881,70 @@ impl Shell {
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
 
+        // Inline thread-search (t3code SidebarV2): placeholder row.
+        // Full keyboard-input search requires a ComposerInput entity;
+        // for now this is a visual placeholder. Future: wire to a real
+        // input entity.
+        let search_query = self.sidebar_search.clone();
+        let searching = !search_query.is_empty();
+        let search_row = div()
+            .flex_none()
+            .h(px(32.0))
+            .px(px(10.0))
+            .mb(px(2.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                crate::icons::icon(crate::icons::MAGNIFER)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.4)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.4))
+                    .child(SharedString::from("Search sessions…")),
+            );
+
+        // "Active" section header (t3code SidebarV2): label + hairline.
+        // Only shows when there are active rows OR the archived section
+        // is present (the header anchors the boundary).
+        let active_header = if !list_items.is_empty() || archived_section.is_some() {
+            let label: SharedString = if searching && !list_items.is_empty() {
+                let count = list_items.len();
+                format!("Matches ({count})").into()
+            } else {
+                "Active".into()
+            };
+            Some(
+                div()
+                    .id("active-header")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pt(px(8.0))
+                    .pb(px(4.0))
+                    .px(px(2.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.45))
+                            .child(label),
+                    )
+                    .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.4))),
+            )
+        } else {
+            None
+        };
+
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
@@ -3886,6 +3953,7 @@ impl Shell {
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             .child(filter_row)
+            .child(search_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
             // a true per-glyph gradient at active overflow edges. Glass-safe
             // (no painted overlay can fade content over see-through blur) and
@@ -3912,6 +3980,7 @@ impl Shell {
                             // No "Sessions" header (user request) — the list
                             // is the whole column; a little air stands in.
                             .pt(px(4.0))
+                            .when_some(active_header, |el, header| el.child(header))
                             .child(if !list_items.is_empty() {
                                 div()
                                     .flex()

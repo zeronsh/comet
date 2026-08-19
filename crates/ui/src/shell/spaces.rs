@@ -606,6 +606,8 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
+        let search = self.sidebar_search.clone();
+        let searching = !search.is_empty();
         let rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
             state
@@ -649,6 +651,18 @@ impl Shell {
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
+            .filter(|row| {
+                if !searching {
+                    return true;
+                }
+                let title = row
+                    .chat
+                    .title
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase();
+                title.contains(&search.to_lowercase())
+            })
             .map(|row| {
                 let ActiveChatRow {
                     status,
@@ -700,6 +714,8 @@ impl Shell {
         const PAGE: usize = 25;
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
+        let search = self.sidebar_search.clone();
+        let searching = !search.is_empty();
         let rows: Vec<zeron_proto::Chat> = {
             let state = self.state.read(cx);
             state
@@ -709,6 +725,16 @@ impl Shell {
                 .filter(|chat| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,
+                })
+                .filter(|chat| {
+                    if !searching {
+                        return true;
+                    }
+                    chat.title
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&search.to_lowercase())
                 })
                 .cloned()
                 .collect()
