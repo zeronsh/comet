@@ -4787,6 +4787,7 @@ impl Shell {
             let rename_id = chat_id.clone();
             let settle_id = chat_id.clone();
             let unsettle_id = chat_id.clone();
+            let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
@@ -4804,8 +4805,8 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
-                // Settle / Unsettle (t3code SidebarV2): replaces the old
-                // Archive item. Renders the action that matches the current
+                // Settle / Unsettle (t3code SidebarV2): toggles the settled
+                // shelf visibility. Renders the action matching the current
                 // state — a settled chat shows Unsettle, an active one Settle.
                 .when(is_settled, |el| {
                     el.child(
@@ -4845,6 +4846,21 @@ impl Shell {
                         .child(SharedString::from("Settle")),
                     )
                 })
+                .child(popover::menu_separator())
+                // Archive (hidden from sidebar → Settings → Archived).
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                        .id("chat-menu-archive")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.archive_chat(archive_id.clone(), cx)
+                        }))
+                        .child(
+                            icon(icons::ARCHIVE_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Archive")),
+                )
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
