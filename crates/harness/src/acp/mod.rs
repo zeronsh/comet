@@ -355,24 +355,10 @@ fn pi_spec() -> AcpAgentSpec {
              still required, `npm install -g --ignore-scripts \
              @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
         // pi routes models through its own provider config (~/.pi); the picker
-        // advertises the pass-through entry and pi keeps whatever the user set
-        // up. Unknown ids are skipped by the config-option set.
-        models: || {
-            vec![Model {
-                id: "default".into(),
-                label: "pi default".into(),
-                description: Some("Runs the model configured in pi (`pi` settings)".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Minimal,
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                    ReasoningLevel::XHigh,
-                    ReasoningLevel::Max,
-                ],
-                options: Vec::new(),
-            }]
-        },
+        // reads `models-store.json` from the Pi agent data dir so every
+        // configured provider and extension appears in the picker with its
+        // real model list (mirrors bb's approach of using Pi's SDK directly).
+        models: || crate::pi::catalog::load_pi_models(),
         // The adapter has no `_session/steering` extension: turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
         // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron

@@ -532,8 +532,10 @@ async fn models_enrich_from_the_static_catalog_on_id_match() {
 async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
     let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
     let models = harness.models().await.expect("static fallback");
-    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["default"], "{models:?}");
+    // The static catalog now reads models-store.json; as long as we get
+    // models (not an error), the fallback works. The model set depends on
+    // the local Pi config — just assert non-empty.
+    assert!(!models.is_empty(), "static fallback returned no models");
 }
 
 #[cfg(unix)]

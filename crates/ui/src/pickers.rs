@@ -1395,10 +1395,21 @@ impl Pickers {
         if self.harness_locked(cx) {
             descriptors.retain(|d| Some(d.id) == effective);
         }
-        let row = |descriptor: &HarnessDescriptor, model: &Model| ModelRowData {
-            harness: descriptor.id,
-            harness_name: SharedString::from(descriptor.name.clone()),
-            model: model.clone(),
+        let row = |descriptor: &HarnessDescriptor, model: &Model| {
+            let harness_name: SharedString = if descriptor.id == HarnessId::Pi {
+                if let Some((provider, _)) = model.id.split_once('/') {
+                    format!("{} · {}", descriptor.name, provider).into()
+                } else {
+                    descriptor.name.clone().into()
+                }
+            } else {
+                descriptor.name.clone().into()
+            };
+            ModelRowData {
+                harness: descriptor.id,
+                harness_name,
+                model: model.clone(),
+            }
         };
         let query = self.search.read(cx).text().trim().to_string();
         if !query.is_empty() {

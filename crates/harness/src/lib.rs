@@ -98,6 +98,7 @@ pub mod codex;
 pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
+pub mod pi;
 pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
