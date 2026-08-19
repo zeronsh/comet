@@ -723,7 +723,7 @@ impl Shell {
             state
                 .chats
                 .iter()
-                .filter(|c| c.archived)
+                .filter(|c| c.settled && !c.archived)
                 .filter(|chat| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,
@@ -831,7 +831,7 @@ impl Shell {
                         .hover(|s| s.bg(crate::theme::wash(0.18)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.set_chat_archived(restore_id.clone(), false, cx);
+                            this.set_chat_settled(restore_id.clone(), false, cx);
                         }))
                         .child(
                             crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)

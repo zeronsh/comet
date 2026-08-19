@@ -4009,6 +4009,7 @@ rename to new_name.rs
             device_id: device.into(),
             title: None,
             archived: false,
+            settled: false,
             cwd: cwd.map(Into::into),
             branch: None,
             checkout_id: checkout.map(Into::into),

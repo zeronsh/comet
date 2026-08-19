@@ -241,6 +241,7 @@ impl WorkspaceDoc {
         row.insert("deviceId", chat.device_id.as_str())?;
         set_opt_str(&row, "title", chat.title.as_deref())?;
         row.insert("archived", chat.archived)?;
+        row.insert("settled", chat.settled)?;
         set_opt_str(&row, "cwd", chat.cwd.as_deref())?;
         set_opt_str(&row, "branch", chat.branch.as_deref())?;
         set_opt_str(&row, "checkoutId", chat.checkout_id.as_deref())?;
@@ -330,6 +331,18 @@ impl WorkspaceDoc {
             return Ok(false);
         };
         row.insert("archived", archived)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// Settle / unsettle a chat (sidebar "Settled" shelf). Distinct from
+    /// `archived` — settled chats are still visible, just demoted to the
+    /// compact bottom section.
+    pub fn set_chat_settled(&self, chat_id: &str, settled: bool) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert("settled", settled)?;
         self.doc.commit();
         Ok(true)
     }
@@ -626,6 +639,8 @@ pub(crate) struct RawChat {
     #[serde(default)]
     archived: bool,
     #[serde(default)]
+    settled: bool,
+    #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     branch: Option<String>,
@@ -658,6 +673,7 @@ impl From<RawChat> for Chat {
             device_id: raw.device_id,
             title: raw.title,
             archived: raw.archived,
+            settled: raw.settled,
             cwd: raw.cwd,
             branch: raw.branch,
             checkout_id: raw.checkout_id,
@@ -724,6 +740,7 @@ mod tests {
             device_id: device_id.into(),
             title: Some("First chat".into()),
             archived: false,
+            settled: false,
             cwd: Some("/tmp/repo".into()),
             branch: Some("main".into()),
             checkout_id: None,

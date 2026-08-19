@@ -91,6 +91,11 @@ pub struct Chat {
     pub device_id: String,
     pub title: Option<String>,
     pub archived: bool,
+    /// Settled threads sink to the sidebar's "Settled" shelf (still visible).
+    /// Distinct from `archived`: archived threads are hidden from the sidebar
+    /// entirely and only accessible from Settings → Archived.
+    #[serde(default)]
+    pub settled: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
     /// Canonical id of the repo checkout/worktree this chat operates in.

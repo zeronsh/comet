@@ -2283,6 +2283,22 @@ impl Shell {
         cx.notify();
     }
 
+    /// Settle / unsettle a chat (sidebar "Settled" shelf). Calls the
+    /// `SetChatSettled` mutation — distinct from archive.
+    pub(super) fn set_chat_settled(
+        &mut self,
+        chat_id: String,
+        settled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_chat_menu(cx);
+        self.mutate(
+            serde_json::json!({ "op": "setChatSettled", "chatId": chat_id, "settled": settled }),
+            cx,
+        );
+        cx.notify();
+    }
+
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -3560,7 +3576,7 @@ impl Shell {
                 .when(corner_hovered, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.set_chat_archived(archive_id.clone(), !archived, cx);
+                        this.set_chat_settled(archive_id.clone(), !archived, cx);
                     }))
                 })
                 .child(corner_body)
@@ -4817,7 +4833,7 @@ impl Shell {
                         )
                         .id("chat-menu-unsettle")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_chat_archived(unsettle_id.clone(), false, cx)
+                            this.set_chat_settled(unsettle_id.clone(), false, cx)
                         }))
                         .child(
                             icon(icons::ARCHIVE_UP_MINIMALISTIC)
@@ -4836,7 +4852,7 @@ impl Shell {
                         )
                         .id("chat-menu-settle")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_chat_archived(settle_id.clone(), true, cx)
+                            this.set_chat_settled(settle_id.clone(), true, cx)
                         }))
                         .child(
                             icon(icons::ARCHIVE_MINIMALISTIC)
