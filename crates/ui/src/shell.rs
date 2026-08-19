@@ -4776,8 +4776,17 @@ impl Shell {
 
         if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
             let chat_menu_closing = self.chat_menu.closing_since();
+            // Resolve whether this chat is currently settled (archived).
+            let is_settled = self
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .find(|c| c.id == chat_id)
+                .is_some_and(|c| c.archived);
             let rename_id = chat_id.clone();
-            let archive_id = chat_id.clone();
+            let settle_id = chat_id.clone();
+            let unsettle_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
@@ -4795,19 +4804,47 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
-                        .id("chat-menu-archive")
+                // Settle / Unsettle (t3code SidebarV2): replaces the old
+                // Archive item. Renders the action that matches the current
+                // state — a settled chat shows Unsettle, an active one Settle.
+                .when(is_settled, |el| {
+                    el.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-unsettle-{chat_id}"),
+                        )
+                        .id("chat-menu-unsettle")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.archive_chat(archive_id.clone(), cx)
+                            this.set_chat_archived(unsettle_id.clone(), false, cx)
+                        }))
+                        .child(
+                            icon(icons::ARCHIVE_UP_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Unsettle")),
+                    )
+                })
+                .when(!is_settled, |el| {
+                    el.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-settle-{chat_id}"),
+                        )
+                        .id("chat-menu-settle")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_archived(settle_id.clone(), true, cx)
                         }))
                         .child(
                             icon(icons::ARCHIVE_MINIMALISTIC)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Archive")),
-                )
+                        .child(SharedString::from("Settle")),
+                    )
+                })
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
