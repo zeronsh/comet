@@ -321,6 +321,63 @@ fn typed_call(update: &Value) -> ToolCall {
                 }),
             input: raw.cloned(),
         },
+        // Pi tool names (kind="other", title=the tool name). Pi's
+        // pi-acp adapter only maps read/write/edit/bash to typed kinds;
+        // everything else arrives as "other" with the real tool name
+        // as the title. Map them here so the chip shows the right glyph
+        // and the renderer can extract structured fields.
+        _ if kind == "other" => match title.as_str() {
+            "grep" | "search" => ToolCall::Search {
+                pattern: raw_str("pattern")
+                    .or_else(|| raw_str("query"))
+                    .or_else(|| arg_from_title(&title))
+                    .unwrap_or_default(),
+                path: raw_str("path").or_else(|| raw_str("dir")),
+            },
+            "glob" => ToolCall::Glob {
+                pattern: raw_str("pattern")
+                    .or_else(|| arg_from_title(&title))
+                    .unwrap_or_default(),
+            },
+            "web_search" => ToolCall::WebSearch {
+                query: raw_str("query")
+                    .or_else(|| arg_from_title(&title))
+                    .unwrap_or_default(),
+            },
+            "web_fetch" => ToolCall::WebFetch {
+                url: raw_str("url")
+                    .or_else(|| arg_from_title(&title))
+                    .unwrap_or_default(),
+                prompt: raw_str("prompt"),
+            },
+            "task" | "agent" => ToolCall::Unknown {
+                name: raw_str("description")
+                    .or_else(|| arg_from_title(&title))
+                    .unwrap_or_else(|| "Task".into()),
+                input: raw.cloned(),
+            },
+            // mcp__servername__toolname → Mcp
+            t if t.starts_with("mcp__") => {
+                let rest = &t[5..]; // after "mcp__"
+                if let Some((server, tool)) = rest.split_once("__") {
+                    ToolCall::Mcp {
+                        server: server.to_owned(),
+                        tool: tool.to_owned(),
+                        input: raw.cloned(),
+                    }
+                } else {
+                    ToolCall::Mcp {
+                        server: rest.to_owned(),
+                        tool: String::new(),
+                        input: raw.cloned(),
+                    }
+                }
+            }
+            _ => ToolCall::Unknown {
+                name: if title.is_empty() { kind.into() } else { title },
+                input: raw.cloned(),
+            },
+        },
         _ => ToolCall::Unknown {
             name: if title.is_empty() { kind.into() } else { title },
             input: raw.cloned(),
