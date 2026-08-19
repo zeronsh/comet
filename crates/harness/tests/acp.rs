@@ -567,6 +567,13 @@ async fn hung_handshake_errors_instead_of_spinning_forever() {
 }
 #[test]
 fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
+    let devin = AcpHarness::devin();
+    assert_eq!(devin.id(), HarnessId::Devin);
+    assert_eq!(devin.display_name(), "Devin");
+    assert!(devin.supports_steering());
+    assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+    assert!(devin.reasoning_levels().is_empty());
+
     let hermes = AcpHarness::hermes();
     assert_eq!(hermes.id(), HarnessId::Hermes);
     assert_eq!(hermes.display_name(), "Hermes");
@@ -608,6 +615,21 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             zeron_proto::ReasoningLevel::Max,
         ]
     );
+}
+
+#[tokio::test]
+async fn devin_spec_drives_the_shared_acp_wire() {
+    let devin = AcpHarness::devin().with_executable(fixture_path());
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&devin, request("scenario:happy"), controls).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted { harness, .. } if *harness == HarnessId::Devin
+    )));
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "Hello".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
 #[tokio::test]

@@ -4,8 +4,8 @@
 //! stream-json ([`ClaudeHarness`]), Codex over the app-server JSON-RPC
 //! ([`CodexHarness`]), Cursor through a pinned @cursor/sdk shim
 //! ([`CursorHarness`]). The shared [`AcpHarness`] remains ONLY for agents
-//! built ground-up on ACP — Grok (`grok agent stdio`), Hermes
-//! (`hermes acp`) and opencode (`opencode acp`) — plus pi via the community
+//! built ground-up on ACP — Devin (`devin acp`), Grok (`grok agent stdio`),
+//! Hermes (`hermes acp`) and opencode (`opencode acp`) — plus pi via the community
 //! `pi-acp` adapter until a native driver exists. Adapter-mediated ACP for
 //! claude/codex/cursor was retired: the
 //! adapters held prompt turns open for background work the

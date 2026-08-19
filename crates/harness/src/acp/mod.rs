@@ -2,8 +2,9 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`) and
-//! opencode ([`AcpHarness::opencode`], `opencode acp`) — plus pi
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`) and opencode
+//! ([`AcpHarness::opencode`], `opencode acp`) — plus pi
 //! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
 //! driver exists. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -29,6 +30,7 @@
 
 mod normalize;
 mod subagent;
+mod subagent_devin;
 mod subagent_opencode;
 
 use std::collections::VecDeque;
@@ -54,6 +56,7 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
+use subagent_devin::DevinTracker;
 use subagent_opencode::OpencodeTracker;
 
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
@@ -268,6 +271,69 @@ fn grok_spec() -> AcpAgentSpec {
         stall_hint: "The agent process is likely wedged — a stale shared leader \
              process or a hung startup check; zeron launches it with --no-leader \
              and --no-auto-update to avoid both.",
+        http_sidecar: false,
+    }
+}
+
+fn devin_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        // The official installer's launcher symlink (the binary lives below
+        // ~/.local/share/devin/cli/_versions).
+        dirs.push(home.join(".local").join("bin").join("devin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/devin"));
+    dirs.push(PathBuf::from("/usr/local/bin/devin"));
+    dirs
+}
+
+fn devin_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Devin,
+        display_name: "Devin",
+        executable: "devin",
+        env_override: "DEVIN_EXECUTABLE",
+        args: &["acp"],
+        // Native ACP server — no adapter package in between.
+        npm_package: None,
+        extra_paths: devin_install_paths,
+        cli_executable: "devin",
+        cli_extra_paths: devin_install_paths,
+        install_hint: "devin (searched PATH, the login shell's PATH, ~/.local/bin, \
+             /opt/homebrew/bin, and /usr/local/bin; install with \
+             `curl -fsSL https://cli.devin.ai/install.sh | bash` or \
+             `brew install --cask devin-cli`, then `devin auth login`; set \
+             DEVIN_EXECUTABLE to override)",
+        // Fallback only: session/new advertises the account's models and the
+        // wire always wins. These ids were live-verified with CLI 3000.4.25.
+        models: || {
+            vec![
+                Model {
+                    id: "claude-5-fable-high".into(),
+                    label: "Claude Fable 5 High".into(),
+                    description: Some("Devin's default coding model".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "adaptive".into(),
+                    label: "Adaptive".into(),
+                    description: Some("Devin picks the model per request".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        steering_mode: SteeringMode::TurnBoundary,
+        // Effort is encoded in Devin's advertised model ids, not a separate
+        // thought_level config option.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
         http_sidecar: false,
     }
 }
@@ -580,6 +646,11 @@ impl AcpHarness {
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Devin (`devin acp`) — Cognition's native ACP server.
+    pub fn devin() -> Self {
+        Self::with_spec(devin_spec())
     }
 
     /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
@@ -1266,11 +1337,18 @@ struct Session {
     stderr_tail: crate::StderrTail,
 }
 
-fn initialize_params(_harness: HarnessId) -> Value {
-    let capabilities = json!({
+fn initialize_params(harness: HarnessId) -> Value {
+    let mut capabilities = json!({
         "fs": { "readTextFile": false, "writeTextFile": false },
         "terminal": false,
     });
+    if harness == HarnessId::Devin {
+        // Devin otherwise exposes only the parent's run_subagent call. This
+        // unlocks lifecycle tags plus every nested message, thought, and tool
+        // update, all of which DevinTracker can route. Do not advertise the
+        // separate subagentControl extension: Zeron has no matching UI yet.
+        capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
+    }
     json!({
         "protocolVersion": 1,
         "clientInfo": {
@@ -1442,9 +1520,9 @@ fn config_option_sets(
             // bypassPermissions / codex approvalPolicy never): pick the
             // no-prompts mode when the agent offers one. claude-agent-acp
             // calls it `bypassPermissions`, codex-acp `agent-full-access`
-            // (approvalPolicy "never" + danger-full-access sandbox).
-            // Cursor instead exposes agent/plan/ask — those arrive as a
-            // Traits "Mode" option and win when the run selected one.
+            // (approvalPolicy "never" + danger-full-access sandbox), Devin
+            // `bypass`. Cursor instead exposes agent/plan/ask — those arrive
+            // as a Traits "Mode" option and win when the run selected one.
             ("select", Some("mode")) => model_options
                 .get("mode")
                 .and_then(Value::as_str)
@@ -1454,6 +1532,7 @@ fn config_option_sets(
                     [
                         "bypassPermissions",
                         "bypass_permissions",
+                        "bypass",
                         "yolo",
                         "agent-full-access",
                         "danger-full-access",
@@ -1502,11 +1581,11 @@ fn config_option_sets(
     sets
 }
 
-/// The per-agent subagent correlator: grok's spawn-tool + disk-tail tracker
-/// (inert for agents that never emit `subagent_*` updates), or opencode's
-/// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
-/// [`map_update`]; their tagged events flow from their own tasks.
+/// Per-agent subagent correlation: Devin maps tagged ACP updates inline,
+/// Grok tails child transcripts from disk, and opencode follows its sidecar
+/// event bus. Every path produces the same [`AgentEvent::Subagent`] contract.
 enum SubagentObserver {
+    Devin(DevinTracker),
     Grok(SubagentTracker),
     Opencode(OpencodeTracker),
 }
@@ -1514,8 +1593,16 @@ enum SubagentObserver {
 impl SubagentObserver {
     fn observe(&mut self, update: &Value) {
         match self {
+            SubagentObserver::Devin(_) => {}
             SubagentObserver::Grok(tracker) => tracker.observe(update),
             SubagentObserver::Opencode(tracker) => tracker.observe(update),
+        }
+    }
+
+    fn finish_open(&mut self, status: DoneStatus) -> Vec<AgentEvent> {
+        match self {
+            SubagentObserver::Devin(tracker) => tracker.finish_open(status),
+            SubagentObserver::Grok(_) | SubagentObserver::Opencode(_) => Vec::new(),
         }
     }
 }
@@ -1537,10 +1624,13 @@ fn session_update_events(
     }
     let update = params.get("update").unwrap_or(&Value::Null);
     match method {
-        "session/update" => {
-            subagents.observe(update);
-            map_update(update)
-        }
+        "session/update" => match subagents {
+            SubagentObserver::Devin(tracker) => tracker.map(update),
+            _ => {
+                subagents.observe(update);
+                map_update(update)
+            }
+        },
         "_x.ai/session_notification" => {
             subagents.observe(update);
             Vec::new()
@@ -2052,10 +2142,12 @@ async fn run_session(session: Session) {
         return;
     }
 
-    // Subagent correlation + transcript tails: opencode rides its sidecar
-    // event bus; everything else gets the grok tracker (inert for agents
-    // that never emit the `subagent_*` extension updates).
-    let mut subagents = if harness == HarnessId::Opencode {
+    // Subagent correlation + transcript tails: Devin carries nested updates
+    // on ACP, opencode rides its sidecar event bus, and everything else gets
+    // the Grok tracker (inert without Grok's subagent lifecycle extension).
+    let mut subagents = if harness == HarnessId::Devin {
+        SubagentObserver::Devin(DevinTracker::default())
+    } else if harness == HarnessId::Opencode {
         SubagentObserver::Opencode(OpencodeTracker::new(
             session_id.clone(),
             event_tx.clone(),
@@ -2948,6 +3040,19 @@ async fn run_session(session: Session) {
         }
     }
 
+    // A vanished Devin process cannot send subagent_completed. Settle every
+    // open nested transcript before the parent's terminal Done.
+    let subagent_status = if interrupted {
+        DoneStatus::Interrupted
+    } else {
+        DoneStatus::Errored
+    };
+    for event in subagents.finish_open(subagent_status) {
+        if !send(&event_tx, event).await {
+            break;
+        }
+    }
+
     // Terminal bookkeeping: never end the stream without a Done unless the
     // consumer already hung up.
     if !event_tx.is_closed() {
@@ -2986,6 +3091,17 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devin_initialize_enables_only_the_supported_subagent_stream() {
+        let devin = initialize_params(HarnessId::Devin);
+        let meta = &devin["clientCapabilities"]["_meta"];
+        assert_eq!(meta["cognition.ai/subagentSupport"], true);
+        assert!(meta.get("cognition.ai/subagentControl").is_none());
+
+        let grok = initialize_params(HarnessId::Grok);
+        assert!(grok["clientCapabilities"].get("_meta").is_none());
+    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {
