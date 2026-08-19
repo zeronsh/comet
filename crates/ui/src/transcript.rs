@@ -1493,6 +1493,9 @@ pub struct Transcript {
     /// the companion task after ~1.2s.
     copied_code: Option<(SharedString, usize)>,
     copied_clear: Option<Task<()>>,
+    /// Entry whose full text was just copied (shows "Copied!" feedback).
+    copied_entry: Option<SharedString>,
+    copied_entry_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -1643,6 +1646,8 @@ impl Transcript {
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
+            copied_entry: None,
+            copied_entry_clear: None,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_loads: HashMap::new(),
@@ -3220,11 +3225,62 @@ impl Transcript {
                 // bubble's right edge (user-reported 4px drift).
                 .when(is_user_row, |el| el.justify_end())
                 .when(hovered, |el| {
+                    let entry_copied = self.copied_entry.as_deref() == Some(row.entry_id.as_ref());
+                    let copy_label: SharedString = if entry_copied {
+                        "Copied!".into()
+                    } else {
+                        "".into()
+                    };
+                    let entry = row.entry_id.clone();
                     el.child(motion::fade_quick(
                         SharedString::from(format!("ts-{}", row.id)),
                         div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
                             .text_size(px(11.0))
                             .text_color(theme.text_muted.opacity(0.55))
+                            .when(!is_user_row, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .cursor_pointer()
+                                        .rounded(px(3.0))
+                                        .px(px(2.0))
+                                        .hover(|s| s.bg(theme.glass_hover()))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            {
+                                                let entry_id = entry.clone();
+                                                cx.listener(move |this: &mut Transcript, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Transcript>| {
+                                                    cx.stop_propagation();
+                                                    this.copy_entry_text(&entry_id, cx);
+                                                })
+                                            },
+                                        )
+                                        .child(
+                                            crate::icons::icon(crate::icons::COPY)
+                                                .size(px(11.0))
+                                                .text_color(if entry_copied {
+                                                    theme.accent
+                                                } else {
+                                                    theme.text_muted.opacity(0.6)
+                                                }),
+                                        )
+                                        .when(entry_copied, |el| {
+                                            el.child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(theme.accent)
+                                                    .child(copy_label),
+                                            )
+                                        }),
+                                )
+                            })
                             .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
                     ))
                 })
@@ -3311,6 +3367,51 @@ impl Transcript {
                     .ok();
             });
         render::CopyUi { handler, copied_ix }
+    }
+
+    /// Copy the full plain text of an entry to clipboard. Walks all rows
+    /// belonging to the entry and extracts text from markdown blocks.
+    fn copy_entry_text(
+        &mut self,
+        entry_id: &SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let mut text = String::new();
+        for row in &self.rows {
+            if &row.entry_id != entry_id {
+                continue;
+            }
+            match &row.kind {
+                RowKind::Markdown { tree, .. } | RowKind::LiveMarkdown { tree, .. } => {
+                    let block_text = tree.plain_text();
+                    if !block_text.is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&block_text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            let entry = entry_id.clone();
+            let entity = cx.weak_entity();
+            self.copied_entry = Some(entry.clone());
+            self.copied_entry_clear = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1200))
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.copied_entry = None;
+                    this.copied_entry_clear = None;
+                    cx.notify();
+                })
+                .ok();
+            }));
+            cx.notify();
+        }
     }
 
     /// Request highlights for the code blocks of a tree. `only` limits to one

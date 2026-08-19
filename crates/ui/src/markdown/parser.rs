@@ -84,6 +84,33 @@ pub struct TopBlock {
     pub block: Block,
 }
 
+fn plain_text_block(block: &Block, out: &mut String) {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+            for run in runs {
+                out.push_str(&run.text);
+            }
+        }
+        Block::CodeBlock { code, .. } => {
+            out.push_str(code);
+        }
+        Block::BlockQuote { children } => {
+            for child in children {
+                plain_text_block(child, out);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for block in item {
+                    plain_text_block(block, out);
+                    out.push('\n');
+                }
+            }
+        }
+        Block::Table { .. } | Block::Rule => {}
+    }
+}
+
 /// The parse result: top-level blocks in document order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BlockTree {
@@ -93,6 +120,24 @@ pub struct BlockTree {
 impl BlockTree {
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    /// Collect all plain text from every block (paragraphs, headings,
+    /// code blocks, block quotes, and list items). Tables and rules
+    /// are skipped. Used for the copy-message action.
+    pub fn plain_text(&self) -> String {
+        let mut out = String::new();
+        for (i, top) in self.blocks.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            plain_text_block(&top.block, &mut out);
+        }
+        // Trim trailing newlines but preserve internal structure.
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
