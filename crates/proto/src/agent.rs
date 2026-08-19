@@ -14,6 +14,8 @@ pub enum HarnessId {
     Hermes,
     /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
     Pi,
+    /// SST's opencode agent, driven over ACP (`opencode acp`).
+    Opencode,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -111,6 +113,26 @@ pub struct RunRequest {
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// Host-side isolated-worktree creation (see [`WorktreeSpec`]): when set,
+    /// the HOST materializes the worktree at command-drain time and runs there
+    /// instead of `cwd`. Additive + serde-defaulted for wire compat — an old
+    /// host ignores it and runs in `cwd` (the repo's main checkout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeSpec>,
+}
+
+/// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
+/// by the HOST while draining the queued Run — not by the sender over a
+/// blocking CreateWorktree RPC — so the send path stays durable: a lost relay
+/// frame can't wedge the composer on "Sending…" while the session runs anyway
+/// (2026-08-18 user report).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSpec {
+    /// The repo whose worktree to create (the space's folder on the host).
+    pub repo_path: String,
+    /// Base ref the fresh `zeron/<name>` branch is created off.
+    pub base: String,
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan
@@ -320,6 +342,29 @@ pub enum AgentEvent {
         error: Option<String>,
         session_id: Option<String>,
     },
+    /// A USER-role message injected into a running session — today only seen
+    /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
+    /// subagent mid-run (claude: a tagged user frame's text blocks). The
+    /// engine writes it to the subagent doc as its own user entry, closing
+    /// the streaming assistant segment above it — the subagent transcript
+    /// then reads like any steered chat. Never emitted untagged (the parent
+    /// chat's user messages come from doc commands, not the wire).
+    #[serde(rename_all = "camelCase")]
+    UserMessage {
+        text: String,
+    },
+    /// An event belonging to a SUBAGENT's nested transcript, attributed to
+    /// the spawning tool call (`parent_tool_use_id` = the parent-feed
+    /// `ToolCall::id` that launched it). Never folded into the parent chat
+    /// doc — the engine routes these to the subagent's own doc; the parent
+    /// keeps only the spawn chip. Additive: old consumers that don't match
+    /// this variant drop the nested traffic, which is the pre-subagent-viz
+    /// behavior.
+    #[serde(rename_all = "camelCase")]
+    Subagent {
+        parent_tool_use_id: String,
+        event: Box<AgentEvent>,
+    },
 }
 
 #[cfg(test)]
@@ -355,6 +400,29 @@ mod tests {
         let round: RunRequest =
             serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
         assert_eq!(round.attachments, vec!["/tmp/a.png".to_string()]);
+    }
+
+    #[test]
+    fn run_request_worktree_default_and_round_trip() {
+        // Old-wire JSON without the field parses (additive compat)…
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.worktree.is_none());
+        // …and `None` serializes away (old readers never see it).
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("worktree").is_none());
+        // A populated spec round-trips camelCased.
+        let req = RunRequest {
+            worktree: Some(WorktreeSpec {
+                repo_path: "/repos/comet".into(),
+                base: "main".into(),
+            }),
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(round.worktree, req.worktree);
     }
 
     #[test]

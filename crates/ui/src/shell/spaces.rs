@@ -11,7 +11,15 @@
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::FocusHandle;
-use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
+use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
+
+struct ActiveChatRow {
+    status: ChatIndicator,
+    chat: zeron_proto::Chat,
+    folder: String,
+    branch: Option<String>,
+    change_request: Option<zeron_proto::ChangeRequestSummary>,
+}
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
@@ -37,9 +45,9 @@ pub(super) enum SpacesMenuRow {
 }
 
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
-/// across the top, folder browser on the left, a Devices rail on the right,
-/// kbd-hint footer. One surface — picking a device in the rail rebrowses in
-/// place, no step wizard.
+/// across the top, folder browser on the left, a Devices + Locations rail on
+/// the right, kbd-hint footer. One surface — picking a device or a drive in
+/// the rail rebrowses in place, no step wizard.
 pub(super) struct AddSpaceFlow {
     /// The device currently browsed (the highlighted rail row).
     device: Option<Device>,
@@ -48,6 +56,9 @@ pub(super) struct AddSpaceFlow {
     /// on a folder-naming query descends immediately.
     search: Entity<ComposerInput>,
     browser: Loadable<FolderListing>,
+    /// The device's mounted drives/volumes (the rail's Locations rows).
+    /// Best-effort: an error just leaves the section at Home only.
+    drives: Loadable<Vec<DriveEntry>>,
     /// Requested browser path (`None` = the device's default, i.e. home).
     browser_path: Option<String>,
     /// The device's home (the path a `None` browse resolved to) — breadcrumbs
@@ -70,8 +81,24 @@ pub(super) struct AddSpaceFlow {
     list_scroll: gpui::ScrollHandle,
     focus_pending: bool,
     load_task: Option<Task<()>>,
+    drives_task: Option<Task<()>>,
     submit_task: Option<Task<()>>,
     _search_events: Subscription,
+}
+
+/// One row of the rail's Locations section: home, or a mounted drive
+/// (by index into the flow's loaded drive list).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocationRow {
+    Home,
+    Drive(usize),
+}
+
+/// Segment-aware "is `path` at or under `base`" (`/media/a` is not under
+/// `/media/ab`); a root base covers everything.
+fn path_under(path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    base.is_empty() || path == base || path.starts_with(&format!("{base}/"))
 }
 
 /// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
@@ -579,7 +606,7 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
-        let rows: Vec<(ChatIndicator, zeron_proto::Chat, String, Option<String>)> = {
+        let rows: Vec<ActiveChatRow> = {
             let state = self.state.read(cx);
             state
                 .overview_chats(now)
@@ -609,13 +636,27 @@ impl Shell {
                         .map(str::trim)
                         .filter(|b| !b.is_empty())
                         .map(str::to_string);
-                    (status, chat.clone(), folder, branch)
+                    let change_request = state.change_request_for_chat(chat).cloned();
+                    ActiveChatRow {
+                        status,
+                        chat: chat.clone(),
+                        folder,
+                        branch,
+                        change_request,
+                    }
                 })
                 .collect()
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
-            .map(|(status, chat, folder, branch)| {
+            .map(|row| {
+                let ActiveChatRow {
+                    status,
+                    chat,
+                    folder,
+                    branch,
+                    change_request,
+                } = row;
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
@@ -630,6 +671,7 @@ impl Shell {
                     time_ago,
                     folder.into(),
                     branch.map(SharedString::from),
+                    change_request,
                     harness,
                     status,
                     is_selected,
@@ -922,6 +964,7 @@ impl Shell {
             device,
             search,
             browser: Loadable::Idle,
+            drives: Loadable::Idle,
             browser_path: None,
             home: None,
             browser_repo: false,
@@ -932,11 +975,13 @@ impl Shell {
             list_scroll: gpui::ScrollHandle::new(),
             focus_pending: true,
             load_task: None,
+            drives_task: None,
             submit_task: None,
             _search_events: search_events,
         });
         if has_device {
             self.load_space_folders(None, cx);
+            self.load_space_drives(cx);
         }
         cx.notify();
     }
@@ -951,6 +996,7 @@ impl Shell {
         }
         flow.device = Some(device);
         flow.browser = Loadable::Idle;
+        flow.drives = Loadable::Idle;
         flow.browser_path = None;
         flow.home = None;
         flow.browser_repo = false;
@@ -959,7 +1005,71 @@ impl Shell {
         let search = flow.search.clone();
         search.update(cx, |input, cx| input.set_text("", cx));
         self.load_space_folders(None, cx);
+        self.load_space_drives(cx);
         cx.notify();
+    }
+
+    /// Locations-rail click: rebrowse at a drive's mount point (or home).
+    /// Same reset as descending — the query clears, the repo seed resets.
+    fn add_space_goto_location(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        // Already standing on that root — a no-op beats a reload flash.
+        if flow.browser.ready().is_some_and(|l| match &path {
+            Some(p) => l.path == *p,
+            None => flow.home.as_deref() == Some(l.path.as_str()),
+        }) {
+            return;
+        }
+        flow.browser_repo = false;
+        let search = flow.search.clone();
+        search.update(cx, |input, cx| input.set_text("", cx));
+        self.load_space_folders(path, cx);
+    }
+
+    /// ListDrives on the flow's device (relay-forwarded when remote).
+    /// Failures stay silent — the section just shows Home; the folder
+    /// browser's own error row already covers "device didn't respond".
+    fn load_space_drives(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        let Some(flow) = self.add_space.as_mut() else {
+            return;
+        };
+        let device_id = flow.device.as_ref().map(|d| d.id.clone());
+        flow.drives = Loadable::Loading;
+        flow.drives_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            // Only target remote devices — local calls skip the relay.
+            if let (Some(target), local) = (&device_id, &local)
+                && local.as_deref() != Some(target.as_str())
+            {
+                params.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
+            }
+            let result = engine
+                .client()
+                .call(methods::LIST_DRIVES, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |shell, cx| {
+                if let Some(flow) = shell.add_space.as_mut() {
+                    flow.drives = match result {
+                        Ok(value) => match serde_json::from_value::<DriveListing>(value) {
+                            Ok(listing) => Loadable::Ready(listing.drives),
+                            Err(err) => Loadable::Error(err.to_string()),
+                        },
+                        Err(err) => Loadable::Error(err.to_string()),
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// The current listing's folder rows filtered by the search query
@@ -981,11 +1091,25 @@ impl Shell {
     }
 
     /// Descend into the highlighted (filtered) folder; clears the query.
+    /// A path-shaped query with no matching rows browses the typed path
+    /// instead — `/disk2⏎` must work, not sit on "No folders match" (an
+    /// absolute query can never match a folder name anyway).
     fn add_space_open_active(&mut self, cx: &mut Context<Self>) {
         let rows = self.add_space_filtered(cx);
         let Some(flow) = self.add_space.as_ref() else {
             return;
         };
+        if rows.is_empty() {
+            let text = flow.search.read(cx).text().to_string();
+            if text.starts_with('/') || text.starts_with('~') {
+                if let Some(target) =
+                    crate::pickers::typed_path_target(&text, flow.home.as_deref())
+                {
+                    self.add_space_descend(target, false, cx);
+                }
+            }
+            return;
+        }
         let Some(listing) = flow.browser.ready() else {
             return;
         };
@@ -1009,6 +1133,26 @@ impl Shell {
     /// descending clears the query, so the caller must not keep acting on the
     /// old text.
     fn add_space_slash_descend(&mut self, cx: &mut Context<Self>) -> bool {
+        // A typed PATH jump: an absolute (`/disk2/`) or home-relative (`~/x/`)
+        // query browses that path directly — mounts at unconventional roots
+        // (and anywhere else) are reachable without a Locations row. Same
+        // trailing-`/` trigger as the folder-name descend below.
+        {
+            let Some(flow) = self.add_space.as_ref() else {
+                return false;
+            };
+            let text = flow.search.read(cx).text().to_string();
+            if text.ends_with('/') && (text.starts_with('/') || text.starts_with('~')) {
+                let target = crate::pickers::typed_path_target(&text, flow.home.as_deref());
+                let Some(target) = target else {
+                    // Path-shaped but unresolvable (`~/…` before home is
+                    // known) — leave the query alone.
+                    return false;
+                };
+                self.add_space_descend(target, false, cx);
+                return true;
+            }
+        }
         let target = {
             let Some(flow) = self.add_space.as_ref() else {
                 return false;
@@ -1352,6 +1496,7 @@ impl Shell {
             focus,
             list_scroll,
             home,
+            drives,
         ) = {
             let flow = self.add_space.as_ref()?;
             (
@@ -1366,6 +1511,7 @@ impl Shell {
                 flow.focus.clone(),
                 flow.list_scroll.clone(),
                 flow.home.clone(),
+                flow.drives.ready().cloned().unwrap_or_default(),
             )
         };
         let devices = self.state.read(cx).devices.clone();
@@ -1394,6 +1540,33 @@ impl Shell {
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "This device".to_string())
             .into();
+        // The rail's active Locations row: the root that owns the browsed
+        // path. Longest mount prefix wins; home outranks a drive covering it
+        // (the System "/" row covers everything).
+        let active_location: Option<LocationRow> = listing.as_ref().and_then(|l| {
+            let mut best = home
+                .as_deref()
+                .filter(|h| path_under(&l.path, h))
+                .map(|h| (h.trim_end_matches('/').len() + 1, LocationRow::Home));
+            for (ix, drive) in drives.iter().enumerate() {
+                if !path_under(&l.path, &drive.path) {
+                    continue;
+                }
+                let len = drive.path.trim_end_matches('/').len();
+                if best.is_none_or(|(b, _)| len > b) {
+                    best = Some((len, LocationRow::Drive(ix)));
+                }
+            }
+            best.map(|(_, row)| row)
+        });
+        // The drive whose mount folds into a breadcrumb (like home folds into
+        // the device crumb). System "/" keeps the plain full-path crumbs.
+        let active_drive: Option<&DriveEntry> = match active_location {
+            Some(LocationRow::Drive(ix)) => drives
+                .get(ix)
+                .filter(|d| !d.path.trim_end_matches('/').is_empty()),
+            _ => None,
+        };
 
         // A quiet mono key-cap chip ("⌘K" / "esc") for the search bar ends.
         let key_chip = |theme: &Theme| {
@@ -1495,13 +1668,27 @@ impl Shell {
                 let segments = breadcrumbs(&listing.path);
                 let last = segments.len().saturating_sub(1);
                 // Root "/" chip always folds; the home segments fold too when
-                // the browsed path sits at/under home.
+                // the browsed path sits at/under home. A drive's mount folds
+                // the same way — into a crumb named after the drive
+                // ("work-laptop / T7 Shield / projects").
                 let at_home = home.as_deref() == Some(listing.path.as_str());
-                let folded = 1 + home
-                    .as_deref()
-                    .filter(|h| listing.path == *h || listing.path.starts_with(&format!("{h}/")))
-                    .map(|h| h.split('/').filter(|s| !s.is_empty()).count())
-                    .unwrap_or(0);
+                let drive_crumb: Option<(SharedString, String, bool)> = active_drive.map(|d| {
+                    let mount = d.path.trim_end_matches('/').to_string();
+                    let at_mount = listing.path.trim_end_matches('/') == mount;
+                    (SharedString::from(d.name.clone()), mount, at_mount)
+                });
+                let folded = 1 + match (&drive_crumb, home.as_deref()) {
+                    (Some((_, mount, _)), _) => {
+                        mount.split('/').filter(|s| !s.is_empty()).count()
+                    }
+                    (None, Some(h))
+                        if listing.path == h
+                            || listing.path.starts_with(&format!("{h}/")) =>
+                    {
+                        h.split('/').filter(|s| !s.is_empty()).count()
+                    }
+                    _ => 0,
+                };
                 div()
                     .flex()
                     .flex_row()
@@ -1537,6 +1724,45 @@ impl Shell {
                                 }))
                                 .into_any_element()
                         }
+                    })
+                    .when_some(drive_crumb, |el, (name, mount, at_mount)| {
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_color(theme.text_faint.opacity(0.7))
+                                        .child(SharedString::from("/")),
+                                )
+                                .child({
+                                    let crumb = div()
+                                        .id("add-space-crumb-drive")
+                                        .px(px(3.0))
+                                        .rounded(px(4.0))
+                                        .child(name);
+                                    if at_mount {
+                                        // Standing at the mount — the drive
+                                        // crumb IS the current folder.
+                                        crumb
+                                            .text_color(theme.text.opacity(0.85))
+                                            .into_any_element()
+                                    } else {
+                                        crumb
+                                            .text_color(theme.text_muted.opacity(0.55))
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(theme.text))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.add_space_goto_location(
+                                                    Some(mount.clone()),
+                                                    cx,
+                                                );
+                                            }))
+                                            .into_any_element()
+                                    }
+                                }),
+                        )
                     })
                     .children(segments.into_iter().enumerate().skip(folded).map(
                         |(ix, (label, full))| {
@@ -1598,10 +1824,18 @@ impl Shell {
                 ))
                 .into_any_element()
         } else if let Some(message) = load_error {
-            let device_line = device
-                .as_ref()
-                .map(|d| format!("{} didn't respond — is it online?", d.name))
-                .unwrap_or(message);
+            // Folder-level failures (typed path that doesn't exist, permission
+            // walls) show as themselves; only transport-shaped failures read
+            // as the device being unreachable. The engine's folder errors all
+            // name the folder ("could not read that folder: …").
+            let device_line = if message.contains("folder") {
+                message
+            } else {
+                device
+                    .as_ref()
+                    .map(|d| format!("{} didn't respond — is it online?", d.name))
+                    .unwrap_or(message)
+            };
             popover::error_row(&theme, &device_line)
                 .px(px(14.0))
                 .py(px(10.0))
@@ -1696,10 +1930,32 @@ impl Shell {
                 .into_any_element()
         };
 
-        // ── devices rail (mock right column): platform glyph + name +
-        //    presence dot per row, an info line naming the browsed device.
-        //    Rows are the tab recipe (h-28 rounded-8 washes), vertical.
+        // ── rail: Devices (platform glyph + name + presence dot per row) over
+        //    Locations (home + the picked device's mounted drives), an info
+        //    line naming the browsed device. Rows are the tab recipe (h-28
+        //    rounded-8 washes), vertical.
+        let location_rows: Vec<(LocationRow, SharedString, &'static str, Option<String>)> = device
+            .is_some()
+            .then(|| {
+                std::iter::once((
+                    LocationRow::Home,
+                    SharedString::from("Home"),
+                    icons::HOME,
+                    None,
+                ))
+                .chain(drives.iter().enumerate().map(|(ix, drive)| {
+                    (
+                        LocationRow::Drive(ix),
+                        SharedString::from(drive.name.clone()),
+                        icons::HARD_DRIVE,
+                        Some(drive.path.clone()),
+                    )
+                }))
+                .collect()
+            })
+            .unwrap_or_default();
         let rail = div()
+            .id("add-space-rail")
             .w(px(196.0))
             .flex_none()
             .border_l_1()
@@ -1709,6 +1965,8 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(2.0))
+            // Locations can outgrow the fixed body on mount-happy machines.
+            .overflow_y_scroll()
             .child(
                 div()
                     .px(px(8.0))
@@ -1783,6 +2041,60 @@ impl Shell {
                             .when(!online, |el| el.bg(crate::theme::ink(0.22))),
                     )
             }))
+            // ── Locations: home + the device's mounted drives. Clicking
+            //    rebrowses the palette at that root; the row owning the
+            //    browsed path carries the selection wash. Drives arrive
+            //    best-effort (ListDrives) — until then the section is just
+            //    Home, and on error it stays that way.
+            .when(!location_rows.is_empty(), |el| {
+                el.child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .pb(px(4.0))
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from("Locations")),
+                    )
+                    .children(location_rows.into_iter().enumerate().map(
+                        |(ix, (row, name, glyph, path))| {
+                            let is_active = active_location == Some(row);
+                            div()
+                                .id(("add-space-location", ix))
+                                .h(px(28.0))
+                                .px(px(8.0))
+                                .rounded(px(8.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_size(px(12.5))
+                                .cursor_pointer()
+                                .when(is_active, |el| {
+                                    // The floating-card selection language:
+                                    // wash + ring-only inset outline.
+                                    el.bg(crate::theme::card_selected_bg())
+                                        .shadow(crate::theme::card_selected_shadows())
+                                        .text_color(theme.text)
+                                })
+                                .when(!is_active, |el| {
+                                    el.text_color(theme.text_muted.opacity(0.7))
+                                        .hover(|s| s.bg(theme.element_hover))
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.add_space_goto_location(path.clone(), cx);
+                                }))
+                                .child(
+                                    icon(glyph)
+                                        .size(px(14.0))
+                                        .flex_none()
+                                        .text_color(theme.text_muted.opacity(0.8)),
+                                )
+                                .child(div().flex_1().min_w_0().truncate().child(name))
+                        },
+                    ))
+            })
             .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
             .child(
                 div()

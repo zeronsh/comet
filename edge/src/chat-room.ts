@@ -120,6 +120,14 @@ export class ChatRoom implements DurableObject {
       }
       const frontier = decodeBase64(request.headers.get("x-chat2-frontier") ?? "");
       if (frontier === undefined) return json({ error: "bad_frontier" }, 400);
+      // A checkpoint that claims to cover rows must name its state: an empty
+      // frontier label on a content-bearing checkpoint made every fresh
+      // reader skip it and park all dependent rows invisibly ("Add Tweets"
+      // incident, 2026-08-18). Empty stays legal only for seqCovered 0
+      // (the M1 empty-doc seed).
+      if (frontier.byteLength === 0 && seqCovered > 0) {
+        return json({ error: "bad_frontier", message: "empty frontier on a content checkpoint" }, 400);
+      }
       const body = new Uint8Array(await request.arrayBuffer());
       if (body.byteLength > MAX_CHECKPOINT_BYTES) return json({ error: "too_large" }, 413);
       const outcome = commitCheckpoint(sql, this.blobs, seqCovered, frontier, body, Date.now());
@@ -128,9 +136,13 @@ export class ChatRoom implements DurableObject {
       return json({ ok: true, seqFloor: outcome.seqFloor, pruned: outcome.pruned });
     }
 
-    // Everything below reads a claimed room.
-    if (!owner) return json({ error: "not_found" }, 404);
-    if (owner !== userId) return json({ error: "forbidden" }, 403);
+    // Claim-on-first-contact for the HTTP surface too — same client-minted-id
+    // discipline as /ws. The /rows twins predate the pull-first HTTPS
+    // transport and 404'd an unclaimed room, which deadlocked a brand-new
+    // chat on WS-hostile networks: the sender's push 404s, the host's pull
+    // 404s, and the only claimants (WS join, checkpoint heal) never run.
+    if (!owner) setMeta(sql, "owner", userId);
+    else if (owner !== userId) return json({ error: "forbidden" }, 403);
 
     if (url.pathname === "/checkpoint" && request.method === "GET") {
       const bytes = this.blobs.get(CHECKPOINT_BLOB);
@@ -158,6 +170,92 @@ export class ChatRoom implements DurableObject {
         );
       }
       return new Response(body, { status: range !== null ? 206 : 200, headers });
+    }
+
+    if (url.pathname === "/rows" && request.method === "GET") {
+      // Pull over plain HTTPS: one GET collapses connect → hello → state →
+      // rowsReq → backfill (4+ serial round trips on a WS, and impossible on
+      // networks that strip the upgrade) into a single request. The body is
+      // u32-LE length-prefixed frames — state (frontier payload), rows after
+      // `?after=`, rowsDone — byte-identical frame encoding to the WS path,
+      // so clients reuse their existing decoder.
+      const afterRaw = Number(url.searchParams.get("after") ?? "0");
+      const after = Number.isInteger(afterRaw) && afterRaw >= 0 ? afterRaw : 0;
+      const device = url.searchParams.get("device") ?? "";
+      const exclude =
+        url.searchParams.get("excludeOwn") === "1" && device !== "" ? device : undefined;
+      const stats = logStats(sql);
+      const frontier = this.blobs.get(FRONTIER_BLOB) ?? new Uint8Array(0);
+      const frames: Uint8Array[] = [
+        encodeFrame(
+          FRAME.state,
+          {
+            headSeq: stats.headSeq,
+            seqFloor: stats.seqFloor,
+            checkpointSeq: stats.checkpointSeq,
+            checkpointSize: stats.checkpointSize,
+            rowCount: stats.rowCount,
+            rowBytes: stats.rowBytes
+          },
+          frontier
+        )
+      ];
+      for (const row of rowsAfter(sql, after, exclude)) {
+        frames.push(
+          encodeFrame(
+            FRAME.row,
+            { seq: row.seq, device: row.device, batchId: row.batchId },
+            row.bytes
+          )
+        );
+      }
+      frames.push(encodeFrame(FRAME.rowsDone, { headSeq: headSeq(sql) }));
+      const total = frames.reduce((n, f) => n + 4 + f.length, 0);
+      const body = new Uint8Array(total);
+      const view = new DataView(body.buffer);
+      let off = 0;
+      for (const f of frames) {
+        view.setUint32(off, f.length, true);
+        body.set(f, off + 4);
+        off += 4 + f.length;
+      }
+      return new Response(body, {
+        headers: { "content-type": "application/octet-stream" }
+      });
+    }
+
+    if (url.pathname === "/rows" && request.method === "POST") {
+      // Push over plain HTTPS — the WS push's fallback twin for networks
+      // where the upgrade never completes. batchId dedupe (UNIQUE column)
+      // makes at-least-once delivery exact-once in effect.
+      const device = url.searchParams.get("device") ?? "";
+      const batchId = url.searchParams.get("batchId") ?? "";
+      if (batchId === "" || batchId.length > 128) {
+        this.recordPush(device, false);
+        return json({ error: "bad_push" }, 400);
+      }
+      const payload = new Uint8Array(await request.arrayBuffer());
+      if (!this.admitQuota(device, payload.byteLength)) {
+        this.recordPush(device, false);
+        return json({ error: "quota" }, 429);
+      }
+      const outcome = appendRow(sql, device, batchId, payload, Date.now());
+      if (!outcome.ok) {
+        this.recordPush(device, false);
+        return json({ error: outcome.error }, outcome.error === "too_large" ? 413 : 400);
+      }
+      this.recordPush(device, true);
+      if (!outcome.dup) {
+        this.markBackupDirty();
+        // Live relay to every ready socket — a same-device socket would
+        // re-import its own bytes as a Loro no-op, so no exclusion needed.
+        for (const socket of this.ctx.getWebSockets()) {
+          const socketState = socket.deserializeAttachment() as SocketState | null;
+          if (!socketState?.ready) continue;
+          send(socket, FRAME.row, { seq: outcome.seq, device, batchId }, payload);
+        }
+      }
+      return json({ batchId, seq: outcome.seq, dup: outcome.dup });
     }
 
     if ((url.pathname === "/tail" || url.pathname === "/diff") && request.method === "PUT") {

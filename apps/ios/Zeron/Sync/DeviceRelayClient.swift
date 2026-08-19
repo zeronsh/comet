@@ -27,6 +27,133 @@ enum RelayError: LocalizedError {
     }
 }
 
+/// Routes multiplexed RPC replies without coupling the wire protocol to the
+/// WebSocket lifecycle. Access is serialized by `DeviceRelayClient`'s actor.
+final class DeviceRpcPending {
+    typealias UnaryCompletion = (Result<Data, RelayError>) -> Void
+
+    private struct PendingStream {
+        let yield: (Data) throws -> Void
+        let finish: (Error?) -> Void
+    }
+
+    private var unary: [UInt64: UnaryCompletion] = [:]
+    private var streams: [UInt64: PendingStream] = [:]
+
+    var unaryCount: Int { unary.count }
+    var streamCount: Int { streams.count }
+
+    func registerUnary(id: UInt64, completion: @escaping UnaryCompletion) {
+        unary[id] = completion
+    }
+
+    func registerStream<Response: Decodable>(
+        id: UInt64,
+        as _: Response.Type,
+        onTermination: @escaping @Sendable () -> Void
+    ) -> AsyncThrowingStream<Response, Error> {
+        let pair = AsyncThrowingStream<Response, Error>.makeStream()
+        streams[id] = PendingStream(
+            yield: { data in
+                pair.continuation.yield(try JSONDecoder().decode(Response.self, from: data))
+            },
+            finish: { error in
+                if let error {
+                    pair.continuation.finish(throwing: error)
+                } else {
+                    pair.continuation.finish()
+                }
+            }
+        )
+        pair.continuation.onTermination = { @Sendable _ in onTermination() }
+        return pair.stream
+    }
+
+    func fail(id: UInt64, error: RelayError) {
+        if let completion = unary.removeValue(forKey: id) {
+            completion(.failure(error))
+        } else if let stream = streams.removeValue(forKey: id) {
+            stream.finish(error)
+        }
+    }
+
+    func failAll(error: RelayError) {
+        // Remove first: finishing a stream invokes onTermination, whose
+        // cancellation task must observe that this request is already gone.
+        let waitingUnary = unary
+        let waitingStreams = streams
+        unary.removeAll()
+        streams.removeAll()
+        for completion in waitingUnary.values {
+            completion(.failure(error))
+        }
+        for stream in waitingStreams.values {
+            stream.finish(error)
+        }
+    }
+
+    /// Returns true only while the consumer still owns a live stream. This
+    /// makes termination idempotent and prevents one consumer from touching
+    /// another request sharing the socket.
+    func removeStreamForCancellation(id: UInt64) -> Bool {
+        streams.removeValue(forKey: id) != nil
+    }
+
+    @discardableResult
+    func handlePayload(_ payload: Data) -> Int {
+        guard let text = String(data: payload, encoding: .utf8) else { return 0 }
+        var handled = 0
+        for line in text.split(separator: "\n") {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  route(object) else { continue }
+            handled += 1
+        }
+        return handled
+    }
+
+    private func route(_ object: [String: Any]) -> Bool {
+        guard let id = (object["id"] as? NSNumber)?.uint64Value else { return false }
+
+        if let stream = streams[id] {
+            if let message = object["err"] as? String {
+                streams.removeValue(forKey: id)
+                stream.finish(RelayError.rpc(message))
+            } else if object.keys.contains("item") {
+                do {
+                    let data = try JSONSerialization.data(withJSONObject: object["item"] ?? NSNull(),
+                                                          options: .fragmentsAllowed)
+                    try stream.yield(data)
+                } catch {
+                    streams.removeValue(forKey: id)
+                    stream.finish(error)
+                }
+            } else if (object["done"] as? Bool) == true {
+                streams.removeValue(forKey: id)
+                stream.finish(nil)
+            } else if object.keys.contains("ok") {
+                // Versioned streams may acknowledge readiness with `ok`
+                // before producing items. The pending stream remains live.
+            } else {
+                streams.removeValue(forKey: id)
+                stream.finish(RelayError.rpc("unexpected reply"))
+            }
+            return true
+        }
+
+        guard let completion = unary.removeValue(forKey: id) else { return false }
+        if let message = object["err"] as? String {
+            completion(.failure(.rpc(message)))
+        } else if object.keys.contains("ok"),
+                  let data = try? JSONSerialization.data(withJSONObject: object["ok"] ?? NSNull(),
+                                                         options: .fragmentsAllowed) {
+            completion(.success(data))
+        } else {
+            completion(.failure(.rpc("unexpected reply")))
+        }
+        return true
+    }
+}
+
 actor DeviceRelayClient {
     static let rpcKind = "rpc"
     static let relayKind = " relay"  // leading space is intentional
@@ -38,7 +165,7 @@ actor DeviceRelayClient {
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var nextId: UInt64 = 1
-    private var pending: [UInt64: CheckedContinuation<Result<Data, RelayError>, Never>] = [:]
+    private let pending = DeviceRpcPending()
     private var connected = false
 
     init(deviceId: String, config: AppConfig) {
@@ -99,11 +226,7 @@ actor DeviceRelayClient {
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         connected = false
-        let waiting = pending
-        pending.removeAll()
-        for (_, continuation) in waiting {
-            continuation.resume(returning: .failure(error))
-        }
+        pending.failAll(error: error)
     }
 
     private func sendPing() async {
@@ -154,7 +277,9 @@ actor DeviceRelayClient {
         // long enough for a fast host reply to reach handleInbound; registering
         // afterward loses that reply and turns a successful call into a timeout.
         let result: Result<Data, RelayError> = await withCheckedContinuation { continuation in
-            pending[id] = continuation
+            pending.registerUnary(id: id) { result in
+                continuation.resume(returning: result)
+            }
             Task {
                 await self.send(data, for: id)
             }
@@ -172,25 +297,57 @@ actor DeviceRelayClient {
 
     private func send(_ data: Data, for id: UInt64) async {
         guard let socket else {
-            failCall(id: id, error: .notConnected)
+            failRequest(id: id, error: .notConnected)
             return
         }
         do {
             try await socket.send(.data(data))
         } catch {
-            failCall(id: id, error: .notConnected)
+            failRequest(id: id, error: .notConnected)
             teardown(error: .notConnected)
         }
     }
 
-    private func failCall(id: UInt64, error: RelayError) {
-        if let continuation = pending.removeValue(forKey: id) {
-            continuation.resume(returning: .failure(error))
-        }
+    private func failRequest(id: UInt64, error: RelayError) {
+        pending.fail(id: id, error: error)
     }
 
     private func timeoutCall(id: UInt64) {
-        failCall(id: id, error: .timeout)
+        failRequest(id: id, error: .timeout)
+    }
+
+    /// A typed streaming ControlRpc call. Items remain registered until a
+    /// terminal `done`/`err`, socket close, or consumer cancellation frame.
+    func stream<Response: Decodable>(
+        method: String,
+        params: [String: Any]
+    ) async throws -> AsyncThrowingStream<Response, Error> {
+        try await connect()
+        let id = nextId
+        nextId += 1
+        let frame: [String: Any] = ["id": id, "method": method, "params": params]
+        let payload = try JSONSerialization.data(withJSONObject: frame)
+        let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        let result = pending.registerStream(id: id, as: Response.self) { [weak self] in
+            Task { await self?.cancelStream(id: id) }
+        }
+
+        // Registration precedes send so an immediate host item cannot race
+        // ahead of its continuation. AsyncThrowingStream buffers until read.
+        await send(data, for: id)
+        return result
+    }
+
+    private func cancelStream(id: UInt64) async {
+        guard pending.removeStreamForCancellation(id: id), let socket else { return }
+        let frame: [String: Any] = ["id": id, "cancel": true]
+        guard let payload = try? JSONSerialization.data(withJSONObject: frame) else { return }
+        let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
+        do {
+            try await socket.send(.data(data))
+        } catch {
+            teardown(error: .notConnected)
+        }
     }
 
     // MARK: Inbound
@@ -216,22 +373,8 @@ actor DeviceRelayClient {
     }
 
     private func handleRpcPayload(_ payload: Data) {
-        // ndjson: each line is one ServerFrame.
-        guard let text = String(data: payload, encoding: .utf8) else { return }
-        for line in text.split(separator: "\n") {
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let id = (obj["id"] as? NSNumber)?.uint64Value,
-                  let continuation = pending.removeValue(forKey: id) else { continue }
-            if let err = obj["err"] as? String {
-                continuation.resume(returning: .failure(.rpc(err)))
-            } else if obj.keys.contains("ok"),
-                      let okData = try? JSONSerialization.data(withJSONObject: obj["ok"] ?? NSNull(),
-                                                               options: .fragmentsAllowed) {
-                continuation.resume(returning: .success(okData))
-            } else {
-                continuation.resume(returning: .failure(.rpc("unexpected reply")))
-            }
-        }
+        // ndjson may interleave many unary and streaming request ids.
+        pending.handlePayload(payload)
     }
 
     // MARK: Frame codec

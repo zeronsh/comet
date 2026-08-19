@@ -32,10 +32,10 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         std::env::set_var("ZERON_NO_LOGIN_SHELL", "1");
         std::env::set_var("PATH", &bin);
         std::env::set_var("HOME", dir.path());
-        std::env::remove_var("CODEX_ACP_EXECUTABLE");
+        std::env::remove_var("PI_ACP_EXECUTABLE");
     }
 
-    let harness = AcpHarness::codex();
+    let harness = AcpHarness::pi();
     let (_steer_tx, steering) = mpsc::channel(1);
     let controls = RunControls {
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
@@ -52,6 +52,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
 
@@ -65,8 +66,5 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     assert!(message.contains("exit code 254"), "{message}");
     assert!(message.contains("ENOENT"), "{message}");
     assert!(message.contains("failed silently"), "{message}");
-    assert!(
-        message.contains("codex-acp"),
-        "names the package: {message}"
-    );
+    assert!(message.contains("pi-acp"), "names the package: {message}");
 }

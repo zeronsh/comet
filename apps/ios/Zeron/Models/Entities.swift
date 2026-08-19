@@ -87,6 +87,44 @@ struct SessionRow: Hashable {
     var updatedAt: Int64
 }
 
+// MARK: - Checkout change requests
+
+/// Provider-neutral lifecycle state from `zeron-proto`.
+enum ChangeRequestState: String, Codable, Hashable {
+    case open
+    case closed
+    case merged
+
+    var label: String {
+        switch self {
+        case .open: return "Open"
+        case .closed: return "Closed"
+        case .merged: return "Merged"
+        }
+    }
+}
+
+struct ChangeRequestSummary: Codable, Hashable {
+    var provider: String
+    var number: UInt64
+    var title: String
+    var url: String
+    var state: ChangeRequestState
+    var baseRef: String
+    var headRef: String
+}
+
+/// Latest successful host-side resolution. A nil `changeRequest` is an
+/// authoritative successful lookup with no matching pull request.
+struct CheckoutChangeRequestStatus: Codable, Hashable {
+    var checkoutId: String
+    var deviceId: String
+    var cwd: String
+    var branch: String
+    var changeRequest: ChangeRequestSummary?
+    var updatedAt: String
+}
+
 // MARK: - Derived display status (entities.rs / state.rs ports)
 
 enum ChatIndicator: Int {

@@ -62,6 +62,7 @@ use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
+use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
@@ -116,6 +117,11 @@ struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
     repo_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckoutChangeRequestParams {
+    cwd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,6 +392,7 @@ pub struct EngineRpc {
     registry: std::sync::Arc<HarnessRegistry>,
     repos: Repos,
     terminals: Terminals,
+    change_requests: CheckoutChangeRequests,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -405,6 +412,7 @@ impl EngineRpc {
         registry: std::sync::Arc<HarnessRegistry>,
         repos: Repos,
         terminals: Terminals,
+        change_requests: CheckoutChangeRequests,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
@@ -421,6 +429,7 @@ impl EngineRpc {
             registry,
             repos,
             terminals,
+            change_requests,
             diff_sync,
             uploads,
             agent_accounts,
@@ -553,6 +562,51 @@ impl EngineRpc {
         }
     }
 
+    /// Accept only a checkout already named by a local chat or contained in a
+    /// local space. Remote clients must not turn this RPC into an arbitrary path probe.
+    async fn change_request_root(&self, cwd: &str) -> Result<std::path::PathBuf, RpcError> {
+        let requested = std::path::PathBuf::from(cwd);
+        let local_device = self.doc_host.device_id();
+        let mut chats_rx = self.workspace.watch_chats();
+        let mut spaces_rx = self.workspace.watch_spaces();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            let chats = chats_rx.borrow_and_update().clone();
+            if chats.iter().any(|chat| {
+                chat.device_id == local_device
+                    && chat.cwd.as_deref().map(std::path::Path::new) == Some(requested.as_path())
+            }) {
+                return Ok(requested);
+            }
+
+            let spaces = spaces_rx.borrow_and_update().clone();
+            for space in spaces
+                .iter()
+                .filter(|space| space.device_id == local_device)
+            {
+                if let Some(checkout) = self
+                    .repos
+                    .workspace_checkout(std::path::Path::new(&space.path), &requested)
+                    .await
+                {
+                    return Ok(checkout);
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                _ = chats_rx.changed() => {}
+                _ = spaces_rx.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        Err(RpcError::BadParams(
+            "cwd is not a known checkout on this device".into(),
+        ))
+    }
+
     /// Most-recent-first paths the current chat actually touched, followed by
     /// files still changed in its checkout. The search worker validates and
     /// normalizes them against the resolved root before using them as ranking
@@ -622,10 +676,29 @@ impl EngineRpc {
         };
         let client = links.client(target).await?;
         if is_stream_method(method) {
+            // Streams are unbounded by design (a quiet WATCH_* is healthy);
+            // only unary calls below get the reply deadline.
+            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+                let rx = match client.subscribe_checked(method, params).await {
+                    Ok(rx) => rx,
+                    Err(err) => {
+                        if should_invalidate_link(&err) {
+                            links.invalidate(target);
+                        }
+                        return Err(err);
+                    }
+                };
+                let stream = futures::stream::unfold((rx, client), |(mut rx, client)| async move {
+                    rx.recv().await.map(|item| (item, (rx, client)))
+                });
+                return Ok(RpcReply::Stream(stream.boxed()));
+            }
             let rx = match client.subscribe(method, params).await {
                 Ok(rx) => rx,
                 Err(err) => {
-                    links.invalidate(target);
+                    if should_invalidate_link(&err) {
+                        links.invalidate(target);
+                    }
                     return Err(err);
                 }
             };
@@ -637,13 +710,27 @@ impl EngineRpc {
             });
             return Ok(RpcReply::Stream(stream.boxed()));
         }
-        match client.call(method, params).await {
-            Ok(value) => Ok(RpcReply::Value(value)),
-            Err(err) => {
-                if matches!(err, RpcError::Closed | RpcError::Transport(_)) {
+        let deadline = forward_deadline(method);
+        match tokio::time::timeout(deadline, client.call(method, params)).await {
+            Ok(Ok(value)) => Ok(RpcReply::Value(value)),
+            Ok(Err(err)) => {
+                if should_invalidate_link(&err) {
                     links.invalidate(target);
                 }
                 Err(err)
+            }
+            Err(_) => {
+                // No reply inside the deadline. The link may be a zombie — the
+                // relay's auto-pong keeps a dead host socket looking alive
+                // (ws3 auto-pong incident) — so drop it; the next call re-dials.
+                // NOTE: the remote may still complete the forwarded work; the
+                // caller sees a retryable failure instead of hanging forever
+                // (the "Sending…" wedge, 2026-08-18).
+                links.invalidate(target);
+                Err(RpcError::Transport(format!(
+                    "no reply from device {target} for {method} within {}s",
+                    deadline.as_secs()
+                )))
             }
         }
     }
@@ -770,6 +857,30 @@ impl EngineRpc {
     }
 }
 
+/// An RPC rejection is scoped to the requested capability. Only a broken
+/// transport means the shared device link itself cannot carry other calls.
+fn should_invalidate_link(error: &RpcError) -> bool {
+    matches!(error, RpcError::Closed | RpcError::Transport(_))
+}
+
+/// Reply deadline for a relay-forwarded unary call. The relay is WebSocket
+/// frames through a DO: a dropped frame (host socket replaced mid-call, DO
+/// restart) loses the reply SILENTLY — the DO's auto-pong keeps the client
+/// socket looking healthy — and an unbounded await wedged callers forever
+/// (the composer's permanent "Sending…", 2026-08-18). Network-bound git and
+/// update methods get a long leash; worktree creation checks out a full tree;
+/// everything else is interactive and must fail fast.
+fn forward_deadline(method: &str) -> std::time::Duration {
+    use std::time::Duration;
+    match method {
+        methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
+            Duration::from_secs(15 * 60)
+        }
+        methods::CREATE_WORKTREE => Duration::from_secs(120),
+        _ => Duration::from_secs(30),
+    }
+}
+
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
@@ -793,11 +904,13 @@ fn forwardable(method: &str) -> bool {
             | methods::FETCH_ALL
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::LIST_DRIVES
             | methods::SEARCH_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
@@ -833,6 +946,7 @@ fn is_stream_method(method: &str) -> bool {
         methods::WATCH_DOC_MESSAGES
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::UPDATE_STATUS
     )
 }
@@ -1034,6 +1148,12 @@ impl RpcService for EngineRpc {
                 // Commands are per workspace, not per harness: project skills
                 // exist only for a session opened in the project. The cache
                 // absorbs the cost — a probe spawns an agent process.
+                //
+                // Forces a lazy resolve, then the harness's own (cached)
+                // discovery — ACP agents advertise availableCommands, claude
+                // answers the initialize control request, codex lists skills;
+                // only harnesses whose wire has no listing (cursor, mock) fall
+                // through to the trait's empty default.
                 let p: ListCommandsParams = parse_params(params)?;
                 let harness = self
                     .registry
@@ -1195,6 +1315,17 @@ impl RpcService for EngineRpc {
             }
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
+            }
+            methods::WATCH_CHECKOUT_CHANGE_REQUEST => {
+                let p: CheckoutChangeRequestParams = parse_params(params)?;
+                let cwd = self.change_request_root(&p.cwd).await?;
+                let stream = self
+                    .change_requests
+                    .watch(&cwd)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?
+                    .filter_map(|status| async move { serde_json::to_value(status).ok() });
+                Ok(RpcReply::Stream(stream.boxed()))
             }
             // One-shot scoped capture for the Changes pane: `branch` diffs the
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the
@@ -1536,6 +1667,14 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
+            methods::LIST_DRIVES => {
+                let drives = self
+                    .repos
+                    .list_drives()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&zeron_proto::DriveListing { drives })
+            }
             methods::SEARCH_FILES => {
                 let p: FileSearchParams = parse_params(params)?;
                 if p.query.chars().count() > 256 {
@@ -1763,6 +1902,32 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+        assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+    }
+
+    /// Every forwardable unary method gets a bounded reply deadline —
+    /// interactive calls fail fast, network-bound git/update calls get the
+    /// long leash, and nothing awaits forever (the "Sending…" wedge).
+    #[test]
+    fn forward_deadlines_are_tiered_and_bounded() {
+        use std::time::Duration;
+        assert_eq!(
+            forward_deadline(methods::CREATE_WORKTREE),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            forward_deadline(methods::CLONE_REPO),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            forward_deadline(methods::LIST_BRANCHES),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            forward_deadline(methods::QUEUE_COMMAND),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

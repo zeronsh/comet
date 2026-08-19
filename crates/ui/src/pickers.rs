@@ -310,6 +310,36 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
     hits.next().is_none().then_some(ix)
 }
 
+/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
+/// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
+/// trailing slash trimmed. `home` is the device's resolved home — `None`
+/// until the first listing lands, when `~` can't expand yet. A query like
+/// `~foo` is a folder name, not a path.
+pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
+    let query = query.trim();
+    if let Some(rest) = query.strip_prefix('~') {
+        let home = home?.trim_end_matches('/');
+        if rest.is_empty() {
+            return Some(home.to_string());
+        }
+        let rest = rest.strip_prefix('/')?.trim_end_matches('/');
+        return Some(if rest.is_empty() {
+            home.to_string()
+        } else {
+            format!("{home}/{rest}")
+        });
+    }
+    if query.starts_with('/') {
+        let trimmed = query.trim_end_matches('/');
+        return Some(if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        });
+    }
+    None
+}
+
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
@@ -2234,14 +2264,17 @@ impl Pickers {
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.
-        let (space, session) = {
+        let (space, session, change_request) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
-            (space, session)
+            let change_request = session
+                .as_ref()
+                .and_then(|chat| state.change_request_for_chat(chat).cloned());
+            (space, session, change_request)
         };
         let row = || {
             // Symmetric: the container's 8px gap sits above the toolbar;
@@ -2291,7 +2324,16 @@ impl Pickers {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(4.0))
                 .min_w_0()
+                .when_some(change_request, |el, summary| {
+                    el.child(crate::change_requests::pull_request_badge(
+                        "composer-pull-request".into(),
+                        summary,
+                        crate::change_requests::ChangeRequestBadgeSurface::Composer,
+                        &theme,
+                    ))
+                })
                 .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch
@@ -3293,6 +3335,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
+        // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
+        HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
     }
 }
 
@@ -3851,6 +3895,29 @@ mod tests {
         assert_eq!(segment_target(&names, "work"), Some(2));
         assert_eq!(segment_target(&names, "g"), None);
         assert_eq!(segment_target(&names, "x"), None);
+    }
+
+    #[test]
+    fn typed_path_target_expands_absolute_and_home_paths() {
+        let home = Some("/home/wing");
+        assert_eq!(typed_path_target("/disk2/", home), Some("/disk2".into()));
+        assert_eq!(
+            typed_path_target("/disk2/projects", home),
+            Some("/disk2/projects".into())
+        );
+        assert_eq!(typed_path_target("/", home), Some("/".into()));
+        assert_eq!(typed_path_target("~", home), Some("/home/wing".into()));
+        assert_eq!(typed_path_target("~/", home), Some("/home/wing".into()));
+        assert_eq!(
+            typed_path_target("~/github/", home),
+            Some("/home/wing/github".into())
+        );
+        // `~x` is a folder name; relative queries are searches, not paths.
+        assert_eq!(typed_path_target("~x", home), None);
+        assert_eq!(typed_path_target("src", home), None);
+        // `~` can't expand before the device's home is known.
+        assert_eq!(typed_path_target("~/github", None), None);
+        assert_eq!(typed_path_target("/disk2", None), Some("/disk2".into()));
     }
 
     #[test]

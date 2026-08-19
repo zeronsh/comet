@@ -334,8 +334,8 @@ pub fn default_registry() -> HarnessRegistry {
             name: "Claude Code".into(),
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
-            // Must mirror AcpHarness::claude()'s spec exactly — the
-            // descriptor-stability rule (see the codex test below).
+            // Must mirror ClaudeHarness exactly — the descriptor-stability
+            // rule (see the codex test below).
             reasoning_levels: vec![
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
@@ -346,8 +346,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::claude().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
     // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
     // exactly (`describe()` after the first resolve must not change the
@@ -373,13 +373,12 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::codex().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::CodexHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
-    // Cursor Agent over ACP (`cursor-agent acp`), same lazy pattern: the
-    // static descriptor mirrors AcpHarness::cursor() exactly. No steering
-    // extension (turn boundaries) and no effort ladder — Cursor bakes effort
-    // into the model id's bracket suffix instead of a `thought_level` option.
+    // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
+    // subagent transcripts), same lazy pattern: the static descriptor mirrors
+    // CursorHarness exactly. Turn-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Cursor,
@@ -390,8 +389,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::cursor().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::cursor()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::CursorHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
@@ -454,6 +453,24 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
+    // opencode over ACP (`opencode acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::opencode() exactly. No steering
+    // extension (turn boundaries) and no effort ladder — opencode exposes no
+    // thought_level config over ACP today (effort stays per-model in its own
+    // config).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Opencode,
+            name: "OpenCode".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -510,7 +527,8 @@ mod tests {
                 HarnessId::Cursor,
                 HarnessId::Grok,
                 HarnessId::Hermes,
-                HarnessId::Pi
+                HarnessId::Pi,
+                HarnessId::Opencode
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -544,6 +562,11 @@ mod tests {
         assert_eq!(hermes.display_name(), "Hermes");
         assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
         assert!(hermes.reasoning_levels().is_empty());
+        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
+        assert_eq!(opencode.id(), HarnessId::Opencode);
+        assert_eq!(opencode.display_name(), "OpenCode");
+        assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(opencode.reasoning_levels().is_empty());
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");

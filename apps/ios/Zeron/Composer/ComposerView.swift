@@ -259,6 +259,13 @@ struct ComposerView: View {
                 onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
                 autoFocus: model.launchFocusComposer
             ) {
+                if let pullRequest = model.changeRequest(for: chat) {
+                    PullRequestBadge(summary: pullRequest, surface: .composer)
+                }
+                if let branch = chat.branch?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !branch.isEmpty {
+                    BranchContextChip(branch: branch)
+                }
                 ComposerChip(label: currentModel.label, badgeHarness: harness) {
                     showModelPicker = true
                 }

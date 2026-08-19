@@ -233,14 +233,11 @@ struct HomeView: View {
                     .listRowSeparator(.hidden)
             }
             ForEach(chats) { chat in
-                Button {
+                // Location shows even when scoped — without it the row's
+                // first line is just a floating dot and a timestamp.
+                ChatRow(chat: chat, showLocation: true) {
                     path.append(.chat(chat.id))
-                } label: {
-                    // Location shows even when scoped — without it the row's
-                    // first line is just a floating dot and a timestamp.
-                    ChatRow(chat: chat, showLocation: true)
                 }
-                .buttonStyle(PressWashButtonStyle())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -279,11 +276,28 @@ struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
     var showLocation: Bool
+    let onSelect: () -> Void
 
     private var subline: Color { Theme.textMuted.opacity(0.5) }
 
     var body: some View {
         let indicator = model.indicator(for: chat)
+        let pullRequest = model.changeRequest(for: chat)
+        ZStack(alignment: .bottomTrailing) {
+            Button(action: onSelect) {
+                content(indicator: indicator, reservesPullRequest: pullRequest != nil)
+            }
+            .buttonStyle(PressWashButtonStyle())
+            if let pullRequest {
+                PullRequestBadge(summary: pullRequest)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 6)
+                    .zIndex(1)
+            }
+        }
+    }
+
+    private func content(indicator: ChatIndicator, reservesPullRequest: Bool) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             // Line 1: space @ device, status corner (time-ago when idle).
             HStack(spacing: 8) {
@@ -333,6 +347,7 @@ struct ChatRow: View {
                     MiniSpinner()
                 }
             }
+            .padding(.trailing, reservesPullRequest ? 46 : 0)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)

@@ -101,15 +101,34 @@ impl ChatDocSink for EngineChatSink {
         let Some(doc) = self.doc.upgrade() else {
             return true; // evicted: claim contained so the client idles, not refetches
         };
-        if frontier.is_empty() {
-            return true;
-        }
+        // NOTE deliberately no empty-frontier shortcut: an empty payload on
+        // a PRESENT checkpoint is unreadable provenance, not proof there is
+        // nothing to fetch — that shortcut made every fresh reader of such a
+        // room skip the chat's founding ops and park all dependent rows
+        // invisibly ("Add Tweets" incident, 2026-08-18). Empty falls through
+        // to the decode failure below: NOT contained, fetch the checkpoint —
+        // always safe (full-state merge; an empty-doc seed applies as a
+        // no-op), never silently skips history. Callers already short-circuit
+        // the checkpointSize == 0 (no checkpoint at all) case.
         let Ok(vv) = loro::VersionVector::decode(frontier) else {
             // Unreadable frontier → claim NOT contained: the client then
             // fetches the checkpoint, which is always safe (full-state
             // merge), never silently skips history.
+            tracing::info!(chat = %self.chat_id, bytes = frontier.len(),
+                "chat2 frontier unreadable; fetching checkpoint");
             return false;
         };
+        // A decoded-but-EMPTY version vector is the vacuous claim: every doc
+        // "includes" empty, so the check would pass for readers that hold
+        // NOTHING and they'd skip the chat's founding ops (the actual "Add
+        // Tweets" poison, one representation deeper than zero-length bytes).
+        // A checkpoint the callers care about (size > 0) claiming empty
+        // state is a contradiction — fetch it.
+        if vv.is_empty() {
+            tracing::info!(chat = %self.chat_id,
+                "chat2 frontier decodes empty (vacuous); fetching checkpoint");
+            return false;
+        }
         doc.doc().oplog_vv().includes_vv(&vv)
     }
 
@@ -216,5 +235,153 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                 "checkpoint fetch exhausted resume attempts".into(),
             ))
         })
+    }
+}
+
+
+/// Plain-HTTPS chat pull/push (the airplane-wifi transport): GET/POST
+/// `/chat2/{id}/rows` with the same bearer auth the checkpoint fetcher uses.
+pub struct EdgeChatTransport {
+    http: reqwest::Client,
+    edge: EdgeConfig,
+    chat_id: String,
+    device_id: String,
+}
+
+impl EdgeChatTransport {
+    pub fn new(
+        http: reqwest::Client,
+        edge: EdgeConfig,
+        chat_id: impl Into<String>,
+        device_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            http,
+            edge,
+            chat_id: chat_id.into(),
+            device_id: device_id.into(),
+        }
+    }
+
+    fn rows_url(&self) -> String {
+        format!(
+            "{}/chat2/{}/rows",
+            self.edge.url.trim_end_matches('/'),
+            self.chat_id
+        )
+    }
+}
+
+impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
+    fn fetch_rows(&self, after: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        let http = self.http.clone();
+        let edge = self.edge.clone();
+        let url = self.rows_url();
+        let device = self.device_id.clone();
+        Box::pin(async move {
+            let bearer = edge
+                .bearer()
+                .await
+                .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+            let res = http
+                .get(&url)
+                .query(&[("after", after.to_string()), ("device", device)])
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+            if !res.status().is_success() {
+                return Err(SyncError::Protocol(format!("chat pull http {}", res.status())));
+            }
+            let bytes = res
+                .bytes()
+                .await
+                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+            Ok(bytes.to_vec())
+        })
+    }
+
+    fn push(
+        &self,
+        batch_id: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String, SyncError>> {
+        let http = self.http.clone();
+        let edge = self.edge.clone();
+        let url = self.rows_url();
+        let device = self.device_id.clone();
+        Box::pin(async move {
+            let bearer = edge
+                .bearer()
+                .await
+                .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+            let res = http
+                .post(&url)
+                .query(&[("batchId", batch_id), ("device", device)])
+                .bearer_auth(&bearer)
+                .body(bytes)
+                .send()
+                .await
+                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+            if !res.status().is_success() {
+                return Err(SyncError::Protocol(format!("chat push http {}", res.status())));
+            }
+            res.text()
+                .await
+                .map_err(|e| SyncError::WebSocket(e.to_string()))
+        })
+    }
+}
+
+#[cfg(test)]
+mod frontier_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The empty-frontier-means-contained shortcut skipped the chat's
+    /// founding ops for every fresh reader of a room whose checkpoint
+    /// carries an empty frontier label, parking all dependent rows
+    /// invisibly ("Add Tweets" incident, 2026-08-18). An empty frontier on
+    /// a present checkpoint must read as NOT contained — the fetch is
+    /// always safe; the skip never is.
+    /// The 2026-08-18 room's actual poison, one level deeper: a frontier
+    /// that is a VALID ENCODING of an EMPTY version vector. Any doc
+    /// vacuously "includes" empty, so the containment check said yes and
+    /// fresh readers skipped the checkpoint anyway. A vacuous claim is not
+    /// containment.
+    #[test]
+    fn encoded_empty_frontier_is_not_contained() {
+        let dir = std::env::temp_dir().join(format!("zeron-frontier2-{}", std::process::id()));
+        let store = Arc::new(DocsStore::open(&dir).expect("store opens"));
+        let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let sink = EngineChatSink::new(&doc, store, "frontier-test-2");
+        let encoded_empty = loro::VersionVector::default().encode();
+        assert!(
+            !sink.contains_frontier(&encoded_empty),
+            "an encoded-empty frontier must trigger the fetch, not vacuous containment"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_frontier_is_not_contained() {
+        let dir = std::env::temp_dir().join(format!("zeron-frontier-test-{}", std::process::id()));
+        let store = Arc::new(DocsStore::open(&dir).expect("store opens"));
+        let doc = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let sink = EngineChatSink::new(&doc, store, "frontier-test");
+        assert!(
+            !sink.contains_frontier(&[]),
+            "empty frontier on a present checkpoint must trigger the fetch"
+        );
+        // A real, contained frontier still short-circuits the fetch — the
+        // doc needs actual ops, or its own frontier is the vacuous-empty one.
+        doc.doc()
+            .get_map("meta")
+            .insert("k", "v")
+            .expect("insert");
+        doc.doc().commit();
+        let vv = doc.doc().oplog_vv().encode();
+        assert!(sink.contains_frontier(&vv));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,6 +6,7 @@ import SwiftUI
 
 enum LineIcon {
     case gitBranch
+    case pullRequest
     case folder
     case folderWithFiles
 
@@ -19,6 +20,15 @@ enum LineIcon {
                     "M17.5 9.75c0 2.9-2.6 4.35-6.2 4.72c-1.9.2-3.3.9-4 2.03",
                 ],
                 circles: [(6.5, 5.5, 2.25), (6.5, 18.5, 2.25), (17.5, 7.5, 2.25)]
+            )
+        case .pullRequest:
+            return (
+                paths: [
+                    "M6 7.25v9.5",
+                    "M15 5h.75A2.25 2.25 0 0 1 18 7.25v9.5",
+                    "m12.75 7.75 2.5-2.75-2.5-2.75",
+                ],
+                circles: [(6, 5, 2.25), (6, 19, 2.25), (18, 19, 2.25)]
             )
         case .folder:
             return (

@@ -216,6 +216,10 @@ export default {
       }
       const routes: Record<string, string[]> = {
         checkpoint: ["GET", "POST"],
+        // Pull/push over plain HTTPS (the airplane-wifi transport): GET
+        // /rows?after= collapses connect→hello→state→rowsReq→backfill into
+        // one round trip; POST /rows is the batchId-deduped push twin.
+        rows: ["GET", "POST"],
         tail: ["GET", "PUT"],
         diff: ["GET", "PUT"],
         stats: ["GET"],
@@ -315,9 +319,17 @@ export default {
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
       }
-      // Repair/inspection read: the full current row table.
+      // Pull over plain HTTPS: `?since=` returns the same delta the WS
+      // hello would (full table without it — the original repair read).
+      // One round trip on any network that passes HTTPS at all, where the
+      // WS upgrade needs 4 and a cooperative middlebox.
       if (parts[2] === "rows" && request.method === "GET") {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/rows", "");
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/rows", url.search);
+      }
+      // Push over plain HTTPS — the WS push's fallback twin (LWW clocks
+      // make replays no-ops, so at-least-once delivery is safe).
+      if (parts[2] === "push" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/push", url.search);
       }
       // Operator wipe. Unlike the CRDT rooms this needs no recipe: clients
       // detect the seq regression on their next hello and re-seed the table

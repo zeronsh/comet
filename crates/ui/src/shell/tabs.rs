@@ -150,7 +150,7 @@ impl Shell {
             None
         } else if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
+            let pr = self.titlebar_right_pad(Theme::SPACE_LG);
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
             // edge (flex_none never shrinks) — cap to the available width. The
@@ -224,10 +224,7 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
             .pl(px(row_left))
-            .pr(px(titlebar_right_padding(
-                cfg!(target_os = "windows"),
-                Theme::SPACE_LG,
-            )))
+            .pr(px(self.titlebar_right_pad(Theme::SPACE_LG)))
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.

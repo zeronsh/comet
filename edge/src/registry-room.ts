@@ -185,8 +185,51 @@ export class RegistryRoom implements DurableObject {
     }
 
     if (url.pathname === "/rows" && request.method === "GET") {
-      // Repair/inspection read: the full current table.
-      return json({ seq: this.seq(), gcFloor: this.gcFloor(), rows: this.rowsSince(0) });
+      // Pull over plain HTTPS: with `?since=` this is the WS hello's exact
+      // delta answer (same full/gcFloor rules); without it, the original
+      // full-table repair read. `?device=&beat=1` doubles as a presence
+      // beat so an HTTP-only client stays visible to socket peers.
+      const sinceRaw = url.searchParams.get("since");
+      const sinceNum = sinceRaw === null ? NaN : Number(sinceRaw);
+      const cursor = Number.isInteger(sinceNum) && sinceNum >= 0 ? sinceNum : null;
+      const device = url.searchParams.get("device") ?? "";
+      if (device !== "" && url.searchParams.get("beat") === "1") {
+        const at = Date.now();
+        this.presence.set(device, at);
+        for (const socket of this.ctx.getWebSockets()) {
+          const socketState = socket.deserializeAttachment() as SocketState | null;
+          if (!socketState?.ready) continue;
+          send(socket, { t: "presence", device, at });
+        }
+      }
+      const seq = this.seq();
+      const gcFloor = this.gcFloor();
+      const full = cursor === null || cursor < gcFloor || cursor > seq;
+      return json({
+        seq,
+        full,
+        gcFloor,
+        rows: full ? this.rowsSince(0) : this.rowsSince(cursor),
+        presence: Object.fromEntries(this.presence)
+      });
+    }
+
+    if (url.pathname === "/push" && request.method === "POST") {
+      // Push over plain HTTPS — the WS push's fallback twin for networks
+      // where the upgrade never completes. Same validation, same atomic
+      // apply, same rows broadcast to live sockets; the ack is the response
+      // body. LWW clocks make replayed batches apply zero ops, so
+      // at-least-once delivery (including 0-RTT/early-data replays) is safe.
+      const device = url.searchParams.get("device") ?? "";
+      let frame: Record<string, unknown>;
+      try {
+        frame = (await request.json()) as Record<string, unknown>;
+      } catch {
+        return json({ error: "bad_push", message: "malformed body" }, 400);
+      }
+      const outcome = this.applyPushBatch(device, frame);
+      if (!outcome.ok) return json({ error: outcome.code, message: outcome.message }, 400);
+      return json({ batch: outcome.batch, seq: outcome.seq, applied: outcome.applied });
     }
 
     if (url.pathname === "/reset" && request.method === "POST") {
@@ -280,17 +323,37 @@ export class RegistryRoom implements DurableObject {
   }
 
   private handlePush(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {
-    const batch = typeof frame.batch === "string" ? frame.batch : "";
-    if (!state.ready || batch === "" || !Array.isArray(frame.ops)) {
+    if (!state.ready) {
       this.recordPush(state.device, false);
       send(ws, { t: "error", code: "bad_push", message: "hello first / malformed push" });
       return;
     }
+    const outcome = this.applyPushBatch(state.device, frame);
+    if (!outcome.ok) {
+      send(ws, { t: "error", code: outcome.code, message: outcome.message });
+      return;
+    }
+    send(ws, { t: "ack", batch: outcome.batch, seq: outcome.seq, applied: outcome.applied });
+  }
+
+  /** Validate + atomically apply one op batch and broadcast merged rows to
+   * every ready socket -- shared by the WS push and the HTTP `POST /push`
+   * fallback. The caller delivers the ack/error on its own transport. */
+  private applyPushBatch(
+    device: string,
+    frame: Record<string, unknown>
+  ):
+    | { ok: false; code: string; message: string }
+    | { ok: true; batch: string; seq: number; applied: number } {
+    const batch = typeof frame.batch === "string" ? frame.batch : "";
+    if (batch === "" || !Array.isArray(frame.ops)) {
+      this.recordPush(device, false);
+      return { ok: false, code: "bad_push", message: "malformed push" };
+    }
     const ops = frame.ops as WireOp[];
     if (ops.length === 0 || ops.length > MAX_BATCH_OPS) {
-      this.recordPush(state.device, false);
-      send(ws, { t: "error", code: "bad_push", message: `batch of ${ops.length} ops` });
-      return;
+      this.recordPush(device, false);
+      return { ok: false, code: "bad_push", message: `batch of ${ops.length} ops` };
     }
     for (const op of ops) {
       const invalid = validateOp(op);
@@ -298,9 +361,8 @@ export class RegistryRoom implements DurableObject {
         // Reject the WHOLE batch: batches are transactional (cascade deletes)
         // and a client that builds one bad op is a client bug to surface, not
         // to partially apply. Rejections are attributed per device on /stats.
-        this.recordPush(state.device, false);
-        send(ws, { t: "error", code: "invalid_op", message: `${op.kind}/${op.id}: ${invalid}` });
-        return;
+        this.recordPush(device, false);
+        return { ok: false, code: "invalid_op", message: `${op.kind}/${op.id}: ${invalid}` };
       }
     }
 
@@ -310,7 +372,7 @@ export class RegistryRoom implements DurableObject {
     const touched = new Map<string, Row>();
     let applied = 0;
     for (const op of ops) {
-      const key = `${op.kind} ${op.id}`;
+      const key = `${op.kind} ${op.id}`;
       const before = touched.get(key) ?? this.loadRow(op.kind, op.id);
       const { row, changed } = applyOp(before, op);
       if (!changed || row === undefined) continue;
@@ -323,13 +385,13 @@ export class RegistryRoom implements DurableObject {
       this.setMeta("seq", String(nextSeq));
       this.markBackupDirty();
     }
-    this.recordPush(state.device, true);
+    this.recordPush(device, true);
     const seq = applied > 0 ? nextSeq : this.seq();
     if (applied > 0) {
-      // Merged full rows to EVERY ready socket (sender included — its op may
+      // Merged full rows to EVERY ready socket (sender included -- its op may
       // have lost LWW, and the merged row is the truth it must display).
       // Rows go out BEFORE the ack so the sender's authoritative state is
-      // current by the time the ack retires its optimistic pending batch —
+      // current by the time the ack retires its optimistic pending batch --
       // no between-frames flicker window.
       const rows = [...touched.values()];
       for (const socket of this.ctx.getWebSockets()) {
@@ -338,7 +400,7 @@ export class RegistryRoom implements DurableObject {
         send(socket, { t: "rows", seq, rows });
       }
     }
-    send(ws, { t: "ack", batch, seq, applied });
+    return { ok: true, batch, seq, applied };
   }
 
   private handlePresence(ws: WebSocket, state: SocketState, frame: Record<string, unknown>): void {

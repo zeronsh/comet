@@ -15,7 +15,10 @@
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
+pub mod badges;
+pub mod change_requests;
 pub mod changes;
+pub mod comments;
 pub mod composer;
 pub mod edge_fade;
 pub mod frost;
@@ -223,6 +226,18 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // Drag + start_window_move) — mark the content view app-owned
             // so AppKit neither dead-zones the strip nor delays clicks.
             app_owns_titlebar_drag: true,
+            // Linux: request client-side decorations — zeron draws its own
+            // unified titlebar and (under CSD) its own caption buttons
+            // (shell.rs `render_linux_caption_controls`). Leaving this unset
+            // requests SERVER decorations, which stacked a compositor
+            // titlebar on top of the app's chrome under sway/KDE, while
+            // compositors without SSD support (GNOME) went client-side
+            // anyway — frameless, and before the shell drew caption buttons,
+            // with no window controls at all. The compositor can still
+            // override via xdg-decoration negotiation; the shell re-resolves
+            // what to draw every frame.
+            window_decorations: cfg!(target_os = "linux")
+                .then_some(gpui::WindowDecorations::Client),
             // Frosted shell (macOS): blur the desktop behind the window; the
             // shell paints its frost surface translucent so the sidebar reads
             // as glass (shell.rs root). Elsewhere blur support is compositor

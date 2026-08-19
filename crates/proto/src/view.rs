@@ -424,7 +424,15 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             ("Todo", format!("{done}/{} done", items.len()))
         }
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
-        ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
+        // Subagent spawns decode as Unknown named "Agent[: <description>]"
+        // (every native driver's convention): label them "Agent" with the
+        // description as the detail — "Tool · Agent: scan repo" read as two
+        // labels fighting.
+        ToolCall::Unknown { name, .. } => match name.strip_prefix("Agent: ") {
+            Some(description) => ("Agent", description.to_owned()),
+            None if name == "Agent" => ("Agent", String::new()),
+            None => ("Tool", name.clone()),
+        },
     }
 }
 

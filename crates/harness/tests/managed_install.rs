@@ -1,10 +1,10 @@
-//! Real-world E2E for the managed adapter install: with no `codex-acp`
+//! Real-world E2E for the managed adapter install: with no `pi-acp`
 //! binary anywhere, `run()` must npm-install the pinned adapter into
 //! `$ZERON_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
 //! `npx -y` at chat time (zeronsh/comet#95).
 //!
-//! Ignored: needs network, npm, and the codex CLI on the machine. Run with
+//! Ignored: needs network, npm, and the pi CLI on the machine. Run with
 //! `cargo test -p zeron-harness --test managed_install -- --ignored`.
 //!
 //! Single-test binary: it mutates ZERON_ADAPTERS_DIR process-wide.
@@ -22,10 +22,10 @@ async fn managed_install_reaches_session_started() {
     // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
         std::env::set_var("ZERON_ADAPTERS_DIR", adapters.path());
-        std::env::remove_var("CODEX_ACP_EXECUTABLE");
+        std::env::remove_var("PI_ACP_EXECUTABLE");
     }
 
-    let harness = AcpHarness::codex();
+    let harness = AcpHarness::pi();
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
@@ -43,6 +43,7 @@ async fn managed_install_reaches_session_started() {
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
 
@@ -82,7 +83,7 @@ async fn managed_install_reaches_session_started() {
 
     // The install landed in the managed dir (not the user's npm state) and
     // is marked complete, so the next launch skips npm entirely.
-    let root = adapters.path().join("agentclientprotocol__codex-acp");
+    let root = adapters.path().join("agentclientprotocol__pi-acp");
     let version_dir = std::fs::read_dir(&root)
         .expect("managed install dir exists")
         .flatten()

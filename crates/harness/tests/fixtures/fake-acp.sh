@@ -15,6 +15,12 @@ update() { # $1 = update json object body
   emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":$1}}"
 }
 
+xnotify() { # $1 = update json object body — grok's extension channel (the
+  # subagent lifecycle rides _x.ai/session_notification, NOT session/update;
+  # same {sessionId, update} envelope. Verified live, 1.0.4.)
+  emit "{\"method\":\"_x.ai/session_notification\",\"params\":{\"sessionId\":\"$SID\",\"update\":$1}}"
+}
+
 # ---- handshake -------------------------------------------------------------
 read -r line || exit 1 # initialize
 has "$line" '"method":"initialize"' || exit 1
@@ -115,18 +121,50 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
-*scenario:autonomous-end*)
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"on it"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  # Background-task wake: a self-continued cycle streams real output with no
-  # prompt in flight, then announces its end with the turn-ended extension.
-  # The sleep orders it AFTER the prompt response settles (responses resolve
-  # through a different channel than notifications and can race).
+*scenario:prompt-complete-hang*)
+  # The grok field hang: the turn really finishes — prompt_complete fires
+  # with the echoed _meta.promptId — but the session/prompt RPC is NEVER
+  # answered. The harness must settle off the notification.
+  reqpid=$(printf '%s' "$promptline" | sed 's/.*"promptId":"\([^"]*\)".*/\1/')
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"pong"}}'
+  emit "{\"method\":\"_x.ai/session/prompt_complete\",\"params\":{\"sessionId\":\"$SID\",\"promptId\":\"$reqpid\",\"stopReason\":\"end_turn\",\"agentResult\":null}}"
+  # Hang the response forever (the wedge under test).
+  exec sleep 60
+  ;;
+
+*scenario:prompt-complete-stale*)
+  # A STALE completion (wrong prompt id — a replay of an already-settled
+  # prompt) must not settle the live turn; the real response follows.
+  emit "{\"method\":\"_x.ai/session/prompt_complete\",\"params\":{\"sessionId\":\"$SID\",\"promptId\":\"stale-p0\",\"stopReason\":\"cancelled\",\"agentResult\":null}}"
+  # A completion for ANOTHER session is equally inert.
+  emit "{\"method\":\"_x.ai/session/prompt_complete\",\"params\":{\"sessionId\":\"other\",\"promptId\":\"zeron-p1\",\"stopReason\":\"cancelled\",\"agentResult\":null}}"
   sleep 1
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"background finished"}}'
-  emit "{\"method\":\"_session/turn_ended\",\"params\":{\"sessionId\":\"$SID\",\"stopReason\":\"end_turn\"}}"
-  # Another session's marker must map to nothing.
-  emit "{\"method\":\"_session/turn_ended\",\"params\":{\"sessionId\":\"other\",\"stopReason\":\"end_turn\"}}"
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"real answer"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\",\"_meta\":{\"inputTokens\":9,\"outputTokens\":4}}}"
+  ;;
+
+*scenario:prompt-stall*)
+  # TOTAL silence after the prompt — the leader-wedge signature. Nothing is
+  # ever emitted; the harness's prompt-stall watchdog must error the run.
+  exec sleep 60
+  ;;
+
+*scenario:subagent*)
+  # Grok's background subagent lifecycle (wire shapes captured live, 1.0.4):
+  # spawn tool_call tagged _meta["x.ai/tool"], completion echoing the minted
+  # subagent_id in its output text, then the subagent_spawned/finished
+  # extension updates. The transcript itself never rides the wire — the test
+  # seeds/app ends a chat_history.jsonl under the harness's sessions root
+  # and the tail turns it into tagged events during the sleep window.
+  update '{"sessionUpdate":"tool_call","toolCallId":"sp1","title":"spawn_subagent","rawInput":{"description":"Count files","prompt":"Count the files.","subagent_type":"explore"},"_meta":{"x.ai/tool":{"version":1,"name":"spawn_subagent","kind":"task","namespace":"grok_build","label":"Subagent","read_only":false},"subagentBackground":true}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sp1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"Subagent started in background.\nsubagent_id: sub-1\ntype: explore"}}],"rawOutput":{"type":"Text","text":"Subagent started in background.\nsubagent_id: sub-1\ntype: explore"}}'
+  xnotify "{\"sessionUpdate\":\"subagent_spawned\",\"subagent_id\":\"sub-1\",\"parent_session_id\":\"$SID\",\"child_session_id\":\"sub-1\",\"subagent_type\":\"explore\",\"description\":\"Count files\"}"
+  # A NESTED spawned update (another parent session) must not bind here.
+  xnotify '{"sessionUpdate":"subagent_spawned","subagent_id":"sub-nested","parent_session_id":"sub-1","child_session_id":"sub-nested","subagent_type":"explore","description":"Count files"}'
+  sleep 1.4
+  xnotify '{"sessionUpdate":"subagent_finished","subagent_id":"sub-1","child_session_id":"sub-1","status":"completed","tool_calls":1,"turns":1,"output":"two files","will_wake":false}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
 *scenario:happy*)

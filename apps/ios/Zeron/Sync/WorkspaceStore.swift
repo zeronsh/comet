@@ -22,7 +22,14 @@ final class WorkspaceStore {
     private(set) var chats: [Chat] = []
     private(set) var sessions: [String: SessionRow] = [:]
     private(set) var presence: [String: Int64] = [:]  // deviceId → last beat ms
+    private(set) var changeRequestSnapshots: [ChangeRequestWatchKey: CheckoutChangeRequestStatus] = [:]
     private(set) var connected = false
+    /// True once ANY transport delivered server state this session (socket
+    /// state frame or HTTPS pull). Drives the "connecting" spinner: with the
+    /// pull-first bootstrap this flips in ~1 round trip, while the socket
+    /// spends 4+ on TLS + upgrade + hello — and on networks that strip WS
+    /// upgrades it's the only flag that ever would.
+    private(set) var synced = false
 
     /// Presence entries older than this are expired (mirrors the Rust
     /// client's 30s TTL, measured from RECEIPT — beats carry the sender's
@@ -66,6 +73,90 @@ final class WorkspaceStore {
                                     delegate: delegate)
         self.client = client
         Task { await client.start() }
+        // Pull-first bootstrap + poll-while-down: one HTTPS GET syncs the
+        // sidebar in ~1 RTT while the socket dials, and while the socket is
+        // down (airplane wifi strips WS upgrades) a 20s poll keeps rows,
+        // presence, and pending writes flowing. The GET doubles as our
+        // presence beat, so this device stays visible to peers.
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            await self?.pullDelta()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if !self.connected {
+                    await self.pushPendingOverHTTP()
+                    await self.pullDelta()
+                }
+            }
+        }
+    }
+
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+
+    /// The WS hello's delta answer over plain HTTPS, applied through the
+    /// exact state path the socket uses.
+    private func pullDelta() async {
+        guard let request = await config.registryRowsRequest(since: doc.helloCursor) else {
+            roomLog.warning("registry: http pull skipped — no URL (token unavailable)")
+            return
+        }
+        let fetched = try? await URLSession.shared.data(for: request)
+        guard let (data, response) = fetched, let http = response as? HTTPURLResponse else {
+            roomLog.warning("registry: http pull transport error; will retry")
+            return
+        }
+        guard http.statusCode == 200 else {
+            roomLog.warning("registry: http pull http=\(http.statusCode); will retry")
+            return
+        }
+        struct PullBody: Decodable {
+            var seq: UInt64
+            var full: Bool
+            var gcFloor: UInt64?
+            var rows: [RegistryRow]
+            var presence: [String: Int64]?
+        }
+        guard let body = try? JSONDecoder().decode(PullBody.self, from: data) else {
+            roomLog.warning("registry: http pull body unparseable")
+            return
+        }
+        handle(.state(seq: body.seq, full: body.full, gcFloor: body.gcFloor ?? 0,
+                      rows: body.rows, presence: body.presence ?? [:]))
+    }
+
+    /// Flush pending op batches over HTTPS while the socket is down (LWW
+    /// clocks make replays apply zero ops).
+    private func pushPendingOverHTTP() async {
+        struct PushBody: Encodable {
+            var batch: String
+            var ops: [RegistryOp]
+        }
+        struct AckBody: Decodable {
+            var batch: String
+            var seq: UInt64
+            var applied: UInt64?
+        }
+        let batches = doc.takePushable()
+        guard !batches.isEmpty else { return }
+        for pending in batches {
+            guard var request = await config.registryPushRequest(),
+                  let body = try? JSONEncoder().encode(PushBody(batch: pending.batch,
+                                                                ops: pending.ops)) else { break }
+            request.httpBody = body
+            let result = try? await URLSession.shared.data(for: request)
+            let status = (result?.1 as? HTTPURLResponse)?.statusCode
+            guard let (data, _) = result, status == 200,
+                  let ack = try? JSONDecoder().decode(AckBody.self, from: data) else {
+                roomLog.warning("registry: http push failed (http=\(status ?? -1)); will retry")
+                // takePushable marked these in flight; nothing clears that
+                // until the next socket disconnect — un-mark so the next
+                // cycle (HTTP or WS) retries them.
+                doc.markDisconnected()
+                break
+            }
+            handle(.ack(batch: ack.batch, seq: ack.seq, applied: ack.applied ?? 0))
+        }
     }
 
     /// Backgrounding hook: persist immediately.
@@ -76,16 +167,26 @@ final class WorkspaceStore {
     /// Foreground hook: revive the room after a suspension (see
     /// RegistryClient.kick).
     func kickRoom() {
-        guard let client else { return }
-        Task { await client.kick() }
+        if let client {
+            Task { await client.kick() }
+        }
+        restartChangeRequestStreams(resetUnsupported: true)
     }
 
     func stop() {
+        pollTask?.cancel()
+        pollTask = nil
         saver?.flush()
         if let client {
             Task { await client.stop() }
         }
         client = nil
+        stopChangeRequestStreams()
+        let relays = Array(relayClients.values)
+        relayClients.removeAll()
+        for relay in relays {
+            Task { await relay.close() }
+        }
         connected = false
     }
 
@@ -109,8 +210,13 @@ final class WorkspaceStore {
             }
             project()
             saver?.poke()
+            synced = true
         case .connected:
+            let reconnected = !connected
             connected = true
+            if reconnected {
+                restartChangeRequestStreams(resetUnsupported: true)
+            }
         case .rows(let seq, let rows):
             doc.applyRows(seq: seq, rows: rows)
             project()
@@ -138,6 +244,11 @@ final class WorkspaceStore {
         saver?.poke()
         if let client {
             Task { await client.nudge() }
+        }
+        // Socket down: the write still leaves the device promptly over
+        // HTTPS instead of waiting out the reconnect backoff.
+        if !connected {
+            Task { await self.pushPendingOverHTTP() }
         }
     }
 
@@ -211,6 +322,7 @@ final class WorkspaceStore {
                                       updatedAt: f["updatedAt"]?.int64Value ?? 0)
         }
         sessions = rows
+        reconcileChangeRequestStreams()
     }
 
     // MARK: Derived views
@@ -245,6 +357,10 @@ final class WorkspaceStore {
         chatIndicator(chat: chat, live: effectiveStatus(sessions[chat.id], now: nowMs()))
     }
 
+    func changeRequest(for chat: Chat) -> ChangeRequestSummary? {
+        resolvedChangeRequest(for: chat, spaces: spaces, snapshots: changeRequestSnapshots)
+    }
+
     /// Aggregate most-urgent member status for a space's leading dot.
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
         let members = chats(in: spaceId).map { indicator(for: $0) }
@@ -254,12 +370,90 @@ final class WorkspaceStore {
     // MARK: Device relay (folder browsing / direct host RPCs)
 
     @ObservationIgnored private var relayClients: [String: DeviceRelayClient] = [:]
+    @ObservationIgnored private var changeRequestTasks: [ChangeRequestWatchKey: Task<Void, Never>] = [:]
+    @ObservationIgnored private var unsupportedChangeRequestDevices: Set<String> = []
 
     private func relay(for deviceId: String) -> DeviceRelayClient {
         if let existing = relayClients[deviceId] { return existing }
         let client = DeviceRelayClient(deviceId: deviceId, config: config)
         relayClients[deviceId] = client
         return client
+    }
+
+    private func reconcileChangeRequestStreams() {
+        let targets = desiredChangeRequestTargets(
+            chats: chats,
+            spaces: spaces,
+            unsupportedDevices: unsupportedChangeRequestDevices
+        )
+
+        for target in Array(changeRequestTasks.keys) where !targets.contains(target) {
+            changeRequestTasks.removeValue(forKey: target)?.cancel()
+        }
+        changeRequestSnapshots = changeRequestSnapshots.filter { targets.contains($0.key) }
+
+        for target in targets where changeRequestTasks[target] == nil {
+            let client = relay(for: target.deviceId)
+            changeRequestTasks[target] = Task { [weak self] in
+                guard let self else { return }
+                await self.watchChangeRequest(target, through: client)
+            }
+        }
+    }
+
+    private func watchChangeRequest(
+        _ target: ChangeRequestWatchKey,
+        through client: DeviceRelayClient
+    ) async {
+        var retryNanoseconds: UInt64 = 500_000_000
+        while !Task.isCancelled {
+            do {
+                let stream: AsyncThrowingStream<CheckoutChangeRequestStatus, Error> = try await client.stream(
+                    method: "WatchCheckoutChangeRequest",
+                    params: ["cwd": target.cwd]
+                )
+                for try await snapshot in stream {
+                    guard !Task.isCancelled else { return }
+                    // Never expose a misrouted frame under another host/path.
+                    guard snapshot.deviceId == target.deviceId,
+                          snapshot.cwd == target.cwd else { continue }
+                    changeRequestSnapshots[target] = snapshot
+                    retryNanoseconds = 500_000_000
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                if isUnknownChangeRequestMethod(error) {
+                    markChangeRequestsUnsupported(on: target.deviceId)
+                    return
+                }
+            }
+
+            // Preserve the latest successful snapshot through transport gaps.
+            try? await Task.sleep(nanoseconds: retryNanoseconds)
+            retryNanoseconds = min(retryNanoseconds * 2, 5_000_000_000)
+        }
+    }
+
+    private func markChangeRequestsUnsupported(on deviceId: String) {
+        unsupportedChangeRequestDevices.insert(deviceId)
+        for target in Array(changeRequestTasks.keys) where target.deviceId == deviceId {
+            changeRequestTasks.removeValue(forKey: target)?.cancel()
+        }
+        changeRequestSnapshots = changeRequestSnapshots.filter { $0.key.deviceId != deviceId }
+    }
+
+    private func restartChangeRequestStreams(resetUnsupported: Bool) {
+        for task in changeRequestTasks.values { task.cancel() }
+        changeRequestTasks.removeAll()
+        if resetUnsupported { unsupportedChangeRequestDevices.removeAll() }
+        reconcileChangeRequestStreams()
+    }
+
+    private func stopChangeRequestStreams() {
+        for task in changeRequestTasks.values { task.cancel() }
+        changeRequestTasks.removeAll()
+        unsupportedChangeRequestDevices.removeAll()
+        changeRequestSnapshots.removeAll()
     }
 
     /// The last relay failure, for surfacing in UI/diagnostics.

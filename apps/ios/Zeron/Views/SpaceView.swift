@@ -20,12 +20,9 @@ struct SpaceView: View {
                 emptyState
             }
             ForEach(chats) { chat in
-                Button {
+                ChatRow(chat: chat, showLocation: true) {
                     path.append(.chat(chat.id))
-                } label: {
-                    ChatRow(chat: chat, showLocation: true)
                 }
-                .buttonStyle(PressWashButtonStyle())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))

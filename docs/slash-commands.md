@@ -1,6 +1,9 @@
 # Slash commands: per-workspace discovery
 
-Status: IMPLEMENTED on `slash-commands-per-workspace`, not yet merged · 2026-08-16 investigation (project skills missing from the composer popup).
+Status: IMPLEMENTED on `slash-commands-per-workspace`, not yet merged · 2026-08-16 investigation (project skills missing from the composer popup) · merged with `main` on 2026-08-19, after #160 gave the native claude/codex drivers their own per-harness discovery.
+
+Every `file.rs:NNN` reference below is a snapshot of the 2026-08-16 investigation. The
+reasoning holds; the line numbers have moved.
 
 ## Why
 
@@ -130,8 +133,10 @@ async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, Harness
   the new cwd dead for any agent that answers initialize, and would fill every cwd key with
   one identical list.
 - `cwd: None` means `$HOME`. That is today's behavior, kept for callers with no workspace.
-- The trait default still returns an empty list for non-ACP harnesses. `MockHarness` and
-  `AcpHarness` are the only implementors, so the signature change is contained.
+- The trait default still returns an empty list for harnesses whose wire carries no
+  listing. Since #160 the native `claude` and `codex` drivers override it with their own
+  per-harness discovery; they accept the `cwd` and ignore it. Scoping a native probe to a
+  workspace is a feature of its own, not part of this change — see Non-goals.
 
 `discover_models` keeps its own `OnceCell` and its `$HOME` cwd. Models are not treated as
 workspace-scoped in this spec. See Non-goals.
@@ -311,6 +316,11 @@ The tests cover that function, next to the existing pure-function tests at
 
 - **Models.** They keep the `$HOME` probe. `ListCommandsParams` and the cache key are
   shaped so models can join later without another interface change.
+- **Per-workspace discovery for the native drivers.** #160 gave `claude` (an `initialize`
+  control request) and `codex` (`skills/list`) their own probes, each cached per harness.
+  Both now take the `cwd` and ignore it, so the engine cache keys their answer per
+  workspace while the answer itself is still workspace-blind. Teaching those two wires to
+  scope by directory is separate work; the interface is already in place for it.
 - **File watchers on `.claude`.** The TTL plus the live event covers the real workflow.
 - **Cleaning the 666 stale directories.** Separate chore.
 - **Changing how an agent resolves skills.** Symlinked skills work correctly once the cwd

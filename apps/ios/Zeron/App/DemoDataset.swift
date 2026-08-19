@@ -13,6 +13,7 @@ final class DemoDataset {
     var spaces: [Space]
     var chats: [Chat]
     var sessions: [String: SessionRow]
+    var changeRequests: [String: ChangeRequestSummary]
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -20,11 +21,13 @@ final class DemoDataset {
         edgeURL: URL(string: "http://localhost:8787")!, mode: .dev,
         userId: "demo", orgId: "demo", deviceId: "ios-demo", deviceName: "iPhone")
 
-    init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow]) {
+    init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow],
+         changeRequests: [String: ChangeRequestSummary] = [:]) {
         self.devices = devices
         self.spaces = spaces
         self.chats = chats
         self.sessions = sessions
+        self.changeRequests = changeRequests
     }
 
     static func standard() -> DemoDataset {
@@ -86,8 +89,25 @@ final class DemoDataset {
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
         ]
+        let changeRequests = [
+            "chat-veil": ChangeRequestSummary(
+                provider: "github", number: 90, title: "Stream pull request status on every client",
+                url: "https://github.com/zeron-sh/zeron/pull/90", state: .open,
+                baseRef: "main", headRef: "veil-fade"
+            ),
+            "chat-picker": ChangeRequestSummary(
+                provider: "github", number: 84, title: "Synchronize model catalogs",
+                url: "https://github.com/zeron-sh/zeron/pull/84", state: .merged,
+                baseRef: "main", headRef: "main"
+            ),
+            "chat-tabs": ChangeRequestSummary(
+                provider: "github", number: 77, title: "Refine tool group colors",
+                url: "https://github.com/zeron-sh/zeron/pull/77", state: .closed,
+                baseRef: "main", headRef: "main"
+            ),
+        ]
         return DemoDataset(devices: [mac, vps], spaces: [zeron, edge],
-                           chats: chats, sessions: sessions)
+                           chats: chats, sessions: sessions, changeRequests: changeRequests)
     }
 
     // MARK: Fake filesystem (folder browser demo)

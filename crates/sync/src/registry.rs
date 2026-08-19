@@ -146,6 +146,15 @@ pub(crate) trait TextConnector: Send + Sync + 'static {
     fn connect(&self) -> BoxFuture<'static, Result<TextPipe, SyncError>>;
 }
 
+/// Plain-HTTPS pull/push seam — the airplane-wifi transport. `fetch` GETs
+/// `/registry/{org}/rows?since=` (the WS hello's exact delta answer as JSON);
+/// `push` POSTs one op batch to `/registry/{org}/push` and returns the ack
+/// body. Both are safe at-least-once: LWW clocks make replays apply zero ops.
+pub trait RegistryTransport: Send + Sync + 'static {
+    fn fetch(&self, since: u64) -> BoxFuture<'static, Result<String, SyncError>>;
+    fn push(&self, body: String) -> BoxFuture<'static, Result<String, SyncError>>;
+}
+
 struct WsTextConnector {
     url: Arc<dyn UrlProvider>,
 }
@@ -310,7 +319,22 @@ impl RegistryClient {
         tuning: RegistryTuning,
     ) -> Result<Self, SyncError> {
         let connector = Arc::new(WsTextConnector { url: provider });
-        Self::connect_with_tuned(connector, doc, device_id, tuning).await
+        Self::connect_with_transport(connector, doc, device_id, tuning, None).await
+    }
+
+    /// Connect with a plain-HTTPS pull/push seam alongside the socket (the
+    /// airplane-wifi transport): an immediate delta GET bootstraps the doc
+    /// in ~1 RTT while the WS dials, and every backoff cycle syncs over
+    /// HTTPS so a network that never passes the upgrade still converges.
+    pub async fn connect_via_transport(
+        provider: Arc<dyn UrlProvider>,
+        doc: Arc<Mutex<RegistryDoc>>,
+        device_id: &str,
+        tuning: RegistryTuning,
+        transport: Arc<dyn RegistryTransport>,
+    ) -> Result<Self, SyncError> {
+        let connector = Arc::new(WsTextConnector { url: provider });
+        Self::connect_with_transport(connector, doc, device_id, tuning, Some(transport)).await
     }
 
     pub(crate) async fn connect_with_tuned(
@@ -318,6 +342,16 @@ impl RegistryClient {
         doc: Arc<Mutex<RegistryDoc>>,
         device_id: &str,
         tuning: RegistryTuning,
+    ) -> Result<Self, SyncError> {
+        Self::connect_with_transport(connector, doc, device_id, tuning, None).await
+    }
+
+    pub(crate) async fn connect_with_transport(
+        connector: Arc<dyn TextConnector>,
+        doc: Arc<Mutex<RegistryDoc>>,
+        device_id: &str,
+        tuning: RegistryTuning,
+        transport: Option<Arc<dyn RegistryTransport>>,
     ) -> Result<Self, SyncError> {
         let (events, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -342,6 +376,8 @@ impl RegistryClient {
             presence_rx,
             presence: presence.clone(),
             stats: stats.clone(),
+            transport,
+            sync_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let task = tokio::spawn(actor.run(ready_tx));
 
@@ -444,6 +480,10 @@ struct Actor {
     presence_rx: mpsc::Receiver<i64>,
     presence: Arc<Mutex<HashMap<String, (i64, tokio::time::Instant)>>>,
     stats: Arc<Stats>,
+    /// Plain-HTTPS pull/push (None = socket-only: tests, dev bearers).
+    transport: Option<Arc<dyn RegistryTransport>>,
+    /// One offline sync in flight at a time.
+    sync_busy: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum SessionEnd {
@@ -465,6 +505,18 @@ impl Actor {
     async fn run(mut self, ready: oneshot::Sender<Result<(), SyncError>>) {
         let mut ready = Some(ready);
         let mut backoff = BACKOFF_BASE;
+        // Pull-first bootstrap: with an HTTPS transport, the doc syncs in
+        // ~1 round trip while the socket spends its 4+ on TLS + upgrade +
+        // hello — and construction resolves immediately (local-first: the
+        // doc is usable now; keeping it converged is this actor's job, over
+        // whichever transport the network permits). Socket-only clients
+        // keep the original contract: ready resolves on the first join.
+        if self.transport.is_some() {
+            if let Some(ready) = ready.take() {
+                let _ = ready.send(Ok(()));
+            }
+            self.spawn_offline_sync();
+        }
         // Suspend/resume and sibling-dial successes are EVENTS that end a
         // backoff wait immediately (see room.rs) — without them a recovered
         // network still waited out the full accumulated delay.
@@ -483,6 +535,7 @@ impl Actor {
                         return; // first join failed: caller owns the retry
                     }
                     tracing::warn!(error = %err, "registry dial failed; backing off");
+                    self.spawn_offline_sync();
                     match self.wait_backoff(&mut wake, &mut online, backoff).await {
                         Waited::Shutdown => return,
                         Waited::Woke => backoff = BACKOFF_BASE,
@@ -496,6 +549,7 @@ impl Actor {
                         return;
                     }
                     tracing::warn!("registry dial timed out; backing off");
+                    self.spawn_offline_sync();
                     match self.wait_backoff(&mut wake, &mut online, backoff).await {
                         Waited::Shutdown => return,
                         Waited::Woke => backoff = BACKOFF_BASE,
@@ -531,6 +585,11 @@ impl Actor {
                     if joined {
                         backoff = BACKOFF_BASE;
                     }
+                    // Socket down: sync over HTTPS while we wait — pending
+                    // pushes flush and the doc stays fresh at backoff cadence
+                    // (≤30s), so a WS-hostile network degrades to polling
+                    // instead of silence.
+                    self.spawn_offline_sync();
                     match self.wait_backoff(&mut wake, &mut online, backoff).await {
                         Waited::Shutdown => return,
                         Waited::Woke => backoff = BACKOFF_BASE,
@@ -728,6 +787,91 @@ impl Actor {
             *probe_deadline = Some(tokio::time::Instant::now() + PROBE_DEADLINE);
         }
         true
+    }
+
+    /// One HTTPS sync cycle off the actor's critical path: flush pending op
+    /// batches (POST — LWW replays are no-ops), then pull the delta (GET) and
+    /// apply it exactly as a state frame. Single-flight; failures are logged
+    /// and retried on the next backoff cycle.
+    fn spawn_offline_sync(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(transport) = self.transport.clone() else {
+            return;
+        };
+        if self.sync_busy.swap(true, Relaxed) {
+            return;
+        }
+        let doc = self.doc.clone();
+        let events = self.events.clone();
+        let presence = self.presence.clone();
+        let stats = self.stats.clone();
+        let busy = self.sync_busy.clone();
+        tokio::spawn(async move {
+            let batches: Vec<PendingBatch> = lock(&doc).take_pushable();
+            let mut push_failed = false;
+            for batch in &batches {
+                let body = serde_json::json!({ "batch": batch.batch, "ops": batch.ops }).to_string();
+                match transport.push(body).await {
+                    Ok(ack) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack) {
+                            if let (Some(b), Some(seq)) = (v["batch"].as_str(), v["seq"].as_u64()) {
+                                lock(&doc).ack_batch(b, seq);
+                                stats.last_ack_ms.store(epoch_ms(), Relaxed);
+                                let _ = events.send(RegistryEvent::Applied);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "registry: http push failed; will retry");
+                        push_failed = true;
+                        break;
+                    }
+                }
+            }
+            if push_failed {
+                // take_pushable marked them in flight; nothing will clear
+                // that until the next socket disconnect — un-mark so the
+                // next cycle (HTTP or WS) retries them.
+                lock(&doc).mark_disconnected();
+            }
+            let since = lock(&doc).cursor();
+            match transport.fetch(since).await {
+                Ok(body) => {
+                    #[derive(serde::Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct PullBody {
+                        seq: u64,
+                        full: bool,
+                        gc_floor: u64,
+                        rows: Vec<RegistryRow>,
+                        #[serde(default)]
+                        presence: HashMap<String, i64>,
+                    }
+                    match serde_json::from_str::<PullBody>(&body) {
+                        Ok(pull) => {
+                            let mut d = lock(&doc);
+                            d.apply_state(pull.seq, pull.full, pull.gc_floor, pull.rows);
+                            drop(d);
+                            let now = tokio::time::Instant::now();
+                            let mut map = lock(&presence);
+                            for (device, at) in pull.presence {
+                                map.insert(device, (at, now));
+                            }
+                            drop(map);
+                            stats.last_pushed_ms.store(epoch_ms(), Relaxed);
+                            let _ = events.send(RegistryEvent::Applied);
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "registry: http pull body unparseable");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "registry: http pull failed; will retry");
+                }
+            }
+            busy.store(false, Relaxed);
+        });
     }
 
     async fn push_pending(&self, pipe: &mut TextPipe) -> bool {

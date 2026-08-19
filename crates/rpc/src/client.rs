@@ -19,6 +19,10 @@ const STREAM_QUEUE_CAP: usize = 256;
 enum Pending {
     Call(oneshot::Sender<Result<serde_json::Value, RpcError>>),
     Stream(mpsc::Sender<serde_json::Value>),
+    CheckedStream {
+        items: mpsc::Sender<serde_json::Value>,
+        ready: Option<oneshot::Sender<Result<(), RpcError>>>,
+    },
 }
 
 struct Shared {
@@ -38,6 +42,47 @@ pub struct RpcClient {
     shared: Arc<Shared>,
     next_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
+}
+
+/// Checked stream receiver whose drop immediately cancels the server task.
+pub struct RpcSubscription {
+    id: u64,
+    items: mpsc::Receiver<serde_json::Value>,
+    out: mpsc::Sender<String>,
+    shared: Arc<Shared>,
+}
+
+impl RpcSubscription {
+    pub async fn recv(&mut self) -> Option<serde_json::Value> {
+        self.items.recv().await
+    }
+}
+
+impl Drop for RpcSubscription {
+    fn drop(&mut self) {
+        if self.shared.lock().remove(&self.id).is_none() {
+            return;
+        }
+        let Ok(frame) = serde_json::to_string(&ClientFrame {
+            id: self.id,
+            method: None,
+            params: serde_json::Value::Null,
+            cancel: true,
+        }) else {
+            return;
+        };
+        match self.out.try_send(frame) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                let out = self.out.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = out.send(frame).await;
+                    });
+                }
+            }
+        }
+    }
 }
 
 impl RpcClient {
@@ -71,10 +116,18 @@ impl RpcClient {
                 pending.drain().map(|(_, p)| p).collect()
             };
             for entry in drained {
-                if let Pending::Call(tx) = entry {
-                    let _ = tx.send(Err(RpcError::Closed));
+                match entry {
+                    Pending::Call(tx) => {
+                        let _ = tx.send(Err(RpcError::Closed));
+                    }
+                    Pending::CheckedStream {
+                        ready: Some(ready), ..
+                    } => {
+                        let _ = ready.send(Err(RpcError::Closed));
+                    }
+                    Pending::Stream(_) | Pending::CheckedStream { ready: None, .. } => {}
                 }
-                // Streams end by sender drop.
+                // Stream item receivers end by sender drop.
             }
         });
         Self {
@@ -141,6 +194,45 @@ impl RpcClient {
         Ok(rx)
     }
 
+    /// Streaming request with a server acknowledgement before returning.
+    ///
+    /// Use this for optional/versioned stream methods: an older server's
+    /// `unknown method` is returned distinctly instead of looking like an empty stream.
+    pub async fn subscribe_checked(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<RpcSubscription, RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (items_tx, items_rx) = mpsc::channel(STREAM_QUEUE_CAP);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        self.shared.lock().insert(
+            id,
+            Pending::CheckedStream {
+                items: items_tx,
+                ready: Some(ready_tx),
+            },
+        );
+        self.send(ClientFrame {
+            id,
+            method: Some(method.into()),
+            params,
+            cancel: false,
+        })
+        .await
+        .inspect_err(|_| {
+            self.shared.lock().remove(&id);
+        })?;
+        let subscription = RpcSubscription {
+            id,
+            items: items_rx,
+            out: self.out.clone(),
+            shared: self.shared.clone(),
+        };
+        ready_rx.await.map_err(|_| RpcError::Closed)??;
+        Ok(subscription)
+    }
+
     async fn send(&self, frame: ClientFrame) -> Result<(), RpcError> {
         let json = serde_json::to_string(&frame)
             .map_err(|e| RpcError::Transport(format!("serialize frame: {e}")))?;
@@ -157,28 +249,49 @@ impl Drop for RpcClient {
 async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: ServerFrame) {
     let id = frame.id;
     if let Some(err) = frame.err {
+        let error = wire_error(err);
         match shared.lock().remove(&id) {
             Some(Pending::Call(tx)) => {
-                let _ = tx.send(Err(RpcError::Failed(err)));
+                let _ = tx.send(Err(error));
             }
-            Some(Pending::Stream(_)) | None => {
+            Some(Pending::CheckedStream {
+                ready: Some(ready), ..
+            }) => {
+                let _ = ready.send(Err(error));
+            }
+            Some(Pending::Stream(_)) | Some(Pending::CheckedStream { ready: None, .. }) | None => {
                 // Stream errored: the sender drop closes the receiver.
-                tracing::debug!(id, %err, "rpc: stream ended with error");
+                tracing::debug!(id, %error, "rpc: stream ended with error");
             }
         }
         return;
     }
     if let Some(value) = frame.ok {
-        if let Some(Pending::Call(tx)) = shared.lock().remove(&id) {
-            let _ = tx.send(Ok(value));
+        let mut pending = shared.lock();
+        if matches!(pending.get(&id), Some(Pending::Call(_))) {
+            if let Some(Pending::Call(tx)) = pending.remove(&id) {
+                let _ = tx.send(Ok(value));
+            }
+        } else if let Some(Pending::CheckedStream { ready, .. }) = pending.get_mut(&id)
+            && let Some(ready) = ready.take()
+        {
+            let _ = ready.send(Ok(()));
         }
         return;
     }
     if let Some(item) = frame.item {
+        let ready = match shared.lock().get_mut(&id) {
+            Some(Pending::CheckedStream { ready, .. }) => ready.take(),
+            _ => None,
+        };
+        if let Some(ready) = ready {
+            let _ = ready.send(Ok(()));
+        }
         // Clone the sender out of the lock: the bounded send must await
         // (backpressure) without holding `shared`.
         let tx = match shared.lock().get(&id) {
             Some(Pending::Stream(tx)) => Some(tx.clone()),
+            Some(Pending::CheckedStream { items, .. }) => Some(items.clone()),
             _ => None,
         };
         let dead = match tx {
@@ -199,9 +312,20 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
         }
         return;
     }
-    if frame.done {
-        shared.lock().remove(&id);
+    if frame.done
+        && let Some(Pending::CheckedStream {
+            ready: Some(ready), ..
+        }) = shared.lock().remove(&id)
+    {
+        let _ = ready.send(Ok(()));
     }
+}
+
+fn wire_error(error: String) -> RpcError {
+    error
+        .strip_prefix("unknown method: ")
+        .map(|method| RpcError::UnknownMethod(method.to_owned()))
+        .unwrap_or(RpcError::Failed(error))
 }
 
 /// How long a dial may take before we give up.

@@ -112,8 +112,20 @@ actor RegistryClient {
     func kick() async {
         guard !closed else { return }
         backoffMs = RegistryClient.backoffBaseMs
-        if socket == nil || !joined {
+        if socket == nil {
             connect()
+            return
+        }
+        if !joined {
+            // A dial/handshake is already in flight on this socket — its own
+            // hello deadline polices it. Redialing here killed the launch
+            // dial mid-TLS every cold open (foregrounded() fires on scene
+            // activation), rerunning the handshake on the busiest link and
+            // doubling the spinner (NLC Edge, 2026-08-17). Only a zombie
+            // socket with NO handshake pending is redialed.
+            if helloSentAt == nil {
+                connect()
+            }
             return
         }
         guard probeSentAt == nil, helloSentAt == nil else { return }  // already policed

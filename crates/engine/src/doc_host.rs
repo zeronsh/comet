@@ -172,6 +172,8 @@ struct DocHostInner {
     /// graph only drops once this back-edge is severed.
     sessions: Mutex<Option<SessionsEngine>>,
     workspace: OnceLock<WorkspaceHost>,
+    /// Worktree materialization for Run commands (see `set_repos`).
+    repos: OnceLock<crate::repos::Repos>,
     /// Cancels every worker spawned through `spawn_worker` — the loops'
     /// own exit conditions (weak handle death, closed channels) don't cover
     /// runtime replacement, where Edge-capable tasks must stop doing
@@ -387,6 +389,7 @@ impl DocHost {
                 config,
                 sessions: Mutex::new(None),
                 workspace: OnceLock::new(),
+                repos: OnceLock::new(),
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
@@ -480,6 +483,12 @@ impl DocHost {
     pub fn retirement_probe(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
         let weak = Arc::downgrade(&self.inner);
         Box::new(move || weak.upgrade().is_none())
+    }
+
+    /// Wire the repos engine (engine assembly) — worktree materialization for
+    /// Run commands carrying a [`zeron_proto::WorktreeSpec`].
+    pub fn set_repos(&self, repos: crate::repos::Repos) {
+        let _ = self.inner.repos.set(repos);
     }
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
@@ -957,19 +966,39 @@ impl DocHost {
             ));
             let url = edge.room_url(format!("/chat2/{chat}/ws"));
             let mut wake = zeron_sync::wake::subscribe();
+            // Sibling-dial successes end a backoff wait immediately, exactly
+            // like the joined clients' own reconnect loops (chat_client.rs).
+            // Without this, a NEW chat whose first joins hit a network blip
+            // waited out the full accumulated backoff (→30s) while every
+            // established room redialed instantly on recovery — fresh sends
+            // to new sessions stalled while other chats hummed (2026-08-19
+            // user report, reproduced on two networks).
+            let mut online = zeron_sync::wake::subscribe_online();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
                 if weak.upgrade().is_none() {
                     return; // evicted or purged while dialing
                 }
+                // Dual transport: WS dial + a plain-HTTPS pull/push seam
+                // (rows GET / POST on the same bearer auth as the checkpoint
+                // fetch) — bootstraps in ~1 RTT and keeps syncing at backoff
+                // cadence on networks that never pass the WS upgrade. With
+                // the transport, connect resolves immediately (local-first).
+                let transport = Arc::new(crate::chat2_host::EdgeChatTransport::new(
+                    host.inner.http.clone(),
+                    edge.clone(),
+                    chat.clone(),
+                    device.clone(),
+                ));
                 let dial = tokio::time::timeout(
                     std::time::Duration::from_secs(60),
-                    zeron_sync::ChatClient::connect_via(
+                    zeron_sync::ChatClient::connect_via_transport(
                         url.clone(),
                         sink.clone(),
                         fetcher.clone(),
                         &device,
                         cursor,
+                        transport,
                     ),
                 )
                 .await;
@@ -1012,11 +1041,26 @@ impl DocHost {
                             let host = host.clone();
                             let weak = weak.clone();
                             host.clone().spawn_worker(async move {
-                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                // With the pull-first transport the client
+                                // constructs before any state answer — wait
+                                // until the server's view is KNOWN (bounded)
+                                // or the all-zero placeholder stats would
+                                // misread as "no checkpoint" and upload a
+                                // spurious full-doc heal on a thin link.
+                                for _ in 0..40u32 {
+                                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                    let Some(handle) = weak.upgrade() else { return };
+                                    let known = lock(&handle.chat2)
+                                        .as_ref()
+                                        .is_some_and(|c| c.stats().server_known);
+                                    if known {
+                                        break;
+                                    }
+                                }
                                 let Some(handle) = weak.upgrade() else { return };
                                 let no_checkpoint = lock(&handle.chat2)
                                     .as_ref()
-                                    .is_some_and(|c| c.stats().checkpoint_size == 0);
+                                    .is_some_and(|c| c.stats().server_known && c.stats().checkpoint_size == 0);
                                 let has_content = handle
                                     .doc
                                     .read_entries()
@@ -1093,11 +1137,18 @@ impl DocHost {
                             "chat2 join timed out; retrying");
                     }
                 }
+                // Drain stale online events first: only successes DURING this
+                // wait count, or our own last dial would cut every wait to
+                // zero (same discipline as chat_client's wait_backoff).
+                while online.try_recv().is_ok() {}
                 tokio::select! {
                     _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
                         backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
                     }
                     _ = wake.recv() => {
+                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                    }
+                    _ = online.recv() => {
                         backoff = crate::workspace_host::JOIN_RETRY_BASE;
                     }
                     _ = crate::workspace_host::token_changed(&mut token_changes) => {
@@ -2019,12 +2070,40 @@ impl DocHost {
                 request,
                 message_id,
             } => {
+                let mut request = request.clone();
+                // Worktree directive (WorktreeSpec): materialize on THIS host at
+                // drain time — the durable command plane replaces the sender's
+                // old blocking CreateWorktree relay RPC, whose lost reply wedged
+                // the composer on "Sending…" while the run proceeded anyway.
+                // `take()` resolves the request before dispatch, so the journal
+                // and steer→new-turn fallbacks reuse the created path instead of
+                // minting another checkout.
+                let fresh_worktree = match request.worktree.take() {
+                    Some(spec) => {
+                        let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
+                        request.cwd = cwd;
+                        fresh
+                    }
+                    None => None,
+                };
                 // Claim-on-first-command: a run for a chat with no workspace row
                 // creates the row under our device id (we are about to host it).
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
+                    // A pre-existing row (the client's createChat raced ahead)
+                    // still carries the repo folder — repoint it at the fresh
+                    // worktree, and stamp the actual `zeron/<name>` branch so
+                    // the footer and the title-rename flow see it.
+                    if let Some(wt) = &fresh_worktree {
+                        if let Err(err) = ws.set_chat_cwd(chat_id, &wt.path) {
+                            tracing::warn!(chat = %chat_id, error = %err, "worktree cwd stamp failed");
+                        }
+                        if let Err(err) = ws.set_chat_branch(chat_id, &wt.branch) {
+                            tracing::warn!(chat = %chat_id, error = %err, "worktree branch stamp failed");
+                        }
+                    }
                 }
-                let harness = self.harness_for_request(chat_id, request);
+                let harness = self.harness_for_request(chat_id, &request);
                 // A row with no config renders no harness glyph (and every
                 // later dispatch falls back to the engine default), so stamp
                 // what this run actually executes with. Claimed rows and
@@ -2045,7 +2124,7 @@ impl DocHost {
                     }
                 }
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
+                    .dispatch(chat_id, harness, request, Some(message_id.clone()))
                     .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
@@ -2159,6 +2238,43 @@ impl DocHost {
         }
     }
 
+    /// Create (or reuse) the isolated worktree a Run's [`zeron_proto::WorktreeSpec`]
+    /// asks for, returning the resolved cwd plus the fresh worktree when one was
+    /// actually created. Reuse guard: a chat whose row already points inside a
+    /// linked worktree of the same repo keeps it — a duplicate Run (client retry
+    /// after a lost ack, ledger reset) must not mint a second checkout.
+    async fn materialize_worktree(
+        &self,
+        chat_id: &str,
+        spec: &zeron_proto::WorktreeSpec,
+    ) -> Result<(String, Option<zeron_proto::Worktree>), EngineError> {
+        if let Some(ws) = self.workspace()
+            && let Ok(Some(chat)) = ws.chat(chat_id)
+            && let Some(cwd) = chat.cwd
+            && cwd != spec.repo_path
+            && crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)).as_deref()
+                == Some(spec.repo_path.as_str())
+        {
+            tracing::info!(chat = %chat_id, cwd = %cwd, "worktree spec: reusing the chat's existing worktree");
+            return Ok((cwd, None));
+        }
+        let repos = self
+            .inner
+            .repos
+            .get()
+            .ok_or_else(|| EngineError::Other("repos engine not wired".into()))?;
+        let worktree = repos
+            .create_worktree(std::path::Path::new(&spec.repo_path), &spec.base)
+            .await?;
+        tracing::info!(
+            chat = %chat_id,
+            path = %worktree.path,
+            branch = %worktree.branch,
+            "worktree materialized for run"
+        );
+        Ok((worktree.path.clone(), Some(worktree)))
+    }
+
     /// A steer-turned-run with no in-process `last_request` (engine restarted
     /// since the last turn): rebuild the run config from the chat's workspace
     /// row — cwd from the row, model/reasoning/options/sandbox from its config
@@ -2195,6 +2311,7 @@ impl DocHost {
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,
+            worktree: None,
         })
     }
 

@@ -60,6 +60,9 @@ async fn a_running_session_fills_the_command_cache() {
         auto_approve: true,
         attachments: Vec::new(),
         resume: None,
+        // Upstream's worktree-send durability work (#159) added this field.
+        // This test is about the command cache, so it runs in the cwd itself.
+        worktree: None,
     };
     core.sessions
         .dispatch(CHAT, HarnessId::Mock, request, None)

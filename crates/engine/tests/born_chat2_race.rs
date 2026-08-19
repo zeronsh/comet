@@ -161,6 +161,7 @@ async fn transcript_survives_open_racing_create_chat() {
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: true,
                         attachments: Vec::new(),
+                        worktree: None,
                         resume: None,
                     },
                     message_id: "msg-race-1".into(),

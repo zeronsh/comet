@@ -110,6 +110,15 @@ pub enum MessageStatus {
     Aborted,
 }
 
+/// Lifecycle of a spawned subagent, carried on its spawn chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -150,6 +159,22 @@ pub enum MessagePart {
         /// Per-file diff stats (additive replacement for inline `diff`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_stats: Option<Vec<ToolDiffStat>>,
+        /// The SUBAGENT doc id this spawn chip indexes (additive; stamped by
+        /// the engine like the sidecar refs — the fold is chat-agnostic).
+        /// The chip IS the index: the client learns the doc/blob id from it,
+        /// there is no listing endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_ref: Option<String>,
+        /// Subagent lifecycle, DISTINCT from `resolved`: under the eager-done
+        /// policy the spawn tool's own result lands while the subagent still
+        /// runs. `running` → the ref is a live doc (watch it); `done`/
+        /// `failed` → frozen (blob first, doc as fallback).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_status: Option<SubagentStatus>,
+        /// One-line live tail of the subagent's latest output, folded from
+        /// its tagged text deltas (capped; display-only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_tail: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -254,6 +279,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     output_bytes: None,
                     diff_ref: None,
                     diff_stats: None,
+                    subagent_ref: None,
+                    subagent_status: None,
+                    subagent_tail: None,
                 });
             }
         }
@@ -336,13 +364,59 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
+        // Subagent-attributed CONTENT belongs to the subagent's own doc (the
+        // engine routes it there); the parent doc keeps only the spawn chip —
+        // which these events refresh in place: LIFECYCLE ONLY. A live tail
+        // was tried and rejected: rewriting the chip per delta batch grew
+        // the parent doc's oplog for the whole subagent run and rendered as
+        // distracting mid-stream fragments (user call, 2026-08-18). The
+        // `subagent_tail` field stays in the schema for docs that carry it.
+        AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } => {
+            let status = match event.as_ref() {
+                AgentEvent::Done { status, .. } => Some(match status {
+                    zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
+                    _ => SubagentStatus::Done,
+                }),
+                _ => None,
+            };
+            for p in out.iter_mut() {
+                if let MessagePart::Tool {
+                    id,
+                    subagent_status,
+                    ..
+                } = p
+                    && id == parent_tool_use_id
+                {
+                    match status {
+                        Some(s) => *subagent_status = Some(s),
+                        // Any tagged traffic proves the subagent is live;
+                        // never regress a terminal state.
+                        None if !matches!(
+                            subagent_status,
+                            Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
+                        ) =>
+                        {
+                            *subagent_status = Some(SubagentStatus::Running);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
         // AvailableCommands feeds the engine's per-workspace command cache
-        // (`engine::commands`), not the transcript.
+        // (`engine::commands`), not the transcript. UserMessage becomes its own
+        // doc ENTRY (the engine's subagent sink writes it), never a part of the
+        // assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::AvailableCommands { .. } => {}
+        | AgentEvent::AvailableCommands { .. }
+        | AgentEvent::UserMessage { .. } => {}
     }
 }
+
 
 /// Stamp sidecar keys onto resolved tool parts that have sidecar content.
 ///
@@ -630,6 +704,9 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             },
         ];
         let chunks = split_parts(&parts);
@@ -813,6 +890,74 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn subagent_events_refresh_the_spawn_chip_in_place() {
+        use zeron_proto::DoneStatus;
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "toolu_sub".into(),
+                call: ToolCall::Unknown {
+                    name: "Agent".into(),
+                    input: None,
+                },
+            },
+        );
+        // Tagged traffic marks the chip running — and ONLY that: the tail
+        // stays untouched (per-delta chip rewrites polluted the parent doc).
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "scanning\nfound 3 issues".into(),
+                }),
+            },
+        );
+        match &parts[0] {
+            MessagePart::Tool {
+                subagent_status,
+                subagent_tail,
+                ..
+            } => {
+                assert_eq!(*subagent_status, Some(SubagentStatus::Running));
+                assert_eq!(*subagent_tail, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A tagged Done is terminal; later traffic must not regress it.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "late flush".into(),
+                }),
+            },
+        );
+        match &parts[0] {
+            MessagePart::Tool {
+                subagent_status, ..
+            } => assert_eq!(*subagent_status, Some(SubagentStatus::Done)),
+            other => panic!("{other:?}"),
+        }
+        // Content never leaked into the parent parts.
+        assert_eq!(parts.len(), 1);
     }
 
     #[test]

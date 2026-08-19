@@ -18,7 +18,10 @@ use zeron_engine::{
     worktree_branch_from_title,
 };
 use zeron_harness::mock::MockHarness;
-use zeron_proto::{AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, SandboxLevel};
+use zeron_proto::{
+    AgentAccountsSnapshot, AgentEvent, AgentLoginMode, AgentLoginStatus, DoneStatus, HarnessId,
+    SandboxLevel,
+};
 use zeron_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +35,7 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         claude_config_dir: root.join("claude"),
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
+        cursor_sdk_auth_file: root.join("cursor-sdk").join("auth.json"),
     };
     (AgentAccounts::new(config.clone()), config)
 }
@@ -568,6 +572,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
     core.sessions
@@ -612,6 +617,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
     core.sessions
@@ -827,4 +833,155 @@ async fn rpc_dispatch_for_m5c_methods() {
             .is_err()
     );
     core.shutdown().await;
+}
+
+fn write_cursor_login(config: &AgentAccountsConfig, email: &str, expires_in_ms: i64) {
+    let file = &config.cursor_sdk_auth_file;
+    std::fs::create_dir_all(file.parent().unwrap()).expect("cursor sdk dir");
+    std::fs::write(
+        file,
+        serde_json::json!({
+            "version": 1,
+            "backendUrl": "https://api2.cursor.sh",
+            "apiKey": format!("key-{email}"),
+            "apiKeyExpiresAtMs": now_ms_test() + expires_in_ms,
+            "email": email,
+            "createdAtMs": now_ms_test(),
+        })
+        .to_string(),
+    )
+    .expect("cursor auth");
+}
+
+fn now_ms_test() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn cursor_slot_swap_round_trip() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (accounts, config) = test_accounts(dir.path());
+
+    // Live SDK login = Erin; listing detects + auto-snapshots her slot.
+    write_cursor_login(&config, "erin@example.com", 86_400_000);
+    let snapshot = accounts.list(false).await.expect("list");
+    assert_eq!(
+        account_emails(&snapshot, HarnessId::Cursor),
+        vec![("erin@example.com".to_string(), true)]
+    );
+    assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+    let erin_id = snapshot.accounts[snapshot
+        .accounts
+        .iter()
+        .position(|a| a.harness == HarnessId::Cursor)
+        .unwrap()]
+    .id
+    .clone();
+
+    // A second login (Frank) becomes live; both slots exist, Frank active.
+    write_cursor_login(&config, "frank@example.com", 86_400_000);
+    let snapshot = accounts.list(false).await.expect("list");
+    assert_eq!(
+        account_emails(&snapshot, HarnessId::Cursor),
+        vec![
+            ("erin@example.com".to_string(), false),
+            ("frank@example.com".to_string(), true),
+        ]
+    );
+
+    // Swap back to Erin: the SDK store file is rewritten from her slot.
+    let snapshot = accounts
+        .activate(HarnessId::Cursor, &erin_id)
+        .await
+        .expect("activate");
+    assert_eq!(
+        account_emails(&snapshot, HarnessId::Cursor),
+        vec![
+            ("erin@example.com".to_string(), true),
+            ("frank@example.com".to_string(), false),
+        ]
+    );
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config.cursor_sdk_auth_file).unwrap())
+            .unwrap();
+    assert_eq!(live["email"], "erin@example.com");
+
+    // An expired live key detects (card + slot survive) but warns.
+    write_cursor_login(&config, "erin@example.com", -1000);
+    let snapshot = accounts.list(false).await.expect("list");
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.harness == HarnessId::Cursor && w.message.contains("expired")),
+        "{:?}",
+        snapshot.warnings
+    );
+}
+
+#[tokio::test]
+async fn cursor_login_flow_spawns_shim_and_auto_activates() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (accounts, config) = test_accounts(dir.path());
+
+    // Fake shim: in login mode, emit the auth-url frame, write the minted
+    // store file where the engine pointed us, exit 0. Mirrors the real shim's
+    // `node <shim> login <store-path>` argv contract.
+    let shim = dir.path().join("fake-cursor-shim.sh");
+    std::fs::write(
+        &shim,
+        r#"#!/bin/sh
+[ "$1" = "login" ] || exit 1
+printf '%s\n' '{"ev":"auth-url","url":"https://cursor.com/loginDeepControl?challenge=fake"}'
+cat > "$2" <<JSON
+{"version":1,"backendUrl":"https://api2.cursor.sh","apiKey":"key-minted","apiKeyExpiresAtMs":99999999999999,"email":"grace@example.com","createdAtMs":1}
+JSON
+printf '%s\n' '{"ev":"logged-in","email":"grace@example.com"}'
+exit 0
+"#,
+    )
+    .expect("fake shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    unsafe { std::env::set_var("CURSOR_SDK_SHIM_EXECUTABLE", &shim) };
+
+    let start = accounts
+        .start_login(HarnessId::Cursor)
+        .await
+        .expect("start");
+    assert_eq!(start.mode, AgentLoginMode::Browser);
+    assert_eq!(
+        start.url,
+        "https://cursor.com/loginDeepControl?challenge=fake"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let poll = accounts.poll_login(&start.login_id).await.expect("poll");
+        match poll.status {
+            AgentLoginStatus::Done => break,
+            AgentLoginStatus::Pending => {}
+            AgentLoginStatus::Error => panic!("login errored: {:?}", poll.message),
+        }
+        assert!(tokio::time::Instant::now() < deadline, "login never landed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // First connect on a device with no live login: the minted key was
+    // auto-activated, so runs work immediately.
+    let live: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config.cursor_sdk_auth_file).unwrap())
+            .unwrap();
+    assert_eq!(live["email"], "grace@example.com");
+    let snapshot = accounts.list(false).await.expect("list");
+    assert_eq!(
+        account_emails(&snapshot, HarnessId::Cursor),
+        vec![("grace@example.com".to_string(), true)]
+    );
 }

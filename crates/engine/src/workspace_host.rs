@@ -333,14 +333,25 @@ impl WorkspaceHost {
                 let tuning = RegistryTuning {
                     probe_quiet: REGISTRY_PROBE_QUIET,
                 };
-                match RegistryClient::connect_via_tuned(
-                    url.clone(),
-                    reg.clone(),
-                    &device_id,
-                    tuning,
-                )
-                .await
-                {
+                // Production path (token present): dual transport — the WS
+                // dials as before, and a plain-HTTPS pull/push seam derived
+                // from the same URL provider bootstraps the doc in ~1 RTT
+                // and keeps syncing at backoff cadence when the socket can't
+                // connect (airplane-wifi networks strip WS upgrades).
+                let result = if token.is_some() {
+                    RegistryClient::connect_via_transport(
+                        url.clone(),
+                        reg.clone(),
+                        &device_id,
+                        tuning,
+                        Arc::new(WsDerivedRegistryTransport::new(url.clone())),
+                    )
+                    .await
+                } else {
+                    RegistryClient::connect_via_tuned(url.clone(), reg.clone(), &device_id, tuning)
+                        .await
+                };
+                match result {
                     Ok(client) => {
                         let client = Arc::new(client);
                         client.set_presence(now_ms());
@@ -1096,7 +1107,7 @@ impl WorkspaceHostInner {
 /// checkout (`.git` is a directory), a non-repo folder, or any other layout
 /// (bare-repo worktrees have no `<root>` working copy to attribute to). Pure
 /// fs reads — no git subprocess; this runs on the synchronous claim path.
-fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
+pub(crate) fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
     let gitfile = path.join(".git");
     if !std::fs::metadata(&gitfile).ok()?.is_file() {
         return None;
@@ -1267,6 +1278,103 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
         })
         .unwrap_or(detected_name)
         .to_string()
+}
+
+/// Plain-HTTPS registry pull/push derived from the SAME WebSocket URL
+/// provider the dial uses (`wss://…/registry/{org}/ws?token=…&device=…`):
+/// swap the scheme, swap the `/ws` leaf for `/rows` or `/push`, keep the
+/// fresh token+device the provider already mints per attempt. No second
+/// auth path to maintain, and the `?beat=1` keeps presence alive for a
+/// device that can only reach the edge over HTTPS.
+struct WsDerivedRegistryTransport {
+    url: Arc<dyn zeron_sync::UrlProvider>,
+    client: reqwest::Client,
+}
+
+impl WsDerivedRegistryTransport {
+    fn new(url: Arc<dyn zeron_sync::UrlProvider>) -> Self {
+        Self {
+            url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    async fn leaf_url(
+        provider: &Arc<dyn zeron_sync::UrlProvider>,
+        leaf: &str,
+    ) -> Result<reqwest::Url, zeron_sync::SyncError> {
+        let ws = provider.url().await?;
+        let mut u = reqwest::Url::parse(&ws)
+            .map_err(|e| zeron_sync::SyncError::Protocol(format!("bad ws url: {e}")))?;
+        let scheme = if u.scheme() == "wss" { "https" } else { "http" };
+        let _ = u.set_scheme(scheme);
+        let path = u.path().to_string();
+        let Some(base) = path.strip_suffix("/ws") else {
+            return Err(zeron_sync::SyncError::Protocol(
+                "ws url without /ws leaf".into(),
+            ));
+        };
+        let new_path = format!("{base}/{leaf}");
+        u.set_path(&new_path);
+        Ok(u)
+    }
+}
+
+impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
+    fn fetch(
+        &self,
+        since: u64,
+    ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+        let provider = self.url.clone();
+        let client = self.client.clone();
+        Box::pin(async move {
+            let mut u = Self::leaf_url(&provider, "rows").await?;
+            u.query_pairs_mut()
+                .append_pair("since", &since.to_string())
+                .append_pair("beat", "1");
+            let resp = client
+                .get(u)
+                .send()
+                .await
+                .map_err(|e| zeron_sync::SyncError::WebSocket(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(zeron_sync::SyncError::Protocol(format!(
+                    "registry pull http {}",
+                    resp.status()
+                )));
+            }
+            resp.text()
+                .await
+                .map_err(|e| zeron_sync::SyncError::WebSocket(e.to_string()))
+        })
+    }
+
+    fn push(
+        &self,
+        body: String,
+    ) -> futures::future::BoxFuture<'static, Result<String, zeron_sync::SyncError>> {
+        let provider = self.url.clone();
+        let client = self.client.clone();
+        Box::pin(async move {
+            let u = Self::leaf_url(&provider, "push").await?;
+            let resp = client
+                .post(u)
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| zeron_sync::SyncError::WebSocket(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(zeron_sync::SyncError::Protocol(format!(
+                    "registry push http {}",
+                    resp.status()
+                )));
+            }
+            resp.text()
+                .await
+                .map_err(|e| zeron_sync::SyncError::WebSocket(e.to_string()))
+        })
+    }
 }
 
 #[cfg(test)]

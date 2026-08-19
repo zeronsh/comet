@@ -55,6 +55,11 @@ final class SessionStore {
     /// the registry never walks a chat back to s2.
     @ObservationIgnored private var roomGen = 1
     @ObservationIgnored private var started = false
+    /// Preload holds the dial (AppModel staggers the release) so a cold
+    /// launch doesn't stampede N TLS handshakes against the registry dial
+    /// on a thin link. The disk snapshot still hydrates immediately —
+    /// only the socket waits its turn.
+    @ObservationIgnored private var holdDial = false
 
     /// Demo mode: no room, entries driven externally.
     private let offline: Bool
@@ -95,9 +100,10 @@ final class SessionStore {
 
     @ObservationIgnored private var saver: DocSaver?
 
-    func start() {
+    func start(holdDial: Bool = false) {
         guard !started, !offline else { return }
         started = true
+        self.holdDial = holdDial
         // Local-first: the last-synced chat2 snapshot renders instantly (even
         // when the host device is offline); the join backfills incrementally
         // from its cursor.
@@ -142,16 +148,39 @@ final class SessionStore {
         connectIfReady()
     }
 
+    /// Still holding the preload dial (never connected) — the kick sweep
+    /// skips these so a foreground/path flap can't stampede held sockets.
+    var isDialHeld: Bool { holdDial }
+
+    /// End a preload dial-hold: an open view (or the stagger timer) wants
+    /// live sync now.
+    func releaseDial() {
+        guard holdDial else { return }
+        holdDial = false
+        connectIfReady()
+    }
+
     private func connectIfReady() {
-        guard started, !offline, chatRoom == nil, roomGen >= 2 else { return }
+        guard started, !offline, !holdDial, chatRoom == nil, roomGen >= 2 else { return }
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
-                // Empty frontier = a checkpoint of an empty doc — nothing to
-                // fetch (mirror of EngineChatSink::contains_frontier).
-                guard !frontier.isEmpty else { return true }
-                guard let self,
+                // Deliberately NO empty-frontier shortcut (mirror of
+                // EngineChatSink::contains_frontier): an empty payload on a
+                // present checkpoint is unreadable provenance, not proof of
+                // emptiness — skipping made fresh readers park every row that
+                // depends on the chat's founding ops ("Add Tweets" incident,
+                // 2026-08-18). Empty fails the decode: NOT contained, fetch —
+                // always safe, never silently skips history.
+                guard let self, !frontier.isEmpty,
                       let vv = try? VersionVector.decode(bytes: frontier) else { return false }
+                // A decoded-but-EMPTY version vector is a vacuous claim every
+                // doc "includes" — the actual poison, one representation
+                // deeper than zero-length bytes. Fetch.
+                guard !vv.toHashmap().isEmpty else {
+                    roomLog.info("chat2 \(self.chatId, privacy: .public): frontier decodes empty (vacuous); fetching checkpoint")
+                    return false
+                }
                 return self.doc.oplogVv().includesVv(other: vv)
             },
             applyCheckpoint: { [weak self] bytes, seq in
@@ -181,6 +210,20 @@ final class SessionStore {
                 self.cursor = max(self.cursor, seq)
                 self.saver?.poke()
             },
+            clampCursor: { [weak self] seq in
+                guard let self, self.cursor > seq else { return }
+                // Cursor amnesty (see ChatRoomClient): a cursor above the
+                // room's checkpoint is only as trustworthy as the doc under
+                // it — rows imported while their deps were missing PARK
+                // silently, vanish on export, and the cursor lied forever
+                // ("Add Tweets" wedge: cursor 75 over a checkpoint-only doc,
+                // 2026-08-18). Clamping re-fetches rows since the checkpoint
+                // (KB-bounded by trim policy; re-imports are no-ops), which
+                // converts any lying cursor into a true one.
+                roomLog.info("chat2 \(self.chatId, privacy: .public): cursor amnesty \(self.cursor) → \(seq)")
+                self.cursor = seq
+                self.saver?.poke()
+            },
             event: { [weak self] event in self?.handle(event) }
         )
         let client = ChatRoomClient(
@@ -188,6 +231,12 @@ final class SessionStore {
             urlProvider: { [config, chatId] in await config.chat2SocketURL(chatId: chatId) },
             checkpointRequest: { [config, chatId] in
                 await config.chat2CheckpointRequest(chatId: chatId)
+            },
+            rowsRequest: { [config, chatId] after in
+                await config.chat2RowsRequest(chatId: chatId, after: after)
+            },
+            pushRequest: { [config, chatId] batchId in
+                await config.chat2PushRequest(chatId: chatId, batchId: batchId)
             },
             delegate: delegate)
         chatRoom = client
@@ -252,6 +301,7 @@ final class SessionStore {
     /// ChatRoomClient.kick). Also the catch-all re-check for a roomGen flip
     /// that landed while this store had no open view.
     func kickRoom() {
+        holdDial = false  // a kick is a user/foreground signal: dial now
         connectIfReady()
         guard let chatRoom else { return }
         Task { await chatRoom.kick() }

@@ -50,14 +50,19 @@ struct RecordingSink {
     checkpoints: Mutex<Vec<(Vec<u8>, u64)>>,
     cursor_advances: Mutex<Vec<u64>>,
     frontier_contained: std::sync::atomic::AtomicBool,
+    /// Global apply order across rows and checkpoints — the overlap test
+    /// pins "checkpoint imports before any row that buffered during it".
+    ops: Mutex<Vec<String>>,
 }
 
 impl ChatDocSink for RecordingSink {
     fn apply_row(&self, bytes: &[u8], cursor: u64) {
         lock(&self.rows).push((bytes.to_vec(), cursor));
+        lock(&self.ops).push(format!("row@{cursor}"));
     }
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
         lock(&self.checkpoints).push((bytes.to_vec(), cursor));
+        lock(&self.ops).push(format!("ckpt@{cursor}"));
         Ok(())
     }
     fn contains_frontier(&self, _frontier: &[u8]) -> bool {
@@ -719,4 +724,193 @@ async fn seeded_at_zero_room_fetches_the_checkpoint() {
         vec![(b"seed-checkpoint-bytes".to_vec(), 0)]
     );
     client.shutdown().await;
+}
+
+// ── 450kbps cold-open: overlap + early push ─────────────────────────────────
+
+/// Fetch that resolves only when the test releases its gate — stands in for
+/// a checkpoint blob crawling down a thin link.
+struct GatedFetcher {
+    gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    bytes: Vec<u8>,
+}
+
+impl CheckpointFetcher for GatedFetcher {
+    fn fetch(&self) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+        let gate = lock(&self.gate).take().expect("single fetch");
+        let bytes = self.bytes.clone();
+        Box::pin(async move {
+            let _ = gate.await;
+            Ok(bytes)
+        })
+    }
+}
+
+/// The rows request leaves BEFORE the checkpoint download finishes (the
+/// server observes it while the fetch is still gated), rows landing
+/// mid-download buffer, and the import still applies before any of them —
+/// the join must not serialize download → request → backfill.
+#[tokio::test]
+async fn checkpoint_fetch_overlaps_row_backfill() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+    let fetch = Arc::new(GatedFetcher {
+        gate: Mutex::new(Some(gate_rx)),
+        bytes: b"parallel-checkpoint".to_vec(),
+    });
+
+    let server = tokio::spawn(async move {
+        let _hello = expect_kind(&mut end, frame_type::HELLO).await;
+        send(
+            &end,
+            frame_type::STATE,
+            serde_json::json!({"headSeq": 7, "seqFloor": 0,
+                "checkpointSeq": 5, "checkpointSize": 1000,
+                "rowCount": 2, "rowBytes": 64}),
+            b"frontier",
+        )
+        .await;
+        // The ordering pin: this arrives while the fetch is still GATED.
+        let req = expect_kind(&mut end, frame_type::ROWS_REQ).await;
+        assert_eq!(req.header["after"], 5, "rows resume past the checkpoint");
+        send(
+            &end,
+            frame_type::ROW,
+            serde_json::json!({"seq": 6, "device": "dev-b", "batchId": "b6"}),
+            b"r6",
+        )
+        .await;
+        send(
+            &end,
+            frame_type::ROW,
+            serde_json::json!({"seq": 7, "device": "dev-b", "batchId": "b7"}),
+            b"r7",
+        )
+        .await;
+        send(
+            &end,
+            frame_type::ROWS_DONE,
+            serde_json::json!({"headSeq": 7}),
+            &[],
+        )
+        .await;
+        // Only now does the "download" complete.
+        let _ = gate_tx.send(());
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds with rows served before the checkpoint bytes");
+
+    let _end = server.await.unwrap();
+    assert_eq!(
+        *lock(&sink.ops),
+        vec!["ckpt@5", "row@6", "row@7"],
+        "checkpoint imports before any row that buffered during the download"
+    );
+    assert_eq!(client.stats().cursor, 7);
+    client.shutdown().await;
+}
+
+/// A batch queued while offline flushes right after the reconnect's state
+/// answer — NOT after backfill converges. The server script only serves the
+/// backfill AFTER seeing (and acking) the push; the old order deadlocks here.
+#[tokio::test(start_paused = true)]
+async fn pending_push_flushes_before_backfill_completes() {
+    let (pipe_a, mut end_a) = pipe_pair();
+    let (pipe_b, mut end_b) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    sink.frontier_contained
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (fetch, _) = fetcher(b"");
+    let empty_state = serde_json::json!({"headSeq": 0, "seqFloor": 0,
+        "checkpointSeq": 0, "checkpointSize": 0, "rowCount": 0, "rowBytes": 0});
+
+    let state_b = empty_state.clone();
+    let server = tokio::spawn(async move {
+        serve_join(&mut end_a, empty_state, &[], vec![], false).await;
+        // The push arrives on session A but goes UNACKED; the socket dies.
+        let _push = expect_kind(&mut end_a, frame_type::PUSH).await;
+        drop(end_a);
+
+        // Session B: the replay must arrive before ANY backfill is served.
+        let _hello = expect_kind(&mut end_b, frame_type::HELLO).await;
+        send(&end_b, frame_type::STATE, state_b, &[]).await;
+        let _req = expect_kind(&mut end_b, frame_type::ROWS_REQ).await;
+        let replay = expect_kind(&mut end_b, frame_type::PUSH).await;
+        let batch_id = replay.header["batchId"].as_str().unwrap().to_string();
+        send(
+            &end_b,
+            frame_type::ACK,
+            serde_json::json!({"batchId": batch_id, "seq": 1, "dup": false}),
+            &[],
+        )
+        .await;
+        send(
+            &end_b,
+            frame_type::ROWS_DONE,
+            serde_json::json!({"headSeq": 1}),
+            &[],
+        )
+        .await;
+        end_b
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe_a, pipe_b]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("first join succeeds");
+
+    client.enqueue_update(vec![0xaa]);
+    let mut events = client.events();
+    // Ride events until the reconnect's early replay is acked.
+    while client.stats().pending_pushes > 0 {
+        let _ = events.recv().await;
+    }
+    let _end = server.await.unwrap();
+    assert_eq!(
+        client.stats().cursor,
+        1,
+        "early replay acked before ROWS_DONE"
+    );
+    client.shutdown().await;
+}
+
+/// A checkpoint that EXISTS (size > 0) but whose frontier payload is empty
+/// must be fetched, not skipped: the empty-frontier-means-contained shortcut
+/// made every fresh reader of such a room skip the chat's founding ops and
+/// park all dependent rows invisibly ("Add Tweets" incident, 2026-08-18).
+/// Fetching is always safe (full-state merge); skipping history never is.
+#[test]
+fn empty_frontier_with_real_checkpoint_is_not_contained() {
+    let state = wire::StateHeader {
+        head_seq: 75,
+        seq_floor: 5,
+        checkpoint_seq: 5,
+        checkpoint_size: 2728,
+        row_count: 70,
+        row_bytes: 17150,
+    };
+    // The sink cannot vouch for a frontier it cannot read — an empty payload
+    // must plan a checkpoint fetch for a cursor-0 reader.
+    assert_eq!(
+        plan_catch_up(0, &state, false),
+        CatchUpPlan::CheckpointThenRows { after: 5 },
+        "fresh reader must fetch a present checkpoint when the frontier is unreadable"
+    );
 }
