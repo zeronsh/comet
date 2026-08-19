@@ -797,8 +797,8 @@ pub struct Shell {
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
-    /// Archived slim row under the pointer — swaps its time label for the
-    /// Unarchive affordance and restores the dimmed harness mark (t3code's
+    /// Settled slim row under the pointer — swaps its time label for the
+    /// Unsettle affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
@@ -3418,8 +3418,8 @@ impl Shell {
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
         // relative time instead. Hovering the ROW swaps the corner for the
-        // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
-        // accordion), t3code's settle-on-hover.
+        // SETTLE button (UNSETTLE on rows in the sidebar's settled
+        // shelf), t3code's settle-on-hover.
         let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
         // Send-truth overrides: a send unadopted past the grace window is
         // FAILED (explicit, with the transcript's retry affordance); a send
@@ -3487,9 +3487,9 @@ impl Shell {
                         .text_size(px(10.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(if archived {
-                            "Unarchive"
+                            "Unsettle"
                         } else {
-                            "Archive"
+                            "Settle"
                         })),
                 )
                 .into_any_element()

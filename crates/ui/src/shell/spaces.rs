@@ -698,13 +698,15 @@ impl Shell {
             .collect()
     }
 
-    /// The sidebar's archived shelf — a direct port of t3code's settled
-    /// shelf: header is label + hairline + chevron ("Archived (N)" closed,
-    /// "Archived" open), rows are 36px SLIM one-liners (dimmed harness mark,
-    /// title, time-ago right — the time yields to Unarchive on row hover),
-    /// and the tail pages behind an explicit "Show N more" row (initial 10,
-    /// +25 a click). `None` when nothing is archived under the current
-    /// project filter.
+    /// The sidebar's settled shelf (t3code SidebarV2): header is label +
+    /// hairline + chevron ("Settled (N)" closed, "Settled" open), rows are
+    /// 36px SLIM one-liners (dimmed harness mark, title, time-ago right —
+    /// the time yields to Unsettle on row hover), and the tail pages behind
+    /// an explicit "Show N more" row (initial 10, +25 a click). `None` when
+    /// nothing is settled under the current project filter.
+    ///
+    /// Truly archived threads (hidden from the sidebar) live in Settings →
+    /// Archived and are NOT shown here.
     pub(super) fn render_archived_section(
         &mut self,
         theme: &Theme,
@@ -749,9 +751,9 @@ impl Shell {
         // filling the middle, chevron flipping open/closed. The count only
         // shows while collapsed — expanded, the rows speak for themselves.
         let label: SharedString = if open {
-            "Archived".into()
+            "Settled".into()
         } else {
-            format!("Archived ({total})").into()
+            format!("Settled ({total})").into()
         };
         let header = div()
             .id("archived-toggle")
@@ -807,12 +809,12 @@ impl Shell {
                     .as_ref()
                     .map(|c| crate::pickers::harness_brand_icon(c.harness))
                     .unwrap_or((crate::icons::CHAT_ROUND_LINE, None));
-                // Right slot: time at rest; the Unarchive affordance takes
+                // Right slot: time at rest; the Unsettle affordance takes
                 // its place on row hover (t3code: "only the time/jump label
                 // yields to the settle affordance").
                 let right: AnyElement = if hovered {
                     let restore_id = id.clone();
-                    // Metrics match the active rows' Archive pill exactly
+                    // Metrics match the active rows' Settle pill exactly
                     // (18px pill, 11px icon, 10px label, padding bled right)
                     // — two sizes of the same affordance read as a mistake.
                     div()
@@ -841,7 +843,7 @@ impl Shell {
                             div()
                                 .text_size(px(10.0))
                                 .text_color(theme.text_muted)
-                                .child(SharedString::from("Unarchive")),
+                                .child(SharedString::from("Unsettle")),
                         )
                         .into_any_element()
                 } else {
