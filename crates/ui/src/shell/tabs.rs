@@ -69,10 +69,11 @@ impl Shell {
         // drag region, and buttons. A session appends its target as a muted
         // "project @ device" tag right of the title (the composer footer no
         // longer carries it).
-        let (title, target, harness, on_canvas): (
+        let (title, target, harness, cwd_path, on_canvas): (
             SharedString,
             Option<SharedString>,
             Option<zeron_proto::HarnessId>,
+            Option<String>,
             bool,
         ) = {
             let state = self.state.read(cx);
@@ -87,16 +88,28 @@ impl Shell {
                     let device = state
                         .device_name(&chat.device_id)
                         .unwrap_or("Unknown device");
+                    // Resolve the absolute path to open: worktree path,
+                    // chat cwd, or the space's folder path.
+                    let open_path = chat
+                        .cwd
+                        .clone()
+                        .or_else(|| {
+                            chat.space_id
+                                .as_deref()
+                                .and_then(|id| state.space_row(id))
+                                .map(|s| s.path.clone())
+                        });
                     (
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )),
                         Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
+                        open_path,
                         false,
                     )
                 }
-                None => (SharedString::from(""), None, None, true),
+                None => (SharedString::from(""), None, None, None, true),
             }
         };
 
@@ -267,6 +280,35 @@ impl Shell {
                                     .text_size(px(12.0))
                                     .text_color(theme.text_muted.opacity(0.5))
                                     .child(target),
+                            )
+                        })
+                        // "Open in editor" button (t3code OpenInPicker):
+                        // opens the session's folder in Finder / file manager.
+                        .when_some(cwd_path.clone(), |el, path| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .size(px(26.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(crate::theme::wash(0.11)))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        {
+                                            let p = path.clone();
+                                            cx.listener(move |_this: &mut Shell, _: &gpui::MouseDownEvent, _: &mut Window, _: &mut Context<Shell>| {
+                                                open_folder(&p);
+                                            })
+                                        },
+                                    )
+                                    .child(
+                                        icon(crate::icons::FOLDER)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted.opacity(0.6)),
+                                    ),
                             )
                         }),
                 )

@@ -6924,6 +6924,37 @@ fn nav_history_button(
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
 /// `grid size-7 place-items-center rounded-md text-muted-foreground`).
+/// Open a folder in the OS file manager (Finder on macOS, xdg-open on
+/// Linux). Best-effort — failures are logged and swallowed.
+pub fn open_folder(path: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let result = std::process::Command::new("open")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(e) = result {
+            tracing::warn!(path, error = %e, "failed to open folder");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let result = std::process::Command::new("xdg-open")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(e) = result {
+            tracing::warn!(path, error = %e, "failed to open folder");
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+    }
+}
+
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
