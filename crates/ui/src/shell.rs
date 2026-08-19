@@ -6924,35 +6924,99 @@ fn nav_history_button(
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
 /// `grid size-7 place-items-center rounded-md text-muted-foreground`).
-/// Open a folder in the OS file manager (Finder on macOS, xdg-open on
-/// Linux). Best-effort — failures are logged and swallowed.
-pub fn open_folder(path: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        let result = std::process::Command::new("open")
-            .arg(path)
+/// Launch a folder in an editor (or Finder as fallback).
+/// `editor` can be a command name like "cursor", "code", "zed", or empty
+/// for the OS file manager.
+pub fn open_in_editor(path: &str, editor: &str) {
+    let (cmd, args): (&str, &[&str]) = match editor {
+        "cursor" => ("cursor", &["."]),
+        "code" | "vscode" => ("code", &["."]),
+        "zed" => ("zed", &["."]),
+        "windsurf" => ("windsurf", &["."]),
+        "idea" => ("idea", &["."]),
+        "pycharm" => ("pycharm", &["."]),
+        "goland" => ("goland", &["."]),
+        "webstorm" => ("webstorm", &["."]),
+        "rustrover" => ("rustrover", &["."]),
+        "terminal" => {
+            #[cfg(target_os = "macos")]
+            {
+                ("open", &["-a", "Terminal", path])
+            }
+            #[cfg(target_os = "linux")]
+            {
+                ("xdg-open", &[path])
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                return;
+            }
+        }
+        // Default: Finder / file manager
+        _ => {
+            #[cfg(target_os = "macos")]
+            {
+                ("open", &[path])
+            }
+            #[cfg(target_os = "linux")]
+            {
+                ("xdg-open", &[path])
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                return;
+            }
+        }
+    };
+    // Editor commands: cd to path first, then launch
+    if editor.is_empty() || editor == "terminal" {
+        let result = std::process::Command::new(cmd)
+            .args(args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
         if let Err(e) = result {
-            tracing::warn!(path, error = %e, "failed to open folder");
+            tracing::warn!(path, editor, error = %e, "failed to open folder");
         }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let result = std::process::Command::new("xdg-open")
-            .arg(path)
+    } else {
+        let result = std::process::Command::new(cmd)
+            .args(args)
+            .current_dir(path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
         if let Err(e) = result {
-            tracing::warn!(path, error = %e, "failed to open folder");
+            tracing::warn!(path, editor, error = %e, "failed to open editor");
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = path;
+}
+
+/// Probe which known editors are installed on this machine.
+pub fn detected_editors() -> Vec<(&'static str, &'static str)> {
+    let mut editors: Vec<(&'static str, &'static str)> = Vec::new();
+    for (id, label, cmd) in [
+        ("cursor", "Cursor", "cursor"),
+        ("code", "VS Code", "code"),
+        ("zed", "Zed", "zed"),
+        ("windsurf", "Windsurf", "windsurf"),
+        ("idea", "IntelliJ IDEA", "idea"),
+        ("pycharm", "PyCharm", "pycharm"),
+        ("goland", "GoLand", "goland"),
+        ("webstorm", "WebStorm", "webstorm"),
+        ("rustrover", "RustRover", "rustrover"),
+    ] {
+        // Quick probe: spawn --version, check if it runs without error
+        if std::process::Command::new(cmd)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+        {
+            editors.push((id, label));
+        }
     }
+    editors
 }
 
 fn header_icon_button(

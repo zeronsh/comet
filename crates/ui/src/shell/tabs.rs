@@ -282,16 +282,20 @@ impl Shell {
                                     .child(target),
                             )
                         })
-                        // "Open in editor" button (t3code OpenInPicker):
-                        // opens the session's folder in Finder / file manager.
+                        // "Open in Editor" button: opens with first
+                        // detected editor, or Finder if none found.
                         .when_some(cwd_path.clone(), |el, path| {
+                            let editors = detected_editors();
+                            let first_editor = editors.first().map(|e| e.0).unwrap_or("");
+                            let first_label = editors.first().map(|e| e.1).unwrap_or("Finder");
                             el.child(
                                 div()
                                     .flex_none()
-                                    .size(px(26.0))
+                                    .h(px(26.0))
+                                    .px(px(6.0))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
+                                    .gap(px(4.0))
                                     .rounded(px(6.0))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(crate::theme::wash(0.11)))
@@ -300,14 +304,21 @@ impl Shell {
                                         {
                                             let p = path.clone();
                                             cx.listener(move |_this: &mut Shell, _: &gpui::MouseDownEvent, _: &mut Window, _: &mut Context<Shell>| {
-                                                open_folder(&p);
+                                                open_in_editor(&p, first_editor);
                                             })
                                         },
                                     )
                                     .child(
                                         icon(crate::icons::FOLDER)
-                                            .size(px(14.0))
+                                            .size(px(13.0))
                                             .text_color(theme.text_muted.opacity(0.6)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .child(SharedString::from(first_label)),
                                     ),
                             )
                         }),
