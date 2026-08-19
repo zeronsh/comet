@@ -430,7 +430,7 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
-    // pi over ACP (community `pi-acp` adapter). Switch to native when ready.
+    // pi native driver (`pi --mode rpc`).
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
@@ -448,8 +448,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::pi().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::PiNativeHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::PiNativeHarness::new()) as Arc<dyn Harness>)),
     );
     // opencode over ACP (`opencode acp`), same lazy pattern: the static
     // descriptor mirrors AcpHarness::opencode() exactly. No steering
