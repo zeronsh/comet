@@ -1106,7 +1106,7 @@ impl AppState {
 
     /// Non-archived chats in sidebar order.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
-        self.chats.iter().filter(|c| !c.archived)
+        self.chats.iter().filter(|c| !c.archived && !c.settled)
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
@@ -2890,11 +2890,14 @@ mod tests {
     }
 
     #[test]
-    fn visible_chats_filters_archived() {
+    #[test]
+    fn visible_chats_filters_archived_and_settled() {
         let mut state = AppState::new();
         let mut archived = chat("a", 0, Some(99));
         archived.archived = true;
-        state.apply_chats(vec![archived, chat("b", 1, None)]);
+        let mut settled = chat("s", 1, Some(100));
+        settled.settled = true;
+        state.apply_chats(vec![archived, settled, chat("b", 2, None)]);
         let visible: Vec<&str> = state.visible_chats().map(|c| c.id.as_str()).collect();
         assert_eq!(visible, ["b"]);
     }
