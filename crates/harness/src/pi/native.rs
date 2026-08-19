@@ -276,26 +276,40 @@ fn pi_model_parts(model_id: &str) -> (&str, &str) {
 }
 
 /// Read and discard lines from stdout until we see a response with the
-/// given id. Returns the response JSON, or None on error/timeout.
+/// given id. Returns the response JSON, or errors on timeout.
 async fn read_response(
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     expected_id: &str,
 ) -> Result<Value, HarnessError> {
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
     loop {
-        let line = lines.next_line().await?.unwrap_or_default();
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: Value = serde_json::from_str(&line)
-            .map_err(|e| HarnessError::Protocol(format!("parse error: {e}")))?;
-        if event.get("type").and_then(Value::as_str) == Some("response")
-            && event.get("id").and_then(Value::as_str) == Some(expected_id)
-        {
-            return Ok(event);
-        }
-        // If we see an agent_settled or error before the response, stop.
-        if event.get("type").and_then(Value::as_str) == Some("agent_settled") {
-            return Err(HarnessError::Protocol("pi settled before response".into()));
+        tokio::select! {
+            line_result = lines.next_line() => {
+                let line = line_result?.unwrap_or_default();
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: Value = serde_json::from_str(&line)
+                    .map_err(|e| HarnessError::Protocol(format!("parse error: {e}")))?;
+                let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+                if event_type == "response"
+                    && event.get("id").and_then(Value::as_str) == Some(expected_id)
+                {
+                    let success = event.get("success").and_then(Value::as_bool).unwrap_or(false);
+                    if !success {
+                        let err = event.get("error").and_then(Value::as_str).unwrap_or("unknown");
+                        tracing::warn!(target: "zeron_harness::pi::native", %expected_id, %err, "pi command failed");
+                    }
+                    return Ok(event);
+                }
+                tracing::debug!(target: "zeron_harness::pi::native", %event_type, id = %expected_id, "skipping event while waiting for response");
+            }
+            _ = &mut deadline => {
+                return Err(HarnessError::Protocol(format!(
+                    "timeout waiting for response {expected_id}"
+                )));
+            }
         }
     }
 }
@@ -448,6 +462,7 @@ impl Harness for PiNativeHarness {
 
         let (child, mut stdin, mut lines) = self.spawn_pi(Some(&request.cwd)).await?;
         let child_pid = child.id();
+        tracing::info!(target: "zeron_harness::pi::native", pid = child_pid, cwd = %request.cwd, "pi native session starting");
 
         // Step 1: get_state to initialize the session.
         let state_id = uuid::Uuid::new_v4().to_string();
