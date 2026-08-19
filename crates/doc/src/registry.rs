@@ -826,6 +826,7 @@ impl RegistryDoc {
             ("deviceId", json!(chat.device_id)),
             ("title", opt_str(chat.title.as_deref())),
             ("archived", json!(chat.archived)),
+            ("settled", json!(chat.settled)),
             ("cwd", opt_str(chat.cwd.as_deref())),
             ("branch", opt_str(chat.branch.as_deref())),
             ("checkoutId", opt_str(chat.checkout_id.as_deref())),
@@ -939,6 +940,21 @@ impl RegistryDoc {
             chat_id,
             OpKind::Update,
             fields([("archived", json!(archived))]),
+        );
+        Ok(true)
+    }
+
+    /// Settle / unsettle a chat (sidebar "Settled" shelf). Distinct from
+    /// `archived` — settled chats stay visible in the sidebar.
+    pub fn set_chat_settled(&mut self, chat_id: &str, settled: bool) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("settled", json!(settled))]),
         );
         Ok(true)
     }
@@ -1187,6 +1203,7 @@ impl RegistryDoc {
                     ("deviceId", json!(chat.device_id)),
                     ("title", opt_str(chat.title.as_deref())),
                     ("archived", json!(chat.archived)),
+                    ("settled", json!(chat.settled)),
                     ("cwd", opt_str(chat.cwd.as_deref())),
                     ("branch", opt_str(chat.branch.as_deref())),
                     ("checkoutId", opt_str(chat.checkout_id.as_deref())),

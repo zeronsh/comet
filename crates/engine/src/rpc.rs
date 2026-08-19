@@ -369,6 +369,11 @@ enum MutateParams {
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
     SetChatArchived { chat_id: String, archived: bool },
+    /// Settle / unsettle a chat — toggles the sidebar's "Settled" shelf.
+    /// Distinct from `archived`: settled chats stay visible, archived chats
+    /// are hidden from the sidebar entirely.
+    #[serde(rename_all = "camelCase")]
+    SetChatSettled { chat_id: String, settled: bool },
     /// Full-config replace on the chat row (zeron `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -831,6 +836,11 @@ impl EngineRpc {
             MutateParams::SetChatArchived { chat_id, archived } => self
                 .workspace
                 .set_chat_archived(&chat_id, archived)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::SetChatSettled { chat_id, settled } => self
+                .workspace
+                .set_chat_settled(&chat_id, settled)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatConfig { chat_id, config } => self

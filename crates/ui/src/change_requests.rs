@@ -329,6 +329,7 @@ mod tests {
             device_id: device.into(),
             title: None,
             archived: false,
+            settled: false,
             cwd: cwd.map(str::to_owned),
             branch: Some("feature/pr".into()),
             checkout_id: checkout.map(str::to_owned),

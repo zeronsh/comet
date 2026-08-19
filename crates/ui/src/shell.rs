@@ -797,8 +797,8 @@ pub struct Shell {
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
     pub(super) archived_shown: usize,
-    /// Archived slim row under the pointer — swaps its time label for the
-    /// Unarchive affordance and restores the dimmed harness mark (t3code's
+    /// Settled slim row under the pointer — swaps its time label for the
+    /// Unsettle affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
@@ -855,8 +855,9 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
-    /// Inline thread-search query (t3code SidebarV2). Empty = no filter.
-    sidebar_search: SharedString,
+    /// Inline thread-search input (t3code SidebarV2).
+    sidebar_search: Entity<ComposerInput>,
+    _sidebar_search_events: Subscription,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -974,6 +975,16 @@ pub struct Shell {
 
 impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        let sidebar_search_input = cx.new(|cx| ComposerInput::new("Search sessions…", cx));
+        let sidebar_search_events = cx.subscribe(
+            &sidebar_search_input,
+            |this: &mut Shell, _input, event, cx| match event {
+                ComposerInputEvent::Edited => {
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
@@ -1111,8 +1122,9 @@ impl Shell {
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
+            sidebar_search: sidebar_search_input,
+            _sidebar_search_events: sidebar_search_events,
             spaces_menu: popover::Popup::default(),
-            sidebar_search: SharedString::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
@@ -2283,6 +2295,22 @@ impl Shell {
         cx.notify();
     }
 
+    /// Settle / unsettle a chat (sidebar "Settled" shelf). Calls the
+    /// `SetChatSettled` mutation — distinct from archive.
+    pub(super) fn set_chat_settled(
+        &mut self,
+        chat_id: String,
+        settled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_chat_menu(cx);
+        self.mutate(
+            serde_json::json!({ "op": "setChatSettled", "chatId": chat_id, "settled": settled }),
+            cx,
+        );
+        cx.notify();
+    }
+
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -3418,8 +3446,8 @@ impl Shell {
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
         // relative time instead. Hovering the ROW swaps the corner for the
-        // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
-        // accordion), t3code's settle-on-hover.
+        // SETTLE button (UNSETTLE on rows in the sidebar's settled
+        // shelf), t3code's settle-on-hover.
         let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
         // Send-truth overrides: a send unadopted past the grace window is
         // FAILED (explicit, with the transcript's retry affordance); a send
@@ -3487,9 +3515,9 @@ impl Shell {
                         .text_size(px(10.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(if archived {
-                            "Unarchive"
+                            "Unsettle"
                         } else {
-                            "Archive"
+                            "Settle"
                         })),
                 )
                 .into_any_element()
@@ -3560,7 +3588,7 @@ impl Shell {
                 .when(corner_hovered, |el| {
                     el.on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.set_chat_archived(archive_id.clone(), !archived, cx);
+                        this.set_chat_settled(archive_id.clone(), !archived, cx);
                     }))
                 })
                 .child(corner_body)
@@ -3881,35 +3909,55 @@ impl Shell {
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
 
-        // Inline thread-search (t3code SidebarV2): placeholder row.
-        // Full keyboard-input search requires a ComposerInput entity;
-        // for now this is a visual placeholder. Future: wire to a real
-        // input entity.
-        let search_query = self.sidebar_search.clone();
+        // Inline thread-search (t3code SidebarV2): ComposerInput row.
+        let search_query = self.sidebar_search.read(cx).text().to_string();
         let searching = !search_query.is_empty();
         let search_row = div()
             .flex_none()
-            .h(px(32.0))
-            .px(px(10.0))
+            .px(px(8.0))
             .mb(px(2.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(6.0))
+            .rounded(px(8.0))
+            .bg(theme.glass_hover().opacity(0.25))
             .child(
                 crate::icons::icon(crate::icons::MAGNIFER)
                     .size(px(13.0))
                     .flex_none()
-                    .text_color(theme.text_muted.opacity(0.4)),
+                    .ml(px(4.0))
+                    .text_color(if searching {
+                        theme.text
+                    } else {
+                        theme.text_muted.opacity(0.45)
+                    }),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.4))
-                    .child(SharedString::from("Search sessions…")),
-            );
+                div().flex_1().min_w_0().child(self.sidebar_search.clone()),
+            )
+            .when(searching, |el| {
+                let input = self.sidebar_search.clone();
+                el.child(
+                    div()
+                        .flex_none()
+                        .mr(px(4.0))
+                        .cursor_pointer()
+                        .rounded(px(4.0))
+                        .px(px(4.0))
+                        .py(px(2.0))
+                        .hover(|s| s.bg(theme.glass_hover()))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |_shell: &mut Shell, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Shell>| {
+                                input.update(cx, |input, cx| {
+                                    input.set_text("", cx);
+                                });
+                            }),
+                        )
+                        .child(SharedString::from("✕")),
+                )
+            });
 
         // "Active" section header (t3code SidebarV2): label + hairline.
         // Only shows when there are active rows OR the archived section
@@ -4776,7 +4824,17 @@ impl Shell {
 
         if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
             let chat_menu_closing = self.chat_menu.closing_since();
+            // Resolve whether this chat is currently settled (archived).
+            let is_settled = self
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .find(|c| c.id == chat_id)
+                .is_some_and(|c| c.archived);
             let rename_id = chat_id.clone();
+            let settle_id = chat_id.clone();
+            let unsettle_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
@@ -4795,6 +4853,49 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                // Settle / Unsettle (t3code SidebarV2): toggles the settled
+                // shelf visibility. Renders the action matching the current
+                // state — a settled chat shows Unsettle, an active one Settle.
+                .when(is_settled, |el| {
+                    el.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-unsettle-{chat_id}"),
+                        )
+                        .id("chat-menu-unsettle")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_settled(unsettle_id.clone(), false, cx)
+                        }))
+                        .child(
+                            icon(icons::ARCHIVE_UP_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Unsettle")),
+                    )
+                })
+                .when(!is_settled, |el| {
+                    el.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-settle-{chat_id}"),
+                        )
+                        .id("chat-menu-settle")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_settled(settle_id.clone(), true, cx)
+                        }))
+                        .child(
+                            icon(icons::ARCHIVE_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Settle")),
+                    )
+                })
+                .child(popover::menu_separator())
+                // Archive (hidden from sidebar → Settings → Archived).
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                         .id("chat-menu-archive")
