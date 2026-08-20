@@ -15,7 +15,7 @@ struct ComposerPopover: View {
     /// Height of the rows, measured. A `ScrollView` is greedy: it takes every
     /// point offered up to its `maxHeight`, so a `.frame(maxHeight: 180)` alone
     /// left a single result floating in a 180pt panel. Measuring the content and
-    /// setting an exact height makes the panel hug one row and still cap at 180.
+    /// capping at it makes the panel hug one row and still stop at 180.
     @State private var contentHeight: CGFloat = 0
 
     private var surfaceShape: RoundedRectangle { RoundedRectangle(cornerRadius: 20) }
@@ -65,11 +65,23 @@ struct ComposerPopover: View {
                         contentHeight = height
                     }
                 }
-                .frame(height: min(contentHeight, Self.maxListHeight))
+                // maxHeight, NOT height. An exact height cannot compress, so on
+                // a page whose other rows already fill the space above the
+                // keyboard the panel kept its full 180pt and the whole column
+                // overflowed instead: the canvas behind it was squeezed under
+                // its own content's minimum and drew over the navigation bar,
+                // and the pill's chip row went under the keyboard (user report,
+                // new-session page on a real device). A maximum is the same
+                // hug — the ScrollView is greedy up to it — but it yields when
+                // the parent has less to give.
+                .frame(maxHeight: min(contentHeight, Self.maxListHeight))
                 .scrollDisabled(contentHeight <= Self.maxListHeight)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Clip to the same shape the glass draws, so a row the panel had to
+        // compress away cannot bleed past the rounded bottom edge.
+        .clipShape(surfaceShape)
         .background(whiteAlpha(0.04), in: surfaceShape)
         .glassEffect(.regular, in: surfaceShape)
         .overlay(surfaceShape.strokeBorder(whiteAlpha(0.05), lineWidth: 1))
