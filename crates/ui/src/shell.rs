@@ -26,7 +26,7 @@ use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 
-use crate::changes::{Changes, ChangesEvent};
+use crate::changes::{Changes, ChangesEvent, DiffScope};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -981,7 +981,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
-    /// The primary transcript's spawn-chip events (subagent tabs).
+    /// The primary transcript's events (subagent tabs, turn-summary clicks).
     _transcript_events: Subscription,
 }
 
@@ -1008,7 +1008,8 @@ impl Shell {
                 }
             }
         });
-        // Spawn chips open their subagent's transcript as a right-pane tab.
+        // Spawn chips open their subagent's transcript as a right-pane tab;
+        // turn-summary cards reveal the turn diff the same way.
         let transcript_events = cx.subscribe(&transcript, Self::on_transcript_event);
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
@@ -1721,6 +1722,53 @@ impl Shell {
         self.set_right_active(RightSurface::Diff(id), cx);
     }
 
+    /// A transcript turn-summary card click: reveal the turn's diff in the
+    /// right-hand pane. Closed → the pane opens onto a turn-scoped diff tab;
+    /// open → the chat's existing "Latest turn" tab activates, else a fresh
+    /// one opens (per-commit History tabs set the precedent for minting tabs
+    /// from content clicks). A clicked file row passes its path through, and
+    /// the pane scrolls that file's section into view once its diff lands.
+    fn show_turn_diff(&mut self, file: Option<String>, cx: &mut Context<Self>) {
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        // Reuse the chat's existing latest-turn tab — one click per turn must
+        // not pile up identical tabs. Commit-pinned panes can't match: their
+        // scope is `Commit`, never `LatestTurn`.
+        let key = self.panel_key(cx);
+        let existing = self
+            .right_tabs
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .find(|surface| match surface {
+                RightSurface::Diff(id) => self
+                    .diffs
+                    .get(id)
+                    .is_some_and(|c| c.read(cx).scope() == DiffScope::LatestTurn),
+                _ => false,
+            })
+            .copied();
+        let changes = match existing {
+            Some(surface) => {
+                self.set_right_active(surface, cx);
+                match surface {
+                    RightSurface::Diff(id) => self.diffs.get(&id).cloned(),
+                    _ => None,
+                }
+            }
+            None => {
+                let changes =
+                    cx.new(|cx| Changes::for_scope(self.state.clone(), DiffScope::LatestTurn, cx));
+                self.register_diff_surface(changes.clone(), cx);
+                Some(changes)
+            }
+        };
+        if let (Some(path), Some(changes)) = (file, changes) {
+            changes.update(cx, |changes, cx| changes.reveal_file(path, cx));
+        }
+    }
+
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
@@ -1762,6 +1810,7 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::OpenTurnDiff { file } => self.show_turn_diff(file.clone(), cx),
         }
     }
 

@@ -597,6 +597,12 @@ pub enum RowKind {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
     },
+    /// End-of-turn edit recap (Codex/Cursor-style): "Edited N files · +X −Y"
+    /// over a foldable per-file stat list — the last row of a settled
+    /// assistant entry that edited files.
+    TurnSummary {
+        edits: Arc<zeron_doc::TurnEdits>,
+    },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
         /// chip shows it; unresolved shows "Awaiting your answer…" — which
@@ -723,6 +729,20 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         }
     }
     acc.push(auto_open as u8);
+    fnv1a(&acc)
+}
+
+/// Diff key for the end-of-turn summary row — a content hash over the file
+/// set and counts, so late-arriving stats (a slow ToolResult) re-splice.
+fn edits_fingerprint(edits: &zeron_doc::TurnEdits) -> u64 {
+    let mut acc = Vec::with_capacity(edits.files.len() * 24);
+    for f in &edits.files {
+        acc.extend_from_slice(f.path.as_bytes());
+        // Sentinel for "no counts": distinct from a real (0, 0).
+        let (a, d) = f.counts.unwrap_or((u64::MAX, u64::MAX));
+        acc.extend_from_slice(&a.to_le_bytes());
+        acc.extend_from_slice(&d.to_le_bytes());
+    }
     fnv1a(&acc)
 }
 
@@ -961,6 +981,24 @@ pub fn rows_for_entry(
         group_last_part_ix,
     );
 
+    // End-of-turn edit recap (Codex/Cursor-style), once the turn settles —
+    // mid-stream the live tool chips already tell the story, and the
+    // aggregate would churn on every edit. Aborted turns keep theirs: the
+    // edits that landed before the stop are exactly what the user needs to
+    // see.
+    if !streaming && let Some(edits) = zeron_doc::turn_edits(&entry.parts) {
+        rows.push(Row {
+            id: format!("{}#edits", entry.id).into(),
+            version: edits_fingerprint(&edits),
+            turn_start: false,
+            kind: RowKind::TurnSummary {
+                edits: Arc::new(edits),
+            },
+            entry_id: entry_id.clone(),
+            timestamp: None,
+        });
+    }
+
     if let Some(first) = rows.first_mut() {
         first.turn_start = true;
     }
@@ -1175,6 +1213,29 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
         ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
     };
     DETAIL_SEPARATOR + body
+}
+
+/// Max file rows the end-of-turn summary card lists before the counted tail
+/// ("… N more files") — the card is a recap, the changes pane is the full view.
+pub const SUMMARY_MAX_FILES: usize = 12;
+
+/// Analytic height of the summary card's foldable file list (separator +
+/// capped rows + the counted tail) — the fold tween's open target.
+pub fn summary_body_height(file_count: usize) -> f32 {
+    let rows = file_count.min(SUMMARY_MAX_FILES) + usize::from(file_count > SUMMARY_MAX_FILES);
+    DETAIL_SEPARATOR + rows as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
+}
+
+/// The engine retains one LatestTurn snapshot per chat. A summary can open it
+/// only while it is the primary transcript's final row; any later row proves
+/// that the retained snapshot may belong to a newer turn.
+fn summary_can_open_diff(row_ix: usize, row_count: usize, subagent_doc: bool) -> bool {
+    !subagent_doc && row_ix + 1 == row_count
+}
+
+/// Headline totals are exact only when every edited file contributed stats.
+fn summary_totals_are_exact(edits: &zeron_doc::TurnEdits) -> bool {
+    edits.files.iter().all(|file| file.counts.is_some())
 }
 
 /// Height of the "Show full output/diff" affordance row appended below an
@@ -1625,6 +1686,10 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// A turn-summary card was clicked: reveal the turn diff in the
+    /// right-hand pane. `file` carries a clicked file row's path — the pane
+    /// scrolls that file's section into view once its diff lands.
+    OpenTurnDiff { file: Option<String> },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -3201,6 +3266,13 @@ impl Transcript {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
+        // `LatestTurn` is backed by the engine's one snapshot per chat. Only
+        // the final transcript row can still own that snapshot; once another
+        // turn adds any row, older summary cards stay readable/foldable but
+        // must not open the newer turn's diff. Subagent transcripts address a
+        // different doc and never own the selected chat's snapshot.
+        let current_turn_summary =
+            summary_can_open_diff(ix, self.rows.len(), self.doc_override.is_some());
         let theme = Theme::of(cx).clone();
         // The viewport spans the full window (under the titlebar): the first
         // row's gap adds the titlebar's height so a top-scrolled transcript
@@ -3392,6 +3464,9 @@ impl Transcript {
             }
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
+            }
+            RowKind::TurnSummary { edits } => {
+                self.render_turn_summary(&row.id, edits, current_turn_summary, &theme, cx)
             }
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
@@ -4038,6 +4113,269 @@ impl Transcript {
             .flex_col()
             .when(collapses, |el| el.child(header))
             .child(body)
+            .into_any_element()
+    }
+
+    /// The end-of-turn edit recap card: a 36px header — pen tile, "Edited N
+    /// files", the turn's `+X −Y` totals — over a foldable per-file stat list
+    /// (the Codex/Cursor change summary, adapted to the chip language). Open
+    /// by default; the chevron folds it with the same RESIZE tween as tool
+    /// groups, and heights stay analytic like every transcript row.
+    fn render_turn_summary(
+        &mut self,
+        row_id: &SharedString,
+        edits: &Arc<zeron_doc::TurnEdits>,
+        interactive: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let open = fold.open.unwrap_or(true);
+        let body_height = summary_body_height(edits.files.len());
+        let target = if open { body_height } else { 0.0 };
+        let animating = fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+
+        let label: SharedString = if edits.files.len() == 1 {
+            "Edited 1 file".into()
+        } else {
+            format!("Edited {} files", edits.files.len()).into()
+        };
+        let toggle_id = row_id.clone();
+        // The card group: hover anywhere on it fades in the "View changes"
+        // hint (opacity only — the hint's slot is reserved, reveal never
+        // shifts layout).
+        let group: SharedString = format!("{row_id}-grp").into();
+        let exact_totals = summary_totals_are_exact(edits);
+        let header = div()
+            .h(px(36.0))
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .pl(px(8.0))
+            .pr(px(6.0))
+            .text_size(px(12.0))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(20.0))
+                    .rounded(px(6.0))
+                    .bg(crate::theme::ink(0.09))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(crate::icons::PEN)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(label),
+            )
+            // A headline total is exact only when EVERY file has counts. If
+            // even one diff failed to reach the doc, the honest file rows
+            // remain but the partial sum must not masquerade as a turn total.
+            .when(
+                exact_totals && (edits.additions > 0 || edits.deletions > 0),
+                |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.5))
+                            .text_color(theme.success)
+                            .child(SharedString::from(format!("+{}", edits.additions))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.5))
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("−{}", edits.deletions))),
+                    )
+                },
+            )
+            .child(div().flex_1())
+            .when(interactive, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .opacity(0.0)
+                        .group_hover(group.clone(), |s| s.opacity(1.0))
+                        .child(SharedString::from("View changes")),
+                )
+            })
+            // The fold toggle is ITS OWN button — the rest of the card is one
+            // big open-the-diff target, and a fold click must not also fling
+            // the pane open.
+            .child(
+                div()
+                    .id(SharedString::from(format!("{row_id}-fold-btn")))
+                    .flex_none()
+                    .size(px(22.0))
+                    .rounded(px(6.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .hover(|s| s.bg(crate::theme::ink(0.08)).text_color(theme.text_muted))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        // auto_open=true: the summary's unpinned default is open.
+                        this.toggle_fold(toggle_id.clone(), body_height, true);
+                        cx.notify();
+                    }))
+                    .child(SharedString::from(if open { "▾" } else { "▸" })),
+            );
+
+        let overflow = edits.files.len().saturating_sub(SUMMARY_MAX_FILES);
+        // Each row is its own jump target: click opens the pane scrolled to
+        // THIS file's section (the plain card click — anywhere else — opens
+        // it untargeted).
+        let file_rows: Vec<_> = edits
+            .files
+            .iter()
+            .take(SUMMARY_MAX_FILES)
+            .enumerate()
+            .map(|(ix, file)| {
+                let path = file.path.clone();
+                div()
+                    .id(SharedString::from(format!("{row_id}-f{ix}")))
+                    .h(px(OUTPUT_LINE_HEIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .when(interactive, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.06)))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(TranscriptEvent::OpenTurnDiff {
+                                    file: Some(path.clone()),
+                                });
+                            }))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme.text.opacity(0.85))
+                            .child(SharedString::from(file.path.clone())),
+                    )
+                    .when_some(file.counts, |el, (additions, deletions)| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.success)
+                                .child(SharedString::from(format!("+{additions}"))),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(theme.danger)
+                                .child(SharedString::from(format!("−{deletions}"))),
+                        )
+                    })
+            })
+            .collect();
+        let files = div()
+            .py(px(6.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .children(file_rows)
+            .when(overflow > 0, |el| {
+                el.child(
+                    div()
+                        .h(px(OUTPUT_LINE_HEIGHT))
+                        .px(px(12.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!("… {overflow} more files"))),
+                )
+            });
+        let list = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(DETAIL_SEPARATOR))
+                    .flex_none()
+                    .bg(crate::theme::hairline(0.06)),
+            )
+            .child(files);
+        // Fold body: same rules as the tool group's — tween only within the
+        // click window (an armed-forever tween replays on every virtualized
+        // remount), static height otherwise.
+        let body: AnyElement = if animating {
+            let from = fold.from;
+            div()
+                .overflow_hidden()
+                .child(list)
+                .with_animation(
+                    SharedString::from(format!("{row_id}-fold{}", fold.epoch)),
+                    RESIZE.animation(),
+                    move |el, t| el.h(px(motion::lerp(from, target, t))),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .overflow_hidden()
+                .h(px(target))
+                .child(list)
+                .into_any_element()
+        };
+
+        // Only the CURRENT turn's card is a diff target: the engine stores one
+        // LatestTurn snapshot per chat, so an older card cannot truthfully
+        // address its own diff. Historical cards remain readable/foldable.
+        div()
+            .py(px(4.0))
+            .w_full()
+            .child(
+                div()
+                    .id(SharedString::from(format!("{row_id}-card")))
+                    .group(group)
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.08))
+                    .bg(crate::theme::ink(0.03))
+                    .when(interactive, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| {
+                                s.bg(crate::theme::ink(0.055))
+                                    .border_color(crate::theme::hairline(0.16))
+                            })
+                            .active(|s| s.bg(crate::theme::ink(0.075)))
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(TranscriptEvent::OpenTurnDiff { file: None });
+                            }))
+                    })
+                    .child(header)
+                    .child(body),
+            )
             .into_any_element()
     }
 }
@@ -5947,5 +6285,128 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    fn edit_part(id: &str, path: &str, additions: u64, deletions: u64) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::EditFile {
+                path: path.into(),
+                old_string: None,
+                new_string: None,
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: Some(vec![zeron_doc::ToolDiffStat {
+                path: path.into(),
+                additions,
+                deletions,
+            }]),
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }
+    }
+
+    #[test]
+    fn edit_turns_end_with_a_summary_row() {
+        let parts = vec![
+            text_part("t0", "changing things"),
+            edit_part("a", "src/a.rs", 10, 2),
+            edit_part("b", "src/b.rs", 3, 0),
+        ];
+        // Mid-stream: no recap — the live chips tell the story.
+        let live = assistant("m1", MessageStatus::Streaming, parts.clone());
+        assert!(
+            rows_for_entry(&live, false, &mut parse)
+                .iter()
+                .all(|r| !matches!(r.kind, RowKind::TurnSummary { .. }))
+        );
+        // Settled: the recap is the LAST row (so it carries the timestamp
+        // strip) and aggregates per file.
+        let done = assistant("m1", MessageStatus::Complete, parts);
+        let rows = rows_for_entry(&done, false, &mut parse);
+        let last = rows.last().unwrap();
+        assert_eq!(last.id.as_ref(), "m1#edits");
+        assert_eq!(last.timestamp, Some(done.created_at));
+        let RowKind::TurnSummary { edits } = &last.kind else {
+            panic!("summary expected")
+        };
+        assert_eq!(edits.files.len(), 2);
+        assert_eq!((edits.additions, edits.deletions), (13, 2));
+        // Late-arriving stats change the diff key, so the row re-splices.
+        let mut richer = assistant(
+            "m1",
+            MessageStatus::Complete,
+            vec![edit_part("a", "src/a.rs", 10, 2)],
+        );
+        let rows_a = rows_for_entry(&richer, false, &mut parse);
+        if let MessagePart::Tool { diff_stats, .. } = &mut richer.parts[0] {
+            diff_stats.as_mut().unwrap()[0].additions = 11;
+        }
+        let rows_b = rows_for_entry(&richer, false, &mut parse);
+        assert_ne!(
+            rows_a.last().unwrap().version,
+            rows_b.last().unwrap().version
+        );
+        // Turns that edited nothing stay recap-free.
+        let plain = assistant(
+            "m2",
+            MessageStatus::Complete,
+            vec![text_part("t0", "hi"), tool_part("x", "ls")],
+        );
+        assert!(
+            rows_for_entry(&plain, false, &mut parse)
+                .iter()
+                .all(|r| !matches!(r.kind, RowKind::TurnSummary { .. }))
+        );
+    }
+
+    #[test]
+    fn summary_body_height_is_analytic_and_capped() {
+        assert_eq!(
+            summary_body_height(2),
+            DETAIL_SEPARATOR + 2.0 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
+        );
+        // Past the cap: capped rows + one counted-tail line, independent of n.
+        let capped = DETAIL_SEPARATOR
+            + (SUMMARY_MAX_FILES as f32 + 1.0) * OUTPUT_LINE_HEIGHT
+            + OUTPUT_BODY_PAD;
+        assert_eq!(summary_body_height(SUMMARY_MAX_FILES + 1), capped);
+        assert_eq!(summary_body_height(500), capped);
+    }
+
+    #[test]
+    fn only_the_primary_transcripts_final_summary_can_open_latest_turn() {
+        assert!(summary_can_open_diff(4, 5, false));
+        assert!(!summary_can_open_diff(2, 5, false));
+        assert!(!summary_can_open_diff(4, 5, true));
+    }
+
+    #[test]
+    fn summary_totals_require_counts_for_every_file() {
+        let exact = zeron_doc::TurnEdits {
+            files: vec![
+                zeron_doc::TurnFileEdit {
+                    path: "a.rs".into(),
+                    counts: Some((3, 1)),
+                },
+                zeron_doc::TurnFileEdit {
+                    path: "b.rs".into(),
+                    counts: Some((2, 0)),
+                },
+            ],
+            additions: 5,
+            deletions: 1,
+        };
+        assert!(summary_totals_are_exact(&exact));
+        let mut partial = exact;
+        partial.files[1].counts = None;
+        assert!(!summary_totals_are_exact(&partial));
     }
 }

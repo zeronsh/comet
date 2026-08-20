@@ -102,6 +102,98 @@ pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
     }
 }
 
+/// One file's aggregate in the end-of-turn edit summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFileEdit {
+    pub path: String,
+    /// Summed `(additions, deletions)` across the turn's edits of this file;
+    /// `None` when no diff reached the doc for it (the harness attached no
+    /// diff content — the file still counts as edited).
+    pub counts: Option<(u64, u64)>,
+}
+
+/// The end-of-turn "Edited N files · +X −Y" recap a settled assistant entry
+/// shows under its reply (Codex/Cursor-style change summary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEdits {
+    /// One entry per file, in first-touched order.
+    pub files: Vec<TurnFileEdit>,
+    /// Totals over the files that carry counts.
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// Aggregate a settled entry's tool parts into its edit summary, or `None`
+/// when the turn edited nothing.
+///
+/// Sources, best first: `diff_stats` (post-strip docs), the inline `diff`
+/// (pre-strip docs), else the edit-shaped call's own path with unknown
+/// counts. Failed and unresolved calls changed nothing — an aborted edit may
+/// never have run — so neither contributes. Shell-side edits (an `Exec` that
+/// writes files) are invisible to the doc; the checkout diff pane's
+/// latest-turn scope is the git-accurate view.
+pub fn turn_edits(parts: &[MessagePart]) -> Option<TurnEdits> {
+    let mut files: Vec<TurnFileEdit> = Vec::new();
+    let mut touch = |path: &str, counts: Option<(u64, u64)>| {
+        if let Some(existing) = files.iter_mut().find(|f| f.path == path) {
+            if let Some((a, d)) = counts {
+                let (ea, ed) = existing.counts.unwrap_or((0, 0));
+                existing.counts = Some((ea + a, ed + d));
+            }
+        } else {
+            files.push(TurnFileEdit {
+                path: path.to_owned(),
+                counts,
+            });
+        }
+    };
+    for part in parts {
+        let MessagePart::Tool {
+            call,
+            is_error,
+            resolved,
+            diff,
+            diff_stats,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        if *is_error || !*resolved {
+            continue;
+        }
+        if let Some(stats) = diff_stats.as_ref().filter(|s| !s.is_empty()) {
+            for stat in stats {
+                touch(&stat.path, Some((stat.additions, stat.deletions)));
+            }
+        } else if let Some(diff) = diff {
+            let stat = diff_stat(diff);
+            touch(&stat.path, Some((stat.additions, stat.deletions)));
+        } else {
+            match call {
+                ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+                    touch(path, None)
+                }
+                // A patch without a path names no file to attribute.
+                ToolCall::ApplyPatch { path: Some(path) } => touch(path, None),
+                _ => {}
+            }
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let (additions, deletions) = files
+        .iter()
+        .filter_map(|f| f.counts)
+        .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
+    Some(TurnEdits {
+        files,
+        additions,
+        deletions,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MessageStatus {
@@ -419,7 +511,6 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         | AgentEvent::UserMessage { .. } => {}
     }
 }
-
 
 /// Stamp sidecar keys onto resolved tool parts that have sidecar content.
 ///
@@ -988,5 +1079,128 @@ mod tests {
         .unwrap();
         assert_eq!(payload.part_id, "t");
         assert_eq!(payload.output.as_deref(), Some("full output"));
+    }
+
+    fn edit_tool(id: &str, path: &str, stats: Option<Vec<ToolDiffStat>>) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::EditFile {
+                path: path.into(),
+                old_string: None,
+                new_string: None,
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: stats,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        }
+    }
+
+    fn stat(path: &str, additions: u64, deletions: u64) -> ToolDiffStat {
+        ToolDiffStat {
+            path: path.into(),
+            additions,
+            deletions,
+        }
+    }
+
+    #[test]
+    fn turn_edits_merges_per_file_and_totals() {
+        let parts = vec![
+            MessagePart::Text {
+                id: "t0".into(),
+                text: "reply".into(),
+            },
+            edit_tool("a", "src/a.rs", Some(vec![stat("src/a.rs", 10, 2)])),
+            edit_tool("b", "src/b.rs", Some(vec![stat("src/b.rs", 3, 0)])),
+            // Second edit of a.rs: counts sum onto the existing row.
+            edit_tool("c", "src/a.rs", Some(vec![stat("src/a.rs", 1, 4)])),
+        ];
+        let edits = turn_edits(&parts).unwrap();
+        assert_eq!(
+            edits.files.len(),
+            2,
+            "one row per file, first-touched order"
+        );
+        assert_eq!(edits.files[0].path, "src/a.rs");
+        assert_eq!(edits.files[0].counts, Some((11, 6)));
+        assert_eq!(edits.files[1].path, "src/b.rs");
+        assert_eq!(edits.files[1].counts, Some((3, 0)));
+        assert_eq!((edits.additions, edits.deletions), (14, 6));
+    }
+
+    #[test]
+    fn turn_edits_skips_failed_unresolved_and_non_edits() {
+        let mut failed = edit_tool("a", "boom.rs", Some(vec![stat("boom.rs", 5, 5)]));
+        if let MessagePart::Tool { is_error, .. } = &mut failed {
+            *is_error = true;
+        }
+        let mut unresolved = edit_tool("b", "maybe.rs", None);
+        if let MessagePart::Tool { resolved, .. } = &mut unresolved {
+            *resolved = false;
+        }
+        let exec = MessagePart::Tool {
+            id: "c".into(),
+            call: ToolCall::Exec {
+                command: "cargo test".into(),
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        assert!(turn_edits(&[failed, unresolved, exec]).is_none());
+        assert!(turn_edits(&[]).is_none());
+    }
+
+    #[test]
+    fn turn_edits_falls_back_to_call_paths_without_counts() {
+        // No diff reached the doc: the call's path still marks the file
+        // edited; the totals then only cover counted files.
+        let parts = vec![
+            edit_tool("a", "src/blind.rs", None),
+            edit_tool("b", "src/seen.rs", Some(vec![stat("src/seen.rs", 7, 1)])),
+        ];
+        let edits = turn_edits(&parts).unwrap();
+        assert_eq!(edits.files[0].counts, None);
+        assert_eq!(edits.files[1].counts, Some((7, 1)));
+        assert_eq!((edits.additions, edits.deletions), (7, 1));
+        // A later counted edit of the blind file upgrades its row in place.
+        let parts = vec![
+            edit_tool("a", "src/blind.rs", None),
+            edit_tool("b", "src/blind.rs", Some(vec![stat("src/blind.rs", 2, 2)])),
+        ];
+        let edits = turn_edits(&parts).unwrap();
+        assert_eq!(edits.files.len(), 1);
+        assert_eq!(edits.files[0].counts, Some((2, 2)));
+    }
+
+    #[test]
+    fn turn_edits_reads_pre_strip_inline_diffs() {
+        // Old docs carry the inline diff instead of stats — counts still come out.
+        let mut part = edit_tool("a", "src/old.rs", None);
+        if let MessagePart::Tool { diff, .. } = &mut part {
+            *diff = Some(ToolDiff {
+                path: "src/old.rs".into(),
+                old_text: Some("one\ntwo\n".into()),
+                new_text: "one\nthree\nfour\n".into(),
+            });
+        }
+        let edits = turn_edits(&[part]).unwrap();
+        assert_eq!(edits.files[0].counts, Some((2, 1)));
     }
 }

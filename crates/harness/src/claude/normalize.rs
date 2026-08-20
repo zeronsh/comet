@@ -2,7 +2,7 @@
 //! decoding, error-code mapping).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall, ToolDiff};
 
 use super::wire::{ContentBlock, Frame};
 
@@ -153,6 +153,35 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
     }
 }
 
+/// The synthesized diff for an edit-shaped call. The wire's `tool_result`
+/// carries no change payload, but the `tool_use` INPUT does: Edit's old/new
+/// strings diff as the changed region; Write's content counts as all-new
+/// lines (the previous file text is never echoed, so an overwrite reads as
+/// additions — approximate, like Cursor's own recap). Feeds the doc fold's
+/// `diff_stats`, which power edit chips and the end-of-turn summary card.
+fn edit_diff(call: &ToolCall) -> Option<ToolDiff> {
+    match call {
+        ToolCall::EditFile {
+            path,
+            old_string,
+            new_string,
+        } if old_string.is_some() || new_string.is_some() => Some(ToolDiff {
+            path: path.clone(),
+            old_text: old_string.clone(),
+            new_text: new_string.clone().unwrap_or_default(),
+        }),
+        ToolCall::WriteFile {
+            path,
+            content: Some(content),
+        } => Some(ToolDiff {
+            path: path.clone(),
+            old_text: None,
+            new_text: content.clone(),
+        }),
+        _ => None,
+    }
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -170,6 +199,10 @@ pub(crate) struct Normalizer {
     /// re-keys them onto the spawn chip's feed (the wire never echoes the
     /// steer on the child feed — live-verified 2.1.228).
     agent_tasks: std::collections::HashMap<String, String>,
+    /// Edit/Write diffs synthesized at `tool_use` time ([`edit_diff`]),
+    /// keyed by tool id and attached to the matching `tool_result` — the
+    /// result frame itself carries no change payload.
+    edit_diffs: std::collections::HashMap<String, ToolDiff>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -182,6 +215,7 @@ impl Normalizer {
         Self {
             saw_init: false,
             agent_tasks: std::collections::HashMap::new(),
+            edit_diffs: std::collections::HashMap::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -325,13 +359,19 @@ impl Normalizer {
                                     text: format!("{}\n\n", b.text.trim_end()),
                                 },
                             )),
-                            "tool_use" => Some(tag(
-                                parent,
-                                AgentEvent::ToolCall {
-                                    id: b.id.clone(),
-                                    call: decode_tool_use(&b.name, &b.input),
-                                },
-                            )),
+                            "tool_use" => {
+                                let call = decode_tool_use(&b.name, &b.input);
+                                if let Some(diff) = edit_diff(&call) {
+                                    self.edit_diffs.insert(b.id.clone(), diff);
+                                }
+                                Some(tag(
+                                    parent,
+                                    AgentEvent::ToolCall {
+                                        id: b.id.clone(),
+                                        call,
+                                    },
+                                ))
+                            }
                             _ => None,
                         })
                         .collect();
@@ -350,9 +390,13 @@ impl Normalizer {
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_use")
                     .flat_map(|b| {
+                        let decoded = decode_tool_use(&b.name, &b.input);
+                        if let Some(diff) = edit_diff(&decoded) {
+                            self.edit_diffs.insert(b.id.clone(), diff);
+                        }
                         let call = AgentEvent::ToolCall {
                             id: b.id.clone(),
-                            call: decode_tool_use(&b.name, &b.input),
+                            call: decoded,
                         };
                         // A spawn's `prompt` is the subagent's opening user
                         // message — the wire never echoes it on the child
@@ -428,7 +472,7 @@ impl Normalizer {
                                     id: b.tool_use_id.clone(),
                                     is_error: b.is_error.unwrap_or(false),
                                     output: None,
-                                    diff: None,
+                                    diff: self.edit_diffs.remove(&b.tool_use_id),
                                 },
                             )
                         })
@@ -456,7 +500,7 @@ impl Normalizer {
                         id: b.tool_use_id.clone(),
                         is_error: b.is_error.unwrap_or(false),
                         output: None,
-                        diff: None,
+                        diff: self.edit_diffs.remove(&b.tool_use_id),
                     })
                     .collect()
             }
@@ -715,6 +759,59 @@ mod tests {
                     diff: None,
                 }),
             }]
+        );
+    }
+
+    #[test]
+    fn edit_results_carry_a_synthesized_diff() {
+        // The wire's tool_result has no change payload — the Edit input
+        // does; the normalizer stashes it at call time and attaches it to
+        // the matching result (feeds diff_stats → the turn summary card).
+        let mut norm = Normalizer::new();
+        let call = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/a.rs","old_string":"one\ntwo","new_string":"one\nthree\nfour"}}]}}"#,
+        )
+        .expect("parses");
+        norm.normalize(call, false);
+        let result_raw = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#;
+        let result = crate::claude::wire::parse_frame(result_raw).expect("parses");
+        let ev = norm.normalize(result, false);
+        let diff = ev
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult { diff, .. } => diff.clone(),
+                _ => None,
+            })
+            .expect("result carries the synthesized diff");
+        assert_eq!(diff.path, "src/a.rs");
+        assert_eq!(diff.old_text.as_deref(), Some("one\ntwo"));
+        assert_eq!(diff.new_text, "one\nthree\nfour");
+        // The stash is spent on attach — a duplicate result stays diff-less.
+        let result = crate::claude::wire::parse_frame(result_raw).expect("parses");
+        let ev = norm.normalize(result, false);
+        assert!(
+            ev.iter()
+                .all(|e| matches!(e, AgentEvent::ToolResult { diff: None, .. }))
+        );
+        // Non-edit tools never stash: their results stay diff-less.
+        let mut norm = Normalizer::new();
+        norm.normalize(
+            crate::claude::wire::parse_frame(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls"}}]}}"#,
+            )
+            .expect("parses"),
+            false,
+        );
+        let ev = norm.normalize(
+            crate::claude::wire::parse_frame(
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":false}]}}"#,
+            )
+            .expect("parses"),
+            false,
+        );
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { diff: None, .. }))
         );
     }
 

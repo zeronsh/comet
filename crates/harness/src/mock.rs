@@ -450,11 +450,66 @@ impl Harness for MockHarness {
             })
             .into_iter()
             .flatten();
+        // Dev/testing knob: `ZERON_MOCK_EDITS=1` appends scripted file edits —
+        // EditFile calls whose results carry diffs, twice for one file (the
+        // per-file sum), plus one diff-less edit (the counts-unknown row) —
+        // the data-side way to put the end-of-turn "Edited N files" summary
+        // card on screen.
+        let mock_edits = std::env::var("ZERON_MOCK_EDITS")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let edit_tool_events = mock_edits
+            .then(|| {
+                let mut events = Vec::new();
+                let mut edit = |id: &str, path: &str, old: Option<&str>, new: Option<&str>| {
+                    events.push(AgentEvent::ToolCall {
+                        id: id.into(),
+                        call: zeron_proto::ToolCall::EditFile {
+                            path: path.into(),
+                            old_string: None,
+                            new_string: None,
+                        },
+                    });
+                    events.push(AgentEvent::ToolResult {
+                        id: id.into(),
+                        is_error: false,
+                        output: None,
+                        diff: new.map(|new_text| zeron_proto::ToolDiff {
+                            path: path.into(),
+                            old_text: old.map(str::to_owned),
+                            new_text: new_text.into(),
+                        }),
+                    });
+                };
+                edit(
+                    "mock-edit-1",
+                    "crates/ui/src/transcript.rs",
+                    Some("let fold = default();\nlet open = auto;\n"),
+                    Some("let fold = folds.get(id);\nlet open = fold.open;\nlet target = h;\n"),
+                );
+                edit(
+                    "mock-edit-2",
+                    "crates/doc/src/parts.rs",
+                    Some("pub fn diff_stat() {}\n"),
+                    Some("pub fn diff_stat() {}\npub fn turn_edits() {}\n"),
+                );
+                edit(
+                    "mock-edit-3",
+                    "crates/ui/src/transcript.rs",
+                    Some("let target = h;\n"),
+                    Some("let target = if open { h } else { 0.0 };\n"),
+                );
+                edit("mock-edit-4", "docs/notes.md", None, None);
+                events
+            })
+            .into_iter()
+            .flatten();
         let events: Vec<Result<AgentEvent, HarnessError>> = body
             .iter()
             .cycle()
             .take(body.len() * repeat)
             .cloned()
+            .chain(edit_tool_events)
             .chain(code_tool_events)
             .chain(subagent_events)
             .chain(code_event)
