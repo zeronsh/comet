@@ -384,8 +384,9 @@ impl PiNativeHarness {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::pi::native", stderr = %line);
+                    tracing::info!(target: "zeron_harness::pi::native", stderr = %line);
                 }
+                tracing::info!(target: "zeron_harness::pi::native", "pi stderr closed");
             });
         }
         Ok((child, stdin, lines))
@@ -501,12 +502,12 @@ impl Harness for PiNativeHarness {
             tracing::info!(target: "zeron_harness::pi::native", level, "set_thinking_level ok");
         }
 
-        // Step 4: enable steering.
+        // Step 4: enable steering (all mode = deliver all queued steers after current turn).
         let steer_id = uuid::Uuid::new_v4().to_string();
         let _ = Self::request(
             &mut stdin,
             &mut lines,
-            &json!({"type": "set_steering_mode", "mode": "steering", "id": steer_id}),
+            &json!({"type": "set_steering_mode", "mode": "all", "id": steer_id}),
         )
         .await?;
         tracing::info!(target: "zeron_harness::pi::native", "set_steering_mode ok");
@@ -624,6 +625,7 @@ impl Harness for PiNativeHarness {
                         }
                     }
                     Ok(None) => {
+                        tracing::info!(target: "zeron_harness::pi::native", "pi stdout closed");
                         let _ = event_tx.send(Ok(AgentEvent::Done {
                             status: if interrupted {
                                 DoneStatus::Interrupted
