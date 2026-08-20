@@ -472,16 +472,21 @@ impl Harness for PiNativeHarness {
             &json!({"type": "get_state", "id": state_id}),
         )
         .await?;
+        tracing::info!(target: "zeron_harness::pi::native", "get_state ok");
 
         // Step 2: set the model if specified.
         if !provider.is_empty() && !model_id.is_empty() {
             let req_id = uuid::Uuid::new_v4().to_string();
+            tracing::info!(target: "zeron_harness::pi::native", provider, model_id, "sending set_model");
             let _ = Self::request(
                 &mut stdin,
                 &mut lines,
                 &json!({"type": "set_model", "provider": provider, "modelId": model_id, "id": req_id}),
             )
             .await?;
+            tracing::info!(target: "zeron_harness::pi::native", "set_model ok");
+        } else {
+            tracing::info!(target: "zeron_harness::pi::native", provider, model_id, "skipping set_model (provider or model empty)");
         }
 
         // Step 3: set thinking level if specified.
@@ -493,6 +498,7 @@ impl Harness for PiNativeHarness {
                 &json!({"type": "set_thinking_level", "level": level, "id": think_id}),
             )
             .await?;
+            tracing::info!(target: "zeron_harness::pi::native", level, "set_thinking_level ok");
         }
 
         // Step 4: enable steering.
@@ -503,6 +509,7 @@ impl Harness for PiNativeHarness {
             &json!({"type": "set_steering_mode", "mode": "steering", "id": steer_id}),
         )
         .await?;
+        tracing::info!(target: "zeron_harness::pi::native", "set_steering_mode ok");
 
         // Step 5: send the prompt.
         let prompt_id = uuid::Uuid::new_v4().to_string();
@@ -512,6 +519,7 @@ impl Harness for PiNativeHarness {
             &json!({"type": "prompt", "message": request.prompt, "id": prompt_id}),
         )
         .await?;
+        tracing::info!(target: "zeron_harness::pi::native", "prompt accepted, starting event loop");
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         let interrupt_grace = self.interrupt_grace;
@@ -565,8 +573,12 @@ impl Harness for PiNativeHarness {
                         };
 
                         // Skip response types (they were already read during setup).
-                        if event.get("type").and_then(Value::as_str) == Some("response") {
+                        let ev_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+                        if ev_type == "response" {
                             continue;
+                        }
+                        if ev_type != "extension_ui_request" {
+                            tracing::info!(target: "zeron_harness::pi::native", %ev_type, "event received");
                         }
 
                         // Emit SessionStarted on first text delta.
@@ -591,6 +603,9 @@ impl Harness for PiNativeHarness {
 
                         let events = translate_pi_event(&event);
                         let is_done = events.iter().any(|ev| matches!(ev, AgentEvent::Done { .. }));
+                        if !events.is_empty() {
+                            tracing::debug!(target: "zeron_harness::pi::native", count = events.len(), is_done, "translated events");
+                        }
                         for ev in events {
                             if event_tx.send(Ok(ev)).await.is_err() {
                                 return;
