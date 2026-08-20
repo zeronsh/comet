@@ -27,8 +27,34 @@ Builds the release binary, assembles `Zeron.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
 dmg. The auto-update tarball retains an internal `Zeron.app` path so older
 installed builds can update into Zeron. CI runs this on tags
-(`.github/workflows/release.yml`). The manual steps it automates, for reference
-(run on a macOS host — gpui needs Metal; no cross-build from Linux):
+(`.github/workflows/release.yml`).
+
+### Local Li and Dev channels
+
+Personal builds can coexist with the official application under distinct
+bundle identities and icons. Li is an alternate daily frontend for the same
+activity; Dev is the isolated unfinished-work channel:
+
+```sh
+scripts/package-macos-local.sh li --install   # ~/Applications/Zeron Li.app
+scripts/package-macos-local.sh dev --install  # ~/Applications/Zeron Dev.app
+```
+
+| Channel | Bundle ID | Data directory | IPC port | Build |
+| --- | --- | --- | --- | --- |
+| Official | `sh.zeron.app` | `~/.zeron` | `27654` | release |
+| Li | `dev.kalibetre.zeron.li` | `~/.zeron` | `27654` | release |
+| Dev | `dev.kalibetre.zeron.dev` | `~/.zeron-dev` | `27655` | debug |
+
+The local bundles use badged icons and set `ZERON_DISABLE_UPDATES=1`: the
+public updater must never replace a personal build. Official and Li share one
+engine and activity store. Whichever starts first owns that engine; the other
+app connects to it. Quit Li before launching Official when comparing the
+actual official engine version rather than only its UI. Dev is fully isolated,
+including its callback port, worktrees, and Cursor state.
+
+The manual production steps follow, for reference (run on a macOS host — gpui
+needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
    ```sh
