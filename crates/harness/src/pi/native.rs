@@ -347,7 +347,7 @@ impl PiNativeHarness {
                 )
             })?;
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--mode", "rpc", "--no-themes"]);
+        cmd.args(["--mode", "rpc"]);
         Ok(cmd)
     }
 
@@ -407,6 +407,7 @@ impl PiNativeHarness {
             .map_err(|e| HarnessError::Protocol(e.to_string()))?;
         line.push(b'\n');
         stdin.write_all(&line).await?;
+        stdin.flush().await?;
         read_response(lines, &id).await
     }
 }
@@ -502,17 +503,7 @@ impl Harness for PiNativeHarness {
             tracing::info!(target: "zeron_harness::pi::native", level, "set_thinking_level ok");
         }
 
-        // Step 4: enable steering (all mode = deliver all queued steers after current turn).
-        let steer_id = uuid::Uuid::new_v4().to_string();
-        let _ = Self::request(
-            &mut stdin,
-            &mut lines,
-            &json!({"type": "set_steering_mode", "mode": "all", "id": steer_id}),
-        )
-        .await?;
-        tracing::info!(target: "zeron_harness::pi::native", "set_steering_mode ok");
-
-        // Step 5: send the prompt.
+        // Step 4: send the prompt.
         let prompt_id = uuid::Uuid::new_v4().to_string();
         let _prompt_response = Self::request(
             &mut stdin,
