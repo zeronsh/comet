@@ -462,7 +462,7 @@ impl Harness for PiNativeHarness {
         let (provider, model_id) = pi_model_parts(&model);
         let thinking = to_pi_thinking(request.reasoning);
 
-        let (child, mut stdin, mut lines) = self.spawn_pi(Some(&request.cwd)).await?;
+        let (mut child, mut stdin, mut lines) = self.spawn_pi(Some(&request.cwd)).await?;
         let child_pid = child.id();
         tracing::info!(target: "zeron_harness::pi::native", pid = child_pid, cwd = %request.cwd, "pi native session starting");
 
@@ -492,9 +492,11 @@ impl Harness for PiNativeHarness {
         let interrupt_token = controls.interrupt.clone();
         let cwd = request.cwd.clone();
 
-        // CRITICAL: keep child alive in the event loop task so kill_on_drop
-        // doesn't kill pi when run() returns the stream.
-        let _child = child;
+        // Monitor child exit in background.
+        tokio::spawn(async move {
+            let status = child.wait().await;
+            tracing::info!(target: "zeron_harness::pi::native", ?status, "pi process exited");
+        });
         tokio::spawn(async move {
             let mut session_id: Option<String> = None;
             let mut sent_started = false;
