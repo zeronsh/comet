@@ -531,6 +531,7 @@ impl Harness for PiNativeHarness {
             let mut session_id: Option<String> = None;
             let mut sent_started = false;
             let mut interrupted = false;
+            tracing::info!(target: "zeron_harness::pi::native", "event loop started");
 
             loop {
                 if interrupt_token.is_cancelled() && !interrupted {
@@ -577,7 +578,14 @@ impl Harness for PiNativeHarness {
                         if ev_type == "response" {
                             continue;
                         }
-                        if ev_type != "extension_ui_request" {
+                        // Log first 5 events of each type unconditionally to debug
+                        if ev_type == "extension_ui_request" {
+                            static EXT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            let n = EXT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 3 {
+                                tracing::info!(target: "zeron_harness::pi::native", %ev_type, n, "event (suppressing further)");
+                            }
+                        } else {
                             tracing::info!(target: "zeron_harness::pi::native", %ev_type, "event received");
                         }
 
