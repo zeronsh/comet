@@ -347,7 +347,7 @@ impl PiNativeHarness {
                 )
             })?;
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--mode", "rpc", "--no-session"]);
+        cmd.args(["--mode", "rpc"]);
         Ok(cmd)
     }
 
@@ -466,15 +466,25 @@ impl Harness for PiNativeHarness {
         let child_pid = child.id();
         tracing::info!(target: "zeron_harness::pi::native", pid = child_pid, cwd = %request.cwd, "pi native session starting");
 
-        // Send prompt directly (matching the Python example from pi's docs).
+        // Acknowledge extension_ui_request events that arrive during setup.
+        // pi's extensions (dex, todos, etc.) may send requests that need
+        // responses to unblock startup.
+        // Step 1: get_state to initialize (needed before prompt).
+        let state_id = uuid::Uuid::new_v4().to_string();
+        Self::request(&mut stdin, &mut lines, &json!({"type": "get_state", "id": state_id})).await?;
+        tracing::info!(target: "zeron_harness::pi::native", "get_state ok");
+
+        // Step 2: set model if we have one.
+        if !provider.is_empty() && !model_id.is_empty() {
+            let req_id = uuid::Uuid::new_v4().to_string();
+            Self::request(&mut stdin, &mut lines, &json!({"type": "set_model", "provider": provider, "modelId": model_id, "id": req_id})).await?;
+            tracing::info!(target: "zeron_harness::pi::native", provider, model_id, "set_model ok");
+        }
+
+        // Step 3: send prompt.
         let prompt_id = uuid::Uuid::new_v4().to_string();
-        let prompt_cmd = json!({"type": "prompt", "message": request.prompt, "id": prompt_id});
-        let mut line = serde_json::to_vec(&prompt_cmd)
-            .map_err(|e| HarnessError::Protocol(e.to_string()))?;
-        line.push(b'\n');
-        stdin.write_all(&line).await?;
-        stdin.flush().await?;
-        tracing::info!(target: "zeron_harness::pi::native", "prompt sent, starting event loop");
+        Self::request(&mut stdin, &mut lines, &json!({"type": "prompt", "message": request.prompt, "id": prompt_id})).await?;
+        tracing::info!(target: "zeron_harness::pi::native", "prompt accepted, starting event loop");
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         let interrupt_grace = self.interrupt_grace;
@@ -482,6 +492,9 @@ impl Harness for PiNativeHarness {
         let interrupt_token = controls.interrupt.clone();
         let cwd = request.cwd.clone();
 
+        // CRITICAL: keep child alive in the event loop task so kill_on_drop
+        // doesn't kill pi when run() returns the stream.
+        let _child = child;
         tokio::spawn(async move {
             let mut session_id: Option<String> = None;
             let mut sent_started = false;
