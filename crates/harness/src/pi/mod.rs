@@ -1,9 +1,6 @@
-//! Pi harness support: model catalog and a native Pi driver that talks
-//! to `pi --mode rpc` directly instead of through the `pi-acp` ACP adapter.
-//!
-//! The native driver mirrors bb's approach of using Pi's SDK — we drive
-//! pi's RPC mode (the same protocol the SDK uses) directly from Rust.
+//! Native Pi harness over the documented `pi --mode rpc` JSONL protocol.
 
+// Retained only for the legacy `AcpHarness::pi` compatibility constructor.
 pub mod catalog;
 pub mod native;
 
