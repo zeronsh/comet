@@ -264,6 +264,18 @@ async fn subagent_tool_replays_child_transcript_as_nested_events() {
         )),
         "{events:?}"
     );
+    assert!(
+        !nested.iter().any(|event| match event {
+            AgentEvent::UserMessage { text }
+            | AgentEvent::TextDelta { text }
+            | AgentEvent::ReasoningDelta { text } =>
+                text.contains("Acceptance Contract")
+                    || text.contains("acceptance-report")
+                    || text.contains("criteriaSatisfied"),
+            _ => false,
+        }),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

@@ -376,6 +376,40 @@ fn transcript_tool_args(record: &Value) -> Value {
     }
 }
 
+fn visible_child_task(text: &str) -> String {
+    let Some((task, _)) = text.split_once("\n\n## Acceptance Contract") else {
+        return text.to_owned();
+    };
+    task.trim()
+        .strip_prefix("Task:")
+        .unwrap_or(task.trim())
+        .trim()
+        .to_owned()
+}
+
+fn visible_child_assistant_text(text: &str) -> String {
+    if !text
+        .lines()
+        .any(|line| line.trim() == "```acceptance-report")
+    {
+        return text.to_owned();
+    }
+
+    let mut visible = String::new();
+    let mut in_report = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !in_report && trimmed == "```acceptance-report" {
+            in_report = true;
+        } else if in_report && trimmed == "```" {
+            in_report = false;
+        } else if !in_report {
+            visible.push_str(line);
+        }
+    }
+    visible.trim().to_owned()
+}
+
 fn transcript_message_events(
     record: &Value,
     emitted_tools: &mut HashSet<String>,
@@ -394,7 +428,9 @@ fn transcript_message_events(
                         .map(str::to_owned)
                 })
             {
-                events.push(AgentEvent::UserMessage { text });
+                events.push(AgentEvent::UserMessage {
+                    text: visible_child_task(&text),
+                });
             }
         }
         Some("assistant") => {
@@ -408,7 +444,10 @@ fn transcript_message_events(
                         }
                         Some("text") => {
                             if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                events.push(AgentEvent::TextDelta { text: text.into() });
+                                let text = visible_child_assistant_text(text);
+                                if !text.is_empty() {
+                                    events.push(AgentEvent::TextDelta { text });
+                                }
                             }
                         }
                         Some("toolCall") => {
@@ -427,7 +466,10 @@ fn transcript_message_events(
                     }
                 }
             } else if let Some(text) = record.get("text").and_then(Value::as_str) {
-                events.push(AgentEvent::TextDelta { text: text.into() });
+                let text = visible_child_assistant_text(text);
+                if !text.is_empty() {
+                    events.push(AgentEvent::TextDelta { text });
+                }
             }
             if let Some(usage) = usage_event(message).or_else(|| usage_event(record)) {
                 events.push(usage);

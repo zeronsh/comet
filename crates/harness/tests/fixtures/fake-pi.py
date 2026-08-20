@@ -117,12 +117,12 @@ for raw in sys.stdin:
             transcript_path = scenario.removeprefix("subagent:")
             records = [
                 {"recordType": "message", "sourceEventType": "initial_prompt", "role": "user", "text": "[prompt redacted]", "message": {"role": "user", "content": [{"type": "text", "text": "[prompt redacted]"}]}},
-                {"recordType": "message", "sourceEventType": "message_end", "role": "user", "text": "Inspect the fixture", "message": {"role": "user", "content": [{"type": "text", "text": "Inspect the fixture"}]}},
+                {"recordType": "message", "sourceEventType": "message_end", "role": "user", "text": "Task: Inspect the fixture\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone.", "message": {"role": "user", "content": [{"type": "text", "text": "Task: Inspect the fixture\n\n## Acceptance Contract\nAcceptance level: attested\nCompletion is not accepted from prose alone."}]}},
                 {"recordType": "message", "sourceEventType": "message_end", "role": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Planning child work"}, {"type": "toolCall", "id": "child-read", "name": "read", "arguments": {"path": "/tmp/input.txt"}}], "usage": {"input": 7, "output": 2}, "stopReason": "toolUse"}},
                 {"recordType": "tool_start", "sourceEventType": "tool_execution_start", "toolCallId": "child-read", "toolName": "read", "argsPayload": {"path": "/tmp/input.txt"}},
                 {"recordType": "tool_end", "sourceEventType": "tool_execution_end", "toolCallId": "child-read", "toolName": "read", "isError": False},
                 {"recordType": "message", "sourceEventType": "tool_result_end", "role": "toolResult", "toolCallId": "child-read", "toolName": "read", "isError": False, "text": "fixture body", "message": {"role": "toolResult", "toolCallId": "child-read", "toolName": "read", "isError": False, "content": [{"type": "text", "text": "fixture body"}]}},
-                {"recordType": "message", "sourceEventType": "message_end", "role": "assistant", "text": "Child finished", "message": {"role": "assistant", "content": [{"type": "text", "text": "Child finished"}], "usage": {"input": 3, "output": 4}, "stopReason": "stop"}},
+                {"recordType": "message", "sourceEventType": "message_end", "role": "assistant", "text": "Child finished\n\n```acceptance-report\n{\"criteriaSatisfied\": []}\n```", "message": {"role": "assistant", "content": [{"type": "text", "text": "Child finished\n\n```acceptance-report\n{\"criteriaSatisfied\": []}\n```"}], "usage": {"input": 3, "output": 4}, "stopReason": "stop"}},
             ]
             with open(transcript_path, "w", encoding="utf-8") as transcript:
                 for record in records:
