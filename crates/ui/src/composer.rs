@@ -31,6 +31,7 @@ use zeron_proto::{
 };
 use zeron_rpc::{RpcError, methods};
 
+use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
@@ -400,6 +401,14 @@ pub enum SendButtonMode {
 /// a legal send — and during a live run has to read as Steer, not Stop.
 pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> bool {
     !text.trim().is_empty() || attachments > 0 || comments > 0
+}
+
+pub fn appshot_strip_height(count: usize) -> f32 {
+    if count == 0 {
+        0.0
+    } else {
+        STRIP_PAD_TOP + count as f32 * 64.0 + count.saturating_sub(1) as f32 * STRIP_GAP
+    }
 }
 
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
@@ -3335,6 +3344,10 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Rich window captures keyed exactly like drafts and ordinary staged
+    /// attachments. Each owns one screenshot that joins the existing upload
+    /// path only at send time.
+    appshots: HashMap<String, Vec<CapturedAppshot>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -3495,6 +3508,7 @@ impl Composer {
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
+            appshots: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
@@ -3588,6 +3602,35 @@ impl Composer {
             .unwrap_or(&[])
     }
 
+    fn staged_appshots(&self) -> &[CapturedAppshot] {
+        self.appshots
+            .get(&self.current_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn stage_appshot(&mut self, appshot: CapturedAppshot, cx: &mut Context<Self>) {
+        self.stage_appshot_for(self.current_key.clone(), appshot, cx);
+    }
+
+    pub fn stage_appshot_for(
+        &mut self,
+        key: String,
+        appshot: CapturedAppshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.appshots.entry(key).or_default().push(appshot);
+        self.failure = None;
+        self.failure_key = None;
+        cx.notify();
+    }
+
+    pub fn show_appshot_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.failure = Some(message.into());
+        self.failure_key = Some(self.current_key.clone());
+        cx.notify();
+    }
+
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
         if staged.is_empty() {
             return;
@@ -3630,10 +3673,21 @@ impl Composer {
         cx.notify();
     }
 
+    fn remove_appshot(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(list) = self.appshots.get_mut(&self.current_key) {
+            list.retain(|appshot| appshot.id != id);
+            if list.is_empty() {
+                self.appshots.remove(&self.current_key);
+            }
+        }
+        cx.notify();
+    }
+
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
+        self.appshots.remove(chat_id);
         self.state.update(cx, |state, _| {
             state.purge_diff_comments(chat_id);
         });
@@ -3762,6 +3816,126 @@ impl Composer {
                                     .text_color(theme.text_muted),
                             ),
                     )),
+            );
+        }
+        Some(strip)
+    }
+
+    fn render_appshot_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let appshots = self.staged_appshots();
+        if appshots.is_empty() {
+            return None;
+        }
+        let mut strip = div()
+            .flex()
+            .flex_col()
+            .gap(px(STRIP_GAP))
+            .px(px(STRIP_PAD_X))
+            .pt(px(STRIP_PAD_TOP));
+        for (ix, appshot) in appshots.iter().enumerate() {
+            let preview = attachments::PreviewImage {
+                name: appshot.screenshot.name.clone().into(),
+                image: appshot.screenshot.image.clone(),
+            };
+            let remove_id = appshot.id.clone();
+            let source: SharedString = appshot
+                .window_title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .map(|title| format!("{} — {title}", appshot.app_name))
+                .unwrap_or_else(|| appshot.app_name.clone())
+                .into();
+            let context: SharedString = if appshot.accessibility.content.is_empty() {
+                "Screenshot only — Accessibility text unavailable".into()
+            } else if appshot.accessibility.truncated {
+                format!(
+                    "{} characters of application text captured (truncated)",
+                    appshot.accessibility.content.chars().count()
+                )
+                .into()
+            } else {
+                format!(
+                    "{} characters of application text captured",
+                    appshot.accessibility.content.chars().count()
+                )
+                .into()
+            };
+            strip = strip.child(
+                div()
+                    .id(("composer-appshot", ix))
+                    .h(px(64.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(crate::theme::ink(0.035))
+                    .px(px(6.0))
+                    .child(
+                        div()
+                            .id(("composer-appshot-preview", ix))
+                            .size(px(50.0))
+                            .flex_none()
+                            .rounded(px(7.0))
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.preview = Some(preview.clone());
+                                this.preview_focus_pending = true;
+                                cx.notify();
+                            }))
+                            .child(
+                                img(appshot.screenshot.image.clone())
+                                    .w(px(50.0))
+                                    .h(px(50.0))
+                                    .object_fit(ObjectFit::Cover),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .child(source),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(context),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("composer-appshot-remove", ix))
+                            .size(px(26.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::ink(0.08)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_appshot(&remove_id, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                                    .size(px(15.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    ),
             );
         }
         Some(strip)
@@ -4493,7 +4667,7 @@ impl Composer {
     fn button_mode(&self, cx: &App) -> SendButtonMode {
         let has_text = composer_has_content(
             self.input.read(cx).text(),
-            self.staged().len(),
+            self.staged().len() + self.staged_appshots().len(),
             self.staged_comments(cx).len(),
         );
         send_button_mode(self.run_live(cx), has_text)
@@ -4510,8 +4684,11 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        let no_content =
-            !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
+        let no_content = !composer_has_content(
+            &text,
+            self.staged().len() + self.staged_appshots().len(),
+            self.staged_comments(cx).len(),
+        );
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if no_content => {}
@@ -4586,10 +4763,17 @@ impl Composer {
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
-        let staged = self
+        let ordinary_staged = self
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
+        let staged_appshots = self.appshots.remove(&self.current_key).unwrap_or_default();
+        let mut staged = ordinary_staged.clone();
+        staged.extend(
+            staged_appshots
+                .iter()
+                .map(|appshot| appshot.screenshot.clone()),
+        );
         // `typed` keeps the user's own words for the failure hand-back below:
         // restoring the folded prompt would paste the comment block into the
         // input as literal text.
@@ -4656,7 +4840,15 @@ impl Composer {
                 .map(|att| format!("pending/{}/{}", att.id, att.name))
                 .collect()
         };
-        let echo_text = attachments::with_attachments(&text, &echo_paths);
+        let echo_appshot_paths: HashMap<String, String> = staged
+            .iter()
+            .zip(&echo_paths)
+            .map(|(attachment, path)| (attachment.id.clone(), path.clone()))
+            .collect();
+        let echo_text = attachments::with_attachments(
+            &appshots::with_appshots(&text, &staged_appshots, &echo_appshot_paths),
+            &echo_paths,
+        );
         // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
         // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
         // path the sender can't predict, but whose id8 it minted. The alias
@@ -4832,7 +5024,15 @@ impl Composer {
                             attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
                         }
                     }
-                    content = attachments::with_attachments(&text, &attachment_paths);
+                    let appshot_paths: HashMap<String, String> = staged
+                        .iter()
+                        .zip(&attachment_paths)
+                        .map(|(attachment, path)| (attachment.id.clone(), path.clone()))
+                        .collect();
+                    content = attachments::with_attachments(
+                        &appshots::with_appshots(&text, &staged_appshots, &appshot_paths),
+                        &attachment_paths,
+                    );
                     // Refresh the echo in place with the attachment refs
                     // (same id, same clock — the bubble grows its thumbnails
                     // without flickering).
@@ -5084,12 +5284,12 @@ impl Composer {
                         // no further swap will fire). Set the input directly.
                         composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
                     }
-                    if !staged.is_empty() {
+                    if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back —
                         // draining the minted chat's slot too when the restore
                         // target is the canvas.
-                        let mut merged = staged.clone();
+                        let mut merged = ordinary_staged.clone();
                         for key in [err_chat_id.clone(), restore_key.clone()] {
                             if let Some(slot) = composer.attachments.get_mut(&key) {
                                 let fresh: Vec<_> = slot
@@ -5099,7 +5299,22 @@ impl Composer {
                                 merged.extend(fresh);
                             }
                         }
-                        composer.attachments.insert(restore_key, merged);
+                        composer.attachments.insert(restore_key.clone(), merged);
+                    }
+                    if !staged_appshots.is_empty() {
+                        let mut merged = staged_appshots.clone();
+                        for key in [err_chat_id.clone(), restore_key.clone()] {
+                            if let Some(slot) = composer.appshots.get_mut(&key) {
+                                let fresh: Vec<_> = slot
+                                    .drain(..)
+                                    .filter(|candidate| {
+                                        !merged.iter().any(|existing| existing.id == candidate.id)
+                                    })
+                                    .collect();
+                                merged.extend(fresh);
+                            }
+                        }
+                        composer.appshots.insert(restore_key, merged);
                     }
                 }
                 cx.notify();
@@ -5836,6 +6051,7 @@ impl Render for Composer {
         // Staged attachments add the wrap strip's height to the pill in BOTH
         // modes (attachment-ui.tsx AttachmentStrip sits above the input row).
         let staged_count = self.staged().len();
+        let appshot_count = self.staged_appshots().len();
         let strip_width_hint = if last_width > 0.0 { last_width } else { 720.0 };
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
@@ -5844,7 +6060,8 @@ impl Render for Composer {
         } else {
             COMPACT_TOTAL_HEIGHT
         };
-        let target_height = base_height + strip_h + comment_strip_h;
+        let target_height =
+            base_height + strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
         let (pill_height, morph_t, morphing) = match self.flip_morph {
             Some(m) if !m.done(now_ms) => {
                 (m.height(target_height, now_ms), m.progress(now_ms), true)
@@ -5895,6 +6112,7 @@ impl Render for Composer {
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
+        let appshot_strip = self.render_appshot_strip(&theme, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
         // The pill chrome (zeron composer.tsx): `rounded-[26px] border
@@ -5934,6 +6152,7 @@ impl Render for Composer {
                 .flex()
                 .flex_col()
                 .children(comments_chip)
+                .children(appshot_strip)
                 .children(strip)
                 .child(
                     div()
@@ -5996,6 +6215,7 @@ impl Render for Composer {
                 .flex_col()
                 .justify_end()
                 .children(comments_chip)
+                .children(appshot_strip)
                 .children(strip)
                 .child(
                     div()
@@ -6473,6 +6693,13 @@ mod tests {
         );
         // Zero lines still measures one.
         assert_eq!(input_content_height(0), INPUT_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn appshot_strip_height_tracks_cards() {
+        assert_eq!(appshot_strip_height(0), 0.0);
+        assert_eq!(appshot_strip_height(1), STRIP_PAD_TOP + 64.0);
+        assert_eq!(appshot_strip_height(2), STRIP_PAD_TOP + 128.0 + STRIP_GAP);
     }
 
     #[test]

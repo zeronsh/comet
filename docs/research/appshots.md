@@ -1,6 +1,6 @@
 # Appshots for Zeron
 
-Status: product and architecture exploration
+Status: implemented on the exploration branch; native validation ongoing
 
 Branch: `wip/appshots-exploration`
 
@@ -168,7 +168,7 @@ trait AppshotCaptureService {
 }
 ```
 
-The macOS helper is responsible for:
+The macOS capture module is responsible for:
 
 - global shortcut detection;
 - frontmost process and window identification;
@@ -177,12 +177,10 @@ The macOS helper is responsible for:
 - permission probing and Settings deep links;
 - returning capture results over a narrow IPC protocol.
 
-A helper mirrors the lifecycle and permission isolation used by mature capture
-features and keeps Objective-C/Swift framework code out of GPUI state. The
-trade-off is signing, packaging, helper crash handling, and a second protocol.
-Before implementation, a small spike should compare this with an in-process
-Rust/Objective-C bridge specifically for TCC attribution and development
-ergonomics. The Rust-facing interface should remain the same either way.
+The implementation uses an in-process Rust/Objective-C bridge. TCC attribution
+is kept correct in development by launching a separately signed `Zeron Dev.app`
+through LaunchServices; the bundle also embeds its isolated data directory and
+IPC port so privacy-driven relaunches cannot enter the personal instance.
 
 ### Capture ordering
 

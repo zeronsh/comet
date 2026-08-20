@@ -8,6 +8,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::appshots::{AppshotDestination, PermissionState};
 use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -37,6 +38,10 @@ pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> R
 pub enum ShortcutsEvent {
     /// The keymap changed — persist + re-apply.
     Changed(KeymapConfig),
+    AppshotsChanged {
+        enabled: bool,
+        destination: AppshotDestination,
+    },
 }
 
 pub struct ShortcutsPage {
@@ -47,6 +52,9 @@ pub struct ShortcutsPage {
     /// conflicts never persist; they're refused at record time, as in zeron.
     conflict_notice: Option<SharedString>,
     focus: FocusHandle,
+    appshots_enabled: bool,
+    appshot_destination: AppshotDestination,
+    appshot_permissions: PermissionState,
     // The page never talks RPC; state is kept for parity with sibling pages
     // (and future per-device keymaps).
     _state: Entity<AppState>,
@@ -55,12 +63,21 @@ pub struct ShortcutsPage {
 impl EventEmitter<ShortcutsEvent> for ShortcutsPage {}
 
 impl ShortcutsPage {
-    pub fn new(state: Entity<AppState>, keymap: KeymapConfig, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        keymap: KeymapConfig,
+        appshots_enabled: bool,
+        appshot_destination: AppshotDestination,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             keymap,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
+            appshots_enabled,
+            appshot_destination,
+            appshot_permissions: crate::appshots::permission_state(),
             _state: state,
         }
     }
@@ -68,6 +85,13 @@ impl ShortcutsPage {
     fn commit(&mut self, cx: &mut Context<Self>) {
         cx.emit(ShortcutsEvent::Changed(self.keymap.clone()));
         cx.notify();
+    }
+
+    fn commit_appshots(&self, cx: &mut Context<Self>) {
+        cx.emit(ShortcutsEvent::AppshotsChanged {
+            enabled: self.appshots_enabled,
+            destination: self.appshot_destination,
+        });
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -134,9 +158,12 @@ fn description(id: ShortcutId) -> &'static str {
 impl Render for ShortcutsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
+        self.appshot_permissions = crate::appshots::permission_state();
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let customized = self.keymap != KeymapConfig::default();
+        let appshots_enabled = self.appshots_enabled;
+        let permissions = self.appshot_permissions;
 
         let rows = ShortcutId::ALL.into_iter().enumerate().map(|(ix, id)| {
             let combo = self.keymap.get(id).to_string();
@@ -245,6 +272,57 @@ impl Render for ShortcutsPage {
             "Shortcuts must be unique.".into()
         };
 
+        let appshot_destination =
+            AppshotDestination::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(ix, destination)| {
+                    let selected = self.appshot_destination == destination;
+                    div()
+                        .id(("appshot-destination", ix))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.text.opacity(0.24)
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            crate::theme::ink(0.09)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_size(px(11.0))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.appshot_destination = destination;
+                            this.commit_appshots(cx);
+                            cx.notify();
+                        }))
+                        .child(SharedString::from(destination.label()))
+                });
+        let permission_copy: SharedString = match (
+            permissions.screen_recording,
+            permissions.accessibility,
+        ) {
+            (true, true) => "Screen Recording and Accessibility access granted.".into(),
+            (true, false) => {
+                "Screenshot capture is ready. Grant Accessibility for off-screen application text."
+                    .into()
+            }
+            (false, _) => {
+                "Screen Recording is required. macOS may ask Zeron to quit and reopen after you enable it."
+                    .into()
+            }
+        };
+
         div()
             .id("shortcuts-page")
             .size_full()
@@ -316,6 +394,103 @@ impl Render for ShortcutsPage {
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
                             .child(helper),
+                    )
+                    .child(
+                        div()
+                            .mt(px(36.0))
+                            .child(widgets::page_header(&theme, "Appshots", None))
+                            .child(
+                                widgets::page_subtitle(
+                                    &theme,
+                                    "Press Control-Option-Space from any app to stage its window, screenshot, and accessible text in Zeron.",
+                                )
+                                .max_w(px(560.0))
+                                .line_height(px(20.0)),
+                            ),
+                    )
+                    .child(
+                        widgets::section_card(&theme)
+                            .child(
+                                widgets::card_row(&theme, true)
+                                    .child(widgets::row_tile(&theme, crate::icons::MONITOR))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(widgets::row_title(&theme, "Capture Appshots"))
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(SharedString::from("Global shortcut: Control-Option-Space (⌃⌥Space). Captures are staged, never sent automatically.")).into_any_element()],
+                                            )),
+                                    )
+                                    .child(
+                                        widgets::toggle_switch(&theme, appshots_enabled)
+                                            .id("appshots-enabled")
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.appshots_enabled = !this.appshots_enabled;
+                                                if this.appshots_enabled {
+                                                    this.appshot_permissions = crate::appshots::request_permissions();
+                                                }
+                                                this.commit_appshots(cx);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::KEYBOARD))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(widgets::row_title(&theme, "Destination"))
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(SharedString::from("Choose where a completed capture is staged.")).into_any_element()],
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .gap(px(6.0))
+                                            .children(appshot_destination),
+                                    ),
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .child(widgets::row_tile(&theme, crate::icons::MONITOR))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(widgets::row_title(&theme, "Capture permissions"))
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(permission_copy).into_any_element()],
+                                            )),
+                                    )
+                                    .when(!(permissions.screen_recording && permissions.accessibility), |el| {
+                                        el.child(
+                                            widgets::ghost_action(&theme)
+                                                .id("appshots-grant-permissions")
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.appshot_permissions = crate::appshots::request_permissions();
+                                                    cx.notify();
+                                                }))
+                                                .child(SharedString::from("Grant access")),
+                                        )
+                                    }),
+                            ),
                     ),
             )
     }

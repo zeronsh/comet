@@ -77,3 +77,21 @@ Tier 2: compile and test the affected Rust UI crate, then visually inspect the s
   matrix.
 - Main architecture decision: desktop capture is viewer-side UI capability,
   never an engine or remote-host responsibility.
+
+## 2026-08-20 — Appshots implementation and macOS hardening
+
+- Implemented the complete macOS capture-to-composer slice on
+  `wip/appshots-exploration` with `Control-Option-Space` as the fixed default.
+- Replaced the initial event tap with Carbon global-hotkey registration, which
+  consumes the chord and does not require Input Monitoring permission.
+- Uses ScreenCaptureKit's desktop-independent window capture on macOS 14+;
+  retains a CoreGraphics fallback for macOS 12/13 and transient failures.
+- Window enumeration is no longer restricted to the current Space. Active
+  ScreenCaptureKit windows win, followed by on-screen state and window area.
+- Added an isolated `Zeron Dev.app` workflow with bundle ID
+  `sh.zeron.app.dev`, stable Apple Development signing, its own data directory,
+  and IPC port. It launches through LaunchServices so TCC attributes capture
+  permissions to Zeron Dev rather than the terminal.
+- The isolated data directory and IPC port are embedded in the development
+  bundle's `LSEnvironment`, so macOS privacy's “Quit & Reopen” preserves the
+  development instance instead of reopening against personal production data.

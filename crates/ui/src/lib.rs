@@ -14,6 +14,7 @@
 
 pub mod app_menus;
 pub mod appearance;
+pub mod appshots;
 pub mod attachments;
 pub mod badges;
 pub mod change_requests;
@@ -171,6 +172,7 @@ pub fn run_app(config: UiConfig) {
             data_dir,
             cx,
         );
+        appshots::set_enabled(ui_settings.appshots_enabled);
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);
@@ -207,6 +209,8 @@ pub fn run_app(config: UiConfig) {
             boot: config.boot(),
         });
         open_main_window(state, config.boot(), cx);
+        #[cfg(target_os = "macos")]
+        start_appshot_service(cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -222,72 +226,128 @@ pub fn run_app(config: UiConfig) {
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
-fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
+fn open_main_window(
+    state: gpui::Entity<state::AppState>,
+    boot: EngineBootConfig,
+    cx: &mut App,
+) -> gpui::WindowHandle<shell::Shell> {
     // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(900.), px(600.))),
-            // `kind` is deliberately left at its default `WindowKind::Normal`
-            // (gpui platform.rs WindowOptions::default), which on macOS maps
-            // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
-            // main window. Nothing here raises the window level or touches
-            // presentation options; the "menu bar never appears" symptom came
-            // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
-            // from window kind/level, and `appears_transparent` only affects
-            // the titlebar, not the menu bar.
-            // macOS: frameless-inset chrome like the original Electron app
-            // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
-            // feature-inventory §1.1). No title text — the strip is
-            // custom-drawn (zed sets `title: None` the same way). On
-            // Linux/Windows `appears_transparent` hides the system titlebar
-            // for our custom-drawn chrome; harmless where unsupported.
-            titlebar: Some(TitlebarOptions {
-                title: None,
-                appears_transparent: true,
-                // Centered on the titlebar's content line (40px bar, content
-                // shifted 4px down, lights ~12px tall → center 22).
-                traffic_light_position: Some(gpui::point(px(14.), px(14.))),
-            }),
-            // Our own titlebar strip drags the window (WindowControlArea::
-            // Drag + start_window_move) — mark the content view app-owned
-            // so AppKit neither dead-zones the strip nor delays clicks.
-            app_owns_titlebar_drag: true,
-            // Linux: request client-side decorations — zeron draws its own
-            // unified titlebar and (under CSD) its own caption buttons
-            // (shell.rs `render_linux_caption_controls`). Leaving this unset
-            // requests SERVER decorations, which stacked a compositor
-            // titlebar on top of the app's chrome under sway/KDE, while
-            // compositors without SSD support (GNOME) went client-side
-            // anyway — frameless, and before the shell drew caption buttons,
-            // with no window controls at all. The compositor can still
-            // override via xdg-decoration negotiation; the shell re-resolves
-            // what to draw every frame.
-            window_decorations: cfg!(target_os = "linux")
-                .then_some(gpui::WindowDecorations::Client),
-            // Frosted shell (macOS): blur the desktop behind the window; the
-            // shell paints its frost surface translucent so the sidebar reads
-            // as glass (shell.rs root). Elsewhere blur support is compositor
-            // roulette — stay opaque.
-            // One source of truth with the re-apply loop in `appearance::apply`
-            // — if these two ever disagree, vibrancy dies on the first theme
-            // change and never comes back.
-            window_background: theme::Theme::of(cx).window_background_appearance(),
-            app_id: Some("zeron".into()),
-            ..Default::default()
-        },
-        move |window, cx| {
-            // React to the user flipping macOS between light and dark. Detached:
-            // the subscription lives as long as the window does, and the window
-            // owns nothing that would drop it early.
-            appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, cx))
-        },
-    )
-    .expect("failed to open window");
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(900.), px(600.))),
+                // `kind` is deliberately left at its default `WindowKind::Normal`
+                // (gpui platform.rs WindowOptions::default), which on macOS maps
+                // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
+                // main window. Nothing here raises the window level or touches
+                // presentation options; the "menu bar never appears" symptom came
+                // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
+                // from window kind/level, and `appears_transparent` only affects
+                // the titlebar, not the menu bar.
+                // macOS: frameless-inset chrome like the original Electron app
+                // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
+                // feature-inventory §1.1). No title text — the strip is
+                // custom-drawn (zed sets `title: None` the same way). On
+                // Linux/Windows `appears_transparent` hides the system titlebar
+                // for our custom-drawn chrome; harmless where unsupported.
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: true,
+                    // Centered on the titlebar's content line (40px bar, content
+                    // shifted 4px down, lights ~12px tall → center 22).
+                    traffic_light_position: Some(gpui::point(px(14.), px(14.))),
+                }),
+                // Our own titlebar strip drags the window (WindowControlArea::
+                // Drag + start_window_move) — mark the content view app-owned
+                // so AppKit neither dead-zones the strip nor delays clicks.
+                app_owns_titlebar_drag: true,
+                // Linux: request client-side decorations — zeron draws its own
+                // unified titlebar and (under CSD) its own caption buttons
+                // (shell.rs `render_linux_caption_controls`). Leaving this unset
+                // requests SERVER decorations, which stacked a compositor
+                // titlebar on top of the app's chrome under sway/KDE, while
+                // compositors without SSD support (GNOME) went client-side
+                // anyway — frameless, and before the shell drew caption buttons,
+                // with no window controls at all. The compositor can still
+                // override via xdg-decoration negotiation; the shell re-resolves
+                // what to draw every frame.
+                window_decorations: cfg!(target_os = "linux")
+                    .then_some(gpui::WindowDecorations::Client),
+                // Frosted shell (macOS): blur the desktop behind the window; the
+                // shell paints its frost surface translucent so the sidebar reads
+                // as glass (shell.rs root). Elsewhere blur support is compositor
+                // roulette — stay opaque.
+                // One source of truth with the re-apply loop in `appearance::apply`
+                // — if these two ever disagree, vibrancy dies on the first theme
+                // change and never comes back.
+                window_background: theme::Theme::of(cx).window_background_appearance(),
+                app_id: Some("zeron".into()),
+                ..Default::default()
+            },
+            move |window, cx| {
+                // React to the user flipping macOS between light and dark. Detached:
+                // the subscription lives as long as the window does, and the window
+                // owns nothing that would drop it early.
+                appearance::observe_window(window, cx).detach();
+                cx.new(|cx| shell::Shell::new(state, boot, cx))
+            },
+        )
+        .expect("failed to open window");
     // Belt and braces: assert the blur once the window actually exists. The
     // `WindowOptions` value is applied during creation, before the view is
     // attached; re-pushing it here means a window is never left opaque.
     appearance::reapply_window_background(cx);
+    handle
+}
+
+#[cfg(target_os = "macos")]
+fn start_appshot_service(cx: &mut App) {
+    let mut shortcuts = appshots::start_global_shortcut();
+    cx.spawn(async move |cx| {
+        while shortcuts.next().await.is_some() {
+            if !appshots::enabled() {
+                continue;
+            }
+            let capture = cx
+                .background_executor()
+                .spawn(async { appshots::capture_frontmost_window() })
+                .await;
+            cx.update(|cx| deliver_appshot(capture, cx));
+        }
+    })
+    .detach();
+}
+
+#[cfg(target_os = "macos")]
+fn deliver_appshot(
+    result: Result<appshots::CapturedAppshot, appshots::CaptureError>,
+    cx: &mut App,
+) {
+    let handle = cx
+        .window_stack()
+        .unwrap_or_else(|| cx.windows())
+        .into_iter()
+        .find_map(|handle| handle.downcast::<shell::Shell>())
+        .or_else(|| {
+            let reopen = cx.try_global::<ReopenState>()?;
+            Some(open_main_window(
+                reopen.state.clone(),
+                reopen.boot.clone(),
+                cx,
+            ))
+        });
+    let Some(handle) = handle else {
+        tracing::warn!("Appshot captured but no Zeron window could be opened");
+        return;
+    };
+    cx.activate(true);
+    let _ = handle.update(cx, |shell, window, cx| {
+        window.activate_window();
+        match result {
+            Ok(appshot) => shell.receive_appshot(appshot, window, cx),
+            Err(error) => shell.show_appshot_error(error.to_string(), window, cx),
+        }
+    });
 }

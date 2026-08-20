@@ -1182,6 +1182,7 @@ impl Shell {
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
+        crate::appshots::set_enabled(settings.appshots_enabled);
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
@@ -1325,6 +1326,55 @@ impl Shell {
             _composer_events: composer_events,
             _transcript_events: transcript_events,
         }
+    }
+
+    /// Route a completed viewer-side capture only after its source window is
+    /// safely captured. The explicit target key avoids relying on the
+    /// state-observation/draft-swap effect ordering when opening the canvas.
+    pub fn receive_appshot(
+        &mut self,
+        appshot: crate::appshots::CapturedAppshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::appshots::AppshotDestination;
+
+        let selected = self.state.read(cx).selected_chat.clone();
+        let target = match self.settings.appshot_destination {
+            AppshotDestination::Automatic if selected.is_some() => selected,
+            AppshotDestination::LastSession if selected.is_some() => selected,
+            AppshotDestination::LastSession if !self.active_chat.is_empty() => {
+                Some(self.active_chat.clone())
+            }
+            AppshotDestination::Automatic
+            | AppshotDestination::LastSession
+            | AppshotDestination::NewSession => None,
+        };
+        self.route = Route::Chat;
+        self.state.update(cx, |state, cx| {
+            if state.selected_chat != target {
+                state.select_chat(target.clone(), cx);
+            }
+        });
+        let key = target.unwrap_or_default();
+        self.composer.update(cx, |composer, cx| {
+            composer.stage_appshot_for(key, appshot, cx)
+        });
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    pub fn show_appshot_error(
+        &mut self,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.route = Route::Chat;
+        self.composer
+            .update(cx, |composer, cx| composer.show_appshot_error(message, cx));
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
     }
 
     // ---- splash ----
@@ -2418,14 +2468,29 @@ impl Shell {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
-                    let page = cx.new(|cx| ShortcutsPage::new(state, keymap, cx));
+                    let appshots_enabled = self.settings.appshots_enabled;
+                    let appshot_destination = self.settings.appshot_destination;
+                    let page = cx.new(|cx| {
+                        ShortcutsPage::new(state, keymap, appshots_enabled, appshot_destination, cx)
+                    });
                     // Persist + re-apply the keymap whenever the page changes it.
                     self.shortcuts_sub = Some(cx.subscribe(
                         &page,
                         |this: &mut Shell, _, event: &ShortcutsEvent, cx| {
-                            let ShortcutsEvent::Changed(keymap) = event;
-                            this.settings.keymap = keymap.clone();
-                            apply_keymap(cx, keymap);
+                            match event {
+                                ShortcutsEvent::Changed(keymap) => {
+                                    this.settings.keymap = keymap.clone();
+                                    apply_keymap(cx, keymap);
+                                }
+                                ShortcutsEvent::AppshotsChanged {
+                                    enabled,
+                                    destination,
+                                } => {
+                                    this.settings.appshots_enabled = *enabled;
+                                    this.settings.appshot_destination = *destination;
+                                    crate::appshots::set_enabled(*enabled);
+                                }
+                            }
                             this.schedule_save(cx);
                             cx.notify();
                         },
