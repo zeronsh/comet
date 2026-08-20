@@ -475,11 +475,11 @@ impl Harness for PiNativeHarness {
 
         // Step 2: set the model if specified.
         if !provider.is_empty() && !model_id.is_empty() {
-            let model_id = uuid::Uuid::new_v4().to_string();
+            let req_id = uuid::Uuid::new_v4().to_string();
             let _ = Self::request(
                 &mut stdin,
                 &mut lines,
-                &json!({"type": "set_model", "provider": provider, "modelId": model_id, "id": model_id}),
+                &json!({"type": "set_model", "provider": provider, "modelId": model_id, "id": req_id}),
             )
             .await?;
         }
