@@ -231,6 +231,25 @@ fn translate_pi_event(event: &Value) -> Vec<AgentEvent> {
                 diff: None,
             }]
         }
+        "message_end" => {
+            // Extract text from completed message content blocks.
+            let message = event.get("message");
+            let mut texts: Vec<String> = Vec::new();
+            if let Some(content) = message.and_then(|m| m.get("content")).and_then(Value::as_array) {
+                for block in content {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        texts.push(text.to_string());
+                    }
+                }
+            }
+            if texts.is_empty() {
+                Vec::new()
+            } else {
+                vec![AgentEvent::TextDelta {
+                    text: texts.join("\n"),
+                }]
+            }
+        }
         "agent_settled" | "agent_end" => {
             vec![AgentEvent::Done {
                 status: DoneStatus::Completed,
