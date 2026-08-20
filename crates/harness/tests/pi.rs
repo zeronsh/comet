@@ -175,6 +175,98 @@ async fn message_end_is_a_fallback_when_no_delta_streamed() {
 }
 
 #[tokio::test]
+async fn subagent_tool_replays_child_transcript_as_nested_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let transcript = temp
+        .path()
+        .join(".pi/subagents/artifacts/child_test_transcript.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    let (controls, _steer, _interrupt) = controls();
+    let events = run_to_end(
+        request(&format!("subagent:{}", transcript.display())),
+        controls,
+    )
+    .await;
+
+    assert!(events.contains(&AgentEvent::ToolResult {
+        id: "parent-subagent".into(),
+        is_error: false,
+        output: Some("Workflow completed".into()),
+        diff: None,
+    }));
+    let nested: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } if parent_tool_use_id == "parent-subagent" => Some(event.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        nested.contains(&&AgentEvent::UserMessage {
+            text: "Inspect the fixture".into(),
+        }),
+        "{events:?}"
+    );
+    assert!(
+        nested.contains(&&AgentEvent::ReasoningDelta {
+            text: "Planning child work".into(),
+        }),
+        "{events:?}"
+    );
+    assert!(
+        nested.contains(&&AgentEvent::ToolCall {
+            id: "child-read".into(),
+            call: ToolCall::ReadFile {
+                path: "/tmp/input.txt".into(),
+            },
+        }),
+        "{events:?}"
+    );
+    assert!(
+        nested.contains(&&AgentEvent::ToolResult {
+            id: "child-read".into(),
+            is_error: false,
+            output: Some("fixture body".into()),
+            diff: None,
+        }),
+        "{events:?}"
+    );
+    assert!(
+        nested.contains(&&AgentEvent::TextDelta {
+            text: "Child finished".into(),
+        }),
+        "{events:?}"
+    );
+    assert!(
+        nested.contains(&&AgentEvent::Usage {
+            input_tokens: 7,
+            output_tokens: 2,
+        }),
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            nested.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(
+        !nested.iter().any(|event| matches!(
+            event,
+            AgentEvent::UserMessage { text } if text == "[prompt redacted]"
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn steering_uses_pi_steer_and_rotates_message_boundary() {
     let (controls, steer, _interrupt) = controls();
     let stream = harness()

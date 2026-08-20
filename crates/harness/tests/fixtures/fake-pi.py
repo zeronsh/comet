@@ -113,6 +113,26 @@ for raw in sys.stdin:
         elif scenario == "steer":
             send({"type": "message_start", "message": {"role": "assistant", "content": []}})
             send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "before"}})
+        elif scenario.startswith("subagent:"):
+            transcript_path = scenario.removeprefix("subagent:")
+            records = [
+                {"recordType": "message", "sourceEventType": "initial_prompt", "role": "user", "text": "[prompt redacted]", "message": {"role": "user", "content": [{"type": "text", "text": "[prompt redacted]"}]}},
+                {"recordType": "message", "sourceEventType": "message_end", "role": "user", "text": "Inspect the fixture", "message": {"role": "user", "content": [{"type": "text", "text": "Inspect the fixture"}]}},
+                {"recordType": "message", "sourceEventType": "message_end", "role": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "Planning child work"}, {"type": "toolCall", "id": "child-read", "name": "read", "arguments": {"path": "/tmp/input.txt"}}], "usage": {"input": 7, "output": 2}, "stopReason": "toolUse"}},
+                {"recordType": "tool_start", "sourceEventType": "tool_execution_start", "toolCallId": "child-read", "toolName": "read", "argsPayload": {"path": "/tmp/input.txt"}},
+                {"recordType": "tool_end", "sourceEventType": "tool_execution_end", "toolCallId": "child-read", "toolName": "read", "isError": False},
+                {"recordType": "message", "sourceEventType": "tool_result_end", "role": "toolResult", "toolCallId": "child-read", "toolName": "read", "isError": False, "text": "fixture body", "message": {"role": "toolResult", "toolCallId": "child-read", "toolName": "read", "isError": False, "content": [{"type": "text", "text": "fixture body"}]}},
+                {"recordType": "message", "sourceEventType": "message_end", "role": "assistant", "text": "Child finished", "message": {"role": "assistant", "content": [{"type": "text", "text": "Child finished"}], "usage": {"input": 3, "output": 4}, "stopReason": "stop"}},
+            ]
+            with open(transcript_path, "w", encoding="utf-8") as transcript:
+                for record in records:
+                    transcript.write(json.dumps(record, separators=(",", ":")) + "\n")
+            send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+            send({"type": "message_update", "assistantMessageEvent": {"type": "toolcall_end", "contentIndex": 0, "toolCall": {"id": "parent-subagent", "name": "subagent", "arguments": {"workflowScript": "return runs.run(...)"}}}})
+            send({"type": "tool_execution_start", "toolCallId": "parent-subagent", "toolName": "subagent", "args": {"workflowScript": "return runs.run(...)"}})
+            send({"type": "tool_execution_end", "toolCallId": "parent-subagent", "toolName": "subagent", "result": {"content": [{"type": "text", "text": "Workflow completed"}], "details": {"results": [{"agent": "delegate", "status": "completed", "transcriptPath": transcript_path, "artifactPaths": {"transcriptPath": transcript_path}}]}}, "isError": False})
+            send({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "parent-subagent", "name": "subagent", "arguments": {}}], "stopReason": "toolUse"}})
+            send({"type": "agent_settled"})
         elif scenario == "interrupt":
             pass
     elif kind == "extension_ui_response":

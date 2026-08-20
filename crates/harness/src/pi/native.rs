@@ -319,6 +319,332 @@ fn usage_event(message: &Value) -> Option<AgentEvent> {
     })
 }
 
+const MAX_CHILD_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CHILD_TRANSCRIPTS: usize = 16;
+const MAX_CHILD_TRANSCRIPT_RECORDS: usize = 20_000;
+
+/// Accept only pi-subagents' artifact layout. A model-controlled tool result
+/// must not turn transcript replay into an arbitrary local-file reader.
+fn is_subagent_transcript_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !file_name.ends_with("_transcript.jsonl") {
+        return false;
+    }
+    path.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("artifacts")
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("subagents")
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(".pi")
+}
+
+fn transcript_path(result: &Value) -> Option<&str> {
+    result
+        .get("transcriptPath")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .get("artifactPaths")
+                .and_then(|paths| paths.get("transcriptPath"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn transcript_tool_args(record: &Value) -> Value {
+    let value = record
+        .get("argsPayload")
+        .or_else(|| record.get("args"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(json) = value.as_str() {
+        serde_json::from_str(json).unwrap_or_else(|_| json!({"value": json}))
+    } else {
+        value
+    }
+}
+
+fn transcript_message_events(
+    record: &Value,
+    emitted_tools: &mut HashSet<String>,
+) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    let message = &record["message"];
+    match message.get("role").and_then(Value::as_str) {
+        Some("user") => {
+            // pi-subagents writes a redacted Prompt Audit record before the
+            // actual child prompt. It is transport metadata, not a child turn.
+            if record.get("sourceEventType").and_then(Value::as_str) != Some("initial_prompt")
+                && let Some(text) = text_content(message).or_else(|| {
+                    record
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+            {
+                events.push(AgentEvent::UserMessage { text });
+            }
+        }
+        Some("assistant") => {
+            if let Some(content) = message.get("content").and_then(Value::as_array) {
+                for block in content {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("thinking") => {
+                            if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                                events.push(AgentEvent::ReasoningDelta { text: text.into() });
+                            }
+                        }
+                        Some("text") => {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                events.push(AgentEvent::TextDelta { text: text.into() });
+                            }
+                        }
+                        Some("toolCall") => {
+                            let id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                            if !id.is_empty() && emitted_tools.insert(id.into()) {
+                                let name =
+                                    block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                                let args = block.get("arguments").cloned().unwrap_or(Value::Null);
+                                events.push(AgentEvent::ToolCall {
+                                    id: id.into(),
+                                    call: pi_tool_call(name, &args),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if let Some(text) = record.get("text").and_then(Value::as_str) {
+                events.push(AgentEvent::TextDelta { text: text.into() });
+            }
+            if let Some(usage) = usage_event(message).or_else(|| usage_event(record)) {
+                events.push(usage);
+            }
+            if message.get("stopReason").and_then(Value::as_str) == Some("error") {
+                events.push(AgentEvent::Error {
+                    message: message
+                        .get("errorMessage")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Pi subagent turn failed")
+                        .into(),
+                });
+            }
+            events.push(AgentEvent::AssistantMessageCompleted {
+                assistant_message_id: new_message_id(),
+            });
+        }
+        Some("toolResult") => {
+            let id = message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .or_else(|| record.get("toolCallId").and_then(Value::as_str))
+                .unwrap_or("");
+            if !id.is_empty() {
+                events.push(AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: message
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .or_else(|| record.get("isError").and_then(Value::as_bool))
+                        .unwrap_or(false),
+                    output: capped_output(message).or_else(|| {
+                        record
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    }),
+                    diff: None,
+                });
+            }
+        }
+        _ => {}
+    }
+    events
+}
+
+fn parse_child_transcript(bytes: &[u8]) -> Vec<AgentEvent> {
+    let records: Vec<Value> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .take(MAX_CHILD_TRANSCRIPT_RECORDS)
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect();
+    let result_ids: HashSet<String> = records
+        .iter()
+        .filter(|record| record.get("role").and_then(Value::as_str) == Some("toolResult"))
+        .filter_map(|record| {
+            record
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut emitted_tools = HashSet::new();
+    let mut events = Vec::new();
+    for record in &records {
+        match record
+            .get("recordType")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            "message" => events.extend(transcript_message_events(record, &mut emitted_tools)),
+            "tool_start" => {
+                let id = record
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !id.is_empty() && emitted_tools.insert(id.into()) {
+                    let name = record
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool");
+                    events.push(AgentEvent::ToolCall {
+                        id: id.into(),
+                        call: pi_tool_call(name, &transcript_tool_args(record)),
+                    });
+                }
+            }
+            "tool_end" => {
+                let id = record
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !id.is_empty() && !result_ids.contains(id) {
+                    events.push(AgentEvent::ToolResult {
+                        id: id.into(),
+                        is_error: record
+                            .get("isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        output: None,
+                        diff: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+fn child_done(results: &[&Value]) -> (DoneStatus, Option<String>) {
+    let error = results.iter().find_map(|result| {
+        result
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let interrupted = results.iter().any(|result| {
+        matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("stopped" | "cancelled" | "interrupted")
+        )
+    });
+    let failed = error.is_some()
+        || results.iter().any(|result| {
+            matches!(
+                result.get("status").and_then(Value::as_str),
+                Some("failed" | "rejected")
+            ) || result
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0)
+        });
+    if interrupted {
+        (DoneStatus::Interrupted, error)
+    } else if failed {
+        (DoneStatus::Errored, error)
+    } else {
+        (DoneStatus::Completed, None)
+    }
+}
+
+async fn replay_subagent_transcripts(event: &Value) -> Vec<AgentEvent> {
+    if event.get("type").and_then(Value::as_str) != Some("tool_execution_end")
+        || event.get("toolName").and_then(Value::as_str) != Some("subagent")
+    {
+        return Vec::new();
+    }
+    let parent_id = event
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if parent_id.is_empty() {
+        return Vec::new();
+    }
+    let results: Vec<&Value> = event["result"]["details"]["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_CHILD_TRANSCRIPTS)
+        .collect();
+    let mut nested = Vec::new();
+    let mut replayed = false;
+    for result in &results {
+        let Some(raw_path) = transcript_path(result).map(PathBuf::from) else {
+            continue;
+        };
+        let raw_path = if raw_path.is_absolute() {
+            raw_path
+        } else if let Some(cwd) = result.get("cwd").and_then(Value::as_str) {
+            Path::new(cwd).join(raw_path)
+        } else {
+            raw_path
+        };
+        let Ok(path) = tokio::fs::canonicalize(&raw_path).await else {
+            tracing::warn!(target: "zeron_harness::pi", path = %raw_path.display(), "Pi subagent transcript missing");
+            continue;
+        };
+        if !is_subagent_transcript_path(&path) {
+            tracing::warn!(target: "zeron_harness::pi", path = %path.display(), "refusing unexpected Pi subagent transcript path");
+            continue;
+        }
+        let Ok(metadata) = tokio::fs::metadata(&path).await else {
+            tracing::warn!(target: "zeron_harness::pi", path = %path.display(), "Pi subagent transcript missing");
+            continue;
+        };
+        if metadata.len() > MAX_CHILD_TRANSCRIPT_BYTES {
+            tracing::warn!(target: "zeron_harness::pi", path = %path.display(), bytes = metadata.len(), "Pi subagent transcript exceeds replay limit");
+            continue;
+        }
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            tracing::warn!(target: "zeron_harness::pi", path = %path.display(), "failed to read Pi subagent transcript");
+            continue;
+        };
+        replayed = true;
+        nested.extend(parse_child_transcript(&bytes));
+    }
+    if !replayed {
+        return Vec::new();
+    }
+    let (status, error) = child_done(&results);
+    nested.push(AgentEvent::Done {
+        status,
+        result: None,
+        error,
+        session_id: None,
+    });
+    nested
+        .into_iter()
+        .map(|event| AgentEvent::Subagent {
+            parent_tool_use_id: parent_id.into(),
+            event: Box::new(event),
+        })
+        .collect()
+}
+
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -1128,7 +1454,12 @@ async fn run_session(session: PiSession) {
                     shutdown_child(&mut child, kill_grace).await;
                     return;
                 }
-                for event in normalizer.normalize(&event) {
+                let subagent_events = replay_subagent_transcripts(&event).await;
+                for event in normalizer
+                    .normalize(&event)
+                    .into_iter()
+                    .chain(subagent_events)
+                {
                     if !send_event(&event_tx, event).await {
                         shutdown_child(&mut child, kill_grace).await;
                         return;
