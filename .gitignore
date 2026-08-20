@@ -10,3 +10,4 @@ node_modules
 .wrangler
 build/
 edge/dist/
+.dex

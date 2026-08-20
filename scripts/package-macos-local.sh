@@ -64,6 +64,11 @@ case "$CHANNEL" in
 esac
 
 command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
+TARGET="aarch64-apple-darwin"
+rustup target list --installed | grep -qx "$TARGET" || {
+  echo "missing Rust target $TARGET; run: rustup target add $TARGET" >&2
+  exit 1
+}
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 OUT_DIR="$ROOT/target/local-apps"
 APP="$OUT_DIR/$APP_NAME.app"
@@ -75,33 +80,29 @@ ICON_FILE="zeron-${CHANNEL}.icns"
 
 cd "$ROOT"
 if [[ "$PROFILE" == release ]]; then
-  cargo build --release -p zeron
-  BIN="$ROOT/target/release/zeron"
+  cargo build --release -p zeron --target "$TARGET"
+  BIN="$ROOT/target/$TARGET/release/zeron"
 else
-  cargo build -p zeron
-  BIN="$ROOT/target/debug/zeron"
+  cargo build -p zeron --target "$TARGET"
+  BIN="$ROOT/target/$TARGET/debug/zeron"
 fi
+lipo "$BIN" -verify_arch arm64
+[[ "$(lipo "$BIN" -archs)" == "arm64" ]] || {
+  echo "refusing non-arm64 local app binary: $BIN" >&2
+  exit 1
+}
 
 rm -rf "$APP" "$ICONSET"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ICONSET"
-install -m 755 "$BIN" "$APP/Contents/Resources/zeron-bin"
-
-# A tiny launcher gives Finder-launched bundles deterministic, isolated state.
-# Explicit caller overrides still win for CLI/debugging use.
-cat >"$APP/Contents/MacOS/zeron-channel" <<LAUNCHER
-#!/bin/sh
-export ZERON_DATA_DIR="\${ZERON_DATA_DIR:-\$HOME/$DATA_DIR_NAME}"
-export ZERON_IPC_PORT="\${ZERON_IPC_PORT:-$IPC_PORT}"
-export ZERON_CALLBACK_PORT="\${ZERON_CALLBACK_PORT:-$CALLBACK_PORT}"
-export ZERON_CURSOR_STATE_DIR="\${ZERON_CURSOR_STATE_DIR:-\$HOME/$DATA_DIR_NAME/cursor-state}"
-export ZERON_WORKTREES_DIR="\${ZERON_WORKTREES_DIR:-\$HOME/$DATA_DIR_NAME/worktrees}"
-export ZERON_DISABLE_UPDATES="\${ZERON_DISABLE_UPDATES:-1}"
-exec "\$(dirname "\$0")/../Resources/zeron-bin" "\$@"
-LAUNCHER
-chmod 755 "$APP/Contents/MacOS/zeron-channel"
+# CFBundleExecutable must be the native Mach-O itself. A shell-script primary
+# executable makes codesign classify the app as a generic bundle and causes
+# macOS to warn about /bin/sh's Intel compatibility slice.
+install -m 755 "$BIN" "$APP/Contents/MacOS/zeron"
 
 APP_NAME="$APP_NAME" BUNDLE_ID="$BUNDLE_ID" VERSION="$VERSION" \
 ICON_FILE="$ICON_FILE" CHANNEL="$CHANNEL" \
+DATA_DIR="$HOME/$DATA_DIR_NAME" IPC_PORT="$IPC_PORT" \
+CALLBACK_PORT="$CALLBACK_PORT" \
 python3 - "$ROOT/dist/macos/Info.plist" "$APP/Contents/Info.plist" <<'PY'
 import os
 import plistlib
@@ -113,10 +114,18 @@ plist.update({
     "CFBundleDisplayName": os.environ["APP_NAME"],
     "CFBundleName": os.environ["APP_NAME"],
     "CFBundleIdentifier": os.environ["BUNDLE_ID"],
-    "CFBundleExecutable": "zeron-channel",
+    "CFBundleExecutable": "zeron",
     "CFBundleIconFile": os.environ["ICON_FILE"],
     "CFBundleShortVersionString": os.environ["VERSION"],
     "CFBundleVersion": os.environ["VERSION"],
+    "LSEnvironment": {
+        "ZERON_DATA_DIR": os.environ["DATA_DIR"],
+        "ZERON_IPC_PORT": os.environ["IPC_PORT"],
+        "ZERON_CALLBACK_PORT": os.environ["CALLBACK_PORT"],
+        "ZERON_CURSOR_STATE_DIR": os.path.join(os.environ["DATA_DIR"], "cursor-state"),
+        "ZERON_WORKTREES_DIR": os.path.join(os.environ["DATA_DIR"], "worktrees"),
+        "ZERON_DISABLE_UPDATES": "1",
+    },
     "ZeronChannel": os.environ["CHANNEL"],
 })
 with open(sys.argv[2], "wb") as target:

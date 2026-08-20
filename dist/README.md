@@ -46,8 +46,12 @@ scripts/package-macos-local.sh dev --install  # ~/Applications/Zeron Dev.app
 | Li | `dev.kalibetre.zeron.li` | `~/.zeron` | `27654` | release |
 | Dev | `dev.kalibetre.zeron.dev` | `~/.zeron-dev` | `27655` | debug |
 
-The local bundles use badged icons and set `ZERON_DISABLE_UPDATES=1`: the
-public updater must never replace a personal build. Official and Li share one
+The local packager explicitly builds and verifies native
+`aarch64-apple-darwin` Mach-O executables. Channel variables live in each
+bundle's `LSEnvironment`, keeping `CFBundleExecutable` native rather than a
+shell launcher. The bundles use tinted/badged icons and set
+`ZERON_DISABLE_UPDATES=1`: the public updater must never replace a personal
+build. Official and Li share one
 engine and activity store. Whichever starts first owns that engine; the other
 app connects to it. Quit Li before launching Official when comparing the
 actual official engine version rather than only its UI. Dev is fully isolated,
