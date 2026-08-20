@@ -180,8 +180,11 @@ fn main() -> anyhow::Result<()> {
         },
         None => {
             let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-            // Headed: the UI probes ZERON_IPC_PORT and connects to a running
-            // daemon, or embeds the engine in-process (ARCHITECTURE §1).
+            let runtime_override = std::env::var_os("ZERON_DATA_DIR").is_some()
+                || std::env::var_os("ZERON_IPC_PORT").is_some();
+            // On macOS, the installed background service owns engine startup;
+            // explicit runtime overrides and other platforms retain the
+            // connect-or-embed behavior (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
                 data_dir: std::env::var_os("ZERON_DATA_DIR")
                     .map(std::path::PathBuf::from)
@@ -190,6 +193,7 @@ fn main() -> anyhow::Result<()> {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(27654),
+                managed_daemon: !runtime_override && daemon::owns_headed_startup()?,
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,

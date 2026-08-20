@@ -7160,6 +7160,7 @@ mod tests {
         let boot = EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
             ipc_port: port,
+            managed_daemon: false,
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
