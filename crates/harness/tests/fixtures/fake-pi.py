@@ -5,6 +5,9 @@ import sys
 scenario = "happy"
 model_set = False
 thinking_set = False
+session_file = "/tmp/fake-pi-session.jsonl"
+if "--session" in sys.argv:
+    session_file = sys.argv[sys.argv.index("--session") + 1]
 
 
 def send(value):
@@ -37,13 +40,17 @@ for raw in sys.stdin:
     request_id = command.get("id")
 
     if kind == "switch_session":
-        response(kind, request_id, data={"cancelled": False})
+        # Session replacement is unsafe for extensions with delayed callbacks;
+        # the native harness must pass --session when spawning instead.
+        sys.stderr.write("switch_session must not be used\n")
+        sys.stderr.flush()
+        sys.exit(91)
     elif kind == "get_state":
         response(kind, request_id, data={
             "model": {"provider": "openai-codex", "id": "gpt-5.6-sol", "name": "GPT-5.6 Sol"},
             "thinkingLevel": "medium",
             "isStreaming": False,
-            "sessionFile": "/tmp/fake-pi-session.jsonl",
+            "sessionFile": session_file,
             "sessionId": "fake-pi-session",
         })
     elif kind == "get_available_models":

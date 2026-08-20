@@ -242,6 +242,33 @@ async fn interrupt_sends_abort_and_finishes_interrupted() {
 }
 
 #[tokio::test]
+async fn resume_opens_session_at_process_start_without_switch_rpc() {
+    let (controls, _steer, _interrupt) = controls();
+    let mut req = request("fallback");
+    req.resume = Some("/tmp/resumed-pi-session.jsonl".into());
+    let events = run_to_end(req, controls).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SessionStarted { session_id, .. }
+                if session_id == "/tmp/resumed-pi-session.jsonl"
+        )),
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn model_and_command_discovery_use_documented_rpc_commands() {
     let models = harness().models().await.expect("models");
     assert_eq!(models.len(), 2);

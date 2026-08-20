@@ -696,12 +696,19 @@ impl PiNativeHarness {
         &self,
         cwd: Option<&str>,
         no_session: bool,
+        session: Option<&str>,
     ) -> Result<(Child, PiRpcClient, mpsc::Receiver<Incoming>, StderrTail), HarnessError> {
         let executable = self.executable()?;
         let mut command = Command::new(&executable);
         command.args(["--mode", "rpc"]);
         if no_session {
             command.arg("--no-session");
+        } else if let Some(session) = session.filter(|session| !session.is_empty()) {
+            // Open resumed sessions at process creation. Calling the
+            // `switch_session` RPC replaces the extension runtime after it has
+            // started; extensions with delayed callbacks can then dereference
+            // their stale context and crash Pi (pi-cc-header, 2026-08-20).
+            command.args(["--session", session]);
         }
         crate::compose_child_path(&mut command, &executable);
         if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
@@ -743,7 +750,7 @@ impl PiNativeHarness {
     }
 
     async fn probe(&self, command: Value) -> Result<Value, HarnessError> {
-        let (mut child, client, mut incoming, _stderr) = self.spawn(None, true).await?;
+        let (mut child, client, mut incoming, _stderr) = self.spawn(None, true, None).await?;
         let mut request = Box::pin(client.request(command));
         let result = loop {
             tokio::select! {
@@ -830,7 +837,9 @@ impl Harness for PiNativeHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (child, client, incoming, stderr_tail) = self.spawn(Some(&request.cwd), false).await?;
+        let (child, client, incoming, stderr_tail) = self
+            .spawn(Some(&request.cwd), false, request.resume.as_deref())
+            .await?;
         let (event_tx, event_rx) = mpsc::channel(256);
         tokio::spawn(run_session(PiSession {
             child,
@@ -935,20 +944,6 @@ async fn run_session(session: PiSession) {
     let mut queued_events = Vec::new();
 
     let setup = async {
-        if let Some(resume) = request
-            .resume
-            .as_deref()
-            .filter(|resume| !resume.is_empty())
-        {
-            request_during_setup(
-                &client,
-                &mut incoming,
-                &request_input,
-                &mut queued_events,
-                json!({"type": "switch_session", "sessionPath": resume}),
-            )
-            .await?;
-        }
         request_during_setup(
             &client,
             &mut incoming,
@@ -1018,6 +1013,17 @@ async fn run_session(session: PiSession) {
         result = setup => match result {
             Ok(session) => session,
             Err(error) => {
+                // Give the stderr reader a scheduling point before composing
+                // the crash so extension stack traces reach the user instead
+                // of an opaque "exited during setup" message.
+                tokio::task::yield_now().await;
+                let error = match &error {
+                    HarnessError::Protocol(message) if message == "Pi exited during setup" => {
+                        let status = child.try_wait().ok().flatten();
+                        HarnessError::Protocol(crash_message("Pi", status, &stderr_tail)).to_string()
+                    }
+                    _ => error.to_string(),
+                };
                 finish_error(&mut child, &event_tx, kill_grace, None, error).await;
                 return;
             }
