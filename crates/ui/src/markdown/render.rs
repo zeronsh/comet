@@ -23,6 +23,16 @@ use zeron_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
 use crate::theme::Theme;
 
+fn code_language_label(lang: &str) -> String {
+    match lang {
+        "text" | "txt" | "plaintext" | "plain" => t("Text").to_string(),
+        "bash" | "sh" | "shell" | "zsh" | "fish" => t("Shell").to_string(),
+        other => other.to_string(),
+    }
+}
+
+use crate::i18n::t;
+
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
@@ -1128,7 +1138,7 @@ fn render_code_block(
                 .size(px(12.0))
                 .text_color(theme.text_muted),
             )
-            .when(copied, |el| el.child(SharedString::from("Copied")))
+            .when(copied, |el| el.child(SharedString::from(t("Copied"))))
     });
     div()
         .rounded(px(10.0))
@@ -1150,7 +1160,7 @@ fn render_code_block(
                     .bg(crate::theme::ink(0.02))
                     .text_size(px(11.0))
                     .text_color(theme.text_muted)
-                    .child(SharedString::from(lang.to_string())),
+                    .child(SharedString::from(code_language_label(lang))),
             )
         })
         .child(

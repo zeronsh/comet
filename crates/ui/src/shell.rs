@@ -28,6 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::i18n::{t, tf};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -199,13 +200,13 @@ impl SettingsSection {
     /// `settingsTitle` — the same strings in both places).
     pub fn label(self) -> &'static str {
         match self {
-            SettingsSection::Devices => "Devices",
-            SettingsSection::Harnesses => "Agents",
-            SettingsSection::Agents => "Accounts",
-            SettingsSection::Appearance => "Appearance",
-            SettingsSection::Notifications => "Notifications",
-            SettingsSection::Shortcuts => "Shortcuts",
-            SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Devices => t("Devices"),
+            SettingsSection::Harnesses => t("Agents"),
+            SettingsSection::Agents => t("Accounts"),
+            SettingsSection::Appearance => t("Appearance"),
+            SettingsSection::Notifications => t("Notifications"),
+            SettingsSection::Shortcuts => t("Shortcuts"),
+            SettingsSection::Archived => t("Archived sessions"),
         }
     }
 }
@@ -625,9 +626,9 @@ async fn wait_for_remote_engine_shutdown(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "the daemon did not finish stopping within {} seconds",
-                timeout.as_secs()
+            return Err(tf!(
+                "the daemon did not finish stopping within {secs} seconds",
+                secs = timeout.as_secs()
             ));
         }
         tokio::time::sleep(RUNTIME_CHANGE_POLL_INTERVAL).await;
@@ -674,14 +675,19 @@ fn import_summary_outcome(item: &serde_json::Value) -> Result<(usize, usize), St
     if errors.is_empty() {
         return Ok((count("importedChats"), count("skippedChats")));
     }
-    let first = errors.first().copied().unwrap_or("unknown error");
+    let first = errors.first().copied().unwrap_or(t("unknown error"));
     Err(if errors.len() == 1 {
-        format!("{} imported, 1 failure: {first}", count("importedChats"))
+        tf!(
+            "{count} imported, 1 failure: {first}",
+            count = count("importedChats"),
+            first = first
+        )
     } else {
-        format!(
-            "{} imported, {} failures — first: {first}",
-            count("importedChats"),
-            errors.len()
+        tf!(
+            "{count} imported, {errors} failures — first: {first}",
+            count = count("importedChats"),
+            errors = errors.len(),
+            first = first
         )
     })
 }
@@ -690,6 +696,14 @@ fn import_summary_outcome(item: &serde_json::Value) -> Result<(usize, usize), St
 /// when the local profile holds nothing importable. Spaces count as work:
 /// a projects-only profile must get the import choice too.
 fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
+    if crate::i18n::is_zh() {
+        return match (chats, spaces) {
+            (0, 0) => None,
+            (c, 0) => Some(format!("{c} 个会话")),
+            (0, s) => Some(format!("{s} 个项目")),
+            (c, s) => Some(format!("{c} 个会话和 {s} 个项目")),
+        };
+    }
     let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     match (chats, spaces) {
         (0, 0) => None,
@@ -1076,7 +1090,7 @@ impl Shell {
             Some("signin") => Some(GatePhase::SignIn),
             Some("org") => Some(GatePhase::OrgGate),
             Some("failed") => Some(GatePhase::Failed(
-                "Could not reach the zeron engine on port 27901".into(),
+                t("Could not reach the zeron engine on port 27901").into(),
             )),
             _ => None,
         };
@@ -1240,8 +1254,7 @@ impl Shell {
             self.debug_upload = None;
             if let Some((pct, img_path)) = spec.split_once(':')
                 && let Ok(pct) = pct.parse::<u64>()
-                && let Ok(att) =
-                    crate::attachments::stage_file(std::path::Path::new(img_path))
+                && let Ok(att) = crate::attachments::stage_file(std::path::Path::new(img_path))
             {
                 let pending_path = format!("pending/{}/{}", att.id, att.name);
                 let device_ids: Vec<String> = {
@@ -1356,10 +1369,10 @@ impl Shell {
                     if self.settings.notifications_enabled
                         && !(self.settings.notifications_background_only && app_focused)
                     {
-                        let title = title.unwrap_or_else(|| "New session".into());
+                        let title = title.unwrap_or_else(|| t("New session").into());
                         let body = match sound {
-                            crate::sound::Sound::Done => "Run finished",
-                            crate::sound::Sound::Request => "Waiting on your input",
+                            crate::sound::Sound::Done => t("Run finished"),
+                            crate::sound::Sound::Request => t("Waiting on your input"),
                         };
                         crate::notify::post(&title, body);
                     }
@@ -2231,7 +2244,7 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.sidebar_notice = Some(t("Engine not connected").into());
             cx.notify();
             return;
         };
@@ -2256,7 +2269,7 @@ impl Shell {
             .find(|c| c.id == chat_id)
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Session title", cx));
+        let input = cx.new(|cx| ComposerInput::new(t("Session title"), cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -2336,7 +2349,7 @@ impl Shell {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.runtime_change_error = Some("Engine not connected".into());
+            self.runtime_change_error = Some(t("Engine not connected").into());
             self.sync_flow = SyncFlow::SignedOutRestartRequired;
             cx.notify();
             return;
@@ -2352,7 +2365,7 @@ impl Shell {
                     .client()
                     .call(methods::SIGN_OUT, serde_json::json!({}))
                     .await
-                    .map_err(|error| format!("Sign out failed: {error}"))?;
+                    .map_err(|error| tf!("Sign out failed: {error}", error = error))?;
             }
             stop_synced_runtime(engine, ipc_port, &shutdown_dir).await
         });
@@ -2423,7 +2436,7 @@ impl Shell {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
                         shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                            Some(tf!("Could not cancel sign-in: {err}", err = err).into());
                     }
                 }
                 cx.notify();
@@ -2476,7 +2489,7 @@ impl Shell {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.runtime_change_error = Some("Engine not connected".into());
+            self.runtime_change_error = Some(t("Engine not connected").into());
             self.sync_flow = SyncFlow::RestartPending { notice_open: true };
             cx.notify();
             return;
@@ -2559,7 +2572,7 @@ impl Shell {
             Some(_) => {
                 self.sync_flow = SyncFlow::RestartPending { notice_open: true };
                 self.runtime_change_error =
-                    Some("The synced workspace did not come up — restart to finish.".into());
+                    Some(t("The synced workspace did not come up — restart to finish.").into());
                 cx.notify();
             }
             None => {}
@@ -2574,7 +2587,7 @@ impl Shell {
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.sync_flow = SyncFlow::RestartPending { notice_open: true };
-            self.runtime_change_error = Some("Engine not connected".into());
+            self.runtime_change_error = Some(t("Engine not connected").into());
             cx.notify();
             return;
         };
@@ -2608,7 +2621,7 @@ impl Shell {
                         if matches!(shell.sync_flow, SyncFlow::Importing { .. }) {
                             shell.sync_flow = SyncFlow::ImportFailed { notice_open: true };
                             shell.runtime_change_error =
-                                Some("The import stream ended before it finished.".into());
+                                Some(t("The import stream ended before it finished.").into());
                         }
                         cx.notify();
                     }
@@ -2671,7 +2684,7 @@ impl Shell {
 
     fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.runtime_change_error = Some("Engine not connected".into());
+            self.runtime_change_error = Some(t("Engine not connected").into());
             cx.notify();
             return;
         };
@@ -2704,9 +2717,7 @@ impl Shell {
                 match result {
                     Ok(_) => cx.quit(),
                     Err(err) => {
-                        shell.runtime_change_error = Some(format!(
-                            "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron."
-                        ).into());
+                        shell.runtime_change_error = Some(tf!("Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron.", err = err).into());
                         cx.notify();
                     }
                 }
@@ -2745,7 +2756,7 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.sidebar_notice = Some(tf!("Sign in failed: {err}", err = err).into());
                     cx.notify();
                 }
             })
@@ -2760,7 +2771,7 @@ impl Shell {
         if self.org.is_some() {
             return;
         }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
+        let name_input = cx.new(|cx| ComposerInput::new(t("Workspace name"), cx));
         let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.create_org(cx);
@@ -2812,7 +2823,7 @@ impl Shell {
         }
         let name = org.name_input.read(cx).text().trim().to_string();
         if !org_name_valid(&name) {
-            org.error = Some("Enter a workspace name".into());
+            org.error = Some(t("Enter a workspace name").into());
             cx.notify();
             return;
         }
@@ -3352,7 +3363,7 @@ impl Shell {
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from("Settings")),
+                            .child(SharedString::from(t("Settings"))),
                     )
                     .child(div().flex().flex_col().gap(px(2.0)).children(
                         SettingsSection::ALL.into_iter().map(|item| {
@@ -3416,7 +3427,7 @@ impl Shell {
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Back")),
+                        .child(SharedString::from(t("Back"))),
                 ),
             )
             .into_any_element()
@@ -3469,15 +3480,15 @@ impl Shell {
             spaces::status_dot_color(status, theme)
         };
         let status_label: Option<&'static str> = if undelivered {
-            Some("Failed")
+            Some(t("Failed"))
         } else if queued {
-            Some("Queued")
+            Some(t("Queued"))
         } else {
             match status {
-                zeron_proto::ChatIndicator::Working => Some("Working"),
-                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
-                zeron_proto::ChatIndicator::Errored => Some("Failed"),
-                zeron_proto::ChatIndicator::Completed => Some("Done"),
+                zeron_proto::ChatIndicator::Working => Some(t("Working")),
+                zeron_proto::ChatIndicator::AwaitingInput => Some(t("Input")),
+                zeron_proto::ChatIndicator::Errored => Some(t("Failed")),
+                zeron_proto::ChatIndicator::Completed => Some(t("Done")),
                 zeron_proto::ChatIndicator::Idle => None,
             }
         };
@@ -3515,9 +3526,9 @@ impl Shell {
                         .text_size(px(10.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(if archived {
-                            "Unarchive"
+                            t("Unarchive")
                         } else {
-                            "Archive"
+                            t("Archive")
                         })),
                 )
                 .into_any_element()
@@ -3765,7 +3776,7 @@ impl Shell {
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
             S::Disabled | S::Connected => return None,
             S::Offline => (
-                "Offline — sends are saved".into(),
+                t("Offline — sends are saved").into(),
                 div()
                     .size(px(5.0))
                     .rounded_full()
@@ -3773,7 +3784,7 @@ impl Shell {
                     .into_any_element(),
             ),
             S::Reconnecting => (
-                "Reconnecting…".into(),
+                t("Reconnecting…").into(),
                 loaders::mini_mono_spinner(
                     "connection-spinner",
                     2.0,
@@ -3879,22 +3890,22 @@ impl Shell {
         ) = match workspace_scope {
             Some(WorkspaceScope::Local) => {
                 let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart"
+                    t("Sync ready after restart")
                 } else {
-                    "Local only"
+                    t("Local only")
                 };
-                (line.into(), None, "Stored on this device".into())
+                (line.into(), None, t("Stored on this device").into())
             }
             Some(WorkspaceScope::Development) => (
-                "Development".into(),
-                Some("Local development runtime".into()),
-                "Authentication disabled".into(),
+                t("Development").into(),
+                Some(t("Local development runtime").into()),
+                t("Authentication disabled").into(),
             ),
             Some(WorkspaceScope::Synced) | None => {
                 let line: SharedString = user
                     .as_ref()
                     .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
+                    .unwrap_or_else(|| SharedString::from(t("Not signed in")));
                 let email = user
                     .as_ref()
                     .map(|u| SharedString::from(u.email.clone()))
@@ -3957,7 +3968,7 @@ impl Shell {
                                     .pb(px(Theme::SPACE_SM))
                                     .text_size(px(12.0))
                                     .text_color(theme.text_faint)
-                                    .child(SharedString::from("No sessions yet"))
+                                    .child(SharedString::from(t("No sessions yet")))
                                     .into_any_element()
                             })
                             .children(archived_section),
@@ -4021,8 +4032,11 @@ impl Shell {
             match &self.update_flow {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
+                UpdateFlow::Ready(_) => (t("Update ready — restart to apply").into(), true),
+                UpdateFlow::Failed(message) => (
+                    tf!("Update failed: {message}", message = message).into(),
+                    true,
+                ),
             }
         } else {
             (
@@ -4282,7 +4296,7 @@ impl Shell {
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Enable sync"))
+                                .child(SharedString::from(t("Enable sync")))
                                 .into_any_element()
                         }
                         AccountMenuAction::SyncInProgress => {
@@ -4294,7 +4308,7 @@ impl Shell {
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Sync setup in progress"))
+                                .child(SharedString::from(t("Sync setup in progress")))
                                 .into_any_element()
                         }
                         AccountMenuAction::RestartPending => {
@@ -4306,7 +4320,7 @@ impl Shell {
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Finish sync setup"))
+                                .child(SharedString::from(t("Finish sync setup")))
                                 .into_any_element()
                         }
                         AccountMenuAction::SignOut => {
@@ -4318,7 +4332,7 @@ impl Shell {
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Sign out"))
+                                .child(SharedString::from(t("Sign out")))
                                 .into_any_element()
                         }
                     };
@@ -4335,7 +4349,7 @@ impl Shell {
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Settings")),
+                        .child(SharedString::from(t("Settings"))),
                 )
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu_above(
@@ -4363,11 +4377,11 @@ impl Shell {
             .engine()
             .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
         let runtime_change_label = if self.runtime_change_task.is_some() {
-            "Stopping engine…"
+            t("Stopping engine…")
         } else if remote_engine {
-            "Stop daemon and quit"
+            t("Stop daemon and quit")
         } else {
-            "Quit Zeron"
+            t("Quit Zeron")
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
@@ -4388,11 +4402,11 @@ impl Shell {
 
         let card = match self.sync_flow {
             SyncFlow::Enabling => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Enable sync"))
+                .child(popover::dialog_title(&theme, t("Enable sync")))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen.",
+                        t("Finish signing in in your browser. Zeron will keep using this local workspace until you quit and reopen."),
                     )),
                 )
                 .child(
@@ -4403,14 +4417,14 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "sync-enable-cancel")
+                            popover::btn_ghost(&theme, t("Cancel"), "sync-enable-cancel")
                                 .id("sync-enable-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.cancel_auth_setup(cx)
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Open browser again")
+                            popover::btn_primary(&theme, t("Open browser again"))
                                 .id("sync-enable-open-browser")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_sign_in(cx)
@@ -4419,11 +4433,11 @@ impl Shell {
                 )
                 .into_any_element(),
             SyncFlow::Canceling => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Canceling sync setup…"))
+                .child(popover::dialog_title(&theme, t("Canceling sync setup…")))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Removing the partial sign-in before returning to your local workspace.",
+                        t("Removing the partial sign-in before returning to your local workspace."),
                     )),
                 )
                 .into_any_element(),
@@ -4431,19 +4445,13 @@ impl Shell {
             SyncFlow::SwitchOffer { notice_open: true } => {
                 let has_local_work = work_phrase.is_some();
                 let body: SharedString = match (&signed_in_email, &work_phrase) {
-                    (Some(email), Some(phrase)) => format!(
-                        "You're signed in as {email}. Bring {phrase} from this device into your synced workspace, or start it fresh."
-                    )
+                    (Some(email), Some(phrase)) => tf!("You're signed in as {email}. Bring {phrase} from this device into your synced workspace, or start it fresh.", email = email, phrase = phrase)
                     .into(),
-                    (Some(email), None) => format!(
-                        "You're signed in as {email}. Zeron can switch to your synced workspace now."
-                    )
+                    (Some(email), None) => tf!("You're signed in as {email}. Zeron can switch to your synced workspace now.", email = email)
                     .into(),
-                    (None, Some(phrase)) => format!(
-                        "Bring {phrase} from this device into your synced workspace, or start it fresh."
-                    )
+                    (None, Some(phrase)) => tf!("Bring {phrase} from this device into your synced workspace, or start it fresh.", phrase = phrase)
                     .into(),
-                    (None, None) => "Zeron can switch to your synced workspace now.".into(),
+                    (None, None) => t("Zeron can switch to your synced workspace now.").into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -4452,7 +4460,7 @@ impl Shell {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_ghost(&theme, "Later", "sync-switch-later")
+                        popover::btn_ghost(&theme, t("Later"), "sync-switch-later")
                             .id("sync-switch-later")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.postpone_sync_restart(cx)
@@ -4461,14 +4469,14 @@ impl Shell {
                 if has_local_work {
                     actions = actions
                         .child(
-                            popover::btn_ghost(&theme, "Start fresh", "sync-switch-fresh")
+                            popover::btn_ghost(&theme, t("Start fresh"), "sync-switch-fresh")
                                 .id("sync-switch-fresh")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_synced_switch(false, cx)
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Bring my work")
+                            popover::btn_primary(&theme, t("Bring my work"))
                                 .id("sync-switch-import")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_synced_switch(true, cx)
@@ -4476,7 +4484,7 @@ impl Shell {
                         );
                 } else {
                     actions = actions.child(
-                        popover::btn_primary(&theme, "Switch now")
+                        popover::btn_primary(&theme, t("Switch now"))
                             .id("sync-switch-now")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.start_synced_switch(false, cx)
@@ -4484,7 +4492,7 @@ impl Shell {
                     );
                 }
                 popover::dialog_card(&theme)
-                    .child(popover::dialog_title(&theme, "Sync is ready"))
+                    .child(popover::dialog_title(&theme, t("Sync is ready")))
                     .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
                     .child(actions)
                     .into_any_element()
@@ -4492,14 +4500,14 @@ impl Shell {
             SyncFlow::Switching { import } => popover::dialog_card(&theme)
                 .child(popover::dialog_title(
                     &theme,
-                    "Switching to your synced workspace…",
+                    t("Switching to your synced workspace…"),
                 ))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
                     if import {
-                        "Handing the engine over to your account. Your local sessions come along next."
+                        t("Handing the engine over to your account. Your local sessions come along next.")
                     } else {
-                        "Handing the engine over to your account."
+                        t("Handing the engine over to your account.")
                     },
                 )))
                 .into_any_element(),
@@ -4510,12 +4518,17 @@ impl Shell {
                     (done as f32 / total as f32).clamp(0.0, 1.0)
                 };
                 let label: SharedString = if total == 0 {
-                    "Looking for local sessions…".into()
+                    t("Looking for local sessions…").into()
                 } else {
-                    format!("Importing session {} of {total}", (done + 1).min(total)).into()
+                    tf!(
+                        "Importing session {n} of {total}",
+                        n = (done + 1).min(total),
+                        total = total
+                    )
+                    .into()
                 };
                 let mut card = popover::dialog_card(&theme)
-                    .child(popover::dialog_title(&theme, "Bringing your work over"))
+                    .child(popover::dialog_title(&theme, t("Bringing your work over")))
                     .child(
                         div()
                             .mt(px(6.0))
@@ -4574,7 +4587,7 @@ impl Shell {
                             .flex_row()
                             .justify_end()
                             .child(
-                                popover::btn_primary(&theme, "Continue")
+                                popover::btn_primary(&theme, t("Continue"))
                                     .id("sync-switch-done")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sync_flow = SyncFlow::Idle;
@@ -4585,10 +4598,10 @@ impl Shell {
                     .into_any_element()
             }
             SyncFlow::ImportFailed { notice_open: true } => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Import didn't finish"))
+                .child(popover::dialog_title(&theme, t("Import didn't finish")))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
-                    "Anything already imported is kept; retrying only copies what's missing.",
+                    t("Anything already imported is kept; retrying only copies what's missing."),
                 )))
                 .when_some(self.runtime_change_error.clone(), |card, error| {
                     card.child(
@@ -4608,14 +4621,14 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Later", "import-failed-dismiss")
+                            popover::btn_ghost(&theme, t("Later"), "import-failed-dismiss")
                                 .id("import-failed-dismiss")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.postpone_sync_restart(cx)
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Retry import")
+                            popover::btn_primary(&theme, t("Retry import"))
                                 .id("import-failed-retry")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.spawn_local_import(cx)
@@ -4626,15 +4639,15 @@ impl Shell {
             SyncFlow::RestartPending { notice_open: true } => popover::dialog_card(&theme)
                 .child(popover::dialog_title(
                     &theme,
-                    "Sync needs a restart",
+                    t("Sync needs a restart"),
                 ))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
                         if remote_engine {
-                            "Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            t("Zeron is using a background daemon. Stop it and quit Zeron, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded.")
                         } else {
-                            "Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                            t("Quit and reopen Zeron to start the synced workspace. Existing local sessions stay on this device and will not be uploaded.")
                         },
                     )),
                 )
@@ -4656,7 +4669,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Later", "sync-restart-later")
+                            popover::btn_ghost(&theme, t("Later"), "sync-restart-later")
                                 .id("sync-restart-later")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.postpone_sync_restart(cx)
@@ -4675,11 +4688,11 @@ impl Shell {
                 )
                 .into_any_element(),
             SyncFlow::SignOutConfirm => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Sign out?"))
+                .child(popover::dialog_title(&theme, t("Sign out?")))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Zeron will remove your credentials, close the synced workspace, and continue in local mode.",
+                        t("Zeron will remove your credentials, close the synced workspace, and continue in local mode."),
                     )),
                 )
                 .child(
@@ -4690,7 +4703,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "signout-cancel")
+                            popover::btn_ghost(&theme, t("Cancel"), "signout-cancel")
                                 .id("signout-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.sync_flow = SyncFlow::Idle;
@@ -4698,7 +4711,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Sign out")
+                            popover::btn_danger(&theme, t("Sign out"))
                                 .id("signout-confirm")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_sign_out(cx)
@@ -4707,11 +4720,11 @@ impl Shell {
                 )
                 .into_any_element(),
             SyncFlow::SigningOut => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Signing out…"))
+                .child(popover::dialog_title(&theme, t("Signing out…")))
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Removing account credentials and closing the synced workspace.",
+                        t("Removing account credentials and closing the synced workspace."),
                     )),
                 )
                 .into_any_element(),
@@ -4755,7 +4768,7 @@ impl Shell {
                             this.open_rename_chat(rename_id.clone(), cx)
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                        .child(SharedString::from("Rename…")),
+                        .child(SharedString::from(t("Rename…"))),
                 )
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
@@ -4768,7 +4781,7 @@ impl Shell {
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
-                        .child(SharedString::from("Archive")),
+                        .child(SharedString::from(t("Archive"))),
                 )
                 .child(popover::menu_separator())
                 .child(
@@ -4785,7 +4798,7 @@ impl Shell {
                                 .size(px(16.0))
                                 .text_color(theme.danger),
                         )
-                        .child(SharedString::from("Delete…")),
+                        .child(SharedString::from(t("Delete…"))),
                 )
                 .into_any_element();
             overlays.push(popover::menu_at(
@@ -4808,7 +4821,7 @@ impl Shell {
                         cx.notify();
                     }
                 }))
-                .child(popover::dialog_title(&theme, "Rename session"))
+                .child(popover::dialog_title(&theme, t("Rename session")))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -4822,7 +4835,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "rename-chat-cancel")
+                            popover::btn_ghost(&theme, t("Cancel"), "rename-chat-cancel")
                                 .id("rename-chat-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.rename_dialog = None;
@@ -4830,7 +4843,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Rename")
+                            popover::btn_primary(&theme, t("Rename"))
                                 .id("rename-chat-save")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.submit_rename_chat(cx)),
@@ -4855,7 +4868,7 @@ impl Shell {
                     .iter()
                     .find(|c| c.id == chat_id)
                     .and_then(|c| c.title.clone())
-                    .unwrap_or_else(|| "New session".into()),
+                    .unwrap_or_else(|| t("New session").into()),
             );
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Delete session?"))
@@ -4871,7 +4884,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel")
+                            popover::btn_ghost(&theme, t("Cancel"), "delete-chat-cancel")
                                 .id("delete-chat-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.delete_confirm = None;
@@ -4879,7 +4892,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Delete")
+                            popover::btn_danger(&theme, t("Delete"))
                                 .id("delete-chat-confirm")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.delete_chat(chat_id.clone(), cx)
@@ -4998,19 +5011,19 @@ impl Shell {
                                 .text_size(px(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child(SharedString::from("Add a project to get started")),
+                                .child(SharedString::from(t("Add a project to get started"))),
                         )
                         .child(
                             div()
                                 .mt(px(6.0))
                                 .text_size(px(13.0))
                                 .text_color(theme.text_muted.opacity(0.7))
-                                .child(SharedString::from(
+                                .child(SharedString::from(t(
                                     "A project is a folder on one of your devices.",
-                                )),
+                                ))),
                         )
                         .child(
-                            popover::btn_primary(&theme_owned, "Add a project")
+                            popover::btn_primary(&theme_owned, t("Add a project"))
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
@@ -5176,7 +5189,7 @@ impl Shell {
                         .justify_center()
                         .text_size(px(13.0))
                         .text_color(theme.text)
-                        .child("Drop images to attach"),
+                        .child(t("Drop images to attach")),
                 )
             })
             .into_any_element()
@@ -5418,7 +5431,7 @@ impl Shell {
             Indicator::AwaitingInput => strip.into_any_element(),
             Indicator::Errored => strip
                 .text_color(theme.danger)
-                .child(SharedString::from("Run failed"))
+                .child(SharedString::from(t("Run failed")))
                 .into_any_element(),
             Indicator::None if sending => strip
                 .child(loaders::gradient_spinner(
@@ -5432,7 +5445,7 @@ impl Shell {
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from("Sending…")),
+                        .child(SharedString::from(t("Sending…"))),
                 )
                 .into_any_element(),
             Indicator::None => strip.into_any_element(),
@@ -5613,7 +5626,7 @@ impl Shell {
                             .text_size(px(13.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(text)
-                            .child(SharedString::from("Open a surface")),
+                            .child(SharedString::from(t("Open a surface"))),
                     )
                     .child(
                         div()
@@ -5621,9 +5634,9 @@ impl Shell {
                             .text_center()
                             .text_size(px(11.5))
                             .text_color(muted)
-                            .child(SharedString::from(
+                            .child(SharedString::from(t(
                                 "Choose what to show in the right panel.",
-                            )),
+                            ))),
                     )
                     .child(
                         div()
@@ -5633,11 +5646,10 @@ impl Shell {
                             .flex_col()
                             .gap(px(8.0))
                             .child(
-                                row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
-                                    cx.listener(|this, _, _, cx| {
+                                row("surface-card-terminal", icons::TERMINAL, t("Terminal"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
                                         this.add_terminal_surface(cx);
-                                    }),
-                                ),
+                                    })),
                             )
                             // Git only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
@@ -5658,9 +5670,9 @@ impl Shell {
     fn render_signed_out_restart(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let runtime_change_label = if self.runtime_change_task.is_some() {
-            "Stopping engine…"
+            t("Stopping engine…")
         } else {
-            "Retry local mode"
+            t("Retry local mode")
         };
         let card = div()
             .w(px(380.0))
@@ -5687,7 +5699,7 @@ impl Shell {
                     .text_size(px(18.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
-                    .child(SharedString::from("Signed out")),
+                    .child(SharedString::from(t("Signed out"))),
             )
             .child(
                 div()
@@ -5697,7 +5709,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                        t("Zeron removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode."),
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -6055,7 +6067,7 @@ impl Shell {
                                         .size(px(13.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Terminal")),
+                                .child(SharedString::from(t("Terminal"))),
                         )
                         .child(
                             popover::menu_row(&theme, false, "right-plus-diff")
@@ -6176,7 +6188,7 @@ impl Shell {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()))
                         .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
-                        .child(SharedString::from("Retry")),
+                        .child(SharedString::from(t("Retry"))),
                 )
                 .into_any_element(),
             // Login card (zeron App.tsx Gate): centered card on the grid —
@@ -6206,7 +6218,7 @@ impl Shell {
                         .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
-                        .child(SharedString::from("Log in to Zeron")),
+                        .child(SharedString::from(t("Log in to Zeron"))),
                 )
                 .child(
                     div()
@@ -6235,7 +6247,7 @@ impl Shell {
                         .cursor_pointer()
                         .hover(|s| s.opacity(0.9))
                         .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
-                        .child(SharedString::from("Log in")),
+                        .child(SharedString::from(t("Log in"))),
                 )
                 .into_any_element(),
         };
@@ -6312,7 +6324,7 @@ impl Shell {
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme.glass_hover()))
                                 .on_click(cx.listener(|this, _, _, cx| this.load_orgs(cx)))
-                                .child(SharedString::from("Retry")),
+                                .child(SharedString::from(t("Retry"))),
                         ),
                     )
                     .into_any_element(),
@@ -6327,9 +6339,9 @@ impl Shell {
                             .text_size(px(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
+                            .child(SharedString::from(t(
                                 "Or continue in a workspace you belong to",
-                            )),
+                            ))),
                     )
                     .child(div().flex().flex_col().gap(px(4.0)).children(
                         rows.iter().enumerate().map(|(ix, row)| {
@@ -6392,7 +6404,7 @@ impl Shell {
                     .text_size(px(18.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
-                    .child(SharedString::from("Create your workspace")),
+                    .child(SharedString::from(t("Create your workspace"))),
             )
             .child(
                 div()
@@ -6440,9 +6452,9 @@ impl Shell {
                             .hover(|s| s.opacity(0.9))
                             .on_click(cx.listener(|this, _, _, cx| this.create_org(cx)))
                             .child(SharedString::from(if submitting {
-                                "Creating…"
+                                t("Creating…")
                             } else {
-                                "Create"
+                                t("Create")
                             })),
                     ),
             )
@@ -6467,9 +6479,9 @@ impl Shell {
                         .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.cancel_auth_setup(cx)))
                         .child(SharedString::from(if local_setup {
-                            "Cancel sync setup"
+                            t("Cancel sync setup")
                         } else {
-                            "Use a different account"
+                            t("Use a different account")
                         })),
                 ),
             );
@@ -7406,6 +7418,13 @@ mod tests {
             local_work_phrase(1, 2).as_deref(),
             Some("the 1 session and 2 projects")
         );
+        crate::i18n::with_locale(crate::i18n::Locale::Zh, || {
+            assert_eq!(local_work_phrase(2, 0).as_deref(), Some("2 个会话"));
+            assert_eq!(
+                local_work_phrase(1, 2).as_deref(),
+                Some("1 个会话和 2 个项目")
+            );
+        });
     }
 
     #[test]

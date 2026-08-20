@@ -16,6 +16,7 @@ use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, ac
 
 use crate::appearance::{self, AppearanceMode};
 use crate::composer;
+use crate::i18n::t;
 
 actions!(
     zeron,
@@ -104,20 +105,20 @@ pub fn app_menus() -> Vec<Menu> {
     // what we pass, but gpui still wants a name.
     let mut app_items = vec![
         // Placeholder until a real about dialog exists (explicitly disabled).
-        MenuItem::action("About Zeron", About).disabled(true),
+        MenuItem::action(t("About Zeron"), About).disabled(true),
         MenuItem::separator(),
     ];
     if macos {
         app_items.extend([
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::os_submenu(t("Services"), SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Zeron", Hide),
-            MenuItem::action("Hide Others", HideOthers),
-            MenuItem::action("Show All", ShowAll),
+            MenuItem::action(t("Hide Zeron"), Hide),
+            MenuItem::action(t("Hide Others"), HideOthers),
+            MenuItem::action(t("Show All"), ShowAll),
             MenuItem::separator(),
         ]);
     }
-    app_items.push(MenuItem::action("Quit Zeron", Quit));
+    app_items.push(MenuItem::action(t("Quit Zeron"), Quit));
 
     let mut menus = vec![
         Menu::new("Zeron").items(app_items),
@@ -126,33 +127,33 @@ pub fn app_menus() -> Vec<Menu> {
         // so the OS Edit menu routes through the responder chain to the focused
         // input — zed wires its editor actions identically
         // (crates/zed/src/zed/app_menus.rs, Edit/Selection menus).
-        Menu::new("Edit").items([
+        Menu::new(t("Edit")).items([
             // Undo/Redo have no `OsAction` counterpart — they dispatch as plain
             // actions to the focused input, same as the composer keymap.
-            MenuItem::action("Undo", composer::Undo),
-            MenuItem::action("Redo", composer::Redo),
+            MenuItem::action(t("Undo"), composer::Undo),
+            MenuItem::action(t("Redo"), composer::Redo),
             MenuItem::separator(),
-            MenuItem::os_action("Cut", composer::Cut, OsAction::Cut),
-            MenuItem::os_action("Copy", composer::Copy, OsAction::Copy),
-            MenuItem::os_action("Paste", composer::Paste, OsAction::Paste),
+            MenuItem::os_action(t("Cut"), composer::Cut, OsAction::Cut),
+            MenuItem::os_action(t("Copy"), composer::Copy, OsAction::Copy),
+            MenuItem::os_action(t("Paste"), composer::Paste, OsAction::Paste),
             MenuItem::separator(),
-            MenuItem::os_action("Select All", composer::SelectAll, OsAction::SelectAll),
+            MenuItem::os_action(t("Select All"), composer::SelectAll, OsAction::SelectAll),
         ]),
     ];
     // Appearance lives under View on every platform — it is the only View verb
     // today, but "Appearance" as a top-level menu would read oddly next to Edit.
-    menus.push(Menu::new("View").items([
-        MenuItem::action("Appearance: System", AppearanceSystem),
-        MenuItem::action("Appearance: Light", AppearanceLight),
-        MenuItem::action("Appearance: Dark", AppearanceDark),
+    menus.push(Menu::new(t("View")).items([
+        MenuItem::action(t("Appearance: System"), AppearanceSystem),
+        MenuItem::action(t("Appearance: Light"), AppearanceLight),
+        MenuItem::action(t("Appearance: Dark"), AppearanceDark),
     ]));
     if macos {
         // Standard Window menu; macOS appends the open-window list itself.
-        menus.push(Menu::new("Window").items([
-            MenuItem::action("Minimize", Minimize),
-            MenuItem::action("Zoom", Zoom),
+        menus.push(Menu::new(t("Window")).items([
+            MenuItem::action(t("Minimize"), Minimize),
+            MenuItem::action(t("Zoom"), Zoom),
             MenuItem::separator(),
-            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::action(t("Close Window"), CloseWindow),
         ]));
     }
     menus

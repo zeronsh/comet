@@ -42,6 +42,7 @@ use gpui::{
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
 use zeron_proto::ToolCall;
 
+use crate::i18n::{t, tf};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
@@ -640,10 +641,14 @@ where
     Tz::Offset: std::fmt::Display,
 {
     match chrono::DateTime::from_timestamp_millis(ms) {
-        Some(utc) => utc
-            .with_timezone(tz)
-            .format("%b %-d, %-I:%M %p")
-            .to_string(),
+        Some(utc) => {
+            let local = utc.with_timezone(tz);
+            if crate::i18n::is_zh() {
+                local.format("%-m月%-d日 %H:%M").to_string()
+            } else {
+                local.format("%b %-d, %-I:%M %p").to_string()
+            }
+        }
         None => String::new(),
     }
 }
@@ -920,7 +925,7 @@ pub fn rows_for_entry(
                             &questions
                                 .first()
                                 .map(|q| q.header.clone())
-                                .unwrap_or_else(|| "Question".to_string()),
+                                .unwrap_or_else(|| t("Question").to_string()),
                         )
                         .into();
                         rows.push(Row {
@@ -1264,8 +1269,36 @@ pub const FLAVOUR_ROTATE_SECS: i64 = 7;
 /// The flavour word for a seed at an elapsed time.
 pub fn flavour_word(seed: u64, elapsed_secs: i64) -> &'static str {
     let step = (elapsed_secs.max(0) / FLAVOUR_ROTATE_SECS) as u64;
-    FLAVOUR_WORDS[((seed.wrapping_add(step)) % FLAVOUR_WORDS.len() as u64) as usize]
+    let i = ((seed.wrapping_add(step)) % FLAVOUR_WORDS.len() as u64) as usize;
+    if crate::i18n::is_zh() {
+        FLAVOUR_WORDS_ZH[i]
+    } else {
+        FLAVOUR_WORDS[i]
+    }
 }
+
+const FLAVOUR_WORDS_ZH: [&str; 20] = [
+    "思考中",
+    "斟酌中",
+    "谋划中",
+    "酝酿中",
+    "编织中",
+    "捣鼓中",
+    "沉思中",
+    "撰写中",
+    "筛选中",
+    "梳理中",
+    "提炼中",
+    "勾画中",
+    "筹划中",
+    "即兴中",
+    "整理中",
+    "发酵中",
+    "浸润中",
+    "琢磨中",
+    "解谜中",
+    "构想中",
+];
 
 /// A stable per-chat seed.
 pub fn flavour_seed(chat_id: &str) -> u64 {
@@ -3122,7 +3155,7 @@ impl Transcript {
                         .text_color(theme.danger)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
-                        .child(SharedString::from("Not delivered — click to retry"))
+                        .child(SharedString::from(t("Not delivered — click to retry")))
                         .into_any_element(),
                 );
             }
@@ -3153,9 +3186,9 @@ impl Transcript {
             (sending, queued, elapsed, flavour_seed(&chat_id))
         };
         let word = if queued {
-            "Queued — will send automatically"
+            t("Queued — will send automatically")
         } else if sending {
-            "Sending"
+            t("Sending")
         } else {
             flavour_word(seed, elapsed_secs)
         };
@@ -3664,8 +3697,8 @@ impl Transcript {
                     best.map(|(_, r)| r)
                 };
                 let candidates = [
-                    (tool.diff_ref.as_ref(), "diff", None),
-                    (tool.output_ref.as_ref(), "output", tool.output_bytes),
+                    (tool.diff_ref.as_ref(), t("diff"), None),
+                    (tool.output_ref.as_ref(), t("output"), tool.output_bytes),
                 ];
                 for (blob_ref, what, bytes) in candidates {
                     let Some(blob_ref) = blob_ref else { continue };
@@ -3674,15 +3707,19 @@ impl Transcript {
                             if shown == Some(blob_ref) {
                                 continue;
                             }
-                            format!("Show full {what}")
+                            tf!("Show full {what}", what = what)
                         }
-                        Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
+                        Some(BlobFetch::Loading(_)) => tf!("Loading full {what}…", what = what),
                         Some(BlobFetch::Failed) => {
-                            format!("Couldn't load full {what} — tap to retry")
+                            tf!("Couldn't load full {what} — tap to retry", what = what)
                         }
                         None => match bytes {
-                            Some(b) => format!("Show full {what} ({})", format_kb(b)),
-                            None => format!("Show full {what}"),
+                            Some(b) => tf!(
+                                "Show full {what} ({size})",
+                                what = what,
+                                size = format_kb(b)
+                            ),
+                            None => tf!("Show full {what}", what = what),
                         },
                     };
                     return Some(ChipAffordance {
@@ -4134,6 +4171,7 @@ fn user_bubble_text(
 /// agent's exit status and stderr, and a one-line ellipsis was exactly what
 /// made zeronsh/comet#95 undiagnosable from the screenshot.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+    let message = SharedString::from(crate::i18n::t_str(&message));
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
     div()
@@ -4174,7 +4212,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .flex_none()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(red_300.opacity(0.8))
-                        .child(SharedString::from("Error")),
+                        .child(SharedString::from(t("Error"))),
                 )
                 .child(
                     div()
@@ -4198,7 +4236,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
     let value: SharedString = if resolved {
         header
     } else {
-        "Awaiting your answer…".into()
+        t("Awaiting your answer…").into()
     };
     div()
         .py(px(4.0))
@@ -4237,7 +4275,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                         .flex_none()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text_muted)
-                        .child(SharedString::from("Question")),
+                        .child(SharedString::from(t("Question"))),
                 )
                 .child(
                     div()
@@ -4386,6 +4424,7 @@ fn chip_header_row(
     cx: &mut gpui::App,
 ) -> gpui::Div {
     let (label, detail) = tool_chip_content(&tool.call);
+    let label = crate::i18n::t_str(label);
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -5908,6 +5947,9 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         assert_eq!(format_timestamp(ms, &tz), "Jul 1, 3:45 PM");
+        crate::i18n::with_locale(crate::i18n::Locale::Zh, || {
+            assert_eq!(format_timestamp(ms, &tz), "7月1日 15:45");
+        });
 
         // User entries carry the strip on their single row (pending too).
         let user = SessionMessageEntry {
@@ -5975,6 +6017,13 @@ mod tests {
         assert_eq!(format_elapsed(59), "59s");
         assert_eq!(format_elapsed(92), "1m 32s");
         assert_eq!(format_elapsed(-5), "0s");
+        crate::i18n::with_locale(crate::i18n::Locale::Zh, || {
+            let word = flavour_word(seed, 0);
+            assert!(
+                FLAVOUR_WORDS_ZH.contains(&word),
+                "zh flavour should stay in the Chinese table, got {word}"
+            );
+        });
     }
 
     #[test]

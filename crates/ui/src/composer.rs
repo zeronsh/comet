@@ -32,6 +32,7 @@ use zeron_proto::{
 use zeron_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::i18n::{t, tf};
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -3297,10 +3298,12 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
 fn mention_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to search its files".into()
+            t("The session's device runs an older zeron — update it to search its files").into()
         }
-        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
+        RpcError::Transport(_) | RpcError::Closed => {
+            t("The session's device is unreachable").into()
+        }
+        RpcError::BadParams(_) | RpcError::Failed(_) => t("File search failed").into(),
     }
 }
 
@@ -3308,11 +3311,13 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 fn slash_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
-            "The session's device runs an older zeron — update it to list commands".into()
+            t("The session's device runs an older zeron — update it to list commands").into()
         }
-        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::Transport(_) | RpcError::Closed => {
+            t("The session's device is unreachable").into()
+        }
         RpcError::BadParams(_) | RpcError::Failed(_) => {
-            "Couldn't load this agent's commands".into()
+            t("Couldn't load this agent's commands").into()
         }
     }
 }
@@ -3433,7 +3438,7 @@ impl Composer {
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            let mut input = ComposerInput::new("Do anything…", cx);
+            let mut input = ComposerInput::new(t("Do anything…"), cx);
             input.enable_mentions();
             input
         });
@@ -4018,9 +4023,9 @@ impl Composer {
                     .text_size(px(12.0))
                     .text_color(theme.text_muted)
                     .child(if token.query.is_empty() {
-                        "No files available"
+                        t("No files available")
                     } else {
-                        "No matching files"
+                        t("No matching files")
                     }),
             );
         } else {
@@ -4300,9 +4305,9 @@ impl Composer {
                     .text_size(px(12.0))
                     .text_color(theme.text_muted)
                     .child(if commands.is_empty() {
-                        "This agent has no slash commands"
+                        t("This agent has no slash commands")
                     } else {
-                        "No matching commands"
+                        t("No matching commands")
                     }),
             );
         } else {
@@ -4426,7 +4431,8 @@ impl Composer {
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
-                        input.set_placeholder("Type your own answer, or pick an option above", cx)
+                        input
+                            .set_placeholder(t("Type your own answer, or pick an option above"), cx)
                     });
                 }
             }
@@ -4449,7 +4455,7 @@ impl Composer {
                         self.wizard = None;
                         self.advance_task = None;
                         self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                            .update(cx, |input, cx| input.set_placeholder(t("Do anything…"), cx));
                     }
                 }
             }
@@ -4521,7 +4527,7 @@ impl Composer {
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.failure = Some("Engine not connected".into());
+            self.failure = Some(t("Engine not connected").into());
             self.failure_key = None; // global — meaningful on every chat
             cx.notify();
             return;
@@ -4998,7 +5004,7 @@ impl Composer {
                     }
                 };
                 let command = serde_json::to_value(&command)
-                    .map_err(|e| format!("Send failed: {e}"))?;
+                    .map_err(|e| tf!("Send failed: {e}", e = e))?;
                 let mut params = serde_json::json!({ "chatId": chat_id, "command": command });
                 if !transfers.is_empty() {
                     params["transfers"] = serde_json::Value::Array(transfers);
@@ -5014,7 +5020,7 @@ impl Composer {
                     std::time::Duration::from_secs(30),
                 )
                 .await
-                .map_err(|e| format!("Send failed: {e}"))?;
+                .map_err(|e| tf!("Send failed: {e}", e = e))?;
                 Ok(())
             }
             .await;
@@ -5120,7 +5126,7 @@ impl Composer {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
-                    composer.failure = Some(format!("Stop failed: {err}").into());
+                    composer.failure = Some(tf!("Stop failed: {err}", err = err).into());
                     composer.failure_key = Some(failure_chat);
                     cx.notify();
                 })
@@ -5140,9 +5146,9 @@ impl Composer {
         self.input.update(cx, |input, cx| {
             input.set_placeholder(
                 if has_pick {
-                    "Type your own answer, or leave this blank to use the selected option"
+                    t("Type your own answer, or leave this blank to use the selected option")
                 } else {
-                    "Type your own answer, or pick an option above"
+                    t("Type your own answer, or pick an option above")
                 },
                 cx,
             )
@@ -5196,7 +5202,7 @@ impl Composer {
         self.input.update(cx, |input, cx| {
             input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
+            input.set_placeholder(t("Do anything…"), cx);
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -5467,7 +5473,7 @@ impl Composer {
                     .pb(px(16.0))
                     .pt(px(4.0))
                     .child(if page > 0 {
-                        crate::popover::btn_ghost(&theme, "Back", "wizard-back")
+                        crate::popover::btn_ghost(&theme, t("Back"), "wizard-back")
                             .id("wizard-back")
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
                             .into_any_element()
@@ -5693,9 +5699,9 @@ impl Render for Composer {
             let offline = state.connectivity.state == S::Offline;
             degraded.then(|| {
                 let text: SharedString = if offline {
-                    "Offline — messages will send when you're back online.".into()
+                    t("Offline — messages will send when you're back online.").into()
                 } else {
-                    "Messages will send once the connection recovers.".into()
+                    t("Messages will send once the connection recovers.").into()
                 };
                 (text, offline)
             })
@@ -5717,7 +5723,7 @@ impl Render for Composer {
                 // DangerTriangle — a subtle tinted wash, not a bare red
                 // stroke. Amber for the offline-ish case (engine not
                 // connected), red for send/run failures. Click dismisses.
-                let offline = message.as_ref() == "Engine not connected";
+                let offline = message.as_ref() == t("Engine not connected");
                 let (border_c, wash, text_c) = if offline {
                     let amber = theme.warning; // amber-400
                     let amber_200 = theme.warning_muted;

@@ -26,6 +26,7 @@ use gpui::{
 use zeron_proto::{TerminalEvent, TerminalSession};
 use zeron_rpc::methods;
 
+use crate::i18n::{t, tf};
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, EngineHandle};
@@ -571,7 +572,7 @@ impl TerminalPanel {
         let tab_no = entry.tabs.len() + 1;
         entry.tabs.push(TerminalTab {
             key,
-            title: format!("Terminal {tab_no}").into(),
+            title: tf!("Terminal {tab_no}", tab_no = tab_no).into(),
             terminal_id: None,
             emulator: Emulator::new(80, 24),
             exited: None,
@@ -1245,12 +1246,7 @@ impl TerminalPanel {
         cx.stop_propagation();
     }
 
-    fn on_terminal_hover(
-        &mut self,
-        hovered: &bool,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_terminal_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
         if self.terminal_hovered != *hovered {
             self.terminal_hovered = *hovered;
             if !*hovered {
@@ -1657,7 +1653,7 @@ impl Render for TerminalPanel {
                 .justify_center()
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("Select a chat to open a terminal"))
+                .child(SharedString::from(t("Select a chat to open a terminal")))
                 .into_any_element();
         };
         let focused = self.focus_handle.is_focused(window);

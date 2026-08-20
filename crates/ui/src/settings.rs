@@ -5,6 +5,7 @@
 //! Corrupt or missing files fall back to defaults; loaded values are clamped so a
 //! hand-edited file can't wedge the layout.
 
+use crate::i18n::t;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -99,6 +100,9 @@ pub struct UiSettings {
     pub appearance: crate::appearance::AppearanceMode,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
+    /// UI language. Defaults to following the OS.
+    #[serde(default)]
+    pub language: crate::i18n::LanguageMode,
 }
 
 impl Default for UiSettings {
@@ -122,6 +126,7 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             diff_split: false,
+            language: crate::i18n::LanguageMode::default(),
         }
     }
 }
@@ -150,10 +155,10 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
-            ShortcutId::ToggleSidebar => "Toggle left sidebar",
-            ShortcutId::ToggleChanges => "Toggle right sidebar",
-            ShortcutId::ToggleTerminal => "Toggle terminal",
-            ShortcutId::NewSession => "New session",
+            ShortcutId::ToggleSidebar => t("Toggle left sidebar"),
+            ShortcutId::ToggleChanges => t("Toggle right sidebar"),
+            ShortcutId::ToggleTerminal => t("Toggle terminal"),
+            ShortcutId::NewSession => t("New session"),
         }
     }
 
@@ -399,6 +404,7 @@ mod tests {
             },
             appearance: crate::appearance::AppearanceMode::Light,
             diff_split: true,
+            language: crate::i18n::LanguageMode::default(),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -417,6 +423,7 @@ mod tests {
         .unwrap();
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
+        assert_eq!(loaded.language, crate::i18n::LanguageMode::System);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
         assert!(
