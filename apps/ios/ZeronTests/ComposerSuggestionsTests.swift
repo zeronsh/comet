@@ -4,6 +4,7 @@
 // caret moves inside one token (composer.rs:3301-3304), and error text that is
 // never rendered as "no results" (composer.rs:3296-3300).
 
+import SwiftUI
 import XCTest
 @testable import Zeron
 
@@ -164,5 +165,29 @@ final class ComposerSuggestionsTests: XCTestCase {
                       "the B request must genuinely be in flight when A re-enters")
         XCTAssertFalse(store.isLoading,
                        "a superseded cache hit must not strand the spinner on")
+    }
+
+    // MARK: cwd
+
+    /// The rule both composers key their command list on, mirroring the
+    /// desktop's `slash_cwd`. The blank cases are the ones that bite: a blank
+    /// `cwd` is dropped from the RPC params, so the host answers for its home
+    /// instead of the space's folder.
+    func testSlashCwdPrefersTheChatThenTheSpaceThenHome() {
+        XCTAssertEqual(slashCwd(chatCwd: "~/chat", spacePath: "~/space"), "~/chat")
+        XCTAssertEqual(slashCwd(chatCwd: nil, spacePath: "~/space"), "~/space")
+        XCTAssertEqual(slashCwd(chatCwd: nil, spacePath: nil), "~")
+        XCTAssertEqual(slashCwd(chatCwd: "  ", spacePath: "~/space"), "~/space")
+        XCTAssertEqual(slashCwd(chatCwd: "", spacePath: ""), "~")
+    }
+
+    /// The new-session composer sends `draft.markdown()`, not the plain text a
+    /// live chat sends, so a picked command has to survive that serialization.
+    func testPickedCommandSurvivesTheNewSessionSerialization() {
+        var draft = ComposerText()
+        var selection = AttributedTextSelection()
+        draft.replaceForTesting(0..<0, with: "/pl")
+        draft.apply(command: "plan", over: 0..<3, selection: &selection)
+        XCTAssertEqual(draft.markdown(), "/plan ")
     }
 }

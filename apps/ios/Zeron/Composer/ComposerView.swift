@@ -505,15 +505,15 @@ struct ComposerView: View {
             // that empty list under the real key — permanently, for the life of
             // the view. Every later `/` then silently shows nothing.
             //
-            // AppModel.workspace is Optional (AppModel.swift:21): signed out or
-            // in demo mode there is no store, and so no suggestions.
+            // Both fetchers go through AppModel, not straight to the store, so
+            // demo mode answers from its own dataset instead of returning [].
             suggestions.fetchCommands = { [weak model] harness, device, cwd in
-                guard let store = model?.workspace else { return [] }
-                return try await store.listCommands(deviceId: device, harness: harness, cwd: cwd)
+                guard let model else { return [] }
+                return try await model.listCommands(deviceId: device, harness: harness, cwd: cwd)
             }
             suggestions.fetchPaths = { [weak model] context, query in
-                guard let store = model?.workspace else { return [] }
-                return try await store.searchFiles(deviceId: context.deviceId,
+                guard let model else { return [] }
+                return try await model.searchFiles(deviceId: context.deviceId,
                                                    chatId: context.chatId,
                                                    spaceId: context.spaceId,
                                                    query: query)
@@ -542,7 +542,8 @@ struct ComposerView: View {
     private var suggestionContext: SuggestionContext {
         SuggestionContext(harness: harness,
                          deviceId: chat.deviceId,
-                         cwd: chat.cwd ?? model.space(for: chat)?.path ?? "~",
+                         cwd: slashCwd(chatCwd: chat.cwd,
+                                       spacePath: model.space(for: chat)?.path),
                          chatId: chat.id,
                          spaceId: nil)
     }

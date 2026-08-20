@@ -31,6 +31,33 @@ struct SuggestionContext: Equatable {
     var spaceId: String?
 }
 
+/// Where the popover's commands come from: the chat's own directory, else the
+/// picked space's folder, else the host's home.
+///
+/// Two rules come from the desktop's `slash_cwd` (crates/ui/src/composer.rs):
+/// a blank path counts as absent, and a draft with no chat falls to the space's
+/// folder. The checkout plan is ignored for the same reason the desktop ignores
+/// it — a draft that will mint a fresh worktree has no directory yet when the
+/// popover opens, and a worktree of the same repo carries the same tracked
+/// commands anyway.
+///
+/// One rule does NOT come from the desktop: a chat whose own `cwd` is absent
+/// falls through to its space's folder here, where the desktop stops at `~`.
+/// That is what this composer already did before the draft case existed, and
+/// the space's folder is the better answer of the two.
+///
+/// Blank counts as absent because `listCommands` drops an empty `cwd` from the
+/// params, and the host then answers for its home — a different list than the
+/// space's.
+func slashCwd(chatCwd: String?, spacePath: String?) -> String {
+    func present(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return value
+    }
+    return present(chatCwd) ?? present(spacePath) ?? "~"
+}
+
 /// Cache identity for one command list. The device belongs in the key because
 /// every project-less chat, on every device, shares the path `~`
 /// (crates/ui/src/composer.rs:3236-3241).

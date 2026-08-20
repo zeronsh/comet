@@ -349,6 +349,33 @@ final class AppModel {
         return HarnessCatalog.models(for: harness)
     }
 
+    /// Slash commands the harness advertises in one folder on one device, for
+    /// the composer popover. Both composers go through here rather than
+    /// straight to the store, so demo mode answers the same way it answers for
+    /// harnesses, models and refs. Signed out there is no store and no answer.
+    func listCommands(deviceId: String, harness: String,
+                      cwd: String) async throws -> [SlashCommand] {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            return DemoDataset.commands
+        }
+        guard let workspace else { return [] }
+        return try await workspace.listCommands(deviceId: deviceId, harness: harness, cwd: cwd)
+    }
+
+    /// Fuzzy file search for the composer's `@` popover. The engine needs
+    /// exactly one of `chatId` or `spaceId`.
+    func searchFiles(deviceId: String, chatId: String?, spaceId: String?,
+                     query: String) async throws -> [FileSearchMatch] {
+        if let demo {
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            return demo.searchFiles(query: query)
+        }
+        guard let workspace else { return [] }
+        return try await workspace.searchFiles(deviceId: deviceId, chatId: chatId,
+                                               spaceId: spaceId, query: query)
+    }
+
     /// Refs of the space's repo (git spaces only).
     func listRefs(space: Space) async -> [RepoRef]? {
         if let demo {
