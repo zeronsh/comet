@@ -33,9 +33,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
-    ListScrollEvent, ListState, ObjectFit, SharedString, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
+    Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas,
+    div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
@@ -60,6 +61,12 @@ pub const STICK_THRESHOLD_PX: f32 = 70.0;
 pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
+/// Text-selection edge scrolling runs only during a drag. A 24 ms cadence is
+/// smooth enough to track text while avoiding a permanent animation-frame loop
+/// on low-end devices.
+const SELECTION_SCROLL_TICK_MS: u64 = 24;
+const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
+const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
@@ -73,6 +80,35 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
+
+/// Signed list scroll step for a pointer near a viewport edge.
+///
+/// GPUI list offsets increase toward the document bottom. The quadratic ramp
+/// keeps entry into the edge zone gentle and reaches full speed at the edge.
+fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
+    let height = f32::from(bounds.size.height);
+    if height <= 0.0 {
+        return 0.0;
+    }
+    let edge = SELECTION_SCROLL_EDGE_PX.min(height / 3.0);
+    if edge <= 0.0 {
+        return 0.0;
+    }
+    let y = f32::from(position.y);
+    let top = f32::from(bounds.top());
+    let bottom = f32::from(bounds.bottom());
+    let scaled = |penetration: f32| {
+        let t = (penetration / edge).clamp(0.0, 1.0);
+        SELECTION_SCROLL_MAX_STEP_PX * t * t
+    };
+    if y < top + edge {
+        -scaled(top + edge - y)
+    } else if y > bottom - edge {
+        scaled(y - (bottom - edge))
+    } else {
+        0.0
+    }
+}
 const CHIPS_TOP_PAD: f32 = 2.0;
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
@@ -1475,6 +1511,11 @@ pub struct Transcript {
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
     scroll_anim: Option<Task<()>>,
+    /// Last pointer sample while markdown selection owns a left-button drag.
+    selection_drag_position: Option<Point<Pixels>>,
+    /// One-shot timer rescheduled only while the pointer remains in an edge
+    /// zone. Dropping it on mouse-up stops all selection scroll work.
+    selection_scroll_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
     /// Height of the shell's composer/status/terminal stack overlaying the
@@ -1637,6 +1678,8 @@ impl Transcript {
             spring_kick: false,
             spring_scheduled: false,
             scroll_anim: None,
+            selection_drag_position: None,
+            selection_scroll_task: None,
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
@@ -1842,6 +1885,93 @@ impl Transcript {
             })
             .ok();
         });
+    }
+
+    fn on_selection_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() || !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        self.selection_drag_position = Some(event.position);
+        if render::update_drag_at(event.position) {
+            cx.notify();
+        }
+        self.schedule_selection_scroll(cx);
+    }
+
+    fn on_selection_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_selection_scroll();
+        if let Some(_text) = crate::markdown::selection::end_active_drag() {
+            // X11 middle-click paste parity, including the case where the
+            // anchor row has virtualized away and cannot receive mouse-up.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(ClipboardItem::new_string(_text));
+        }
+    }
+
+    fn stop_selection_scroll(&mut self) {
+        self.selection_drag_position = None;
+        self.selection_scroll_task = None;
+    }
+
+    fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_task.is_some() || !crate::markdown::selection::is_dragging() {
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        if selection_scroll_step(self.list.viewport_bounds(), position) == 0.0 {
+            return;
+        }
+        self.selection_scroll_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECTION_SCROLL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |transcript, cx| {
+                transcript.selection_scroll_task = None;
+                transcript.step_selection_scroll(cx);
+            });
+        }));
+    }
+
+    fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        let step = selection_scroll_step(self.list.viewport_bounds(), position);
+        if step == 0.0 {
+            return;
+        }
+
+        // Resolve against the registry painted after the previous step before
+        // moving it again. This is what lets a stationary edge pointer consume
+        // successive virtualized rows.
+        render::update_drag_at(position);
+        self.scroll_anim = None;
+        self.release_own_turn_hold();
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.list.scroll_by(px(step));
+        self.last_scroll_distance = self.distance_from_bottom();
+        self.show_jump_button = self.last_scroll_distance > SCROLL_BUTTON_THRESHOLD_PX;
+        cx.notify();
+        self.schedule_selection_scroll(cx);
     }
 
     /// Reserve the reply's space below a locally-sent prompt — EVERY send,
@@ -2740,15 +2870,34 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
-            // The in-flight send's upload progress belongs ON the thumbnail:
-            // only the un-refreshed echo carries synthetic `pending/` refs, so
-            // the pair (pending path, upload in flight) is exactly "this image
-            // is crossing the relay right now" (2026-08-18 user request).
-            let uploading = att
+            // The in-flight send's progress belongs ON the thumbnail
+            // (2026-08-18 user request). Two ref shapes mean "still
+            // crossing": the queued flow's `pending://` (bytes ship
+            // engine-side after the send; the host rewrites the ref to an
+            // absolute path once they land and the run starts) and the
+            // legacy echo's synthetic `pending/`. Percent sources, in order:
+            // this attachment's own relay transfer (`WatchTransfers`, by the
+            // uploadId its ref names — the leg that actually takes time),
+            // else the send-wide staging/legacy upload percent. Neither → the
+            // indeterminate spinner (staged-but-waiting, retry backoff, or
+            // committed-awaiting-rewrite), so the ring never shows a number
+            // that isn't a real transfer position (2026-08-20 report: the
+            // staging-only percent blinked out in ~100ms and lied about the
+            // slow part).
+            let sending =
+                att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let upload_id = att
                 .path
-                .starts_with("pending/")
-                .then(|| self.state.read(cx).upload_progress_percent())
-                .flatten();
+                .strip_prefix("pending://")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(id, _)| id);
+            let uploading = upload_id
+                .and_then(|id| self.state.read(cx).transfer_percent(id))
+                .or_else(|| {
+                    sending
+                        .then(|| self.state.read(cx).upload_progress_percent())
+                        .flatten()
+                });
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -2775,7 +2924,14 @@ impl Transcript {
                         }))
                         .child(
                             img(image.image.clone())
-                                .size_full()
+                                // EXPLICIT dims, not size_full: img layout
+                                // honors the intrinsic aspect ratio over a
+                                // percent height (gpui f8d8a90 repoint), so
+                                // size_full let a tall photo grow past the
+                                // frame and the rectangular overflow clip
+                                // squared the bottom corners (2026-08-19).
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
                                 // The IMG needs its own radii: the frame's
                                 // rounding only clips rectangularly, so the
                                 // sprite must round its own corners (7 = the
@@ -2783,15 +2939,27 @@ impl Transcript {
                                 .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
-                        .when_some(uploading, |el, pct| {
+                        .when(sending, |el| {
                             // The pulse read registers this entity for frames,
-                            // so the percent stays live even once the trailer's
+                            // so the overlay stays live even once the trailer's
                             // 30s pending-send bridge has lapsed.
                             let pulse = motion::pulse_wave(motion::pulse_delta(
                                 &motion::ZERON_PULSE,
                                 cx.entity_id(),
                                 cx,
                             ));
+                            let indicator: AnyElement = match uploading {
+                                Some(pct) => {
+                                    crate::loaders::upload_progress_ring(pct, 34.0)
+                                }
+                                None => crate::loaders::mini_gradient_spinner(
+                                    format!("att-sending-{row_id}-{aix}"),
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                )
+                                .into_any_element(),
+                            };
                             el.child(
                                 div()
                                     .absolute()
@@ -2801,7 +2969,7 @@ impl Transcript {
                                     .items_center()
                                     .justify_center()
                                     .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
-                                    .child(crate::loaders::upload_progress_ring(pct, 34.0)),
+                                    .child(indicator),
                             )
                         })
                         .into_any_element()
@@ -2840,9 +3008,37 @@ impl Transcript {
     /// — user request), so it reads as part of the streaming reply and
     /// scrolls away with it. The spinner drives this entity's frames, which
     /// keeps the elapsed timer ticking through delta-quiet tool runs.
+    /// The failed-send retry (trailer affordance): re-kick every delivery
+    /// road engine-side (fresh chat2 socket, host nudge, delivery escorts)
+    /// and restart the grace clock so the trailer returns to Sending/Queued
+    /// while the retry runs.
+    fn retry_send(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
+        let engine = self.state.read(cx).engine().cloned();
+        self.state.update(cx, |s, cx| {
+            s.retry_pending_send(&chat_id, chrono::Utc::now());
+            cx.notify();
+        });
+        if let Some(engine) = engine {
+            cx.spawn(async move |_, _| {
+                let params = serde_json::json!({ "chatId": chat_id });
+                if let Err(err) = engine
+                    .client()
+                    .call(zeron_rpc::methods::RETRY_DELIVERY, params)
+                    .await
+                {
+                    tracing::warn!(error = %err, "delivery retry RPC failed");
+                }
+            })
+            .detach();
+        }
+    }
+
     fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let now = chrono::Utc::now();
-        let (sending, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
+        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
             // A subagent doc has no Session row — `indicator_for` would read
             // the PARENT chat's live state into this tab. Liveness rides the
             // doc itself instead: the sink's assistant entry streams until
@@ -2860,32 +3056,32 @@ impl Transcript {
                 return None;
             }
             let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, elapsed, flavour_seed(doc_id))
+            (false, false, elapsed, flavour_seed(doc_id))
         } else {
             let chat_id = self.chat_id.clone()?;
-            let (sending, elapsed) = {
+            // Failed-send state first: past the grace window the trailer IS
+            // the retry affordance, whatever the indicator fell back to.
+            if self.state.read(cx).send_undelivered(&chat_id, now) {
+                let theme = Theme::of(cx).clone();
+                return Some(
+                    div()
+                        .id("undelivered-retry")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .pt(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.danger)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
+                        .child(SharedString::from("Not delivered — click to retry"))
+                        .into_any_element(),
+                );
+            }
+            let (sending, queued, elapsed) = {
                 let state = self.state.read(cx);
                 if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
-                    // Past the pending-send TTL with no ack, the Working
-                    // overlay has lapsed but the queued command is still
-                    // undelivered (edge link down). Silence here read as a
-                    // hang (2026-08-19) — say what's actually happening.
-                    // Static line, no spinner: nothing is progressing; the
-                    // ack notify clears it.
-                    if state.send_queued_unacked(&chat_id, now) {
-                        let theme = Theme::of(cx).clone();
-                        return Some(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .pt(px(10.0))
-                                .text_size(px(12.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from("Queued — waiting for connection…"))
-                                .into_any_element(),
-                        );
-                    }
                     return None;
                 }
                 // During the send→turn window the session row's `started_at`
@@ -2897,14 +3093,21 @@ impl Transcript {
                 let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
                 let sending =
                     sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+                // Degraded delivery path: the send is a durable local write
+                // waiting on connectivity — say so instead of faking
+                // progress. (The overlay holds while degraded, so this line
+                // owns the surface until the ack or the failed state.)
+                let queued = sending && state.chat_delivery_degraded(&chat_id);
                 let elapsed = turn_started
                     .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                     .unwrap_or(0);
-                (sending, elapsed)
+                (sending, queued, elapsed)
             };
-            (sending, elapsed, flavour_seed(&chat_id))
+            (sending, queued, elapsed, flavour_seed(&chat_id))
         };
-        let word = if sending {
+        let word = if queued {
+            "Queued — will send automatically"
+        } else if sending {
             "Sending"
         } else {
             flavour_word(seed, elapsed_secs)
@@ -2928,8 +3131,16 @@ impl Transcript {
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(format!("{word}…"))),
+                        .text_color(if queued {
+                            theme.warning
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(SharedString::from(if queued {
+                            word.to_string()
+                        } else {
+                            format!("{word}…")
+                        })),
                 )
                 .when(!sending, |el| {
                     el.child(
@@ -4504,6 +4715,9 @@ impl Render for Transcript {
             .relative()
             .size_full()
             .min_h_0()
+            .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).
@@ -4535,6 +4749,24 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use zeron_doc::MessagePart;
+
+    #[test]
+    fn selection_scroll_ramps_at_viewport_edges() {
+        let bounds = Bounds::new(
+            gpui::point(px(10.0), px(20.0)),
+            gpui::size(px(300.0), px(200.0)),
+        );
+        assert_eq!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(120.0))),
+            0.0
+        );
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(20.0))) < 0.0);
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0))) > 0.0);
+        assert!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0)))
+                > selection_scroll_step(bounds, gpui::point(px(20.0), px(200.0)))
+        );
+    }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 

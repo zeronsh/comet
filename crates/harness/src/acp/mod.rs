@@ -56,6 +56,23 @@ use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
 
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// OpenCode loads its plugins and MCP configuration before it answers ACP.
+/// Plugin-heavy cold starts can take minutes, so model discovery and a real
+/// chat must share one generous startup budget instead of racing 10s vs 120s.
+const DEFAULT_OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "ZERON_OPENCODE_STARTUP_TIMEOUT_SECS";
+
+fn opencode_startup_timeout() -> Duration {
+    std::env::var(OPENCODE_STARTUP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_OPENCODE_STARTUP_TIMEOUT)
+}
+
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -111,6 +128,9 @@ struct AcpAgentSpec {
     /// a dead update check) — surface a visible error chip instead of
     /// indefinite Working.
     prompt_stall: Option<Duration>,
+    /// Agent-specific advice appended to the stall error chip: what a wedge
+    /// usually means for THIS agent and what the user can check.
+    stall_hint: &'static str,
     /// The agent's ACP process doubles as its own HTTP server (opencode):
     /// runs pass `--port <free>` and tail the `/event` SSE bus for subagent
     /// transcripts, which never ride the ACP wire. A failed port pick (or a
@@ -262,6 +282,9 @@ fn grok_spec() -> AcpAgentSpec {
         // `_meta.promptId`, just ahead of the RPC response.
         prompt_complete_extension: true,
         prompt_stall: Some(Duration::from_secs(30)),
+        stall_hint: "The agent process is likely wedged — a stale shared leader \
+             process or a hung startup check; zeron launches it with --no-leader \
+             and --no-auto-update to avoid both.",
         http_sidecar: false,
     }
 }
@@ -327,6 +350,7 @@ fn hermes_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
         http_sidecar: false,
     }
 }
@@ -383,6 +407,7 @@ fn pi_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: None,
+        stall_hint: "The agent process is likely wedged.",
         http_sidecar: false,
     }
 }
@@ -445,14 +470,43 @@ fn opencode_spec() -> AcpAgentSpec {
         },
         // No `_session/steering` extension (1.18.18): turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
-        // No `thought_level` config option over ACP today — effort stays
-        // with opencode's own per-model config; revisit when advertised.
-        reasoning_levels: &[],
+        // Effort rides opencode's model VARIANTS: when the session's current
+        // model has variants (models.dev metadata, or `variants` in
+        // opencode.json), the session advertises an `effort` config option
+        // (category thought_level) whose values mirror them — verified live
+        // (1.18.18) end to end: set_config_option effort=high applies the
+        // variant's options to the provider request. Variant-less models
+        // (the Zen frees today) advertise no option and the run-start set
+        // skips, falling to the agent default — so the blanket ladder here
+        // is safe (pi precedent). The option is per-model and reactive;
+        // exact per-model ladders would need the sidecar's provider.list
+        // (model.variants) — follow-up.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
         prompt_complete_extension: false,
-        prompt_stall: None,
+        // A failing model provider is INVISIBLE on this wire: opencode
+        // retries the provider stream forever without failing the
+        // session/prompt RPC, and neither session/update nor the /event bus
+        // carries the error (verified live, 1.18.18, unreachable provider —
+        // only ~/.local/share/opencode/log records the AI_APICallError
+        // retry loop). Fast provider rejections (e.g. a Zen model without a
+        // subscription) DO fail the RPC and surface as an error chip; total
+        // silence past the bound means the retry loop, so the watchdog is
+        // the only way the user ever learns.
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "The model provider is likely unreachable or rejecting \
+             requests — opencode retries these silently and never reports the \
+             failure. Check the model/provider setup (`opencode auth list`, \
+             opencode.json) or the opencode log \
+             (~/.local/share/opencode/log).",
         http_sidecar: true,
     }
 }
@@ -521,9 +575,16 @@ pub struct AcpHarness {
     /// Bound on the initialize → session handshake; a hang past it errors the
     /// run instead of spinning "Working" forever.
     handshake_timeout: Duration,
+    /// Bound on the initialize → session/new probe used to populate the model
+    /// picker. OpenCode shares this with its real startup budget because both
+    /// paths wait for the same plugin-heavy boot.
+    model_discovery_timeout: Duration,
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
+    /// Coalesce concurrent picker/title probes. Starting several OpenCode
+    /// processes at once makes cold plugin loading slower and wastes memory.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl AcpHarness {
@@ -537,8 +598,10 @@ impl AcpHarness {
             // Generous: the handshake is local work for every agent
             // (session/load replays from disk), so a hang past this is a
             // wedged agent, not a slow one.
-            handshake_timeout: Duration::from_secs(120),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
             models_cache: tokio::sync::OnceCell::new(),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -560,7 +623,11 @@ impl AcpHarness {
 
     /// opencode (`opencode acp`) — SST's native ACP agent.
     pub fn opencode() -> Self {
-        Self::with_spec(opencode_spec())
+        let startup_timeout = opencode_startup_timeout();
+        let mut harness = Self::with_spec(opencode_spec());
+        harness.handshake_timeout = startup_timeout;
+        harness.model_discovery_timeout = startup_timeout;
+        harness
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -587,6 +654,14 @@ impl AcpHarness {
     /// Tune the handshake bound (tests shrink it; default 120s).
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Tune the model-probe bound (tests shrink it; OpenCode defaults to the
+    /// same five-minute, environment-overridable budget as its real startup).
+    #[doc(hidden)]
+    pub fn with_model_discovery_timeout(mut self, timeout: Duration) -> Self {
+        self.model_discovery_timeout = timeout;
         self
     }
 
@@ -827,7 +902,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -857,11 +932,22 @@ impl AcpHarness {
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("model discovery timed out".into())),
+            Err(_) => {
+                let mut error = format!(
+                    "{} model discovery did not complete within {}s",
+                    self.spec.display_name,
+                    self.model_discovery_timeout.as_secs()
+                );
+                if let Some(stderr) = stderr_tail.snapshot() {
+                    error.push_str("; stderr: ");
+                    error.push_str(&stderr);
+                }
+                Err(HarnessError::Protocol(error))
+            }
         }
     }
 }
@@ -1144,10 +1230,16 @@ impl Harness for AcpHarness {
 
     /// ACP is the source of truth: a short-lived probe reads the agent's
     /// advertised model list (cached on success). The spec's static catalog
-    /// answers when the agent advertises nothing or the probe fails — and an
-    /// absent binary still surfaces as NotInstalled, like before.
+    /// answers when the agent advertises nothing. Most legacy ACP adapters also
+    /// use it when probing fails; OpenCode does not, because presenting two
+    /// static Zen models as a successful load permanently hides a slow or
+    /// failed plugin-backed catalog from the picker.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        let _probe = self.models_probe.lock().await;
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
@@ -1156,7 +1248,9 @@ impl Harness for AcpHarness {
                 let _ = self.models_cache.set(models.clone());
                 Ok(self.models_cache.get().cloned().unwrap_or(models))
             }
-            Ok(_) | Err(_) => Ok((self.spec.models)()),
+            Ok(_) => Ok((self.spec.models)()),
+            Err(error) if self.spec.id == HarnessId::Opencode => Err(error),
+            Err(_) => Ok((self.spec.models)()),
         }
     }
 
@@ -1204,6 +1298,7 @@ impl Harness for AcpHarness {
             effort_values: self.spec.effort_values,
             prompt_complete_extension: self.spec.prompt_complete_extension,
             prompt_stall: self.spec.prompt_stall,
+            stall_hint: self.spec.stall_hint,
             sessions_root: self.sessions_root.clone(),
             sidecar_port,
             interrupt_grace: self.interrupt_grace,
@@ -1234,6 +1329,7 @@ struct Session {
     agent_name: &'static str,
     prompt_complete_extension: bool,
     prompt_stall: Option<Duration>,
+    stall_hint: &'static str,
     /// Sessions-root override for the subagent transcript tail (tests).
     sessions_root: Option<PathBuf>,
     /// The http_sidecar port this run's agent was told to bind (opencode).
@@ -1367,6 +1463,60 @@ fn pick_model_value(requested: &str, available: &[&str], context_1m: bool) -> Op
         .find(|v| context_hint_1m(v) == context_1m)
         .or_else(|| candidates.first())
         .map(|v| (**v).to_owned())
+}
+
+/// Pick a first-class ACP model switch when the session uses the legacy
+/// `models` state instead of a category=model config option. Grok Build 1.0.5
+/// has exactly this shape and accepts the selected id through
+/// `session/set_model`; treating its advertised models as config options makes
+/// the picker look functional while every selection is silently ignored.
+///
+/// Config options remain preferred when present: org adapters can expose a
+/// legacy `models` matrix alongside the canonical base-model config option.
+fn first_class_model_change(
+    session_response: &Value,
+    requested: Option<&str>,
+) -> Result<Option<String>, HarnessError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let has_model_config = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                option.get("type").and_then(Value::as_str) == Some("select")
+                    && option.get("category").and_then(Value::as_str) == Some("model")
+            })
+        });
+    if has_model_config {
+        return Ok(None);
+    }
+
+    let Some(models) = session_response.get("models") else {
+        return Ok(None);
+    };
+    let available: Vec<&str> = models
+        .get("availableModels")
+        .and_then(Value::as_array)
+        .map(|models| models.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|model| model.get("modelId").and_then(Value::as_str))
+        .collect();
+    if available.is_empty() {
+        return Ok(None);
+    }
+    if !available.contains(&requested) {
+        return Err(HarnessError::Protocol(format!(
+            "agent does not advertise requested model {requested}; available models: {}",
+            available.join(", ")
+        )));
+    }
+    if models.get("currentModelId").and_then(Value::as_str) == Some(requested) {
+        return Ok(None);
+    }
+    Ok(Some(requested.to_owned()))
 }
 
 /// The `session/set_config_option` calls a session response's `configOptions`
@@ -1857,6 +2007,7 @@ async fn run_session(session: Session) {
         agent_name,
         prompt_complete_extension,
         prompt_stall,
+        stall_hint,
         sessions_root,
         sidecar_port,
         prompt_transform,
@@ -1944,13 +2095,36 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
+        // ACP has had two model-selection surfaces. Newer config-option agents
+        // use category=model below; Grok Build currently advertises only the
+        // first-class `models` state and requires `session/set_model`. Paseo
+        // follows the same split. Unlike the best-effort auxiliary options,
+        // an explicit model switch is strict: prompting with a different
+        // model than the picker shows is worse than surfacing the RPC error.
+        if let Some(model) = first_class_model_change(&session_response, request.model.as_deref())?
+        {
+            request_draining(
+                &client,
+                &mut incoming,
+                "session/set_model",
+                json!({
+                    "sessionId": session_id,
+                    "modelId": model,
+                }),
+                &mut session_commands,
+            )
+            .await
+            .map_err(|error| {
+                HarnessError::Protocol(format!("agent rejected model switch to {model}: {error}"))
+            })?;
+        }
         // Apply the run's model + effort + model options through the
-        // session's advertised config options (ACP has no per-prompt model
-        // field). Best-effort: a rejected set is logged, never fatal — the
-        // agent's default runs.
+        // session's advertised config options. Best-effort for effort and
+        // traits: a rejected auxiliary set is logged and the agent default
+        // runs.
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let requested_model = request.model.as_deref();
-        let mut options_snapshot = session_response;
+        let options_snapshot = session_response;
         for (config_id, payload) in config_option_sets(
             &options_snapshot,
             requested_model,
@@ -2387,9 +2561,27 @@ async fn run_session(session: Session) {
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
                     last_update_at = tokio::time::Instant::now();
-                    // Any wire traffic is a sign of life: the prompt-stall
-                    // watchdog only guards TOTAL silence after a prompt.
-                    prompt_stall_deadline = None;
+                    // Wire traffic is a sign of life for the prompt-stall
+                    // watchdog — EXCEPT session boilerplate: opencode emits
+                    // available_commands_update right after session/new on
+                    // every session, including ones whose provider is down
+                    // (where it then retries the provider stream forever
+                    // with nothing further on the wire — verified live,
+                    // 1.18.18). One such frame must not disarm the watchdog
+                    // for the whole turn; only turn progress counts.
+                    let boilerplate = method == "session/update"
+                        && matches!(
+                            params
+                                .get("update")
+                                .and_then(|u| u.get("sessionUpdate"))
+                                .and_then(Value::as_str),
+                            Some("available_commands_update")
+                                | Some("config_option_update")
+                                | Some("current_mode_update")
+                        );
+                    if !boilerplate {
+                        prompt_stall_deadline = None;
+                    }
                     // `_x.ai/session/prompt_complete` — the AUTHORITATIVE
                     // turn end for agents advertising it (grok): the
                     // `session/prompt` RPC can hang after the turn really
@@ -2935,8 +3127,10 @@ async fn run_session(session: Session) {
                     &event_tx,
                     AgentEvent::Error {
                         message: format!(
-                            "{agent_name} did not respond to the prompt at all                              (no wire activity for {}s). The agent process is                              likely wedged — a stale shared leader process or a                              hung startup check; zeron launches it with                              --no-leader and --no-auto-update to avoid both.",
-                            prompt_stall.map(|d| d.as_secs()).unwrap_or(0)
+                            "{agent_name} did not respond to the prompt at all \
+                             (no wire activity for {}s). {}",
+                            prompt_stall.map(|d| d.as_secs()).unwrap_or(0),
+                            stall_hint,
                         ),
                     },
                 )
@@ -2999,6 +3193,18 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_model_probe_and_chat_share_one_startup_budget() {
+        let harness = AcpHarness::opencode();
+        assert_eq!(
+            harness.model_discovery_timeout, harness.handshake_timeout,
+            "model discovery must not fail before the same OpenCode process would be considered hung"
+        );
+        if std::env::var_os(OPENCODE_STARTUP_TIMEOUT_ENV).is_none() {
+            assert_eq!(harness.handshake_timeout, DEFAULT_OPENCODE_STARTUP_TIMEOUT);
+        }
+    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {
@@ -3094,6 +3300,54 @@ mod tests {
         assert_eq!(
             config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn first_class_models_use_session_set_model_without_config_option() {
+        let response = json!({
+            "models": {
+                "currentModelId": "grok-4.6",
+                "availableModels": [
+                    { "modelId": "grok-4.6", "name": "Grok 4.6" },
+                    { "modelId": "grok-4.5", "name": "Grok 4.5" },
+                ],
+            },
+        });
+        assert_eq!(
+            first_class_model_change(&response, Some("grok-4.5")).unwrap(),
+            Some("grok-4.5".into())
+        );
+        assert_eq!(
+            first_class_model_change(&response, Some("grok-4.6")).unwrap(),
+            None
+        );
+        assert!(first_class_model_change(&response, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn model_config_option_takes_precedence_over_legacy_models_state() {
+        let response = json!({
+            "models": {
+                "currentModelId": "gpt-5.6-sol low",
+                "availableModels": [
+                    { "modelId": "gpt-5.6-sol low", "name": "GPT-5.6-Sol (low)" },
+                ],
+            },
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-5.6-sol",
+                "options": [
+                    { "value": "gpt-5.6-sol", "name": "GPT-5.6-Sol" },
+                    { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
+                ],
+            }],
+        });
+        assert_eq!(
+            first_class_model_change(&response, Some("gpt-5.6-terra")).unwrap(),
+            None
         );
     }
 

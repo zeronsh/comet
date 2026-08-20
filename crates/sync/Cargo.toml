@@ -19,6 +19,10 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+# NWPathMonitor bridge (net_path.rs) — the update handler is an ObjC block.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+
 [features]
 # In-process registry server speaking the DO's JSON WS protocol — test
 # infrastructure for this crate's tests and zeron-engine's integration tests.

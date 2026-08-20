@@ -165,6 +165,11 @@ fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
 /// resume turns them into the done→Working→done wake.
 pub(crate) struct Normalizer {
     saw_init: bool,
+    /// Background-agent ids (`task_started.task_id`) → the spawning Agent
+    /// tool_use id. `SendMessage` steers address the AGENT id; this map
+    /// re-keys them onto the spawn chip's feed (the wire never echoes the
+    /// steer on the child feed — live-verified 2.1.228).
+    agent_tasks: std::collections::HashMap<String, String>,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -176,6 +181,7 @@ impl Normalizer {
     pub fn new() -> Self {
         Self {
             saw_init: false,
+            agent_tasks: std::collections::HashMap::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -223,6 +229,19 @@ impl Normalizer {
                             session_id: None,
                         },
                     )];
+                }
+                // An AGENT task starting (subagent_type present — subagent-
+                // owned shell tasks carry the same subtype without it):
+                // record agentId → spawn id for SendMessage steer re-keying.
+                if f.subtype == "task_started"
+                    && f.subagent_type.is_some()
+                    && let (Some(task), Some(tool)) = (
+                        f.task_id.as_deref().filter(|t| !t.is_empty()),
+                        f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+                    )
+                {
+                    self.agent_tasks.insert(task.to_owned(), tool.to_owned());
+                    return Vec::new();
                 }
                 if f.subtype != "init" || self.saw_init {
                     return Vec::new();
@@ -351,7 +370,30 @@ impl Normalizer {
                                     text: prompt.to_owned(),
                                 },
                             ));
-                        std::iter::once(call).chain(opening)
+                        // A SendMessage steer never echoes on the child feed
+                        // (live-verified) — surface it from the parent's own
+                        // call, re-keyed onto the spawn it addresses.
+                        let steer = (b.name == "SendMessage")
+                            .then(|| {
+                                let to = ["to", "recipient"]
+                                    .iter()
+                                    .find_map(|k| b.input.get(*k))
+                                    .and_then(Value::as_str)?;
+                                let spawn = self.agent_tasks.get(to)?;
+                                let text = ["message", "content"]
+                                    .iter()
+                                    .find_map(|k| b.input.get(*k))
+                                    .and_then(Value::as_str)
+                                    .filter(|m| !m.trim().is_empty())?;
+                                Some(tag(
+                                    spawn,
+                                    AgentEvent::UserMessage {
+                                        text: text.to_owned(),
+                                    },
+                                ))
+                            })
+                            .flatten();
+                        std::iter::once(call).chain(opening).chain(steer)
                     })
                     .collect();
                 // A failed turn (usage limit, billing, auth, overloaded, …)
@@ -705,6 +747,51 @@ mod tests {
                 "{frame}: {ev:?}"
             );
         }
+    }
+
+    #[test]
+    fn send_message_steers_rekey_onto_the_spawn_feed() {
+        // Live 2.1.228: the steer NEVER echoes on the child feed; the only
+        // wire evidence is the parent's SendMessage call addressed to the
+        // agent id that task_started paired with the spawn tool id.
+        let mut norm = Normalizer::new();
+        let started = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"a20b2336","tool_use_id":"toolu_spawn","subagent_type":"general-purpose","prompt":"p","description":"d"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(started, false).is_empty());
+        let send = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{"to":"a20b2336","message":"Also read the rebuild.","summary":"s"}}]}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(send, false);
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == "toolu_spawn"
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { text } if text == "Also read the rebuild.")
+            )),
+            "{ev:?}"
+        );
+        // Unknown recipient (no task_started seen) or a subagent-owned shell
+        // task's task_started: no steer synthesized.
+        let mut norm = Normalizer::new();
+        let shell_task = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"bg1","tool_use_id":"toolu_bash","task_type":"local_bash"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(shell_task, false).is_empty());
+        let send = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"bg1","message":"x"}}]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !norm
+                .normalize(send, false)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Subagent { .. }))
+        );
     }
 
     #[test]

@@ -32,6 +32,10 @@ emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabiliti
 # ---- session new / load ----------------------------------------------------
 read -r line || exit 1
 SID="s-1"
+MODEL_API=0
+if has "$line" '"sessionId":"existing-grok-session"'; then
+  MODEL_API=1
+fi
 if has "$line" '"method":"session/load"'; then
   if has "$line" '"sessionId":"load-fail"'; then
     emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32602,\"message\":\"unknown session\"}}"
@@ -40,7 +44,11 @@ if has "$line" '"method":"session/load"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-fresh\"}}"
     SID="s-fresh"
   else
-    SID="s-loaded"
+    if [ "$MODEL_API" -eq 1 ]; then
+      SID="existing-grok-session"
+    else
+      SID="s-loaded"
+    fi
     # Replay history BEFORE the load response resolves: the harness must
     # drain these without emitting events (the doc already has them) and
     # without deadlocking on a full incoming channel.
@@ -50,7 +58,11 @@ if has "$line" '"method":"session/load"'; then
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old reply"}}'
       i=$((i+1))
     done
-    emit "{\"id\":$(rid "$line"),\"result\":{}}"
+    if [ "$MODEL_API" -eq 1 ]; then
+      emit "{\"id\":$(rid "$line"),\"result\":{\"models\":{\"currentModelId\":\"grok-4-fast\",\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]}}}"
+    else
+      emit "{\"id\":$(rid "$line"),\"result\":{}}"
+    fi
   fi
 elif has "$line" '"method":"session/new"'; then
   # Reject one marker cwd once, then require the retry to use a different
@@ -67,7 +79,11 @@ elif has "$line" '"method":"session/new"'; then
   # forcing a set) and thought_level (current high). The model config option
   # feeds discovery first; the first-class `models` state (SessionModelState)
   # is the legacy fallback — codex-acp enumerates model × effort there.
-  emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+  if [ "$MODEL_API" -eq 1 ]; then
+    emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"currentModelId\":\"grok-4-fast\",\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]}}}"
+  else
+    emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+  fi
   # Marker cwd: advertise commands the way claude-agent-acp does — as an
   # update sent right after the session/new response, inside the handshake
   # window where request_draining used to discard notifications.
@@ -84,18 +100,33 @@ else
   exit 1
 fi
 
-# ---- config option sets (0..n), then the first turn -------------------------
+# ---- model/config sets (0..n), then the first turn ---------------------------
 CONFIG_SETS=""
+MODEL_SETS=""
 read -r promptline || exit 1
-while has "$promptline" '"method":"session/set_config_option"'; do
+while has "$promptline" '"method":"session/set_config_option"' \
+  || has "$promptline" '"method":"session/set_model"'; do
   emit "{\"id\":$(rid "$promptline"),\"result\":{}}"
-  CONFIG_SETS="$CONFIG_SETS $promptline"
+  if has "$promptline" '"method":"session/set_model"'; then
+    MODEL_SETS="$MODEL_SETS $promptline"
+  else
+    CONFIG_SETS="$CONFIG_SETS $promptline"
+  fi
   read -r promptline || exit 1
 done
 has "$promptline" '"method":"session/prompt"' || exit 1
 pid=$(rid "$promptline")
 
 case "$promptline" in
+
+*scenario:model-api*)
+  if has "$MODEL_SETS" '"modelId":"grok-4.5"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"model switched"}}'
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
 
 *scenario:config*)
   # The tests' request carries model grok-4.5 + medium effort; both differ
@@ -144,8 +175,11 @@ case "$promptline" in
   ;;
 
 *scenario:prompt-stall*)
-  # TOTAL silence after the prompt — the leader-wedge signature. Nothing is
-  # ever emitted; the harness's prompt-stall watchdog must error the run.
+  # Session boilerplate, then silence — the REAL wedge signature. opencode
+  # emits available_commands_update on every session (provider dead or not),
+  # so the watchdog must not count it as turn progress: exactly this frame
+  # used to disarm the watchdog for the whole turn (found live, 1.18.18).
+  emit "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"init\",\"description\":\"guided AGENTS.md setup\"}]}}}"
   exec sleep 60
   ;;
 

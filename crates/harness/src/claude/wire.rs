@@ -41,6 +41,14 @@ pub(crate) struct SystemFrame {
     /// `task_notification` terminal status (`completed`/`failed`/`killed`…).
     #[serde(default)]
     pub status: Option<String>,
+    /// `task_started`: the agent/task id (`SendMessage`'s `to:` address) —
+    /// with `tool_use_id`, the agentId→spawn mapping steers need.
+    #[serde(default, alias = "taskId")]
+    pub task_id: Option<String>,
+    /// `task_started`: present only for AGENT tasks (a subagent spawning),
+    /// absent on subagent-owned background shell tasks.
+    #[serde(default)]
+    pub subagent_type: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

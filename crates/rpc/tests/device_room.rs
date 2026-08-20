@@ -47,6 +47,9 @@ enum Out {
 struct RelayState {
     host: Option<mpsc::UnboundedSender<Out>>,
     clients: HashMap<String, mpsc::UnboundedSender<Out>>,
+    /// Zombie-path simulation: the host stays "connected" (no bounce) but
+    /// client→host frames vanish — the 2026-08-19 dead edge↔host leg.
+    blackhole_host_bound: bool,
 }
 
 struct FakeRelay {
@@ -88,6 +91,12 @@ impl FakeRelay {
 
     async fn wait_host_connected(&self) {
         wait_until(|| self.host_connected()).await;
+    }
+
+    /// Swallow client→host frames while keeping the host registered — the
+    /// zombie relay path (client↔edge healthy, edge↔host dead).
+    fn set_blackhole_host_bound(&self, on: bool) {
+        self.state.lock().expect("lock").blackhole_host_bound = on;
     }
 
     /// Deliver a nudge frame to the connected host (the DO's /nudge live path).
@@ -179,6 +188,9 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
         };
         let st = state.lock().expect("lock");
         if !is_host {
+            if st.blackhole_host_bound {
+                continue; // zombie path: frame vanishes, no bounce
+            }
             match &st.host {
                 Some(host) => {
                     let mut routed = DeviceFrameHeader::new(header.s, header.k);
@@ -718,4 +730,37 @@ async fn live_edge_relay_round_trip() {
         .expect("echo");
     assert_eq!(echoed["host"], "live-host");
     assert_eq!(echoed["params"]["live"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zombie_relay_path_trips_the_echo_deadline() {
+    // 2026-08-19 incident shape: the client↔edge leg stays healthy (pongs
+    // flow), the edge↔host leg is dead — the link used to sit "open" for
+    // minutes, retrying frames into the void, until an unrelated host-session
+    // cycle exposed it. The app-level echo must rule the link dead within its
+    // deadline instead.
+    zeron_rpc::device_room::set_client_liveness_for_tests(
+        Duration::from_millis(100),
+        Duration::from_millis(600),
+    );
+    let relay = FakeRelay::start().await;
+    let service = TestService::new("host-a");
+    let _host = HostRelay::spawn(relay_config(&relay.edge_url(), 100), service, noop_nudge());
+    relay.wait_host_connected().await;
+
+    let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("c-echo"), "tok");
+    let link = DeviceLink::connect(&url).await.expect("client link dials");
+    // Healthy phase: echoes flow, the deadline never trips.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!link.is_closed(), "echoing link must stay open");
+
+    relay.set_blackhole_host_bound(true);
+    wait_until(|| link.is_closed()).await;
+    assert_eq!(
+        link.closed().borrow().as_deref(),
+        Some("host echo silent"),
+        "the zombie path must be ruled dead by the echo deadline"
+    );
+    // Restore the production clocks for the rest of the process's tests.
+    zeron_rpc::device_room::set_client_liveness_for_tests(Duration::ZERO, Duration::ZERO);
 }

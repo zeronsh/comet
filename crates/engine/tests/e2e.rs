@@ -553,17 +553,26 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
 
-    // Give the drain a moment: the command must be SKIPPED — no user entry, no run.
+    // Give the drain a moment: the command must not EXECUTE — no user entry,
+    // no run. But it must not stay a forever-Pending ghost either (v0.2.12
+    // swallowed-send: "Sending…" forever, retry a no-op): the dead-command
+    // sweep terminalizes it as Rejected so the doc tells the truth and a
+    // retry can mint a fresh attempt.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         entries(&core).is_empty(),
         "skipped command must not execute"
     );
-    assert_eq!(
-        command_status(&core, "cmd-crashed"),
-        Some((SessionCommandStatus::Pending, None)),
-        "skip leaves the entry pending without an outcome"
-    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-crashed"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "crash-window command terminalized as Rejected",
+    )
+    .await;
     assert!(core.sessions.session_status(CHAT).is_none());
 
     // Direct ledger-evaluation check: re-evaluating a processed command = Skip.
@@ -583,6 +592,88 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
     assert_eq!(verdict, zeron_doc::CommandDisposition::Skip);
+}
+
+/// The v0.2.12 field report: a send whose command was consumed by the ledger
+/// but never executed (crash between mark and resolve) was invisible to
+/// every retry — the drain filters processed ids, so the session was dead
+/// forever while new sessions worked. Retry must mint a FRESH attempt.
+#[tokio::test]
+async fn retry_reissues_a_swallowed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        assert!(store.mark_processed("cmd-dead").unwrap());
+    }
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-dead",
+        SessionCommandPayload::Run {
+            request: run_request("try again"),
+            message_id: "m-retry".into(),
+        },
+    );
+    // The sweep terminalizes the dead attempt without executing it…
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-dead"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "dead attempt rejected",
+    )
+    .await;
+    assert!(entries(&core).is_empty(), "dead attempt must not execute");
+
+    // …and the user's retry mints a fresh attempt that actually runs.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-retry" && e.role == MessageRole::User)
+        },
+        "re-issued send writes the user entry",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+        },
+        "re-issued send runs to completion",
+    )
+    .await;
+    let run_attempts = |cmds: &[SessionCommandEntry]| {
+        cmds.iter()
+            .filter(|c| {
+                matches!(&c.payload,
+                    SessionCommandPayload::Run { message_id, .. } if message_id == "m-retry")
+            })
+            .count()
+    };
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "original + exactly one re-issue"
+    );
+    // A delivered message must never re-issue: retry while healthy is a no-op.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "retry after delivery must not duplicate the send"
+    );
 }
 
 #[tokio::test]

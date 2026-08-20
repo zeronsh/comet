@@ -382,6 +382,7 @@ impl Auth {
             }
             let mut state_rx = auth.watch_state();
             let mut wake = zeron_sync::wake::subscribe();
+            let mut online = zeron_sync::wake::subscribe_online();
             loop {
                 if !state_rx.borrow().is_signed_in() {
                     if state_rx.changed().await.is_err() {
@@ -416,7 +417,15 @@ impl Auth {
                 }
                 if let Err(err) = auth.refresh(None).await {
                     tracing::warn!(error = %err, "auth: background refresh failed");
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    // A failed refresh is usually the network, not WorkOS —
+                    // retry the moment connectivity returns (online bus)
+                    // instead of always waiting out the full pause.
+                    while online.try_recv().is_ok() {}
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                        _ = wake.recv() => {}
+                        _ = online.recv() => {}
+                    }
                 }
             }
         })

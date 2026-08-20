@@ -67,9 +67,45 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
+/// Configuration baked into a live harness runtime. The steering mailbox only
+/// carries prompt text, so routing a request whose model/effort/sandbox changed
+/// would silently run it with the old process configuration. Such requests
+/// must replace the runtime and resume its harness-native session instead.
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeConfig {
+    harness_id: HarnessId,
+    model: Option<String>,
+    reasoning: Option<zeron_proto::ReasoningLevel>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+    cwd: String,
+    sandbox: zeron_proto::SandboxLevel,
+    auto_approve: bool,
+    worktree: Option<zeron_proto::WorktreeSpec>,
+}
+
+impl RuntimeConfig {
+    fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
+        Self {
+            harness_id,
+            model: request.model.clone(),
+            reasoning: request.reasoning,
+            model_options: request.model_options.clone(),
+            cwd: request.cwd.clone(),
+            sandbox: request.sandbox,
+            auto_approve: request.auto_approve,
+            worktree: request.worktree.clone(),
+        }
+    }
+
+    fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
+        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+    }
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -311,16 +347,17 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable,
+                h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
             )
         });
-        if let Some((run_id, steerable, steer_tx, ledger)) = routed {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
-            if steerable && steer_tx.try_send(message).is_ok() {
+            if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
                 // The run can vanish between the send and here (the idle
                 // reaper, a parked child death): the ledger entry below is
                 // the at-least-once guarantee — the run task's exit drain
@@ -359,8 +396,15 @@ impl SessionsEngine {
                 // below (write_user_message dedupes by id).
                 message_id = Some(user_id);
             }
+            if !same_runtime {
+                tracing::debug!(
+                    chat = %chat_id,
+                    "restarting live harness to apply changed run configuration"
+                );
+            }
             // Mailbox closed (runtime mid-teardown / non-steering harness) or
-            // the routed run died with the message reclaimed: replace it.
+            // the routed run died with the message reclaimed, or configuration
+            // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
         }
 
@@ -417,6 +461,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
                 cancel: cancel_tx,
@@ -1362,6 +1407,13 @@ async fn drive_run(
             None => Some(std::time::Duration::from_secs(20)),
         };
     let mut self_continued_turn = false;
+    // Spawn chips that have SETTLED (tagged Done seen). Content events for a
+    // settled chip with no live sink are dropped — a straggler frame after
+    // the freeze must not mint a new doc entry or wedge the transcript back
+    // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
+    // settled subagent: it announces more work is coming.
+    let mut settled_subagents: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
@@ -1528,6 +1580,16 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            let is_steer = matches!(sub_event.as_ref(), AgentEvent::UserMessage { .. });
+            if is_steer {
+                settled_subagents.remove(parent_tool_use_id);
+            } else if settled_subagents.contains(parent_tool_use_id)
+                && !subagents.contains_key(parent_tool_use_id)
+            {
+                // Straggler after the freeze: chip-only silence (the old
+                // pre-viz behavior), never a reopened doc.
+                continue;
+            }
             let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
             let chip_streaming = folded
                 .iter()
@@ -1590,6 +1652,9 @@ async fn drive_run(
                 }
             }
             let done = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            if done {
+                settled_subagents.insert(parent_tool_use_id.clone());
+            }
             if let Some(sink) = subagents.get_mut(parent_tool_use_id) {
                 if let AgentEvent::UserMessage { text } = sub_event.as_ref() {
                     // A steer splits ENTRIES, not parts — handled at the
@@ -2088,8 +2153,47 @@ async fn drive_run(
 }
 
 #[cfg(test)]
-mod subagent_id_tests {
-    use super::subagent_doc_id;
+mod tests {
+    use super::{RuntimeConfig, subagent_doc_id};
+    use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    fn request() -> RunRequest {
+        RunRequest {
+            prompt: "first".into(),
+            harness: None,
+            model: Some("grok-4.6".into()),
+            reasoning: Some(zeron_proto::ReasoningLevel::High),
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn live_routing_requires_the_same_runtime_configuration() {
+        let initial = request();
+        let config = RuntimeConfig::from_request(HarnessId::Grok, &initial);
+
+        let mut follow_up = initial.clone();
+        follow_up.prompt = "second".into();
+        follow_up.resume = Some("session-1".into());
+        assert!(config.can_route(HarnessId::Grok, &follow_up));
+
+        follow_up.model = Some("grok-4.5".into());
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        follow_up.model = initial.model.clone();
+
+        follow_up.reasoning = Some(zeron_proto::ReasoningLevel::Medium);
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        follow_up.reasoning = initial.reasoning;
+
+        follow_up.attachments.push("/tmp/image.png".into());
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+    }
 
     #[test]
     fn clean_tool_ids_ride_verbatim_and_fit_id_re() {

@@ -25,8 +25,8 @@ mod server;
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
-    encode_device_frame,
+    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenSource, decode_device_frame,
+    device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
 
@@ -40,6 +40,17 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
+    /// command entry (client-minted id and all) straight over the device-room
+    /// link when its chat2 rows can't reach the edge but the host's peer link
+    /// is alive. The host claims the id in its processed ledger before
+    /// executing, so the doc row arriving later dedupes to a no-op —
+    /// exactly-once by construction. Params `{chatId, entry}`.
+    pub const RELAY_COMMAND: &str = "RelayCommand";
+    /// User-driven delivery retry for a chat with unadopted queued sends:
+    /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
+    /// per pending command. Params `{chatId}`; IPC-only.
+    pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
@@ -50,6 +61,14 @@ pub mod methods {
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
+    /// Pushed edge-connectivity posture (`zeron_proto::Connectivity`):
+    /// current value first, then every change — the connection pill /
+    /// composer-honesty / queued-badge feed. No params; IPC-only.
+    pub const WATCH_CONNECTIVITY: &str = "WatchConnectivity";
+    /// In-flight queued-attachment transfers (`zeron_proto::TransferProgress`
+    /// list): current set first, then a fresh snapshot per landed chunk —
+    /// the sending thumbnail's percent-ring feed. No params; IPC-only.
+    pub const WATCH_TRANSFERS: &str = "WatchTransfers";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";

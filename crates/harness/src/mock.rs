@@ -339,6 +339,24 @@ impl Harness for MockHarness {
                     ),
                     resolve("mock-sub-1"),
                     tag("mock-sub-1", done.clone()),
+                    // A steer AFTER the subagent settled (claude's queued
+                    // SendMessage shape): resurrects the chip and reopens
+                    // the frozen transcript for the resumed segment.
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::UserMessage {
+                            text: "One more: confirm the rebuild path holds the byte cap too."
+                                .into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Rebuild path checked — same cap, applied before persisting."
+                                .into(),
+                        },
+                    ),
+                    tag("mock-sub-1", done.clone()),
                     tag(
                         "mock-sub-2",
                         AgentEvent::TextDelta {

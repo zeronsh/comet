@@ -82,7 +82,7 @@ impl Element for Frosted {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if Theme::of(cx).is_glass() {
+        if Theme::of(cx).is_frost() {
             window.paint_layer(bounds, |window| {
                 window.paint_backdrop_blur(
                     bounds,

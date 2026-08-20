@@ -565,6 +565,70 @@ pub enum TerminalEvent {
     },
 }
 
+/// One in-flight queued-attachment transfer (the `WatchTransfers` stream):
+/// raw-byte progress of the engine-side relay leg pushing staged bytes to a
+/// remote host. An entry appears when a file's chunks start moving, updates
+/// per landed chunk, and disappears when the host commits it (or the attempt
+/// fails — the retry re-adds it). Keyed by the send-minted uploadId, so the
+/// sender's thumbnails can resolve their `pending://{uploadId}/…` refs to a
+/// real percent instead of an indeterminate spinner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub upload_id: String,
+    pub file_name: String,
+    /// Raw bytes the host has acknowledged so far.
+    pub done: u64,
+    /// Total raw bytes of the staged file.
+    pub total: u64,
+}
+
+/// Live edge-connectivity posture (the `WatchConnectivity` stream): the truth
+/// the connection pill, composer honesty, and queued-send badges render.
+/// Derived engine-side from the registry room's reconnect state, the OS
+/// network-path monitor, and each open chat room's stats.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Connectivity {
+    pub state: ConnectivityState,
+    /// Epoch ms of the next scheduled registry dial while reconnecting
+    /// (0 = none pending / dialing right now). The countdown renders
+    /// client-side from this.
+    #[serde(default)]
+    pub retry_at_ms: i64,
+    /// The failure that started the current outage — sticky through the next
+    /// attempt (no flicker back to a bare "connecting…"), cleared on rejoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    /// Per-OPEN-chat room state; a chat absent here is unknown (consumers
+    /// fall back to the global state).
+    #[serde(default)]
+    pub chats: Vec<ChatConnectivity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectivityState {
+    /// No edge transports on this profile (local scope) — hide the pill.
+    #[default]
+    Disabled,
+    /// The OS reports no network path.
+    Offline,
+    /// Edge expected but the registry room is down (dialing/backing off).
+    Reconnecting,
+    Connected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatConnectivity {
+    pub chat_id: String,
+    pub connected: bool,
+    /// Local update batches not yet acked by the chat's edge room.
+    #[serde(default)]
+    pub pending_pushes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

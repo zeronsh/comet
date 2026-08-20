@@ -1616,10 +1616,12 @@ impl Shell {
         // Header and footer sit a shade DEEPER than the body (the shared
         // recessed-band tone) — the bands frame the folder list, which stays
         // on the brighter tint.
+        let card_radius = 14.0;
         let band = popover::band();
         let input_row = div()
             .h(px(46.0))
             .flex_none()
+            .rounded_t(px(card_radius))
             .pl(px(12.0))
             .pr(px(10.0))
             .flex()
@@ -2140,6 +2142,7 @@ impl Shell {
         // ── footer: the shared key-cap legend voice (popover::key_hint).
         let footer = div()
             .flex_none()
+            .rounded_b(px(card_radius))
             .bg(band)
             .border_t_1()
             .border_color(hairline)
@@ -2173,13 +2176,13 @@ impl Shell {
             div()
                 .id("add-space-palette")
                 .w(px(680.0))
-                .rounded(px(14.0))
+                .rounded(px(card_radius))
                 .border_1()
                 .border_color(crate::theme::hairline(0.10))
                 // The popover_card glass recipe: a translucent tint over the
                 // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
                 // an opaque fill here killed the vibrancy every other float has.
-                .bg(if theme.is_glass() {
+                .bg(if theme.is_frost() {
                     theme.glass_overlay()
                 } else {
                     theme.surface_overlay
@@ -2213,7 +2216,7 @@ impl Shell {
             "add-space-dialog",
             viewport,
             card,
-            14.0,
+            card_radius,
         ))
     }
 

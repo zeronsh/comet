@@ -109,6 +109,20 @@ struct SetHarnessEnabledParams {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    /// Queued attachments (bytes already committed locally as `pending://`
+    /// refs) the engine delivers to a remote host AFTER the command is
+    /// durably queued — never as a gate in front of it.
+    #[serde(default)]
+    transfers: Vec<crate::uploads::AttachmentTransfer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RelayCommandParams {
+    chat_id: String,
+    /// The full command entry, client-minted id included — the exactly-once
+    /// key the host claims in its processed ledger before executing.
+    entry: zeron_doc::SessionCommandEntry,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1176,9 +1190,25 @@ impl RpcService for EngineRpc {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
                     .doc_host
-                    .queue_command(&p.chat_id, p.command)
+                    .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::RETRY_DELIVERY => {
+                let p: ChatParams = parse_params(params)?;
+                self.doc_host
+                    .retry_delivery(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
+            }
+            methods::RELAY_COMMAND => {
+                let p: RelayCommandParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .ingest_relayed_command(&p.chat_id, p.entry)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "outcome": outcome }))
             }
             methods::WATCH_DOC_MESSAGES => {
                 let p: ChatParams = parse_params(params)?;
@@ -1193,6 +1223,7 @@ impl RpcService for EngineRpc {
             methods::PROBE_SYNC => {
                 self.workspace.probe();
                 self.doc_host.probe_open_chats();
+                self.doc_host.probe_edge_reachability();
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::SYNC_STATUS => {
@@ -1244,6 +1275,12 @@ impl RpcService for EngineRpc {
                     "chats": chats,
                 }))
             }
+            methods::WATCH_CONNECTIVITY => Ok(RpcReply::Stream(watch_stream(
+                self.doc_host.watch_connectivity(),
+            ))),
+            methods::WATCH_TRANSFERS => Ok(RpcReply::Stream(watch_stream(
+                self.doc_host.watch_transfers(),
+            ))),
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }
@@ -1842,6 +1879,9 @@ impl RpcService for EngineRpc {
                     .uploads
                     .commit(&p.upload_id, &p.file_name)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Bytes just landed on this device: any command deferred on
+                // them (queued-attachment refs) is executable NOW.
+                self.doc_host.kick_drains();
                 RpcReply::value(&serde_json::json!({ "path": path }))
             }
             methods::READ_ATTACHMENT_CHUNK => {

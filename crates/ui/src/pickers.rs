@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
@@ -29,6 +30,11 @@ use zeron_rpc::methods;
 /// footer; a flat cap + "Showing X of Y refs" reads the same without
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
+const MODEL_SCROLLBAR_TRACK_INSET: f32 = 4.0;
+const MODEL_SCROLLBAR_HIT_WIDTH: f32 = 10.0;
+const MODEL_SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
+const MODEL_SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 5.0;
+const MODEL_SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
@@ -387,6 +393,38 @@ struct ModelRowData {
     model: Model,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ModelScrollbarGrab {
+    grab_offset: f32,
+}
+
+/// Marker for GPUI's captured drag stream. The actual grab geometry stays in
+/// [`ModelScrollbarGrab`] so a track click can center the thumb first.
+struct ModelScrollbarDrag;
+
+/// Invisible drag preview: scrollbar drags manipulate the existing thumb.
+struct ModelScrollbarDragGhost;
+
+impl gpui::Render for ModelScrollbarDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        gpui::Empty
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelScrollbarMetrics {
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    max_scroll: f32,
+}
+
+impl ModelScrollbarMetrics {
+    fn travel(self) -> f32 {
+        (self.track_height - self.thumb_height).max(0.0)
+    }
+}
+
 /// Which picker popover is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -433,6 +471,11 @@ pub struct Pickers {
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
     /// (`scroll_to_item`; the add-space palette standard).
     model_scroll: gpui::ScrollHandle,
+    /// Drag state for the floating model-list scrollbar.
+    model_scrollbar_drag: Option<ModelScrollbarGrab>,
+    /// The scrollbar is an on-demand affordance for the model-list surface.
+    model_list_hovered: bool,
+    model_scrollbar_hovered: bool,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     /// One-shot mute for the next Edited event's highlight reset — armed by
@@ -584,6 +627,9 @@ impl Pickers {
             refs_space: None,
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
+            model_scrollbar_drag: None,
+            model_list_hovered: false,
+            model_scrollbar_hovered: false,
             search,
             search_reset_muted: false,
             focus: cx.focus_handle(),
@@ -769,6 +815,9 @@ impl Pickers {
 
     /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
+        self.model_scrollbar_drag = None;
+        self.model_list_hovered = false;
+        self.model_scrollbar_hovered = false;
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
@@ -883,7 +932,10 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
-                self.prefetch_models(cx);
+                // Model discovery can recover after a slow/plugin-heavy ACP
+                // cold start. Revalidate on every open instead of pinning a
+                // timeout/fallback result until the application restarts.
+                self.prefetch_models(true, cx);
             }
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
@@ -937,7 +989,7 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                pickers.prefetch_models(cx);
+                pickers.prefetch_models(false, cx);
                 cx.notify();
             })
             .ok();
@@ -949,7 +1001,7 @@ impl Pickers {
     /// tabs) the lists are already there, instead of a per-selection
     /// "Loading models…" round-trip. Each `ensure_models` call is guarded by
     /// its slot state, so re-running this every catalog load/render is free.
-    fn prefetch_models(&mut self, cx: &mut Context<Self>) {
+    fn prefetch_models(&mut self, force: bool, cx: &mut Context<Self>) {
         let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
             Some(list) => offered_harnesses(list).iter().map(|d| d.id).collect(),
             None => Vec::new(),
@@ -962,25 +1014,29 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            self.ensure_models(harness, cx);
+            self.ensure_models(harness, force, cx);
         }
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
-        // the retry row clears the map to re-arm.
-        if self
-            .models
-            .get(&harness)
-            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
-        {
+    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
+        // Normal prefetches load absent/Idle slots once. Picker-open refreshes
+        // also retry Ready/Error slots, while an in-flight load is always
+        // reused. Ready rows stay visible until the replacement lands.
+        let reload = match self.models.get(&harness) {
+            None | Some(Loadable::Idle) => true,
+            Some(Loadable::Loading) => false,
+            Some(Loadable::Ready(_)) | Some(Loadable::Error(_)) => force,
+        };
+        if !reload {
             return;
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let target = self.space_target(cx);
-        self.models.insert(harness, Loadable::Loading);
+        if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
+            self.models.insert(harness, Loadable::Loading);
+        }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
@@ -989,7 +1045,34 @@ impl Pickers {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            // A plugin-heavy OpenCode cold start can fail once while caches,
+            // MCP servers, or plugin runtimes are still warming. Keep this
+            // single Loading slot alive for two retries so recovery requires
+            // no picker close/reopen and cannot launch duplicate probes.
+            let mut attempt = 1_u64;
+            let result = loop {
+                let result = engine
+                    .client()
+                    .call(methods::LIST_MODELS, params.clone())
+                    .await;
+                if result.is_ok() || harness != HarnessId::Opencode || attempt >= 3 {
+                    break result;
+                }
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        %error,
+                        attempt,
+                        "OpenCode model discovery failed; retrying automatically"
+                    );
+                }
+                if this.update(cx, |_, _| {}).is_err() {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(attempt * 2))
+                    .await;
+                attempt += 1;
+            };
             this.update(cx, |pickers, cx| {
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
@@ -1210,7 +1293,7 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
-        self.ensure_models(harness, cx);
+        self.ensure_models(harness, false, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -2498,6 +2581,194 @@ impl Pickers {
             .into_any_element()
     }
 
+    fn model_scrollbar_metrics(&self) -> Option<ModelScrollbarMetrics> {
+        let bounds = self.model_scroll.bounds();
+        let viewport_height = f32::from(bounds.size.height);
+        // GPUI stores the maximum as a positive distance; only the live
+        // scroll offset is negative while content moves upward.
+        let max_scroll = f32::from(self.model_scroll.max_offset().y).max(0.0);
+        if viewport_height <= 0.0 || max_scroll <= 0.0 {
+            return None;
+        }
+        let track_height = (viewport_height - MODEL_SCROLLBAR_TRACK_INSET * 2.0).max(0.0);
+        if track_height <= 0.0 {
+            return None;
+        }
+        let content_height = viewport_height + max_scroll;
+        let thumb_height = (track_height * viewport_height / content_height)
+            .max(MODEL_SCROLLBAR_MIN_THUMB)
+            .min(track_height);
+        let current_scroll = (-f32::from(self.model_scroll.offset().y)).clamp(0.0, max_scroll);
+        let travel = (track_height - thumb_height).max(0.0);
+        Some(ModelScrollbarMetrics {
+            track_height,
+            thumb_top: travel * current_scroll / max_scroll,
+            thumb_height,
+            max_scroll,
+        })
+    }
+
+    fn model_scrollbar_to_pointer(
+        &mut self,
+        pointer_y: gpui::Pixels,
+        grab_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.model_scrollbar_metrics() else {
+            return;
+        };
+        let bounds = self.model_scroll.bounds();
+        let pointer_in_track = f32::from(pointer_y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
+        let thumb_top = (pointer_in_track - grab_offset).clamp(0.0, metrics.travel());
+        let scroll = if metrics.travel() <= 0.0 {
+            0.0
+        } else {
+            thumb_top / metrics.travel() * metrics.max_scroll
+        };
+        let offset = self.model_scroll.offset();
+        self.model_scroll
+            .set_offset(gpui::Point::new(offset.x, px(-scroll)));
+        cx.notify();
+    }
+
+    fn on_model_list_hover(
+        &mut self,
+        hovered: &bool,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.model_list_hovered == *hovered {
+            return;
+        }
+        self.model_list_hovered = *hovered;
+        if !*hovered && self.model_scrollbar_drag.is_none() {
+            self.model_scrollbar_hovered = false;
+        }
+        cx.notify();
+    }
+
+    fn on_model_scrollbar_hover(
+        &mut self,
+        hovered: &bool,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Keep the active treatment while a captured drag travels outside the
+        // model list; the hover callback quite correctly turns false there.
+        let active = *hovered || self.model_scrollbar_drag.is_some();
+        if self.model_scrollbar_hovered != active {
+            self.model_scrollbar_hovered = active;
+            cx.notify();
+        }
+    }
+
+    fn on_model_scrollbar_mouse_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.model_scrollbar_metrics() else {
+            return;
+        };
+        window.focus(&self.focus, cx);
+        let bounds = self.model_scroll.bounds();
+        let pointer_in_track =
+            f32::from(event.position.y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
+        let grab_offset = if (metrics.thumb_top..=metrics.thumb_top + metrics.thumb_height)
+            .contains(&pointer_in_track)
+        {
+            pointer_in_track - metrics.thumb_top
+        } else {
+            metrics.thumb_height / 2.0
+        };
+        self.model_scrollbar_drag = Some(ModelScrollbarGrab { grab_offset });
+        self.model_scrollbar_to_pointer(event.position.y, grab_offset, cx);
+        cx.stop_propagation();
+    }
+
+    fn on_model_scrollbar_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<ModelScrollbarDrag>,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.model_scrollbar_drag else {
+            return;
+        };
+        self.model_scrollbar_to_pointer(event.event.position.y, drag.grab_offset, cx);
+    }
+
+    fn on_model_scrollbar_mouse_up(
+        &mut self,
+        _event: &gpui::MouseUpEvent,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_scrollbar_drag = None;
+        if !self.model_list_hovered {
+            self.model_scrollbar_hovered = false;
+        }
+        cx.notify();
+    }
+
+    fn render_model_scrollbar(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let dragging = self.model_scrollbar_drag.is_some();
+        if !self.model_list_hovered && !dragging {
+            return None;
+        }
+        let metrics = self.model_scrollbar_metrics()?;
+        let active = self.model_scrollbar_hovered || dragging;
+        let thumb_width = if active {
+            MODEL_SCROLLBAR_HOVER_THUMB_WIDTH
+        } else {
+            MODEL_SCROLLBAR_THUMB_WIDTH
+        };
+        Some(
+            div()
+                .id("model-scrollbar")
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(MODEL_SCROLLBAR_HIT_WIDTH))
+                .on_hover(cx.listener(Self::on_model_scrollbar_hover))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(Self::on_model_scrollbar_mouse_down),
+                )
+                .on_drag(ModelScrollbarDrag, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| ModelScrollbarDragGhost)
+                })
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(Self::on_model_scrollbar_mouse_up),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(Self::on_model_scrollbar_mouse_up),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(MODEL_SCROLLBAR_TRACK_INSET + metrics.thumb_top))
+                        .right(px(2.0))
+                        // The thumb is an absolute child inside a fixed-width
+                        // hit rail, so hover expansion never reflows rows.
+                        .w(px(thumb_width))
+                        .h(px(metrics.thumb_height))
+                        .rounded(px(thumb_width / 2.0))
+                        .bg(theme.text_faint.opacity(if active { 0.68 } else { 0.5 })),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
@@ -3036,6 +3307,7 @@ impl Pickers {
             }
         };
 
+        let model_scrollbar = self.render_model_scrollbar(&theme, cx);
         let pane = div()
             .flex_1()
             .min_w_0()
@@ -3049,18 +3321,28 @@ impl Pickers {
             })
             .child(search_row)
             .child(
-                div().flex_1().min_h_0().py(px(6.0)).child(
-                    div()
-                        .id("model-menu-scroll")
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .px(px(6.0))
-                        .overflow_y_scroll()
-                        .track_scroll(&model_scroll)
-                        .children(list_children),
-                ),
+                div()
+                    .id("model-list-scroll-host")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .py(px(6.0))
+                    .on_hover(cx.listener(Self::on_model_list_hover))
+                    .child(
+                        div()
+                            .id("model-menu-scroll")
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .px(px(6.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&model_scroll)
+                            .children(list_children),
+                    )
+                    // Absolute child: the hit rail and thumb float above the
+                    // scroll content without consuming any list width.
+                    .children(model_scrollbar),
             );
 
         div()
@@ -3479,7 +3761,7 @@ impl Render for Pickers {
         // the chip reads "Fable 5" (a concrete pick) before any popover
         // opens, and rail switches inside the picker are instant.
         self.ensure_harnesses(false, cx);
-        self.prefetch_models(cx);
+        self.prefetch_models(false, cx);
         // A popover opened data-side (ZERON_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(
@@ -3641,6 +3923,9 @@ impl Render for Pickers {
             .items_center()
             .justify_between()
             .gap(px(Theme::SPACE_SM))
+            // GPUI dispatches this captured stream while the thumb is dragged,
+            // including when the pointer has left the model popover.
+            .on_drag_move(cx.listener(Self::on_model_scrollbar_drag_move))
             .child(left)
             .child(right)
     }

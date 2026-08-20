@@ -561,6 +561,7 @@ impl gpui::Element for TerminalElement {
         let snapshot = self.panel.update(cx, |panel, cx| {
             panel.on_grid_metrics(
                 super::panel::GridGeometry {
+                    bounds,
                     origin,
                     cell_w: f32::from(cell_w),
                     line_h: f32::from(line_h),

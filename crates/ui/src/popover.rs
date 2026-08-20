@@ -314,7 +314,7 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .overflow_hidden()
         .text_size(px(13.0))
         .text_color(theme.text);
-    if theme.is_glass() {
+    if theme.is_frost() {
         // Translucent tint — the backdrop blur beneath it comes from the
         // [`crate::frost::frosted`] wrapper at the mount helpers below.
         card.bg(theme.glass_overlay())

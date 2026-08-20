@@ -335,18 +335,20 @@ fn chunk_ranges(b64_len: usize) -> Vec<(u64, std::ops::Range<usize>)> {
 /// [`UPLOAD_CHUNK_B64_CHARS`] slice (positional `seq` makes the cheap retry
 /// idempotent), a few chunks in flight at once, then
 /// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
-/// device. `progress` (when given) accumulates uploaded BINARY bytes — the
+/// device. The caller mints `upload_id` — the queued-attachment flow derives
+/// its `pending://` refs from the same identity before the bytes move.
+/// `progress` (when given) accumulates uploaded BINARY bytes — the
 /// composer's "Uploading… N%" reads it every paint. Errors return the raw
 /// cause (the composer shows friendly copy).
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    upload_id: &str,
     attachment: &StagedAttachment,
     progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String, String> {
     let b64 = BASE64.encode(attachment.bytes());
-    let upload_id = uuid::Uuid::new_v4().to_string();
     let ranges = chunk_ranges(b64.len());
     let deadline = executor.timer(attachment_deadline(ranges.len()));
     let upload = async {
@@ -388,7 +390,16 @@ pub async fn upload_attachment(
                             Ok(_) => break,
                             Err(err) if attempt < 2 => {
                                 attempt += 1;
-                                tracing::debug!(error = %err, seq, "upload chunk retry");
+                                // warn, not debug: the 2026-08-19 incident
+                                // ground through silent timeout/retry cycles
+                                // for minutes with a literally empty log —
+                                // degraded uploads must narrate.
+                                tracing::warn!(error = %err, seq, attempt, "upload chunk retry");
+                                // Stagger by seq so parallel chunks that failed
+                                // together don't re-collide in lockstep.
+                                executor
+                                    .timer(Duration::from_millis(50 * (attempt as u64) * (seq + 1)))
+                                    .await;
                             }
                             Err(err) => return Err(err),
                         }
@@ -630,8 +641,52 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
         },
-        _ => AttachmentSnapshot::Loading,
+        Some(CacheEntry::Loading { .. }) => AttachmentSnapshot::Loading,
+        None => {
+            // Queued-send alias: the host materializes `pending://{id}/{name}`
+            // at `{uploads}/{id8}-{name}` and rewrites the persisted ref to
+            // that ABSOLUTE path — one the sender can't know up front (it's
+            // the host's disk). The id8 basename prefix IS derivable though,
+            // so the send seeds the bytes under an alias and this fallback
+            // resolves the rewritten ref instantly instead of blanking the
+            // thumbnail into a skeleton while the bytes round-trip
+            // (2026-08-19 "photo disappears after it finishes sending").
+            if let Some(image) = upload_alias_id8(path)
+                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+                    Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
+                    _ => None,
+                })
+            {
+                cache.insert_loaded(key(device_id, path), image.clone());
+                return AttachmentSnapshot::Loaded(image);
+            }
+            AttachmentSnapshot::Loading
+        }
     }
+}
+
+/// The uploadId fragment a committed upload's basename starts with
+/// (`{id8}-{name}` per the engine's `Uploads::pending_target`). `None` when
+/// the path can't be a committed upload.
+fn upload_alias_id8(path: &str) -> Option<String> {
+    let base = std::path::Path::new(path).file_name()?.to_str()?;
+    let (id8, _) = base.split_at_checked(8)?;
+    (base.as_bytes().get(8) == Some(&b'-')
+        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+    .then(|| id8.to_string())
+}
+
+fn alias_key(device_id: &str, id8: &str) -> (String, String) {
+    key(device_id, &format!("upload-alias://{id8}"))
+}
+
+/// Seed the just-sent image under its upload identity so the persisted
+/// message's rewritten absolute ref (host-side path) resolves from the same
+/// local bytes — see the alias fallback in [`attachment_snapshot`].
+pub fn seed_attachment_alias(device_id: &str, upload_id: &str, name: &str, image: Arc<Image>) {
+    let id8: String = upload_id.chars().take(8).collect();
+    let (device, path) = alias_key(device_id, &id8);
+    store_loaded(&device, &path, name.to_string().into(), image);
 }
 
 /// Release gpui's decoded copies of evicted images: the asset-system entry

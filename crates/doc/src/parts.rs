@@ -380,6 +380,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
                     _ => SubagentStatus::Done,
                 }),
+                // A steer RESURRECTS a settled chip — it announces more work
+                // (claude: a queued SendMessage relaunches the agent), so
+                // this is the one event allowed past the no-regress guard.
+                AgentEvent::UserMessage { .. } => Some(SubagentStatus::Running),
                 _ => None,
             };
             for p in out.iter_mut() {

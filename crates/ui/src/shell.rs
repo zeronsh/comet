@@ -1006,6 +1006,13 @@ impl Shell {
                         s.selected_chat
                             .as_deref()
                             .is_some_and(|id| s.indicator_for(id, Utc::now()) != Indicator::None)
+                            // The connection pill's retry countdown needs the
+                            // same per-second refresh while degraded.
+                            || matches!(
+                                s.connectivity.state,
+                                zeron_proto::ConnectivityState::Offline
+                                    | zeron_proto::ConnectivityState::Reconnecting
+                            )
                     };
                     if live {
                         cx.notify();
@@ -1728,7 +1735,13 @@ impl Shell {
                 title,
                 frozen,
             } => {
-                self.add_subagent_surface(chat_id.clone(), doc_id.clone(), title.clone(), *frozen, cx);
+                self.add_subagent_surface(
+                    chat_id.clone(),
+                    doc_id.clone(),
+                    title.clone(),
+                    *frozen,
+                    cx,
+                );
             }
         }
     }
@@ -2853,8 +2866,15 @@ impl Shell {
         motion::lerp(from, to, RESIZE.progress(raw))
     }
 
-    /// Animated width container: tweens 200ms ease-out on collapse/expand, and
-    /// clips a fixed-width inner so content never reflows mid-transition.
+    fn tween_active(&self, tween: Option<WidthTween>) -> bool {
+        tween.is_some_and(|tween| {
+            !self.reduced_motion
+                && tween.started.elapsed() < RESIZE.total().mul_f32(motion::speed_scale())
+        })
+    }
+
+    /// Animated width container: tweens 200ms ease-out on collapse/expand and
+    /// clips the surface as it follows the current width.
     fn pane_container(
         &self,
         tween: Option<WidthTween>,
@@ -3405,14 +3425,39 @@ impl Shell {
         // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
         // accordion), t3code's settle-on-hover.
         let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
-        let status_color = spaces::status_dot_color(status, theme);
-        let status_label: Option<&'static str> = match status {
-            zeron_proto::ChatIndicator::Working => Some("Working"),
-            zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
-            zeron_proto::ChatIndicator::Errored => Some("Failed"),
-            zeron_proto::ChatIndicator::Completed => Some("Done"),
-            zeron_proto::ChatIndicator::Idle => None,
+        // Send-truth overrides: a send unadopted past the grace window is
+        // FAILED (explicit, with the transcript's retry affordance); a send
+        // whose delivery path is degraded is QUEUED, not Working — the
+        // pending pill tells the truth instead of faking a spinner.
+        let (queued, undelivered) = {
+            let now = Utc::now();
+            let state = self.state.read(cx);
+            (
+                state.send_queued(&id, now),
+                state.send_undelivered(&id, now),
+            )
         };
+        let status_color = if undelivered {
+            theme.danger
+        } else if queued {
+            theme.warning
+        } else {
+            spaces::status_dot_color(status, theme)
+        };
+        let status_label: Option<&'static str> = if undelivered {
+            Some("Failed")
+        } else if queued {
+            Some("Queued")
+        } else {
+            match status {
+                zeron_proto::ChatIndicator::Working => Some("Working"),
+                zeron_proto::ChatIndicator::AwaitingInput => Some("Input"),
+                zeron_proto::ChatIndicator::Errored => Some("Failed"),
+                zeron_proto::ChatIndicator::Completed => Some("Done"),
+                zeron_proto::ChatIndicator::Idle => None,
+            }
+        };
+        let queued = queued && !undelivered;
         let corner_body: AnyElement = if corner_hovered {
             div()
                 .flex()
@@ -3657,14 +3702,18 @@ impl Shell {
                     .child(div().flex_1().min_w_0())
                     // Working rows animate the spinner at the row's
                     // bottom-right (the status word keeps its dot up top).
-                    .when(status == zeron_proto::ChatIndicator::Working, |el| {
-                        el.child(loaders::mini_gradient_spinner(
-                            format!("chat-working-{id}"),
-                            2.0,
-                            cx.entity_id(),
-                            cx,
-                        ))
-                    })
+                    // Queued/Failed rows don't: a spinner would fake progress.
+                    .when(
+                        status == zeron_proto::ChatIndicator::Working && !queued && !undelivered,
+                        |el| {
+                            el.child(loaders::mini_gradient_spinner(
+                                format!("chat-working-{id}"),
+                                2.0,
+                                cx.entity_id(),
+                                cx,
+                            ))
+                        },
+                    )
                     .when_some(change_request, |el, summary| {
                         el.child(crate::change_requests::pull_request_badge(
                             format!("chat-pr-{id}").into(),
@@ -3680,6 +3729,61 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
+    /// The global connection line. `None` while healthy (`Connected`) or on
+    /// local profiles (`Disabled`) — and the engine's degrade grace means it
+    /// only exists during REAL outages, never join/wake blips. No surface,
+    /// no border (v0.2.12 feedback): a bare spinner + faint caption while
+    /// reconnecting; an amber dot only when the OS says offline. The
+    /// transport error belongs in logs, not the sidebar.
+    fn render_connection_pill(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use zeron_proto::ConnectivityState as S;
+        let conn = self.state.read(cx).connectivity.clone();
+        let (label, glyph): (SharedString, AnyElement) = match conn.state {
+            S::Disabled | S::Connected => return None,
+            S::Offline => (
+                "Offline — sends are saved".into(),
+                div()
+                    .size(px(5.0))
+                    .rounded_full()
+                    .bg(theme.warning)
+                    .into_any_element(),
+            ),
+            S::Reconnecting => (
+                "Reconnecting…".into(),
+                loaders::mini_mono_spinner(
+                    "connection-spinner",
+                    2.0,
+                    theme.text_muted,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element(),
+            ),
+        };
+        Some(
+            crate::motion::fade_in(
+                "connection-pill",
+                div()
+                    .id("connection-pill")
+                    .mx(px(Theme::SPACE_SM + 4.0))
+                    .mb(px(Theme::SPACE_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(glyph)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child(label),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (user, workspace_scope) = {
             let state = self.state.read(cx);
@@ -3837,6 +3941,12 @@ impl Shell {
                 )
                 .fade_overflow_y(&self.sidebar_scroll),
             )
+            // Global connection pill (durable-by-design UI truth): appears
+            // whenever the edge posture is degraded; hidden while healthy —
+            // appearing IS the signal.
+            .when_some(self.render_connection_pill(theme, cx), |el, pill| {
+                el.child(pill)
+            })
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
@@ -5074,12 +5184,7 @@ impl Shell {
                 .right(px(10.0))
                 .flex()
                 .justify_center()
-                .child(self.jump_pill(
-                    "jump-to-bottom",
-                    "jump-pill",
-                    self.transcript.clone(),
-                    cx,
-                ))
+                .child(self.jump_pill("jump-to-bottom", "jump-pill", self.transcript.clone(), cx))
                 .into_any_element(),
         )
     }
@@ -5349,7 +5454,11 @@ impl Shell {
                     let panel = self.right_terminal_panel(cx);
                     // Keep the embedded panel's own active tab aligned with
                     // the resolved surface (fallbacks can move it).
-                    panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+                    let resize_suspended = self.tween_active(self.right_tween);
+                    panel.update(cx, |panel, cx| {
+                        panel.set_resize_suspended(resize_suspended);
+                        panel.select_tab_by_key(tab, cx);
+                    });
                     panel.into_any_element()
                 }
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {

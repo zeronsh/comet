@@ -74,6 +74,9 @@ struct UnboundChild {
 /// What a bound child's bus traffic has produced so far.
 #[derive(Default)]
 struct ChildState {
+    /// Text parts whose message ROLE is not yet known (`message.part.updated`
+    /// raced ahead of `message.updated`): replayed when the role lands.
+    pending_parts: Vec<Value>,
     /// The spawn chip this child streams to.
     parent_tool_use_id: String,
     /// messageID → is-assistant (user prompt echoes must not render).
@@ -213,7 +216,12 @@ impl OpencodeTracker {
             Some(id) => {
                 state.unbound.remove(&id);
                 let entry = state.children.entry(id.clone()).or_default();
-                entry.parent_tool_use_id = tool_call_id.to_owned();
+                // First completion binds; a RESUME tool call's completion
+                // must not re-key an already-bound child — its transcript
+                // continues under the ORIGINAL spawn chip.
+                if entry.parent_tool_use_id.is_empty() {
+                    entry.parent_tool_use_id = tool_call_id.to_owned();
+                }
                 id
             }
             // No id on the completion (older wire?): settle whichever bound
@@ -547,6 +555,27 @@ fn handle_bus_event(state: &mut OcState, event: &Value) -> Vec<AgentEvent> {
                     .assistant_messages
                     .entry(message.to_owned())
                     .or_insert(role == "assistant");
+                // A NEW user message on a settled child is a steer resuming
+                // it (opencode re-prompts the same session): un-latch so the
+                // resumed traffic streams to the same chip again.
+                if role == "user" && child.done {
+                    child.done = false;
+                }
+                // Parts that raced ahead of this role fact replay now.
+                let held: Vec<Value> = std::mem::take(&mut child.pending_parts)
+                    .into_iter()
+                    .filter(|part| {
+                        part.get("messageID").and_then(Value::as_str) == Some(message)
+                    })
+                    .collect();
+                if !held.is_empty() {
+                    let parent = child.parent_tool_use_id.clone();
+                    return held
+                        .iter()
+                        .flat_map(|part| part_snapshot_events(child, part))
+                        .map(|ev| tag(&parent, ev))
+                        .collect();
+                }
             }
             Vec::new()
         }
@@ -610,6 +639,18 @@ fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent>
             // these, so we do too: one UserMessage per part (posted
             // atomically — there is no user delta channel), which the engine
             // writes as its own user entry.
+            if kind == "text" && child.assistant_messages.get(message_id).is_none() {
+                // Role unknown: hold the part instead of guessing (dedup by
+                // part id — snapshots re-deliver).
+                if !child
+                    .pending_parts
+                    .iter()
+                    .any(|p| p.get("id").and_then(Value::as_str) == Some(part_id))
+                {
+                    child.pending_parts.push(part.clone());
+                }
+                return Vec::new();
+            }
             if kind == "text" && child.assistant_messages.get(message_id) == Some(&false) {
                 let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                 if text.trim().is_empty() {

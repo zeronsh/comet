@@ -508,6 +508,17 @@ impl Theme {
         self.glass().a < 1.0
     }
 
+    /// Whether FLOATING surfaces (popovers, the composer pill) paint their
+    /// backdrop blur and translucent tints. Unlike [`Self::is_glass`] this is
+    /// scene-level: the blur runs on in-app content inside the window, not on
+    /// the desktop behind it, so it needs no compositor vibrancy — macOS
+    /// rasterizes it in Metal and Linux in the vendored wgpu renderer (other
+    /// wgpu platforms keep opaque floats until tested). The window chrome
+    /// itself stays opaque off macOS either way.
+    pub fn is_frost(&self) -> bool {
+        cfg!(any(target_os = "macos", target_os = "linux"))
+    }
+
     /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
     /// buttons). One recipe, both appearances: the 11% [`wash`], tone-flipped
     /// by the palette convention (soft-white on dark, soft-black on light).
@@ -550,7 +561,7 @@ impl Theme {
     /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
     /// is already glass-native.
     pub fn input_glass_bg(&self) -> Hsla {
-        if self.is_glass() && matches!(self.appearance, Appearance::Light) {
+        if self.is_frost() && matches!(self.appearance, Appearance::Light) {
             self.input_bg.opacity(0.30)
         } else {
             self.input_bg

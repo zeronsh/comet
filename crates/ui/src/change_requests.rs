@@ -79,7 +79,7 @@ impl Render for ChangeRequestTooltip {
             .rounded(px(6.0))
             .border_1()
             .border_color(theme.border_strong)
-            .bg(if theme.is_glass() {
+            .bg(if theme.is_frost() {
                 theme.glass_overlay()
             } else {
                 theme.surface_raised

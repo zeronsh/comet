@@ -158,6 +158,30 @@ pub fn mini_gradient_spinner(
     view: EntityId,
     cx: &mut App,
 ) -> impl IntoElement {
+    let tints = GSPIN_ROW_TINTS.map(|t| gpui::rgb(t).into());
+    mini_spinner_tinted(key, cell_px, tints, view, cx)
+}
+
+/// [`mini_gradient_spinner`] in a single flat tint — the grayscale take for
+/// surfaces where the brand gradient would pull focus (the sidebar
+/// connection line): same grid, snake, and timing, color left to the caller.
+pub fn mini_mono_spinner(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    tint: gpui::Hsla,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
+    mini_spinner_tinted(key, cell_px, [tint; 3], view, cx)
+}
+
+fn mini_spinner_tinted(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    row_tints: [gpui::Hsla; 3],
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
     const COLS: usize = 2;
     const ROWS: usize = 3;
     /// Clockwise ring position of each `(row, col)` cell, top-left first:
@@ -171,7 +195,7 @@ pub fn mini_gradient_spinner(
         .flex_col()
         .gap(px(cell_px / 2.0))
         .children((0..ROWS).map(move |row| {
-            let tint: gpui::Hsla = gpui::rgb(GSPIN_ROW_TINTS[row]).into();
+            let tint = row_tints[row];
             div()
                 .flex()
                 .flex_row()

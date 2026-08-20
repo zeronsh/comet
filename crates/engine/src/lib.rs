@@ -255,6 +255,9 @@ impl EngineCore {
         {
             uploads.add_read_only_root(&root);
         }
+        // Queued-attachment support: the doc host resolves `pending://` refs
+        // against this store and pushes staged bytes to remote hosts.
+        doc_host.set_uploads(uploads.clone());
         let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
@@ -334,8 +337,10 @@ impl EngineCore {
         .clone()
     }
 
-    /// Attach the peer link cache — enables `targetDeviceId` routing and [`Self::dial_device`].
+    /// Attach the peer link cache — enables `targetDeviceId` routing,
+    /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+        self.doc_host.set_links(links.clone());
         *self
             .links
             .lock()
@@ -709,6 +714,13 @@ impl Engine {
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
         };
+        if edge_enabled {
+            // OS network-path events (macOS NWPathMonitor): the instant the
+            // path returns every parked reconnect backoff redials, and while
+            // the OS says there is no path the dial loops park instead of
+            // burning attempts. No-op on platforms without a monitor.
+            zeron_sync::net_path::spawn_path_monitor();
+        }
         let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = edge_enabled.then(|| {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
@@ -758,10 +770,16 @@ impl Engine {
         zeron_harness::acp::prewarm_managed_adapters();
 
         let host_relay = edge.as_ref().map(|edge| {
-            let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(
-                edge.url.clone(),
-                Arc::new(auth.clone()),
-            ));
+            let mut link_config =
+                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
+            // Registry-dark dial gate: devices with no recent presence fail
+            // fast with zero dials; presence returning un-parks them (the
+            // peer-alive hook below clears any cooldown at the same moment).
+            let workspace_for_liveness = core.workspace.clone();
+            link_config.liveness = Some(Arc::new(move |device_id: &str| {
+                workspace_for_liveness.peer_liveness(device_id)
+            }));
+            let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
