@@ -741,10 +741,12 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
-        if edge_enabled {
+        if edge_enabled && std::env::var_os("ZERON_DISABLE_UPDATES").is_none() {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
             // on quiescence so a restart never lands under a live run or open PTY.
+            // Local Li/Dev bundles disable this so the official release channel
+            // can never replace a personal build with Zeron.app.
             let quiescent: zeron_update::QuiescentCheck = {
                 let sessions = core.sessions.clone();
                 let terminals = core.terminals.clone();
