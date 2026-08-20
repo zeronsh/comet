@@ -18,7 +18,8 @@ struct NewSessionView: View {
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
 
-    @State private var draft = ""
+    @State private var draft = ComposerText()
+    @State private var selection = AttributedTextSelection()
     @State private var showPicker = false
     @State private var showTraitPicker = false
     @State private var showRefPicker = false
@@ -197,7 +198,7 @@ struct NewSessionView: View {
             focused = true
             if model.launchAutosend {
                 model.launchAutosend = false
-                draft = "Sketch the plan for porting the diff pane."
+                draft = ComposerText("Sketch the plan for porting the diff pane.")
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     send()
@@ -220,6 +221,7 @@ struct NewSessionView: View {
             }
             ComposerShell(
                 draft: $draft,
+                selection: $selection,
                 placeholder: "Do anything…",
                 sendEnabled: space != nil,
                 showStop: false,
@@ -344,7 +346,7 @@ struct NewSessionView: View {
 
     private var canSend: Bool {
         guard !busy, space != nil else { return false }
-        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !draft.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
 
@@ -365,7 +367,7 @@ struct NewSessionView: View {
     /// picked ref's worktree, or CreateWorktree off the base first).
     private func send() {
         guard let space, canSend else { return }
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = draft.markdown().trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
         let config = ChatConfig(harness: harness, model: selectedModel.id,
                                 reasoning: reasoning, sandbox: "workspace-write")
@@ -412,7 +414,7 @@ struct NewSessionView: View {
             store.sendRun(prompt: paths.isEmpty ? prompt : withAttachments(text: prompt, paths: paths),
                           chat: chat, attachments: paths)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
+            draft.clear(selection: &selection)
             attachments = []
             busy = false
             // Replace the canvas with the live session (in-place swap, no

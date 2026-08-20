@@ -56,7 +56,13 @@ extension [InlineRun] {
             if let link = run.style.link {
                 // Monochrome links: primary text + muted hairline underline,
                 // never accent (desktop render.rs:536).
-                piece.link = URL(string: link)
+                // A zeron-file: mention is styled like a link but carries no
+                // destination: the scheme is private to the UI, and openURL
+                // has no handler for it. Desktop renders these as chips
+                // (transcript.rs:671); that is a follow-up here.
+                if !link.hasPrefix(MentionLink.scheme) {
+                    piece.link = URL(string: link)
+                }
                 piece.foregroundColor = baseColor
                 piece.underlineStyle = Text.LineStyle(pattern: .solid, color: Theme.textMuted)
             }

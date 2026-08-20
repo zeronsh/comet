@@ -154,6 +154,21 @@ final class DeviceRpcPending {
     }
 }
 
+extension RelayError {
+    /// True when the host answered "no such method". The relay flattens the
+    /// typed Rust error into a plain string (see `handleRpcPayload`), so this
+    /// is the only signal on the wire. Matched exactly, not by prefix, the same
+    /// way the desktop does it (crates/ui/src/state.rs).
+    ///
+    /// A helper rather than a `RelayError` case because the pending table holds
+    /// only continuations and does not know which method a reply belongs to.
+    /// The caller does.
+    func isUnknownMethod(_ method: String) -> Bool {
+        guard case .rpc(let message) = self else { return false }
+        return message == "unknown method: \(method)"
+    }
+}
+
 actor DeviceRelayClient {
     static let rpcKind = "rpc"
     static let relayKind = " relay"  // leading space is intentional
