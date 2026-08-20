@@ -403,11 +403,15 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
+pub const APPSHOT_TILE_WIDTH: f32 = 232.0;
+pub const APPSHOT_PREVIEW_HEIGHT: f32 = 140.0;
+pub const APPSHOT_TILE_HEIGHT: f32 = 168.0;
+
 pub fn appshot_strip_height(count: usize) -> f32 {
     if count == 0 {
         0.0
     } else {
-        STRIP_PAD_TOP + count as f32 * 64.0 + count.saturating_sub(1) as f32 * STRIP_GAP
+        STRIP_PAD_TOP + APPSHOT_TILE_HEIGHT
     }
 }
 
@@ -3821,18 +3825,25 @@ impl Composer {
         Some(strip)
     }
 
-    fn render_appshot_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    fn render_appshot_strip(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let appshots = self.staged_appshots();
         if appshots.is_empty() {
             return None;
         }
         let mut strip = div()
+            .id("composer-appshots-strip")
             .flex()
-            .flex_col()
+            .flex_row()
             .gap(px(STRIP_GAP))
             .px(px(STRIP_PAD_X))
-            .pt(px(STRIP_PAD_TOP));
+            .pt(px(STRIP_PAD_TOP))
+            .overflow_x_scroll();
         for (ix, appshot) in appshots.iter().enumerate() {
+            let group: SharedString = format!("composer-appshot-{}", appshot.id).into();
             let preview = attachments::PreviewImage {
                 name: appshot.screenshot.name.clone().into(),
                 image: appshot.screenshot.image.clone(),
@@ -3842,103 +3853,107 @@ impl Composer {
                 .window_title
                 .as_deref()
                 .filter(|title| !title.trim().is_empty())
-                .map(|title| format!("{} — {title}", appshot.app_name))
+                .map(str::to_owned)
                 .unwrap_or_else(|| appshot.app_name.clone())
                 .into();
-            let context: SharedString = if appshot.accessibility.content.is_empty() {
-                "Screenshot only — Accessibility text unavailable".into()
-            } else if appshot.accessibility.truncated {
-                format!(
-                    "{} characters of application text captured (truncated)",
-                    appshot.accessibility.content.chars().count()
+            let mut card = div()
+                .id(("composer-appshot", ix))
+                .group(group.clone())
+                .relative()
+                .w(px(APPSHOT_TILE_WIDTH))
+                .h(px(APPSHOT_TILE_HEIGHT))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .rounded(px(14.0))
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::ink(0.045)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.preview = Some(preview.clone());
+                    this.preview_focus_pending = true;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id(("composer-appshot-preview", ix))
+                        .w(px(APPSHOT_TILE_WIDTH))
+                        .h(px(APPSHOT_PREVIEW_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .items_end()
+                        .justify_center()
+                        .overflow_hidden()
+                        .rounded(px(12.0))
+                        .child(
+                            img(appshot.screenshot.image.clone())
+                                .w(px(APPSHOT_TILE_WIDTH))
+                                .h(px(APPSHOT_PREVIEW_HEIGHT))
+                                .object_fit(ObjectFit::Contain),
+                        ),
                 )
-                .into()
-            } else {
-                format!(
-                    "{} characters of application text captured",
-                    appshot.accessibility.content.chars().count()
-                )
-                .into()
-            };
-            strip = strip.child(
+                .child(
+                    div()
+                        .mt(px(6.0))
+                        .max_w(px(APPSHOT_TILE_WIDTH - 20.0))
+                        .truncate()
+                        .text_center()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(source),
+                );
+            if let Some(icon) = &appshot.app_icon {
+                card = card.child(crate::frost::layered(
+                    div()
+                        .absolute()
+                        .top(px(APPSHOT_PREVIEW_HEIGHT - 14.0))
+                        .left(px((APPSHOT_TILE_WIDTH - 28.0) / 2.0))
+                        .size(px(28.0))
+                        .rounded(px(7.0))
+                        .bg(theme.bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            img(icon.clone())
+                                .size(px(24.0))
+                                .rounded(px(5.0))
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                ));
+            }
+            card = card.child(crate::frost::layered(
                 div()
-                    .id(("composer-appshot", ix))
-                    .h(px(64.0))
+                    .id(("composer-appshot-remove", ix))
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(6.0))
+                    .size(px(22.0))
+                    .rounded_full()
+                    .bg(theme.bg.opacity(0.92))
                     .flex()
-                    .flex_row()
                     .items_center()
-                    .gap(px(10.0))
-                    .rounded(px(10.0))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(crate::theme::ink(0.035))
-                    .px(px(6.0))
+                    .justify_center()
+                    .cursor_pointer()
+                    .shadow_sm()
+                    .opacity(0.0)
+                    .group_hover(group, |style| style.opacity(1.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_appshot(&remove_id, cx);
+                    }))
                     .child(
-                        div()
-                            .id(("composer-appshot-preview", ix))
-                            .size(px(50.0))
-                            .flex_none()
-                            .rounded(px(7.0))
-                            .overflow_hidden()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.preview = Some(preview.clone());
-                                this.preview_focus_pending = true;
-                                cx.notify();
-                            }))
-                            .child(
-                                img(appshot.screenshot.image.clone())
-                                    .w(px(50.0))
-                                    .h(px(50.0))
-                                    .object_fit(ObjectFit::Cover),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(12.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text)
-                                    .child(source),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(2.0))
-                                    .truncate()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .child(context),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("composer-appshot-remove", ix))
-                            .size(px(26.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::ink(0.08)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_appshot(&remove_id, cx);
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::CLOSE_CIRCLE)
-                                    .size(px(15.0))
-                                    .text_color(theme.text_muted),
-                            ),
+                        crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                            .size(px(15.0))
+                            .text_color(theme.text_muted),
                     ),
-            );
+            ));
+            strip = strip.child(card);
         }
-        Some(strip)
+        Some(strip.into_any_element())
     }
 
     /// Paperclip: the native image picker (the original's hidden
@@ -6698,8 +6713,8 @@ mod tests {
     #[test]
     fn appshot_strip_height_tracks_cards() {
         assert_eq!(appshot_strip_height(0), 0.0);
-        assert_eq!(appshot_strip_height(1), STRIP_PAD_TOP + 64.0);
-        assert_eq!(appshot_strip_height(2), STRIP_PAD_TOP + 128.0 + STRIP_GAP);
+        assert_eq!(appshot_strip_height(1), STRIP_PAD_TOP + APPSHOT_TILE_HEIGHT);
+        assert_eq!(appshot_strip_height(2), appshot_strip_height(1));
     }
 
     #[test]

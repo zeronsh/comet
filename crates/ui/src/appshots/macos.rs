@@ -105,6 +105,7 @@ struct FrontmostApplication {
     pid: i32,
     name: String,
     bundle_identifier: Option<String>,
+    icon_png: Option<Vec<u8>>,
 }
 
 struct FrontmostWindow {
@@ -119,7 +120,7 @@ pub(super) fn permission_state() -> PermissionState {
     }
 }
 
-pub(super) fn request_permissions() -> PermissionState {
+pub(super) fn request_accessibility_permission() -> PermissionState {
     autoreleasepool(|| unsafe {
         let prompt_value = CFBoolean::true_value();
         let prompt: *mut Object = msg_send![class!(NSDictionary),
@@ -127,8 +128,12 @@ pub(super) fn request_permissions() -> PermissionState {
             forKey: kAXTrustedCheckOptionPrompt as *mut Object
         ];
         let _ = AXIsProcessTrustedWithOptions(prompt.cast());
-        let _ = ScreenCaptureAccess.request();
     });
+    permission_state()
+}
+
+pub(super) fn request_screen_recording_permission() -> PermissionState {
+    let _ = ScreenCaptureAccess.request();
     permission_state()
 }
 
@@ -203,7 +208,7 @@ pub(super) fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError
             return Err(CaptureError::NoEligibleWindow);
         }
         if !ScreenCaptureAccess.preflight() {
-            let state = request_permissions();
+            let state = request_screen_recording_permission();
             return Err(CaptureError::PermissionRequired(state));
         }
         let (window, png) = match capture_with_screen_capture_kit(app.pid) {
@@ -235,6 +240,9 @@ pub(super) fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError
             window_title: window.title,
             accessibility,
             screenshot,
+            app_icon: app.icon_png.map(|bytes| {
+                std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
+            }),
             captured_at: Utc::now(),
         })
     })
@@ -250,13 +258,45 @@ fn frontmost_application() -> Result<FrontmostApplication, CaptureError> {
         let pid: i32 = msg_send![app, processIdentifier];
         let name_obj: *mut Object = msg_send![app, localizedName];
         let bundle_obj: *mut Object = msg_send![app, bundleIdentifier];
+        let icon: *mut Object = msg_send![app, icon];
         let name = nsstring(name_obj).unwrap_or_else(|| "Application".into());
         Ok(FrontmostApplication {
             pid,
             name,
             bundle_identifier: nsstring(bundle_obj),
+            icon_png: nsimage_png(icon),
         })
     }
+}
+
+unsafe fn nsimage_png(image: *mut Object) -> Option<Vec<u8>> {
+    if image.is_null() {
+        return None;
+    }
+    let tiff: *mut Object = unsafe { msg_send![image, TIFFRepresentation] };
+    if tiff.is_null() {
+        return None;
+    }
+    let rep: *mut Object = unsafe { msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff] };
+    if rep.is_null() {
+        return None;
+    }
+    let properties: *mut Object = unsafe { msg_send![class!(NSDictionary), dictionary] };
+    let data: *mut Object =
+        unsafe { msg_send![rep, representationUsingType: 4usize properties: properties] };
+    unsafe { nsdata_bytes(data) }
+}
+
+unsafe fn nsdata_bytes(data: *mut Object) -> Option<Vec<u8>> {
+    if data.is_null() {
+        return None;
+    }
+    let len: usize = unsafe { msg_send![data, length] };
+    let bytes: *const u8 = unsafe { msg_send![data, bytes] };
+    if bytes.is_null() || len == 0 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec())
 }
 
 fn frontmost_window(pid: i32) -> Result<FrontmostWindow, CaptureError> {

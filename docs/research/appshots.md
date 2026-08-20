@@ -38,8 +38,10 @@ Inspection of Codex's installed desktop client shows that its Appshot feature:
   context while also attaching the image;
 - requires Screen Recording and Accessibility permission on macOS.
 
-App icons, sounds, and the capture-to-composer transition are useful polish but
-are not part of the semantic core.
+Codex's composer presents each capture as a 232×140 visual tile with the source
+application icon over the screenshot, a concise title, hover removal, and one
+horizontal attachment tray. Its native helper presents Screen Recording and
+Accessibility as separate rows in one guided permission surface.
 
 ## Product contract
 
@@ -65,9 +67,11 @@ to Zeron, attach a file, and manually copy otherwise invisible text.
 - The frontmost eligible window at shortcut time is the capture target.
 - Zeron never steals focus until the screenshot has been acquired.
 - A staged Appshot is visually distinct from an ordinary image attachment.
-- The staged card shows the source application and window title when available.
-- The user can preview the screenshot, inspect a summary of captured text,
-  remove the Appshot, and type an instruction before sending.
+- The staged tile shows a large contained screenshot, the source application
+  icon, and the window title when available.
+- The user can preview the screenshot, remove the Appshot, and type an
+  instruction before sending. Semantic text remains attached without adding
+  technical character counts to the composer.
 - A successful capture never sends on its own.
 - A failed or permission-blocked capture presents a concrete recovery action.
 
@@ -100,12 +104,14 @@ from another product.
 ### Capture permissions
 
 - Explain why Screen Recording is needed.
-- Explain why Accessibility access is needed and that it includes off-screen
-  application text.
+- Explain that Accessibility is optional and adds off-screen application text.
+- Never launch both permission prompts from the feature toggle.
+- Request each permission from its own explicit user action.
 - Open the relevant macOS Settings pane.
 - Re-check permission state after the user returns.
-- Allow screenshot-only degraded capture if Screen Recording is granted but
-  Accessibility is not; mark the missing semantic context visibly.
+- Allow screenshot-only capture whenever Screen Recording is granted; the
+  settings checklist, rather than every staged tile, communicates whether
+  semantic context is available.
 
 ### Destination and draft
 
@@ -398,15 +404,13 @@ content, with provenance and prompt-injection framing.
 
 ## Open product decisions
 
-1. Should screenshot-only capture be allowed when Accessibility permission is
-   denied, or should an Appshot require both sources?
-2. Should Automatic ever target a session whose agent is currently running,
+1. Should Automatic ever target a session whose agent is currently running,
    where the eventual send becomes a steer?
-3. Does a new-session Appshot use the existing last space/device immediately,
+2. Does a new-session Appshot use the existing last space/device immediately,
    or pause on the canvas until the user confirms the destination?
-4. How much extracted application text should be visible before send: a status
+3. How much extracted application text should be visible before send: a status
    summary, a preview, or the full serialized snapshot?
-5. Should one shortcut invocation capture only the frontmost window, or should
+4. Should one shortcut invocation capture only the frontmost window, or should
    holding the shortcut open a window picker in a later release?
 
 ## Recommended initial decisions
@@ -419,6 +423,7 @@ content, with provenance and prompt-injection framing.
   still decides whether to Send or Steer;
 - a new-session capture opens the canvas and preserves existing space/device
   defaults without creating a chat until send;
-- show source identity and a concise captured-text status in the staged card;
+- show source identity as an application icon and window title in a compact
+  visual tile; keep permission/semantic status in Settings;
 - use a temporary structured prompt representation before extending the RPC or
   document schemas.

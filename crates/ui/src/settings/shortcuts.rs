@@ -55,6 +55,8 @@ pub struct ShortcutsPage {
     appshots_enabled: bool,
     appshot_destination: AppshotDestination,
     appshot_permissions: PermissionState,
+    screen_recording_prompted: bool,
+    accessibility_prompted: bool,
     // The page never talks RPC; state is kept for parity with sibling pages
     // (and future per-device keymaps).
     _state: Entity<AppState>,
@@ -78,6 +80,8 @@ impl ShortcutsPage {
             appshots_enabled,
             appshot_destination,
             appshot_permissions: crate::appshots::permission_state(),
+            screen_recording_prompted: false,
+            accessibility_prompted: false,
             _state: state,
         }
     }
@@ -308,19 +312,15 @@ impl Render for ShortcutsPage {
                         }))
                         .child(SharedString::from(destination.label()))
                 });
-        let permission_copy: SharedString = match (
-            permissions.screen_recording,
-            permissions.accessibility,
-        ) {
-            (true, true) => "Screen Recording and Accessibility access granted.".into(),
-            (true, false) => {
-                "Screenshot capture is ready. Grant Accessibility for off-screen application text."
-                    .into()
-            }
-            (false, _) => {
-                "Screen Recording is required. macOS may ask Zeron to quit and reopen after you enable it."
-                    .into()
-            }
+        let screen_action: SharedString = if self.screen_recording_prompted {
+            "Open System Settings".into()
+        } else {
+            "Allow".into()
+        };
+        let accessibility_action: SharedString = if self.accessibility_prompted {
+            "Open System Settings".into()
+        } else {
+            "Enable text capture".into()
         };
 
         div()
@@ -402,7 +402,7 @@ impl Render for ShortcutsPage {
                             .child(
                                 widgets::page_subtitle(
                                     &theme,
-                                    "Press Control-Option-Space from any app to stage its window, screenshot, and accessible text in Zeron.",
+                                    "Set up once, one permission at a time. Screen Recording captures the window; Accessibility optionally adds off-screen application text.",
                                 )
                                 .max_w(px(560.0))
                                 .line_height(px(20.0)),
@@ -431,9 +431,6 @@ impl Render for ShortcutsPage {
                                             .cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.appshots_enabled = !this.appshots_enabled;
-                                                if this.appshots_enabled {
-                                                    this.appshot_permissions = crate::appshots::request_permissions();
-                                                }
                                                 this.commit_appshots(cx);
                                                 cx.notify();
                                             })),
@@ -465,6 +462,7 @@ impl Render for ShortcutsPage {
                             )
                             .child(
                                 widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
                                     .child(widgets::row_tile(&theme, crate::icons::MONITOR))
                                     .child(
                                         div()
@@ -472,24 +470,121 @@ impl Render for ShortcutsPage {
                                             .min_w_0()
                                             .flex()
                                             .flex_col()
-                                            .child(widgets::row_title(&theme, "Capture permissions"))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Screen Recording",
+                                                    ))
+                                                    .child(if permissions.screen_recording {
+                                                        widgets::badge_active(&theme, "Ready")
+                                                    } else {
+                                                        widgets::badge(&theme, "Required")
+                                                    }),
+                                            )
                                             .child(widgets::meta_line(
                                                 &theme,
-                                                vec![div().child(permission_copy).into_any_element()],
+                                                vec![div().child(SharedString::from("Allows Zeron to capture the frontmost window. macOS may ask you to quit and reopen Zeron once.")).into_any_element()],
                                             )),
                                     )
-                                    .when(!(permissions.screen_recording && permissions.accessibility), |el| {
+                                    .when(appshots_enabled && !permissions.screen_recording, |el| {
                                         el.child(
                                             widgets::ghost_action(&theme)
-                                                .id("appshots-grant-permissions")
+                                                .id("appshots-screen-recording")
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.appshot_permissions = crate::appshots::request_permissions();
+                                                    if this.screen_recording_prompted {
+                                                        cx.open_url(crate::appshots::SCREEN_RECORDING_SETTINGS_URL);
+                                                    } else {
+                                                        this.screen_recording_prompted = true;
+                                                        this.appshot_permissions = crate::appshots::request_screen_recording_permission();
+                                                    }
                                                     cx.notify();
                                                 }))
-                                                .child(SharedString::from("Grant access")),
+                                                .child(screen_action),
                                         )
-                                    }),
+                                    })
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::CHECKLIST))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Application text",
+                                                    ))
+                                                    .child(if permissions.accessibility {
+                                                        widgets::badge_active(&theme, "Ready")
+                                                    } else {
+                                                        widgets::badge(&theme, "Optional")
+                                                    }),
+                                            )
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(SharedString::from("Accessibility adds visible and off-screen application text. Screenshots work without it.")).into_any_element()],
+                                            )),
+                                    )
+                                    .when(appshots_enabled && !permissions.accessibility, |el| {
+                                        el.child(
+                                            widgets::ghost_action(&theme)
+                                                .id("appshots-accessibility")
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if this.accessibility_prompted {
+                                                        cx.open_url(crate::appshots::ACCESSIBILITY_SETTINGS_URL);
+                                                    } else {
+                                                        this.accessibility_prompted = true;
+                                                        this.appshot_permissions = crate::appshots::request_accessibility_permission();
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(accessibility_action),
+                                        )
+                                    })
+                            )
+                            .when(
+                                appshots_enabled
+                                    && !(permissions.screen_recording
+                                        && permissions.accessibility),
+                                |card| {
+                                    card.child(
+                                        widgets::card_row(&theme, false)
+                                            .child(div().w(px(36.0)).flex_none())
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.text_muted.opacity(0.65))
+                                                    .child(SharedString::from("Changed a permission in System Settings? Return here and check again.")),
+                                            )
+                                            .child(
+                                                widgets::ghost_action(&theme)
+                                                    .id("appshots-refresh-permissions")
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.appshot_permissions = crate::appshots::permission_state();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(SharedString::from("Check again")),
+                                            ),
+                                    )
+                                },
                             ),
                     ),
             )

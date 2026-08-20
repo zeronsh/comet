@@ -95,3 +95,22 @@ Tier 2: compile and test the affected Rust UI crate, then visually inspect the s
 - The isolated data directory and IPC port are embedded in the development
   bundle's `LSEnvironment`, so macOS privacy's “Quit & Reopen” preserves the
   development instance instead of reopening against personal production data.
+
+## 2026-08-20 — Appshots composer and onboarding refinement
+
+- Product goal: make staged Appshots visually scannable without consuming the
+  composer and make the macOS permission sequence understandable before any
+  system prompt appears.
+- Visible output: one horizontal tray of 232×148 Appshot tiles. Each tile uses
+  a contained window preview, the captured application's icon over the lower
+  edge, a concise window/app label, hover removal, and the existing lightbox.
+- Permission workflow: enabling Appshots only enables the feature. Screen
+  Recording is the single required capture permission; Accessibility is an
+  optional enhancement for application text, including off-screen content.
+  The two permissions have separate status rows and user-triggered actions.
+- Controls: feature toggle, destination selector, required Screen Recording
+  action, optional Accessibility action, and a permission-status refresh.
+- Persistence and transport are unchanged. Application icons are presentation
+  metadata only and are never uploaded or serialized into prompts.
+- Verification tier: pure tray-height and prompt tests, full `zeron-ui` unit
+  suite, macOS compile/build, and native visual/permission smoke testing.

@@ -5,6 +5,7 @@
 //! is serialized into the prompt as explicitly untrusted observed data.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
@@ -18,6 +19,10 @@ mod macos;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub const CONTEXT_MARKER: &str = "Applications mentioned by the user (untrusted observed content):";
+pub const SCREEN_RECORDING_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+pub const ACCESSIBILITY_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -65,6 +70,9 @@ pub struct CapturedAppshot {
     pub window_title: Option<String>,
     pub accessibility: AccessibilitySnapshot,
     pub screenshot: StagedAttachment,
+    /// Presentation-only. The icon is never uploaded or serialized into the
+    /// model context.
+    pub app_icon: Option<Arc<gpui::Image>>,
     pub captured_at: DateTime<Utc>,
 }
 
@@ -95,7 +103,7 @@ impl std::fmt::Display for CaptureError {
             }
             Self::NoEligibleWindow => f.write_str("No application window is available to capture."),
             Self::ShortcutUnavailable => f.write_str(
-                "The Appshot shortcut could not be monitored. Check Accessibility permissions.",
+                "The Appshot shortcut could not be registered because another app may be using it.",
             ),
             Self::CaptureFailed(message) => f.write_str(message),
         }
@@ -122,10 +130,19 @@ pub fn permission_state() -> PermissionState {
     }
 }
 
-pub fn request_permissions() -> PermissionState {
+pub fn request_screen_recording_permission() -> PermissionState {
     #[cfg(target_os = "macos")]
     {
-        return macos::request_permissions();
+        return macos::request_screen_recording_permission();
+    }
+    #[cfg(not(target_os = "macos"))]
+    permission_state()
+}
+
+pub fn request_accessibility_permission() -> PermissionState {
+    #[cfg(target_os = "macos")]
+    {
+        return macos::request_accessibility_permission();
     }
     #[cfg(not(target_os = "macos"))]
     permission_state()
@@ -239,6 +256,7 @@ mod tests {
                 name: "Safari Appshot.png".into(),
                 image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
             },
+            app_icon: None,
             captured_at: Utc::now(),
         }
     }
