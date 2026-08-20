@@ -56,3 +56,24 @@ Tier 2: compile and test the affected Rust UI crate, then visually inspect the s
 - `cargo test -p zeron-ui --lib settings::appearance` passes (4 tests).
 - A packaged debug build was opened on macOS and the Appearance page, installed-theme row, and empty import state were visually inspected at 1365 × 768.
 - The final visual pass found and removed a remaining overflowing helper sentence; long error paths are now explicitly truncated within the dialog.
+
+## 2026-08-20 — Appshots exploration
+
+- Product goal: capture the frontmost application from a global shortcut and
+  stage screenshot plus semantic application context in a Zeron composer.
+- Visible output: a distinct, removable Appshot card in the destination draft;
+  the existing paperclip and ordinary attachment flows remain unchanged.
+- Editable entities: global shortcut, destination policy, staged Appshot, and
+  the user's accompanying prompt.
+- Required controls: documented by workflow in
+  `docs/research/appshots.md#control-section-inventory`.
+- Export behavior: none. A send reuses Zeron's attachment upload and prompt
+  transport.
+- Persistence: device-local settings; unsent-capture persistence remains an
+  explicit product decision.
+- Layers/timeline/custom renderer: not required.
+- Verification tier: native macOS spike, pure routing/serialization tests,
+  local and remote integration tests, and a manual permissions/application
+  matrix.
+- Main architecture decision: desktop capture is viewer-side UI capability,
+  never an engine or remote-host responsibility.
