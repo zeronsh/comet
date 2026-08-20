@@ -231,7 +231,7 @@ fn translate_pi_event(event: &Value) -> Vec<AgentEvent> {
                 diff: None,
             }]
         }
-        "agent_settled" => {
+        "agent_settled" | "agent_end" => {
             vec![AgentEvent::Done {
                 status: DoneStatus::Completed,
                 result: None,
@@ -347,7 +347,7 @@ impl PiNativeHarness {
                 )
             })?;
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--mode", "rpc"]);
+        cmd.args(["--mode", "rpc", "--no-session"]);
         Ok(cmd)
     }
 
@@ -466,52 +466,15 @@ impl Harness for PiNativeHarness {
         let child_pid = child.id();
         tracing::info!(target: "zeron_harness::pi::native", pid = child_pid, cwd = %request.cwd, "pi native session starting");
 
-        // Step 1: get_state to initialize the session.
-        let state_id = uuid::Uuid::new_v4().to_string();
-        let _state = Self::request(
-            &mut stdin,
-            &mut lines,
-            &json!({"type": "get_state", "id": state_id}),
-        )
-        .await?;
-        tracing::info!(target: "zeron_harness::pi::native", "get_state ok");
-
-        // Step 2: set the model if specified.
-        if !provider.is_empty() && !model_id.is_empty() {
-            let req_id = uuid::Uuid::new_v4().to_string();
-            tracing::info!(target: "zeron_harness::pi::native", provider, model_id, "sending set_model");
-            let _ = Self::request(
-                &mut stdin,
-                &mut lines,
-                &json!({"type": "set_model", "provider": provider, "modelId": model_id, "id": req_id}),
-            )
-            .await?;
-            tracing::info!(target: "zeron_harness::pi::native", "set_model ok");
-        } else {
-            tracing::info!(target: "zeron_harness::pi::native", provider, model_id, "skipping set_model (provider or model empty)");
-        }
-
-        // Step 3: set thinking level if specified.
-        if let Some(level) = thinking {
-            let think_id = uuid::Uuid::new_v4().to_string();
-            let _ = Self::request(
-                &mut stdin,
-                &mut lines,
-                &json!({"type": "set_thinking_level", "level": level, "id": think_id}),
-            )
-            .await?;
-            tracing::info!(target: "zeron_harness::pi::native", level, "set_thinking_level ok");
-        }
-
-        // Step 4: send the prompt.
+        // Send prompt directly (matching the Python example from pi's docs).
         let prompt_id = uuid::Uuid::new_v4().to_string();
-        let _prompt_response = Self::request(
-            &mut stdin,
-            &mut lines,
-            &json!({"type": "prompt", "message": request.prompt, "id": prompt_id}),
-        )
-        .await?;
-        tracing::info!(target: "zeron_harness::pi::native", "prompt accepted, starting event loop");
+        let prompt_cmd = json!({"type": "prompt", "message": request.prompt, "id": prompt_id});
+        let mut line = serde_json::to_vec(&prompt_cmd)
+            .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+        line.push(b'\n');
+        stdin.write_all(&line).await?;
+        stdin.flush().await?;
+        tracing::info!(target: "zeron_harness::pi::native", "prompt sent, starting event loop");
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         let interrupt_grace = self.interrupt_grace;
