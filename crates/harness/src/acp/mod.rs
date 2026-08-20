@@ -3,9 +3,9 @@
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
 //! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`) and
-//! opencode ([`AcpHarness::opencode`], `opencode acp`) — plus pi
-//! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
-//! driver exists. Claude, Codex and Cursor moved to native drivers
+//! opencode ([`AcpHarness::opencode`], `opencode acp`). The legacy
+//! [`AcpHarness::pi`] constructor remains for compatibility, but the registry
+//! uses Pi's native RPC driver. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
