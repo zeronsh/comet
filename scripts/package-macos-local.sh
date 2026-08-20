@@ -41,7 +41,9 @@ case "$CHANNEL" in
     CALLBACK_PORT=27641
     PROFILE=release
     BADGE_TEXT="LI"
-    BADGE_COLOR="20CDBB"
+    BADGE_COLOR="8EF3E8"
+    TINT_DARK="001B24"
+    TINT_LIGHT="39E6D4"
     ;;
   dev)
     APP_NAME="Zeron Dev"
@@ -51,7 +53,9 @@ case "$CHANNEL" in
     CALLBACK_PORT=27642
     PROFILE=debug
     BADGE_TEXT="DEV"
-    BADGE_COLOR="FF9F1C"
+    BADGE_COLOR="FFD080"
+    TINT_DARK="2A0A00"
+    TINT_LIGHT="FF9F1C"
     ;;
   *)
     echo "usage: $0 {li|dev} [--install]" >&2
@@ -125,12 +129,23 @@ python3 -c 'import PIL' 2>/dev/null ||
   python3 -m pip install --quiet --user pillow 2>/dev/null ||
   python3 -m pip install --quiet --user --break-system-packages pillow
 BADGE_TEXT="$BADGE_TEXT" BADGE_COLOR="$BADGE_COLOR" \
+TINT_DARK="$TINT_DARK" TINT_LIGHT="$TINT_LIGHT" \
 python3 - "$ROOT/dist/macos/icon-1024.png" "$ICON_PNG" <<'PY'
 import os
 import sys
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-source = Image.open(sys.argv[1]).convert("RGBA")
+original = Image.open(sys.argv[1]).convert("RGBA")
+alpha = original.getchannel("A")
+# Re-map the complete artwork through a channel palette. Luminance, texture,
+# baked shadow, and transparency survive, but no purple-dominant area remains
+# to make Li/Dev look like the official icon at Dock size.
+source = ImageOps.colorize(
+    ImageOps.grayscale(original),
+    black="#" + os.environ["TINT_DARK"],
+    white="#" + os.environ["TINT_LIGHT"],
+).convert("RGBA")
+source.putalpha(alpha)
 text = os.environ["BADGE_TEXT"]
 color = "#" + os.environ["BADGE_COLOR"]
 font_path = "/System/Library/Fonts/SFNS.ttf"
