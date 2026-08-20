@@ -128,6 +128,10 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
+        ShortcutId::NextSession => "Select the next session in the sidebar, wrapping at the end.",
+        ShortcutId::PrevSession => {
+            "Select the previous session in the sidebar, wrapping at the start."
+        }
     }
 }
 
@@ -336,12 +340,18 @@ mod tests {
             RecordOutcome::Cancelled
         );
         assert_eq!(
-            record_key("s", true, false, false, false),
+            record_key("s", false, false, false, true),
             RecordOutcome::Set("mod-s".into())
         );
         assert_eq!(
             record_key("k", false, true, true, true),
             RecordOutcome::Set("mod-alt-shift-k".into())
+        );
+        // macOS-only: elsewhere ctrl IS the primary and records as "mod".
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            record_key("tab", true, false, true, false),
+            RecordOutcome::Set("ctrl-shift-tab".into())
         );
         // Bare modifiers stay recording.
         assert_eq!(
@@ -359,7 +369,7 @@ mod tests {
         // zeron parity: a combo bound elsewhere is refused at record time (the
         // helper names the owner) — conflicts never persist into the keymap.
         let keymap = KeymapConfig::default();
-        let RecordOutcome::Set(combo) = record_key("b", true, false, false, false) else {
+        let RecordOutcome::Set(combo) = record_key("b", false, false, false, true) else {
             panic!("expected Set");
         };
         assert_eq!(
