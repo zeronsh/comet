@@ -13,6 +13,22 @@ struct DeviceRow: Identifiable, Hashable {
     var platform: String
     var lastSeenAt: Int64?
     var createdAt: Int64?
+    /// Engine version stamped by the device ("0.2.12"); gates the queued-
+    /// attachment flow and other capability checks. nil reads as "too old".
+    var version: String?
+}
+
+/// proto/src/lib.rs version_triple: parse a leading major.minor.patch,
+/// tolerating a -suffix or +build on the patch. Anything else is nil —
+/// version gates treat that as "too old".
+func versionTriple(_ raw: String) -> (Int, Int, Int)? {
+    let parts = raw.split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
+    guard parts.count == 3, let major = Int(parts[0]), let minor = Int(parts[1]) else { return nil }
+    let digits = parts[2].prefix { $0.isNumber }
+    guard !digits.isEmpty, let patch = Int(digits) else { return nil }
+    let rest = parts[2].dropFirst(digits.count)
+    guard rest.isEmpty || rest.first == "-" || rest.first == "+" else { return nil }
+    return (major, minor, patch)
 }
 
 struct Space: Identifiable, Hashable {
@@ -283,6 +299,15 @@ struct RepoRef: Codable, Hashable, Identifiable {
 
 let commandDefaultTtlMs: Int64 = 86_400_000
 
+/// zeron-proto WorktreeSpec (agent.rs, PR #159): a worktree the HOST
+/// materializes at command-drain time — the client never blocks on a
+/// CreateWorktree relay RPC before a send. Old hosts ignore the field and run
+/// in `cwd` (the repo's main checkout): degraded, never hung.
+struct WorktreeSpec: Codable, Hashable {
+    var repoPath: String
+    var base: String
+}
+
 /// zeron-proto RunRequest (agent.rs:81). `reasoning` is lowercase
 /// ("high"/"xhigh"/…), `sandbox` kebab-case ("workspace-write"), harness ids
 /// kebab-case ("claude-code").
@@ -300,10 +325,15 @@ struct RunRequest: Codable {
     var autoApprove: Bool = true
     var resume: String?
     /// Absolute paths of image attachments already staged on the run device
-    /// (UploadChunk/UploadCommit). The same paths ride the prompt text as
-    /// `Attached images (local files …)` refs — this field additionally lets
+    /// (UploadChunk/UploadCommit) — or `pending://{uploadId}/{name}` refs on
+    /// the queued flow (host ≥ 0.2.12), which the host resolves to absolute
+    /// paths once the bytes land. The same refs ride the prompt text as
+    /// `Attached images (local files …)` lines — this field additionally lets
     /// a harness inline the bytes as image content blocks.
     var attachments: [String] = []
+    /// Worktree for the host to materialize at drain time (PR #159). Omitted
+    /// from the JSON when nil, so old hosts see the legacy shape.
+    var worktree: WorktreeSpec?
 }
 
 enum SessionCommandPayload {

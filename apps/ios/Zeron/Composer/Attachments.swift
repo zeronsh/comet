@@ -83,8 +83,21 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
 let maxAttachmentBytes = 24 * 1024 * 1024
-/// Base64 chars per `UploadChunk` — sized for the relay link.
-let uploadChunkB64Chars = 60_000
+/// Base64 chars per `UploadChunk` (attachments.rs UPLOAD_CHUNK_B64_CHARS,
+/// PR #164): ≈510KB binary — sized to clear Cloudflare's 1MiB WS message cap
+/// with envelope headroom, and % 4 == 0 so every slice decodes independently.
+/// The old 60k (~45KB) sequential chunks made a 5MB photo 112 round trips.
+let uploadChunkB64Chars = 680_000
+/// Chunks in flight at once (attachments.rs UPLOAD_CONCURRENCY): order is
+/// irrelevant — host `seq` slots are positional and idempotent.
+let uploadConcurrency = 3
+
+/// Whole-attachment deadline (attachments.rs attachment_deadline): a lawful
+/// crawl of retrying chunks must still FAIL visibly rather than spin for
+/// hours (the 2026-08-19 image-send incident class).
+func attachmentDeadlineSeconds(chunkCount: Int) -> Int {
+    min(120 + 15 * chunkCount, 900)
+}
 
 /// An image staged in the composer, before upload. Bytes are what uploads;
 /// the decoded UIImage feeds thumbnails, the lightbox, and the post-send
@@ -131,45 +144,117 @@ struct StagedAttachment: Identifiable, Hashable {
     }
 }
 
-// MARK: - Upload (attachments.rs upload_attachment)
+// MARK: - Upload (attachments.rs upload_attachment, PR #164 shape)
 
-/// Chunked upload straight to the host device's relay room: base64 the bytes,
-/// `UploadChunk {uploadId, seq, data}` per 60k-char slice (positional `seq`
-/// makes retries idempotent), then `UploadCommit {uploadId, fileName}` → the
-/// durable absolute path on the host.
-func uploadAttachmentChunked(relay: DeviceRelayClient, name: String, data: Data) async throws -> String {
+/// Concurrency-safe progress tally shared by the parallel chunk tasks.
+private final class UploadTally: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = 0
+
+    func add(_ bytes: Int) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        done += bytes
+        return done
+    }
+}
+
+/// Chunked upload straight to the host device's relay room: base64 slices as
+/// `UploadChunk {uploadId, seq, data}` — positional `seq` makes retries
+/// idempotent — 3 in flight at once, then `UploadCommit {uploadId, fileName}`
+/// → the durable absolute path on the host. The whole upload races a
+/// chunk-count-scaled deadline, and per-chunk retries stagger by seq so a
+/// window that failed together doesn't re-collide in lockstep.
+///
+/// The caller mints `uploadId`: on the queued flow the id is the persisted
+/// `pending://` ref's identity, and retries must re-commit the same file.
+/// Progress reports the fraction of committed binary bytes, clamped at 0.99 —
+/// the last point belongs to the commit.
+func uploadAttachmentChunked(relay: DeviceRelayClient, name: String, data: Data,
+                             uploadId: String? = nil,
+                             progress: (@MainActor @Sendable (Double) -> Void)? = nil) async throws -> String {
     struct OkReply: Decodable { var ok: Bool? }
     struct CommitReply: Decodable { var path: String }
 
-    let b64 = data.base64EncodedString()
-    let uploadId = UUID().uuidString.lowercased()
-    var start = b64.startIndex
-    var seq: UInt64 = 0
-    while start < b64.endIndex {
-        let end = b64.index(start, offsetBy: uploadChunkB64Chars, limitedBy: b64.endIndex) ?? b64.endIndex
-        let params: [String: Any] = ["uploadId": uploadId, "seq": seq, "data": String(b64[start..<end])]
-        // One transient blip must not abort a long upload; `seq` slots are
-        // idempotent engine-side, so a blind re-send is safe.
+    let id = uploadId ?? UUID().uuidString.lowercased()
+    // Slice the BINARY at a % 3 == 0 boundary (b64 chars / 4 * 3): each
+    // slice's independent base64 then concatenates to the whole file's.
+    let chunkBytes = uploadChunkB64Chars / 4 * 3
+    var ranges: [Range<Int>] = []
+    var offset = 0
+    // An empty file still sends one empty chunk (the commit needs the
+    // uploadId staged); an exact multiple gets no trailing empty chunk.
+    repeat {
+        let end = min(offset + chunkBytes, data.count)
+        ranges.append(offset..<end)
+        offset = end
+    } while offset < data.count
+
+    let tally = UploadTally()
+    let total = max(data.count, 1)
+
+    @Sendable func pushChunk(seq: Int, range: Range<Int>) async throws {
+        let slice = data.subdata(in: range).base64EncodedString()
+        // The whole first window shares the cold-dial allowance, not just
+        // seq 0 — its chunks all race the same handshake.
+        let timeout: UInt64 = seq < uploadConcurrency ? 90 : 30
         var attempt = 0
         while true {
             do {
-                let _: OkReply = try await relay.call(method: "UploadChunk", params: params,
-                                                      timeoutSeconds: seq == 0 ? 90 : 30)
+                let _: OkReply = try await relay.call(
+                    method: "UploadChunk",
+                    params: ["uploadId": id, "seq": seq, "data": slice],
+                    timeoutSeconds: timeout)
                 break
             } catch {
                 attempt += 1
-                if attempt > 2 { throw error }
+                guard attempt < 3 else { throw error }
+                // Degraded uploads must narrate (silent crawls read as hangs).
+                roomLog.warning("upload \(id, privacy: .public): chunk \(seq) attempt \(attempt) failed (\(error.localizedDescription, privacy: .public)); retrying")
+                try? await Task.sleep(nanoseconds: UInt64(50 * attempt * (seq + 1)) * 1_000_000)
             }
         }
-        start = end
-        seq += 1
+        let done = tally.add(range.count)
+        if let progress {
+            let fraction = min(Double(done) / Double(total), 0.99)
+            await progress(fraction)
+        }
     }
-    // Commit outlasts the engine's assemble + best-effort edge mirror.
-    let reply: CommitReply = try await relay.call(
-        method: "UploadCommit",
-        params: ["uploadId": uploadId, "fileName": name],
-        timeoutSeconds: 150)
-    return reply.path
+
+    let deadline = attachmentDeadlineSeconds(chunkCount: ranges.count)
+    return try await withThrowingTaskGroup(of: String?.self) { race in
+        race.addTask {
+            // 3-wide sliding window over the chunk list, then the commit
+            // (which outlasts the engine's assemble + best-effort mirror).
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var iterator = ranges.enumerated().makeIterator()
+                var launched = 0
+                while launched < uploadConcurrency, let (seq, range) = iterator.next() {
+                    group.addTask { try await pushChunk(seq: seq, range: range) }
+                    launched += 1
+                }
+                while try await group.next() != nil {
+                    if let (seq, range) = iterator.next() {
+                        group.addTask { try await pushChunk(seq: seq, range: range) }
+                    }
+                }
+            }
+            let reply: CommitReply = try await relay.call(
+                method: "UploadCommit",
+                params: ["uploadId": id, "fileName": name],
+                timeoutSeconds: 150)
+            return reply.path
+        }
+        race.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(deadline) * 1_000_000_000)
+            return nil  // deadline expired
+        }
+        defer { race.cancelAll() }
+        guard let path = try await race.next() ?? nil else {
+            roomLog.error("upload \(id, privacy: .public): exceeded the \(deadline)s deadline; failing the send")
+            throw RelayError.timeout
+        }
+        return path
+    }
 }
 
 // MARK: - Transcript image cache (attachments.rs image cache)

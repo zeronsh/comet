@@ -3,8 +3,8 @@
 //!
 //! Row model (docs/research/mugen-pretext.md §3):
 //! - one row per BLOCK: user message = one bubble row; assistant messages split
-//!   into one row per markdown top-level block, plus consecutive-tool groups and
-//!   input/error chips;
+//!   into one row per markdown top-level block, plus consecutive-tool groups
+//!   (agent/spawn chips split out so they never collapse) and input/error chips;
 //! - stable row ids `{msgId}#{partId}.{blockIx}` / `{msgId}#g{groupIx}` — LIVE
 //!   (streaming) entries split per block exactly like completed ones (the list
 //!   virtualizes them, so a fading live reply re-renders only its visible tail
@@ -80,6 +80,11 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
+/// Inner height of the chip header: [`CHIP_CARD_HEIGHT`] is the card's
+/// border-box (explicit `h` in gpui includes the 1px border), so a 30px
+/// header inside a 30px bordered card clips 2px off the bottom and every
+/// glyph/icon reads high (user report).
+const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
 
 /// Signed list scroll step for a pointer near a viewport edge.
 ///
@@ -285,6 +290,32 @@ pub struct ToolItem {
     /// per-delta header rewrites read as noise). Never rendered; still
     /// fingerprinted so an old doc's chips re-splice correctly.
     pub subagent_tail: Option<SharedString>,
+}
+
+/// Subagent spawn chips — the "Agent[: <description>]" Unknown convention
+/// every native driver uses, or any tool the engine has already bound to a
+/// subagent doc. These stay out of the collapsible "Called N tools" wrap so
+/// a running subagent is visible without opening the fold.
+fn is_agent_name(name: &str) -> bool {
+    name == "Agent" || name.starts_with("Agent: ")
+}
+
+fn is_agent_call(call: &ToolCall) -> bool {
+    match call {
+        ToolCall::Unknown { name, .. } => is_agent_name(name),
+        ToolCall::Mcp { tool, .. } => is_agent_name(tool),
+        _ => false,
+    }
+}
+
+fn is_agent_tool(item: &ToolItem) -> bool {
+    item.subagent_ref.is_some() || is_agent_call(&item.call)
+}
+
+/// Ordinary tool groups fold behind a summary header; agent/spawn chips
+/// render as their own always-open row.
+fn tool_group_collapses(tools: &[ToolItem]) -> bool {
+    tools.iter().any(|t| !is_agent_tool(t))
 }
 
 /// A chip's expandable detail payload.
@@ -750,7 +781,9 @@ pub fn rows_for_entry(
         }];
     }
 
-    // Assistant/system: split parts into block rows, folding consecutive tools.
+    // Assistant/system: split parts into block rows, folding consecutive
+    // ordinary tools. Agent/spawn chips flush into their own group so they
+    // never share a collapse with Reads/Runs.
     let last_part_ix = entry.parts.len().saturating_sub(1);
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
@@ -794,7 +827,7 @@ pub fn rows_for_entry(
                 subagent_tail,
                 ..
             } => {
-                pending_group.push(ToolItem {
+                let item = ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
@@ -807,7 +840,21 @@ pub fn rows_for_entry(
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
-                });
+                };
+                // Agent chips don't share a fold with ordinary tools: flush
+                // whenever the genus flips so each group is uniform.
+                if pending_group
+                    .first()
+                    .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_last_part_ix,
+                    );
+                }
+                pending_group.push(item);
                 group_last_part_ix = part_ix;
             }
             other => {
@@ -2884,8 +2931,7 @@ impl Transcript {
             // that isn't a real transfer position (2026-08-20 report: the
             // staging-only percent blinked out in ~100ms and lied about the
             // slow part).
-            let sending =
-                att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let upload_id = att
                 .path
                 .strip_prefix("pending://")
@@ -2949,9 +2995,7 @@ impl Transcript {
                                 cx,
                             ));
                             let indicator: AnyElement = match uploading {
-                                Some(pct) => {
-                                    crate::loaders::upload_progress_ring(pct, 34.0)
-                                }
+                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
                                 None => crate::loaders::mini_gradient_spinner(
                                     format!("att-sending-{row_id}-{aix}"),
                                     3.0,
@@ -3050,8 +3094,8 @@ impl Transcript {
             }
             let state = self.state.read(cx);
             let last = state.sub_transcript(doc_id).last()?;
-            let live = last.status == Some(MessageStatus::Streaming)
-                || last.role == MessageRole::User;
+            let live =
+                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
             if !live {
                 return None;
             }
@@ -3555,7 +3599,10 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
-        let open = fold.open.unwrap_or(auto_open);
+        // Agent/spawn chips never fold: they are their own row, always open,
+        // no "Called N tools" header — a running subagent stays visible.
+        let collapses = tool_group_collapses(tools);
+        let open = !collapses || fold.open.unwrap_or(auto_open);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -3714,6 +3761,7 @@ impl Transcript {
             .h(px(26.0))
             .cursor_pointer()
             .text_size(px(12.0))
+            .line_height(px(18.0))
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
@@ -3741,6 +3789,9 @@ impl Transcript {
             .child(
                 div()
                     .min_w_0()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
                     .truncate()
                     .child(SharedString::from(summary)),
             );
@@ -3773,6 +3824,7 @@ impl Transcript {
                                 frozen,
                             });
                         }),
+                        collapses,
                         theme,
                         cx.entity_id(),
                         cx,
@@ -3781,7 +3833,7 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, theme, cx.entity_id(), cx);
+                    return tool_chip(tool, collapses, theme, cx.entity_id(), cx);
                 }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
@@ -3817,7 +3869,7 @@ impl Transcript {
                 let group_key = row_id.clone();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
-                    .ml(px(12.0))
+                    .when(collapses, |el| el.ml(px(12.0)))
                     .min_w_0()
                     .flex_1()
                     .flex()
@@ -3830,6 +3882,10 @@ impl Transcript {
                     .child(
                         div()
                             .id(key.clone())
+                            .h(px(CHIP_HEADER_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let entry =
@@ -3929,14 +3985,17 @@ impl Transcript {
                     .flex()
                     .flex_row()
                     // Guide rail: no fixed height — stretches to the card,
-                    // detail included.
-                    .child(
-                        div()
-                            .ml(px(12.0))
-                            .w(px(1.0))
-                            .flex_none()
-                            .bg(crate::theme::ink(0.08)),
-                    )
+                    // detail included. Agent-only groups skip it (no header
+                    // chevron for the rail to sit under).
+                    .when(collapses, |row| {
+                        row.child(
+                            div()
+                                .ml(px(12.0))
+                                .w(px(1.0))
+                                .flex_none()
+                                .bg(crate::theme::ink(0.08)),
+                        )
+                    })
                     .child(card)
                     .into_any_element()
             }));
@@ -3946,12 +4005,16 @@ impl Transcript {
         // content growth never tween, and a SETTLED fold renders at its static
         // height: leaving the tween armed replayed it on every remount, which
         // in a virtualized list means every scroll-back-into-view (only `open`
-        // toggles animate — composes with the stick spring).
-        let animating = fold.epoch > 0
+        // toggles animate — composes with the stick spring). Agent groups skip
+        // the fold entirely (always open, no header).
+        let animating = collapses
+            && fold.epoch > 0
             && fold
                 .toggled_at
                 .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
-        let body: AnyElement = if animating {
+        let body: AnyElement = if !collapses {
+            chips.into_any_element()
+        } else if animating {
             let from = fold.from;
             div()
                 .overflow_hidden()
@@ -3973,7 +4036,7 @@ impl Transcript {
         div()
             .flex()
             .flex_col()
-            .child(header)
+            .when(collapses, |el| el.child(header))
             .child(body)
             .into_any_element()
     }
@@ -4203,11 +4266,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
-        // Subagent spawns (the "Agent[: <description>]" Unknown convention
-        // every native driver uses) carry the bot, matching their tab.
-        ToolCall::Unknown { name, .. } if name == "Agent" || name.starts_with("Agent: ") => {
-            crate::icons::BOT
-        }
+        call if is_agent_call(call) => crate::icons::BOT,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -4340,7 +4399,7 @@ fn chip_header_row(
         theme.text_muted
     };
     div()
-        .h(px(CHIP_CARD_HEIGHT))
+        .h(px(CHIP_HEADER_HEIGHT))
         .w_full()
         .min_w_0()
         .flex()
@@ -4349,6 +4408,7 @@ fn chip_header_row(
         .gap(px(8.0))
         .px(px(8.0))
         .text_size(px(12.0))
+        .line_height(px(18.0))
         .child(
             // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
             // icon size-3).
@@ -4369,6 +4429,9 @@ fn chip_header_row(
         .child(
             div()
                 .flex_none()
+                .h(px(18.0))
+                .flex()
+                .items_center()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(tint)
                 .child(SharedString::from(label)),
@@ -4377,6 +4440,9 @@ fn chip_header_row(
             div()
                 .flex_1()
                 .min_w_0()
+                .h(px(18.0))
+                .flex()
+                .items_center()
                 .truncate()
                 .text_color(if failed {
                     theme.danger
@@ -4499,9 +4565,11 @@ fn subagent_tab_title(call: &ToolCall) -> SharedString {
     "Subagent".into()
 }
 
-/// A plain (non-expandable) chip: guide rail + bordered card.
+/// A plain (non-expandable) chip: bordered card, plus the group guide rail
+/// when the chip lives under a collapsible header.
 fn tool_chip(
     tool: &ToolItem,
+    rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -4513,21 +4581,24 @@ fn tool_chip(
         .flex()
         .flex_row()
         .items_center()
-        // Guide rail: hairline centered under the header's chevron tile.
+        .when(rail, |row| {
+            row.child(
+                div()
+                    .ml(px(12.0))
+                    .h_full()
+                    .w(px(1.0))
+                    .flex_none()
+                    .bg(crate::theme::ink(0.08)),
+            )
+        })
         .child(
             div()
-                .ml(px(12.0))
-                .h_full()
-                .w(px(1.0))
-                .flex_none()
-                .bg(crate::theme::ink(0.08)),
-        )
-        .child(
-            div()
-                .ml(px(12.0))
+                .when(rail, |el| el.ml(px(12.0)))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
                 .flex_1()
+                .flex()
+                .items_center()
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
@@ -4541,11 +4612,13 @@ fn tool_chip(
 /// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
 /// "open the subagent tab" click (open-arrow tile in the trailing slot).
 /// No accordion — an inline body would only repeat the subagent's own
-/// transcript.
+/// transcript. The group guide rail is omitted for agent-only rows (no
+/// collapse header for it to hang from).
 fn subagent_chip(
     tool: &ToolItem,
     id: SharedString,
     on_open: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -4557,22 +4630,25 @@ fn subagent_chip(
         .flex()
         .flex_row()
         .items_center()
-        // Guide rail: hairline centered under the header's chevron tile.
-        .child(
-            div()
-                .ml(px(12.0))
-                .h_full()
-                .w(px(1.0))
-                .flex_none()
-                .bg(crate::theme::ink(0.08)),
-        )
+        .when(rail, |row| {
+            row.child(
+                div()
+                    .ml(px(12.0))
+                    .h_full()
+                    .w(px(1.0))
+                    .flex_none()
+                    .bg(crate::theme::ink(0.08)),
+            )
+        })
         .child(
             div()
                 .id(id)
-                .ml(px(12.0))
+                .when(rail, |el| el.ml(px(12.0)))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
                 .flex_1()
+                .flex()
+                .items_center()
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
@@ -5110,6 +5186,141 @@ mod tests {
         };
         assert_eq!(tools.len(), 2);
         assert!(rows[0].turn_start && !rows[1].turn_start);
+    }
+
+    fn agent_part(id: &str, description: &str) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: format!("Agent: {description}"),
+                input: Some(serde_json::json!({ "description": description })),
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: Some(format!("chat--sub--{id}")),
+            subagent_status: Some(SubagentStatus::Running),
+            subagent_tail: None,
+        }
+    }
+
+    #[test]
+    fn agent_calls_split_out_of_ordinary_tool_groups() {
+        // Agent/spawn chips must not share a collapse with Reads/Runs: a
+        // lone Agent used to hide behind "Called 1 tool", and a mixed
+        // group hid the running subagent until the user opened the fold.
+        let entry = assistant(
+            "m-agent",
+            MessageStatus::Complete,
+            vec![
+                text_part("t0", "before"),
+                tool_part("a", "ls"),
+                tool_part("b", "pwd"),
+                agent_part("s1", "Map URL import ingest path"),
+                tool_part("c", "make"),
+                agent_part("s2", "Audit the fold path"),
+                agent_part("s3", "Verify the commit cadence"),
+                text_part("t1", "after"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            [
+                "m-agent#t0.0",
+                "m-agent#g0",
+                "m-agent#g1",
+                "m-agent#g2",
+                "m-agent#g3",
+                "m-agent#t1.0",
+            ]
+        );
+
+        let RowKind::ToolGroup { tools, auto_open } = &rows[1].kind else {
+            panic!("ordinary group expected")
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(tool_group_collapses(tools));
+        assert!(!*auto_open);
+
+        let RowKind::ToolGroup { tools, .. } = &rows[2].kind else {
+            panic!("agent group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(!tool_group_collapses(tools));
+        assert!(is_agent_tool(&tools[0]));
+
+        let RowKind::ToolGroup { tools, .. } = &rows[3].kind else {
+            panic!("ordinary group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(tool_group_collapses(tools));
+
+        let RowKind::ToolGroup { tools, .. } = &rows[4].kind else {
+            panic!("consecutive agents share a group")
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(!tool_group_collapses(tools));
+        assert!(tools.iter().all(is_agent_tool));
+    }
+
+    #[test]
+    fn lone_completed_agent_stays_uncollapsed() {
+        let entry = assistant(
+            "m-lone",
+            MessageStatus::Complete,
+            vec![agent_part("s1", "scan repo")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        let RowKind::ToolGroup { tools, auto_open } = &rows[0].kind else {
+            panic!("agent group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(!tool_group_collapses(tools), "no 'Called 1 tool' wrap");
+        assert!(
+            !*auto_open,
+            "auto_open is a streaming flag; agent rows ignore it at paint"
+        );
+    }
+
+    #[test]
+    fn pre_spawn_agent_name_is_enough_to_split() {
+        // Before the engine stamps subagent_ref the chip is already named
+        // "Agent: …" — that genus must split, or the spawn hides until the
+        // first tagged event.
+        let mut part = agent_part("s1", "scan repo");
+        if let MessagePart::Tool {
+            subagent_ref,
+            subagent_status,
+            ..
+        } = &mut part
+        {
+            *subagent_ref = None;
+            *subagent_status = None;
+        }
+        let entry = assistant(
+            "m-pre",
+            MessageStatus::Complete,
+            vec![tool_part("a", "ls"), part],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!()
+        };
+        assert!(tool_group_collapses(tools));
+        let RowKind::ToolGroup { tools, .. } = &rows[1].kind else {
+            panic!()
+        };
+        assert!(!tool_group_collapses(tools));
+        assert!(is_agent_call(&tools[0].call));
     }
 
     #[test]

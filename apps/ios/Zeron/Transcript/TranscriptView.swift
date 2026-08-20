@@ -495,7 +495,7 @@ final class TranscriptBuilderCache {
     /// does — gate on the revision and hand back the same array.
     func rows(revision: UInt64,
               entries: [MessageEntry],
-              pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
+              pendingSends: [PendingSend]) -> [TranscriptRow] {
         if cachedRevision == revision { return cachedRows }
         cachedRows = TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
                                                parsers: &parsers, completed: &completed)
