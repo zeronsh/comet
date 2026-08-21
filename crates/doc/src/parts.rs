@@ -4,6 +4,7 @@
 //! `packages/session-doc/src/{render-parts,messages}.ts`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use zeron_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
 
@@ -480,7 +481,9 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
 /// Keeps: command / path / pattern / url / query / todo items / server+tool names.
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// For Mcp/Unknown inputs, keeps a light projection: structure survives but long
+/// string values are truncated, so details render without shipping heavy content.
+/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
@@ -497,17 +500,54 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
             url: url.clone(),
             prompt: None,
         },
-        ToolCall::Mcp { server, tool, .. } => ToolCall::Mcp {
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => ToolCall::Mcp {
             server: server.clone(),
             tool: tool.clone(),
-            input: None,
+            input: input.as_ref().map(light_input),
         },
-        ToolCall::Unknown { name, .. } => ToolCall::Unknown {
+        ToolCall::Unknown { name, input } => ToolCall::Unknown {
             name: name.clone(),
-            input: None,
+            input: input.as_ref().map(light_input),
         },
         other => other.clone(),
     }
+}
+
+/// Longest string value kept inside a light-projected tool input.
+const LIGHT_INPUT_STRING_LIMIT: usize = 200;
+/// Most entries kept per array/object level, so pathological payloads stay small.
+const LIGHT_INPUT_ENTRIES_LIMIT: usize = 20;
+
+fn light_input(value: &Value) -> Value {
+    match value {
+        Value::String(string) => Value::String(truncate_chars(string, LIGHT_INPUT_STRING_LIMIT)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(LIGHT_INPUT_ENTRIES_LIMIT)
+                .map(light_input)
+                .collect(),
+        ),
+        Value::Object(map) => map
+            .iter()
+            .take(LIGHT_INPUT_ENTRIES_LIMIT)
+            .map(|(key, value)| (key.clone(), light_input(value)))
+            .collect(),
+        other => other.clone(),
+    }
+}
+
+fn truncate_chars(string: &str, limit: usize) -> String {
+    if string.chars().count() <= limit {
+        return string.to_owned();
+    }
+    let mut truncated: String = string.chars().take(limit).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// Deterministic continuation id: `"{root}#c{n}"`.

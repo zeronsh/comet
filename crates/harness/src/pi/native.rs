@@ -245,9 +245,9 @@ fn pi_tool_call(tool_name: &str, args: &Value) -> ToolCall {
         "bash" => ToolCall::Exec {
             command: string(&["command", "cmd"]).unwrap_or_default(),
         },
-        "grep" | "search" => ToolCall::Search {
+        "grep" | "search" | "ffgrep" => ToolCall::Search {
             pattern: string(&["pattern", "query"]).unwrap_or_default(),
-            path: string(&["path", "dir"]),
+            path: string(&["path", "dir"]).filter(|p| !p.is_empty()),
         },
         "find" | "glob" => ToolCall::Glob {
             pattern: string(&["pattern"]).unwrap_or_default(),
@@ -361,6 +361,13 @@ fn transcript_path(result: &Value) -> Option<&str> {
                 .and_then(|paths| paths.get("transcriptPath"))
                 .and_then(Value::as_str)
         })
+}
+
+fn parsed_args(value: Value) -> Value {
+    match value {
+        Value::String(json) => serde_json::from_str(&json).unwrap_or_else(|_| json!({"value": json})),
+        value => value,
+    }
 }
 
 fn transcript_tool_args(record: &Value) -> Value {
@@ -743,7 +750,9 @@ impl Normalizer {
                         let id = tool.get("id").and_then(Value::as_str).unwrap_or("");
                         if !id.is_empty() && self.emitted_tools.insert(id.into()) {
                             let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
-                            let args = tool.get("arguments").cloned().unwrap_or(Value::Null);
+                            let args = parsed_args(
+                                tool.get("arguments").cloned().unwrap_or(Value::Null),
+                            );
                             output.push(AgentEvent::ToolCall {
                                 id: id.into(),
                                 call: pi_tool_call(name, &args),
@@ -765,7 +774,7 @@ impl Normalizer {
                         .unwrap_or("tool");
                     output.push(AgentEvent::ToolCall {
                         id: id.into(),
-                        call: pi_tool_call(name, &event["args"]),
+                        call: pi_tool_call(name, &parsed_args(event["args"].clone())),
                     });
                 }
             }
