@@ -286,13 +286,19 @@ impl FlipMorph {
 /// the two SOURCE geometries. The morph glides it instead of snapping.
 pub const CLUSTER_Y_DELTA: f32 = 2.5;
 
-/// The cluster's INTERNAL spacing is mode-independent in the source — it is
-/// ONE element (`clusterRef`: `gap-1` chips + `ml-1` attach) reused by both
-/// layouts, so inter-button distances never change across the flip (round 9:
-/// branch-specific gaps read as a horizontal compression pulse mid-morph).
+/// The cluster's INTERNAL geometry is mode-independent. Reasoning/service
+/// tier and attachment form one utility group; Send is a distinct primary
+/// action. Both layouts reuse these distances so the flip cannot create a
+/// horizontal compression pulse.
 /// Only the wrapper's right inset differs: `pr-2` (8) compact vs `px-3` (12)
 /// expanded — a whole-cluster 4px shift that glides with the morph.
 pub const CLUSTER_X_DELTA: f32 = 4.0;
+/// Optical join between the picker group and the paperclip. This is tighter
+/// than the structural spacing ladder because the narrow paperclip glyph
+/// otherwise looks farther away than its hit target actually is.
+pub const ACTION_UTILITY_GAP: f32 = 2.0;
+/// Structural separation between utility actions and the primary Send action.
+pub const ACTION_PRIMARY_GAP: f32 = Theme::SPACE_SM;
 
 /// The right inset for the in-flight morph: eases from the OLD mode's resting
 /// inset to the committed mode's (compact 8 ↔ expanded 12) — pairwise button
@@ -5856,11 +5862,11 @@ impl Render for Composer {
         let send_button = self.render_send_button(mode, cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
-        // the same strip. `ml-1` per the source cluster — chips→attach reads
-        // 8px (4 gap + 4 margin) in BOTH modes.
+        // the same strip. The parent action cluster owns the spacing: adding a
+        // second margin here made the picker→attachment gap twice as wide as
+        // attachment→send and made the paperclip look detached.
         let attach = div()
             .id("composer-attach")
-            .ml(px(4.0))
             .size(px(28.0))
             .flex_none()
             .flex()
@@ -5879,6 +5885,11 @@ impl Render for Composer {
             .child(
                 crate::icons::icon(crate::icons::PAPERCLIP)
                     .size(px(16.0))
+                    // The source path's painted bounds are centered at x=11
+                    // inside a 24px viewbox. Correct that optical offset while
+                    // keeping the 28px hit target geometrically centered.
+                    .relative()
+                    .left(px(1.0))
                     .text_color(theme.text_muted),
             );
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
@@ -5944,17 +5955,26 @@ impl Render for Composer {
                         .flex()
                         .flex_row()
                         .items_center()
-                        // Shared cluster metrics (see CLUSTER_X_DELTA): gap-1
-                        // internals identical to compact; only the right
-                        // inset (`px-3` 12) differs, and it GLIDES in from
-                        // the compact 8 so the buttons never step sideways.
-                        .gap(px(4.0))
+                        // Shared group geometry (see CLUSTER_X_DELTA): the
+                        // attachment belongs to the utility pickers, while
+                        // Send has a larger structural separation.
+                        .gap(px(ACTION_PRIMARY_GAP))
                         .pl(px(12.0))
                         .pr(px(morph_cluster_inset(true, morph_t)))
                         .pt(px(4.0))
                         .pb(px(10.0))
-                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
-                        .child(attach)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(ACTION_UTILITY_GAP))
+                                .child(self.pickers.clone())
+                                .child(attach),
+                        )
                         .child(send_button),
                 )
         } else {
@@ -5999,17 +6019,23 @@ impl Render for Composer {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                // Shared cluster metrics (`gap-1 pl-1 pr-2`,
-                                // zeron composer-actions.tsx): identical
-                                // internals to expanded; the right inset
-                                // glides 12→8 on collapse.
-                                .gap(px(4.0))
+                                // Same utility/primary grouping as expanded;
+                                // the right inset alone glides 12→8.
+                                .gap(px(ACTION_PRIMARY_GAP))
                                 .pl(px(4.0))
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(div().flex_none().child(self.pickers.clone()))
-                                .child(attach)
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(ACTION_UTILITY_GAP))
+                                        .child(self.pickers.clone())
+                                        .child(attach),
+                                )
                                 .child(send_button),
                         ),
                 )
@@ -6627,6 +6653,9 @@ mod tests {
 
     #[test]
     fn cluster_inset_glides_between_the_source_endpoints() {
+        assert_eq!(ACTION_UTILITY_GAP, 2.0);
+        assert_eq!(ACTION_PRIMARY_GAP, Theme::SPACE_SM);
+        assert!(ACTION_UTILITY_GAP < ACTION_PRIMARY_GAP);
         // The morph starts from the OLD mode's resting inset (no sideways
         // step at the commit) and eases to the committed mode's…
         assert_eq!(morph_cluster_inset(true, 0.0), 8.0); // expand: from compact pr-2
@@ -6640,8 +6669,8 @@ mod tests {
             assert!(v >= prev && v <= 8.0 + CLUSTER_X_DELTA);
             prev = v;
         }
-        // Internal spacing is SHARED between modes (one cluster in the
-        // source) — only this wrapper inset may differ across the flip.
+        // Internal group spacing is shared between modes — only this wrapper
+        // inset may differ across the flip.
     }
 
     #[test]

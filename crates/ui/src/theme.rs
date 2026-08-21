@@ -471,6 +471,10 @@ impl Theme {
     pub const SPACE_SM: f32 = 8.0;
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
+    /// Optical separation for a tightly coupled title/description stack.
+    /// This is intentionally outside the base spacing ladder: it corrects
+    /// line-box whitespace rather than separating layout regions.
+    pub const TEXT_STACK_GAP: f32 = 1.0;
 
     /// The frost tint painted over the blurred window background (macOS glass).
     /// Dark: darker than `surface`, matched to the reference vibrancy scrim
