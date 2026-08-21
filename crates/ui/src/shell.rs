@@ -3978,8 +3978,11 @@ impl Shell {
         let searching = !search_query.is_empty();
         let search_row = div()
             .flex_none()
-            .px(px(8.0))
-            .mb(px(2.0))
+            .h(px(34.0))
+            .mx(px(Theme::SPACE_SM))
+            .mt(px(Theme::SPACE_SM))
+            .mb(px(Theme::SPACE_XS))
+            .px(px(10.0))
             .flex()
             .flex_row()
             .items_center()
@@ -3990,7 +3993,6 @@ impl Shell {
                 crate::icons::icon(crate::icons::MAGNIFER)
                     .size(px(13.0))
                     .flex_none()
-                    .ml(px(4.0))
                     .text_color(if searching {
                         theme.text
                     } else {
@@ -4102,8 +4104,11 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            .child(filter_row)
+            // Search and project navigation are separate controls in the
+            // sidebar: search gets its own breathing room, while the project
+            // selector stays visually aligned with the session list below.
             .child(search_row)
+            .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
             // a true per-glyph gradient at active overflow edges. Glass-safe
             // (no painted overlay can fade content over see-through blur) and
