@@ -132,6 +132,10 @@ pub mod methods {
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
+    /// Local provider CLI/account status for Settings → Source Control.
+    pub const LIST_SOURCE_CONTROL_CONNECTIONS: &str = "ListSourceControlConnections";
+    /// Repository-wide pull requests from the configured source-control providers.
+    pub const LIST_PULL_REQUESTS: &str = "ListPullRequests";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
