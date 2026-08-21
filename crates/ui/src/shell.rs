@@ -3545,9 +3545,9 @@ impl Shell {
                 .hover(|s| s.bg(crate::theme::wash(0.18)))
                 .child(
                     icon(if archived {
-                        icons::ARCHIVE_UP_MINIMALISTIC
+                        icons::UNDO
                     } else {
-                        icons::ARCHIVE_MINIMALISTIC
+                        icons::CHECK
                     })
                     .size(px(11.0))
                     .flex_none()
@@ -5017,7 +5017,7 @@ impl Shell {
                             this.set_chat_settled(unsettle_id.clone(), false, cx)
                         }))
                         .child(
-                            icon(icons::ARCHIVE_UP_MINIMALISTIC)
+                            icon(icons::UNDO)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
@@ -5036,7 +5036,7 @@ impl Shell {
                             this.set_chat_settled(settle_id.clone(), true, cx)
                         }))
                         .child(
-                            icon(icons::ARCHIVE_MINIMALISTIC)
+                            icon(icons::CHECK)
                                 .size(px(16.0))
                                 .text_color(theme.text_muted),
                         )
