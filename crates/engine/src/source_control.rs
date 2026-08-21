@@ -3,25 +3,582 @@
 //! Process execution and provider calls intentionally live outside this layer so
 //! remote parsing and head selector construction remain deterministic and testable.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::Mutex;
 
-use zeron_proto::{ChangeRequestState, ChangeRequestSummary};
+use zeron_proto::{
+    ChangeRequestState, ChangeRequestSummary, PullRequestChecksState, PullRequestListItem,
+    PullRequestReviewState, SourceControlConnection, Space,
+};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
-const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
+const PULL_REQUEST_RESULT_LIMIT: &str = "50";
+const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner,author";
+const GITHUB_LIST_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner,author,isDraft,reviewDecision,statusCheckRollup,body,additions,deletions,changedFiles";
+const PULL_REQUEST_CACHE_TTL: Duration = Duration::from_secs(60);
+const PULL_REQUEST_CACHE_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PullRequestFetchState {
+    #[default]
+    Open,
+    All,
+    Closed,
+    Merged,
+}
+
+impl PullRequestFetchState {
+    fn github_arg(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::All => "all",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+
+    fn bitbucket_states(self) -> &'static [&'static str] {
+        match self {
+            Self::Open => &["OPEN"],
+            Self::All => &["OPEN", "MERGED", "DECLINED"],
+            Self::Closed => &["DECLINED"],
+            Self::Merged => &["MERGED"],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PullRequestListOptions {
+    pub state: PullRequestFetchState,
+    pub authored: bool,
+    pub host: Option<String>,
+    pub project: Option<String>,
+    pub refresh: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PullRequestCacheKey {
+    provider: String,
+    repository: String,
+    state: PullRequestFetchState,
+    authored: bool,
+}
+
+impl PullRequestCacheKey {
+    fn new(
+        provider: impl Into<String>,
+        repository: impl Into<String>,
+        state: PullRequestFetchState,
+        authored: bool,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            repository: repository.into(),
+            state,
+            authored,
+        }
+    }
+}
+
+struct PullRequestCacheEntry {
+    fetched_at: Instant,
+    items: Vec<PullRequestListItem>,
+}
+
+#[derive(Clone, Default)]
+pub struct PullRequestCache {
+    entries: Arc<Mutex<HashMap<PullRequestCacheKey, PullRequestCacheEntry>>>,
+    bitbucket_user: Arc<Mutex<Option<(Instant, String, Option<BitbucketUser>)>>>,
+}
+
+impl PullRequestCache {
+    async fn bitbucket_user(
+        &self,
+        client: &reqwest::Client,
+        email: &str,
+        token: &str,
+    ) -> Option<BitbucketUser> {
+        let mut cached = self.bitbucket_user.lock().await;
+        if let Some((fetched_at, cached_email, user)) = cached.as_ref()
+            && cached_email == email
+            && fetched_at.elapsed() < PULL_REQUEST_CACHE_TTL
+        {
+            return user.clone();
+        }
+        let user = bitbucket_user(client, email, token).await;
+        *cached = Some((Instant::now(), email.to_owned(), user.clone()));
+        user
+    }
+
+    async fn get_or_fetch<F, Fut>(
+        &self,
+        key: PullRequestCacheKey,
+        refresh: bool,
+        fetch: F,
+    ) -> Option<Vec<PullRequestListItem>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<Vec<PullRequestListItem>>>,
+    {
+        let mut entries = self.entries.lock().await;
+        if !refresh
+            && let Some(entry) = entries.get(&key)
+            && entry.fetched_at.elapsed() < PULL_REQUEST_CACHE_TTL
+        {
+            return Some(entry.items.clone());
+        }
+
+        let items = fetch().await?;
+        if entries.len() >= PULL_REQUEST_CACHE_CAPACITY
+            && let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest);
+        }
+        entries.insert(
+            key,
+            PullRequestCacheEntry {
+                fetched_at: Instant::now(),
+                items: items.clone(),
+            },
+        );
+        Some(items)
+    }
+}
+
+/// Probe the two source-control providers currently supported by the UI.
+/// GitHub authentication stays in the provider's own CLI; Bitbucket API
+/// credentials are read from the process environment and never persisted.
+pub async fn list_connections() -> Vec<SourceControlConnection> {
+    let runner: Arc<dyn ProcessRunner> = Arc::new(SystemProcessRunner);
+    vec![
+        probe_connection(
+            runner,
+            "github",
+            "GitHub",
+            "gh",
+            &["auth", "status", "--hostname", "github.com"],
+            &["--version"],
+            "gh auth login",
+        )
+        .await,
+        probe_bitbucket_connection().await,
+    ]
+}
+
+/// List pull requests for Git workspaces hosted on this device.
+/// Provider failures are isolated per repository so one disconnected provider
+/// does not hide results from the others.
+pub async fn list_pull_requests(
+    spaces: &[Space],
+    device_id: &str,
+    options: &PullRequestListOptions,
+    cache: &PullRequestCache,
+) -> Vec<PullRequestListItem> {
+    let runner: Arc<dyn ProcessRunner> = Arc::new(SystemProcessRunner);
+    let github = GitHubCli::with_runner(runner);
+    let bitbucket = bitbucket_credentials();
+    let bitbucket_client = bitbucket.as_ref().and_then(|_| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .ok()
+    });
+    let bitbucket_user = match (options.authored, &bitbucket, &bitbucket_client) {
+        (true, Some((token, email)), Some(client)) => {
+            cache.bitbucket_user(client, email, token).await
+        }
+        _ => None,
+    };
+
+    let mut pull_requests = Vec::new();
+    for path in pull_request_paths(spaces, device_id) {
+        let Some(remote_url) = git_remote_url(&path).await else {
+            continue;
+        };
+        let Some(remote) = parse_git_remote(&remote_url) else {
+            continue;
+        };
+        let repository = format!("{}/{}", remote.owner, remote.repository);
+        let provider = match remote.host.as_str() {
+            "github.com" => "github",
+            "bitbucket.org" => "bitbucket",
+            _ => "",
+        };
+        if options.host.as_deref().is_some_and(|host| host != provider)
+            || options
+                .project
+                .as_deref()
+                .is_some_and(|project| project != repository)
+        {
+            continue;
+        }
+        match remote.host.as_str() {
+            "github.com" => {
+                let key = PullRequestCacheKey::new(
+                    "github",
+                    &repository,
+                    options.state,
+                    options.authored,
+                );
+                let checkout_path = path.to_string_lossy().into_owned();
+                let repository_for_fetch = repository.clone();
+                let github = github.clone();
+                if let Some(items) = cache
+                    .get_or_fetch(key, options.refresh, move || async move {
+                        github
+                            .list_for_repository(
+                                &checkout_path,
+                                &repository_for_fetch,
+                                options.state,
+                                options.authored,
+                            )
+                            .await
+                            .ok()
+                            .map(|items| {
+                                items
+                                    .into_iter()
+                                    .filter_map(|item| {
+                                        pull_request_list_item(
+                                            "github",
+                                            &repository_for_fetch,
+                                            item,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                    })
+                    .await
+                {
+                    pull_requests.extend(items);
+                }
+            }
+            "bitbucket.org" => {
+                if let (Some((token, email)), Some(client)) = (&bitbucket, &bitbucket_client) {
+                    let key = PullRequestCacheKey::new(
+                        "bitbucket",
+                        &repository,
+                        options.state,
+                        options.authored,
+                    );
+                    let workspace = remote.owner.clone();
+                    let repository_name = remote.repository.clone();
+                    let repository_for_fetch = repository.clone();
+                    let email = email.clone();
+                    let token = token.clone();
+                    let current_user = bitbucket_user.clone();
+                    if let Some(items) = cache
+                        .get_or_fetch(key, options.refresh, move || async move {
+                            list_bitbucket_pull_requests(
+                                client,
+                                &workspace,
+                                &repository_name,
+                                &email,
+                                &token,
+                                current_user.as_ref(),
+                                options.state,
+                                options.authored,
+                            )
+                            .await
+                            .ok()
+                            .map(|items| {
+                                items
+                                    .into_iter()
+                                    .filter_map(|item| {
+                                        bitbucket_pull_request_list_item(
+                                            "bitbucket",
+                                            &repository_for_fetch,
+                                            item,
+                                        )
+                                    })
+                                    .collect()
+                            })
+                        })
+                        .await
+                    {
+                        pull_requests.extend(items);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    pull_requests.sort_by(|left, right| {
+        left.repository
+            .cmp(&right.repository)
+            .then_with(|| right.number.cmp(&left.number))
+    });
+    pull_requests
+}
+
+fn pull_request_paths(spaces: &[Space], device_id: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for space in spaces.iter().filter(|space| space.device_id == device_id) {
+        let root = PathBuf::from(&space.path);
+        if space.git_detected || root.join(".git").exists() {
+            paths.push(root.clone());
+        }
+
+        // A project can be a containing folder rather than the checkout root
+        // itself (for example, `reception-assistant/reception-assistant`).
+        // The project picker intentionally allows those folders, so inspect
+        // their direct children for Git checkouts before giving up on PRs.
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join(".git").exists() {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+async fn git_remote_url(path: &Path) -> Option<String> {
+    let remotes = tokio::process::Command::new("git")
+        .args(["remote"])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !remotes.status.success() {
+        return None;
+    }
+    let remotes = String::from_utf8_lossy(&remotes.stdout);
+    let remote = remotes
+        .lines()
+        .map(str::trim)
+        .find(|remote| *remote == "origin")
+        .or_else(|| {
+            remotes
+                .lines()
+                .map(str::trim)
+                .find(|remote| !remote.is_empty())
+        })?;
+    let push = tokio::process::Command::new("git")
+        .args(["remote", "get-url", "--push", remote])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if push.status.success() {
+        return Some(String::from_utf8_lossy(&push.stdout).trim().to_owned());
+    }
+    let fetch = tokio::process::Command::new("git")
+        .args(["remote", "get-url", remote])
+        .current_dir(path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    fetch
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&fetch.stdout).trim().to_owned())
+}
+
+/// Bitbucket does not have a supported local CLI for this integration. Use
+/// Bitbucket's API-token basic-auth flow instead, with credentials supplied by
+/// the process environment and never persisted by the app.
+async fn probe_bitbucket_connection() -> SourceControlConnection {
+    let credentials = match bitbucket_credentials() {
+        Some((token, email)) => (token, email),
+        _ => {
+            return SourceControlConnection {
+                provider: "bitbucket".into(),
+                name: "Bitbucket".into(),
+                connected: false,
+                account: None,
+                cli_version: None,
+                detail: "Set BITBUCKET_API_TOKEN and BITBUCKET_EMAIL in the app environment".into(),
+            };
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return bitbucket_connection_error("Could not initialize Bitbucket API client"),
+    };
+    let response = match client
+        .get("https://api.bitbucket.org/2.0/user")
+        .basic_auth(credentials.1, Some(credentials.0))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return bitbucket_connection_error("Could not reach the Bitbucket API"),
+    };
+    if !response.status().is_success() {
+        return bitbucket_connection_error("Bitbucket rejected the API credentials");
+    }
+    let account = response
+        .json::<BitbucketUser>()
+        .await
+        .ok()
+        .and_then(|user| user.display_name.or(user.nickname).or(user.username));
+    SourceControlConnection {
+        provider: "bitbucket".into(),
+        name: "Bitbucket".into(),
+        connected: true,
+        account,
+        cli_version: None,
+        detail: "Authenticated via Bitbucket API token".into(),
+    }
+}
+
+fn bitbucket_connection_error(detail: &str) -> SourceControlConnection {
+    SourceControlConnection {
+        provider: "bitbucket".into(),
+        name: "Bitbucket".into(),
+        connected: false,
+        account: None,
+        cli_version: None,
+        detail: detail.into(),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BitbucketUser {
+    uuid: Option<String>,
+    display_name: Option<String>,
+    nickname: Option<String>,
+    username: Option<String>,
+}
+
+fn bitbucket_credentials() -> Option<(String, String)> {
+    let token = std::env::var("BITBUCKET_API_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let email = std::env::var("BITBUCKET_EMAIL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    Some((token, email))
+}
+
+async fn bitbucket_user(
+    client: &reqwest::Client,
+    email: &str,
+    token: &str,
+) -> Option<BitbucketUser> {
+    client
+        .get("https://api.bitbucket.org/2.0/user")
+        .basic_auth(email, Some(token))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+async fn probe_connection(
+    runner: Arc<dyn ProcessRunner>,
+    provider: &str,
+    name: &str,
+    program: &str,
+    auth_args: &[&str],
+    version_args: &[&str],
+    login_command: &str,
+) -> SourceControlConnection {
+    let cwd = PathBuf::from(".");
+    let env = if program == "gh" {
+        vec![("GH_PROMPT_DISABLED".into(), "1".into())]
+    } else {
+        Vec::new()
+    };
+    let auth = runner
+        .run(ProcessRequest {
+            program: program.into(),
+            args: auth_args.iter().map(|arg| (*arg).into()).collect(),
+            cwd: cwd.clone(),
+            env: env.clone(),
+            timeout: Duration::from_secs(8),
+            output_limit: 64 * 1024,
+        })
+        .await;
+    let connected = auth.as_ref().is_ok_and(|output| output.success);
+    let combined = auth
+        .as_ref()
+        .map(|output| {
+            format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+        .unwrap_or_default();
+    let account = connected.then(|| account_from_status(&combined)).flatten();
+    let cli_version = runner
+        .run(ProcessRequest {
+            program: program.into(),
+            args: version_args.iter().map(|arg| (*arg).into()).collect(),
+            cwd,
+            env,
+            timeout: Duration::from_secs(4),
+            output_limit: 16 * 1024,
+        })
+        .await
+        .ok()
+        .filter(|output| output.success)
+        .and_then(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.lines()
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+        });
+    SourceControlConnection {
+        provider: provider.into(),
+        name: name.into(),
+        connected,
+        account,
+        cli_version,
+        detail: if connected {
+            "Connected on this device".into()
+        } else {
+            format!("Not connected — run {login_command}")
+        },
+    }
+}
+
+fn account_from_status(status: &str) -> Option<String> {
+    let lower = status.to_ascii_lowercase();
+    let marker = " account ";
+    let start = lower.find(marker)? + marker.len();
+    let account = status[start..]
+        .split_whitespace()
+        .next()?
+        .trim_matches(['\'', '"', '`', '(', ')', ',']);
+    (!account.is_empty()).then(|| account.to_owned())
+}
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +777,48 @@ impl GitHubCli {
             output_limit: GITHUB_OUTPUT_LIMIT,
         };
         let output = self.runner.run(request).await.map_err(classify_run_error)?;
+        if !output.success {
+            return Err(classify_github_failure(&output.stderr));
+        }
+        if output.stdout_truncated {
+            return Err(ChangeRequestError::Decode);
+        }
+        serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)
+    }
+
+    async fn list_for_repository(
+        &self,
+        checkout_path: &str,
+        repository: &str,
+        state: PullRequestFetchState,
+        authored: bool,
+    ) -> Result<Vec<GhPullRequest>, ChangeRequestError> {
+        let mut args = vec![
+            "pr".into(),
+            "list".into(),
+            "--repo".into(),
+            repository.into(),
+            "--state".into(),
+            state.github_arg().into(),
+            "--limit".into(),
+            PULL_REQUEST_RESULT_LIMIT.into(),
+        ];
+        if authored {
+            args.extend(["--author".into(), "@me".into()]);
+        }
+        args.extend(["--json".into(), GITHUB_LIST_JSON_FIELDS.into()]);
+        let output = self
+            .runner
+            .run(ProcessRequest {
+                program: "gh".into(),
+                args,
+                cwd: PathBuf::from(checkout_path),
+                env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
+                timeout: GITHUB_TIMEOUT,
+                output_limit: GITHUB_OUTPUT_LIMIT,
+            })
+            .await
+            .map_err(classify_run_error)?;
         if !output.success {
             return Err(classify_github_failure(&output.stderr));
         }
@@ -623,6 +1222,30 @@ struct GhPullRequest {
     updated_at: DateTime<Utc>,
     is_cross_repository: bool,
     head_repository_owner: GhRepositoryOwner,
+    #[serde(default)]
+    author: Option<GhPullRequestAuthor>,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    review_decision: Option<String>,
+    #[serde(default)]
+    status_check_rollup: Vec<GhCheckStatus>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    additions: u64,
+    #[serde(default)]
+    deletions: u64,
+    #[serde(default)]
+    changed_files: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhCheckStatus {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -646,6 +1269,232 @@ impl From<GhPullRequestState> for ChangeRequestState {
 #[derive(Debug, Deserialize)]
 struct GhRepositoryOwner {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPullRequestAuthor {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketPullRequestsResponse {
+    values: Vec<BitbucketPullRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketPullRequest {
+    id: u64,
+    title: String,
+    state: String,
+    links: BitbucketPullRequestLinks,
+    source: BitbucketBranchContainer,
+    destination: BitbucketBranchContainer,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    author: Option<BitbucketUser>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    diffstat: Option<BitbucketDiffstat>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BitbucketDiffstat {
+    #[serde(default)]
+    lines_added: u64,
+    #[serde(default)]
+    lines_removed: u64,
+    #[serde(default)]
+    files_changed: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketPullRequestLinks {
+    html: BitbucketHref,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketHref {
+    href: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketBranchContainer {
+    branch: Option<BitbucketBranch>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketBranch {
+    name: String,
+}
+
+async fn list_bitbucket_pull_requests(
+    client: &reqwest::Client,
+    workspace: &str,
+    repository: &str,
+    email: &str,
+    token: &str,
+    current_user: Option<&BitbucketUser>,
+    state: PullRequestFetchState,
+    authored: bool,
+) -> Result<Vec<BitbucketPullRequest>, ()> {
+    let url =
+        format!("https://api.bitbucket.org/2.0/repositories/{workspace}/{repository}/pullrequests");
+    let mut query: Vec<(&str, String)> = state
+        .bitbucket_states()
+        .iter()
+        .map(|state| ("state", (*state).to_owned()))
+        .collect();
+    query.push(("pagelen", PULL_REQUEST_RESULT_LIMIT.to_owned()));
+    if authored {
+        let Some(uuid) = current_user.and_then(|user| user.uuid.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        query.push(("q", format!("author.uuid=\"{uuid}\"")));
+    }
+    let response = client
+        .get(url)
+        .query(&query)
+        .basic_auth(email, Some(token))
+        .send()
+        .await
+        .map_err(|_| ())?
+        .error_for_status()
+        .map_err(|_| ())?
+        .json::<BitbucketPullRequestsResponse>()
+        .await
+        .map_err(|_| ())?;
+    let mut values = response.values;
+    if authored {
+        let Some(uuid) = current_user.and_then(|user| user.uuid.as_deref()) else {
+            return Ok(Vec::new());
+        };
+        values.retain(|item| {
+            item.author
+                .as_ref()
+                .and_then(|author| author.uuid.as_deref())
+                .is_some_and(|author_uuid| author_uuid == uuid)
+        });
+    }
+    Ok(values)
+}
+
+fn pull_request_list_item(
+    provider: &str,
+    repository: &str,
+    pull_request: GhPullRequest,
+) -> Option<PullRequestListItem> {
+    let url = reqwest::Url::parse(pull_request.url.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(PullRequestListItem {
+        provider: provider.into(),
+        repository: repository.into(),
+        number: pull_request.number,
+        title: pull_request.title,
+        url: url.to_string(),
+        state: pull_request.state.into(),
+        base_ref: pull_request.base_ref_name,
+        head_ref: pull_request.head_ref_name,
+        draft: pull_request.is_draft,
+        review: github_review_state(pull_request.review_decision.as_deref()),
+        checks: github_checks_state(&pull_request.status_check_rollup),
+        author: pull_request.author.map(|author| author.login),
+        description: pull_request.body,
+        additions: pull_request.additions,
+        deletions: pull_request.deletions,
+        changed_files: pull_request.changed_files,
+    })
+}
+
+fn bitbucket_pull_request_list_item(
+    provider: &str,
+    repository: &str,
+    pull_request: BitbucketPullRequest,
+) -> Option<PullRequestListItem> {
+    let url = reqwest::Url::parse(pull_request.links.html.href.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let base_ref = pull_request.destination.branch?.name;
+    let head_ref = pull_request.source.branch?.name;
+    if pull_request.title.trim().is_empty()
+        || base_ref.trim().is_empty()
+        || head_ref.trim().is_empty()
+    {
+        return None;
+    }
+    let state = match pull_request.state.to_ascii_uppercase().as_str() {
+        "OPEN" => ChangeRequestState::Open,
+        "MERGED" => ChangeRequestState::Merged,
+        _ => ChangeRequestState::Closed,
+    };
+    let diffstat = pull_request.diffstat.unwrap_or_default();
+    Some(PullRequestListItem {
+        provider: provider.into(),
+        repository: repository.into(),
+        number: pull_request.id,
+        title: pull_request.title,
+        url: url.to_string(),
+        state,
+        base_ref,
+        head_ref,
+        draft: pull_request.draft,
+        review: PullRequestReviewState::None,
+        checks: PullRequestChecksState::None,
+        author: pull_request
+            .author
+            .and_then(|author| author.display_name.or(author.nickname).or(author.username)),
+        description: pull_request.description,
+        additions: diffstat.lines_added,
+        deletions: diffstat.lines_removed,
+        changed_files: diffstat.files_changed,
+    })
+}
+
+fn github_review_state(decision: Option<&str>) -> PullRequestReviewState {
+    match decision.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "APPROVED" => PullRequestReviewState::Approved,
+        "CHANGES_REQUESTED" => PullRequestReviewState::ChangesRequested,
+        "REVIEW_REQUIRED" => PullRequestReviewState::Required,
+        _ => PullRequestReviewState::None,
+    }
+}
+
+fn github_checks_state(checks: &[GhCheckStatus]) -> PullRequestChecksState {
+    if checks.is_empty() {
+        return PullRequestChecksState::None;
+    }
+    let mut pending = false;
+    let mut failing = false;
+    for check in checks {
+        let conclusion = check
+            .conclusion
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(
+            conclusion.as_str(),
+            "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+        ) {
+            failing = true;
+        } else if check
+            .status
+            .as_deref()
+            .is_none_or(|status| status != "COMPLETED")
+        {
+            pending = true;
+        }
+    }
+    if failing {
+        PullRequestChecksState::Failing
+    } else if pending {
+        PullRequestChecksState::Pending
+    } else {
+        PullRequestChecksState::Passing
+    }
 }
 
 /// The default branch only matters to suppress historical terminal pull
@@ -855,6 +1704,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
+    use tempfile::tempdir;
+
     use super::*;
 
     #[derive(Default)]
@@ -948,6 +1799,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pull_request_paths_use_local_git_spaces() {
+        let spaces = vec![zeron_proto::Space {
+            id: "space-1".into(),
+            device_id: "device-1".into(),
+            path: "/workspace/project".into(),
+            name: None,
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        }];
+
+        assert_eq!(
+            pull_request_paths(&spaces, "device-1"),
+            vec![PathBuf::from("/workspace/project")]
+        );
+    }
+
+    #[test]
+    fn pull_request_paths_find_a_git_checkout_nested_in_a_project_folder() {
+        let root = tempdir().expect("temporary project folder");
+        let checkout = root.path().join("reception-assistant");
+        std::fs::create_dir_all(&checkout).expect("nested checkout directory");
+        run_git(&checkout, &["init", "--quiet"]);
+
+        let spaces = vec![zeron_proto::Space {
+            id: "space-1".into(),
+            device_id: "device-1".into(),
+            path: root.path().display().to_string(),
+            name: Some("reception-assistant".into()),
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        }];
+
+        assert_eq!(
+            pull_request_paths(&spaces, "device-1"),
+            vec![checkout],
+            "PR discovery should inspect the checkout nested in a project folder"
+        );
+    }
+
     fn pull_request(
         number: u64,
         state: &str,
@@ -1023,6 +1918,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_repository_listing_uses_requested_state() {
+        let runner = FakeProcessRunner::with_responses([command_success(b"[]".to_vec())]);
+        let github = GitHubCli::with_runner(runner.clone());
+
+        github
+            .list_for_repository(
+                "/checkout",
+                "acme/zeron",
+                PullRequestFetchState::Open,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = runner.requests();
+        assert_eq!(
+            requests[0].args,
+            [
+                "pr",
+                "list",
+                "--repo",
+                "acme/zeron",
+                "--state",
+                "open",
+                "--limit",
+                PULL_REQUEST_RESULT_LIMIT,
+                "--json",
+                GITHUB_LIST_JSON_FIELDS,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_cache_reuses_fresh_results() {
+        let cache = PullRequestCache::default();
+        let key =
+            PullRequestCacheKey::new("github", "acme/zeron", PullRequestFetchState::Open, false);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let first = cache
+            .get_or_fetch(key.clone(), false, {
+                let calls = calls.clone();
+                move || async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(Vec::new())
+                }
+            })
+            .await;
+        let second = cache
+            .get_or_fetch(key, false, {
+                let calls = calls.clone();
+                move || async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(Vec::new())
+                }
+            })
+            .await;
+
+        assert_eq!(first, Some(Vec::new()));
+        assert_eq!(second, Some(Vec::new()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let refreshed = cache
+            .get_or_fetch(
+                PullRequestCacheKey::new(
+                    "github",
+                    "acme/zeron",
+                    PullRequestFetchState::Open,
+                    false,
+                ),
+                true,
+                {
+                    let calls = calls.clone();
+                    move || async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Some(Vec::new())
+                    }
+                },
+            )
+            .await;
+        assert_eq!(refreshed, Some(Vec::new()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn repository_listing_requests_all_fields_required_by_decoder() {
+        for field in [
+            "updatedAt",
+            "isCrossRepository",
+            "headRepositoryOwner",
+            "isDraft",
+            "reviewDecision",
+            "statusCheckRollup",
+        ] {
+            assert!(
+                GITHUB_LIST_JSON_FIELDS
+                    .split(',')
+                    .any(|candidate| candidate == field),
+                "repository listing is missing {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn real_git_checkout_resolves_through_host_fake_gh() {
         let temp = tempfile::tempdir().expect("fixture tempdir");
         let checkout = temp.path().join("checkout");
@@ -1037,6 +2036,10 @@ mod tests {
                 "origin",
                 "https://github.com/acme/zeron.git",
             ],
+        );
+        assert_eq!(
+            git_remote_url(&checkout).await.as_deref(),
+            Some("https://github.com/acme/zeron.git")
         );
 
         let fake_gh = temp.path().join("gh");
