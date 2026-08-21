@@ -379,6 +379,67 @@ pub struct ChangeRequestSummary {
     pub head_ref: String,
 }
 
+/// One repository-wide pull request returned by the source-control list view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestListItem {
+    pub provider: String,
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: ChangeRequestState,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub draft: bool,
+    pub review: PullRequestReviewState,
+    pub checks: PullRequestChecksState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    #[serde(default)]
+    pub changed_files: u64,
+}
+
+/// Review status normalized across source-control providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestReviewState {
+    None,
+    Approved,
+    ChangesRequested,
+    Required,
+}
+
+/// Checks status normalized across source-control providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestChecksState {
+    None,
+    Passing,
+    Failing,
+    Pending,
+}
+
+/// Local source-control CLI/account status shown by Settings → Source Control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceControlConnection {
+    pub provider: String,
+    pub name: String,
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    pub detail: String,
+}
+
 /// Latest successful change request resolution for one checkout and branch.
 ///
 /// `change_request: None` is an authoritative successful lookup with no match;

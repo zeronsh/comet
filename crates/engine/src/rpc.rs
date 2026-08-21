@@ -409,6 +409,7 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    source_control_cache: crate::source_control::PullRequestCache,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
@@ -429,6 +430,7 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        source_control_cache: crate::source_control::PullRequestCache,
         workspace_scope: WorkspaceScope,
     ) -> Self {
         let engine_info = EngineInfo {
@@ -446,6 +448,7 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            source_control_cache,
             auth: None,
             links: None,
             updater: None,
@@ -934,6 +937,8 @@ fn forwardable(method: &str) -> bool {
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
+            | methods::LIST_SOURCE_CONTROL_CONNECTIONS
+            | methods::LIST_PULL_REQUESTS
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
@@ -1362,6 +1367,57 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?
                     .filter_map(|status| async move { serde_json::to_value(status).ok() });
                 Ok(RpcReply::Stream(stream.boxed()))
+            }
+            methods::LIST_SOURCE_CONTROL_CONNECTIONS => {
+                let connections = crate::source_control::list_connections().await;
+                RpcReply::value(&connections)
+            }
+            methods::LIST_PULL_REQUESTS => {
+                #[derive(Debug, Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    #[serde(default)]
+                    state: Option<String>,
+                    #[serde(default)]
+                    authored: bool,
+                    #[serde(default)]
+                    host: Option<String>,
+                    #[serde(default)]
+                    project: Option<String>,
+                    #[serde(default)]
+                    refresh: bool,
+                }
+                let p: Params = parse_params(params)?;
+                let state = match p.state.as_deref().unwrap_or("open") {
+                    "open" => crate::source_control::PullRequestFetchState::Open,
+                    "all" => crate::source_control::PullRequestFetchState::All,
+                    "closed" => crate::source_control::PullRequestFetchState::Closed,
+                    "merged" => crate::source_control::PullRequestFetchState::Merged,
+                    _ => {
+                        return Err(RpcError::BadParams(
+                            "state must be open, all, closed, or merged".into(),
+                        ));
+                    }
+                };
+                let options = crate::source_control::PullRequestListOptions {
+                    state,
+                    authored: p.authored,
+                    host: p.host,
+                    project: p.project,
+                    refresh: p.refresh,
+                };
+                let spaces = self
+                    .workspace
+                    .read_spaces()
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let pull_requests = crate::source_control::list_pull_requests(
+                    &spaces,
+                    self.doc_host.device_id(),
+                    &options,
+                    &self.source_control_cache,
+                )
+                .await;
+                RpcReply::value(&pull_requests)
             }
             // One-shot scoped capture for the Changes pane: `branch` diffs the
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the

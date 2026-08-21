@@ -127,6 +127,7 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    pub source_control_cache: source_control::PullRequestCache,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
@@ -295,6 +296,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            source_control_cache: source_control::PullRequestCache::default(),
             local_import,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
@@ -423,6 +425,7 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.source_control_cache.clone(),
             self.workspace_scope,
         )
         .with_auth(self.auth());
