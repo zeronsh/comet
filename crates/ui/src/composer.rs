@@ -17,7 +17,7 @@ use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point, Role,
     ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
     prelude::*, px, quad, relative, size,
@@ -743,6 +743,46 @@ fn local_file_link(path: &str, is_dir: bool) -> String {
     )
 }
 
+/// Build the text inserted when a workspace item is dropped at an arbitrary
+/// selection. Unlike completion, a drop does not necessarily happen at a
+/// token boundary, so it supplies its own leading separator when needed.
+fn dropped_file_mention(
+    content: &str,
+    range: Range<usize>,
+    path: &str,
+    is_dir: bool,
+) -> Option<(String, usize)> {
+    if range.start > range.end
+        || !local_path_is_safe(path)
+        || !content.is_char_boundary(range.start)
+    {
+        return None;
+    }
+    let suffix = content.get(range.end..)?;
+    let prefix = if range.start > 0
+        && content[..range.start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !ch.is_whitespace())
+    {
+        " "
+    } else {
+        ""
+    };
+    let existing_separator = suffix
+        .chars()
+        .next()
+        .filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
+    let trailing = if existing_separator.is_some() {
+        ""
+    } else {
+        " "
+    };
+    let inserted = format!("{prefix}{}{trailing}", local_file_link(path, is_dir));
+    let cursor_advance = inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
+    Some((inserted, cursor_advance))
+}
+
 fn local_path_is_safe(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -1274,6 +1314,7 @@ pub struct ComposerInput {
     /// Key context for the binding map ("Composer", or "PaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
+    accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
     placeholder: SharedString,
@@ -1289,6 +1330,8 @@ pub struct ComposerInput {
     /// Normally keeps the caret visible through edits and rewraps. Manual
     /// wheel scrolling pauses it until the next caret move or edit.
     follow_cursor: bool,
+    text_size: f32,
+    configured_line_height: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
@@ -1354,6 +1397,7 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
+            accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
             placeholder: placeholder.into(),
@@ -1366,6 +1410,8 @@ impl ComposerInput {
             drag_autoscroll_active: false,
             scroll_top: 0.0,
             follow_cursor: true,
+            text_size: INPUT_TEXT_SIZE,
+            configured_line_height: INPUT_LINE_HEIGHT,
             last_lines: Vec::new(),
             line_starts: vec![0],
             last_bounds: None,
@@ -1392,6 +1438,19 @@ impl ComposerInput {
             mention_tooltip_task: None,
             mention_tooltip_view: None,
         }
+    }
+
+    pub fn with_text_metrics(mut self, text_size: f32, line_height: f32) -> Self {
+        self.text_size = text_size;
+        self.configured_line_height = line_height;
+        self.line_height = px(line_height);
+        self.content_height = line_height;
+        self
+    }
+
+    pub fn with_accessibility_role(mut self, role: Role) -> Self {
+        self.accessibility_role = role;
+        self
     }
 
     /// Reset the caret blink phase (solid again) — called on every edit and
@@ -1487,6 +1546,31 @@ impl ComposerInput {
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
+    }
+
+    /// Insert a workspace reference at the current selection. Drag-and-drop
+    /// uses the same strict local Markdown transport and projected chip as an
+    /// `@` mention selected from completion.
+    fn insert_dropped_mention(&mut self, path: &str, is_dir: bool, cx: &mut Context<Self>) -> bool {
+        let range = self.selected_range.clone();
+        let Some((inserted, cursor_advance)) =
+            dropped_file_mention(&self.content, range.clone(), path, is_dir)
+        else {
+            return false;
+        };
+        self.invalidate_mention_tooltip();
+        self.record_edit(&range, &inserted);
+        self.content =
+            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.refresh_projection();
+        let cursor = range.start + cursor_advance;
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+        true
     }
 
     /// Replace a completed plain-text token (slash commands) as one
@@ -2490,7 +2574,7 @@ impl ComposerInput {
             (SharedString::from(self.projection.display.clone()), false)
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        self.line_height = px(INPUT_LINE_HEIGHT);
+        self.line_height = px(self.configured_line_height);
 
         // Chips read as inline code: the markdown renderer's recipe (mono font
         // + `code_text` violet) over the rounded `code_wash` painted beneath.
@@ -2576,7 +2660,7 @@ impl ComposerInput {
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
-        self.content_height = content_height.max(INPUT_LINE_HEIGHT);
+        self.content_height = content_height.max(self.configured_line_height);
         self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
         self.last_width = f32::from(width);
         self.layout_epoch += 1;
@@ -3124,6 +3208,10 @@ impl Render for ComposerInput {
             theme.text
         };
         div()
+            .id(("composer-input", cx.entity_id()))
+            .role(self.accessibility_role)
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
             .key_context(self.key_context)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
@@ -3168,8 +3256,8 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
-            .text_size(px(INPUT_TEXT_SIZE))
-            .line_height(px(INPUT_LINE_HEIGHT))
+            .text_size(px(self.text_size))
+            .line_height(px(self.configured_line_height))
             .text_color(text_color)
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {
@@ -3620,6 +3708,28 @@ impl Composer {
         self.add_staged(staged, cx);
     }
 
+    /// Add a file-tree or file-tab drop through the existing file-mention
+    /// pipeline. This keeps the reference workspace-relative and therefore
+    /// valid for local and remote sessions alike.
+    pub(crate) fn add_workspace_path(
+        &mut self,
+        path: &str,
+        is_directory: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inserted = self.input.update(cx, |input, cx| {
+            input.insert_dropped_mention(path, is_directory, cx)
+        });
+        if inserted {
+            self.reset_mention(None, cx);
+            self.reset_slash(None, cx);
+            let focus = self.input.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            cx.notify();
+        }
+    }
+
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(list) = self.attachments.get_mut(&self.current_key) {
             list.retain(|a| a.id != id);
@@ -3635,15 +3745,15 @@ impl Composer {
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
         self.state.update(cx, |state, _| {
-            state.purge_diff_comments(chat_id);
+            state.purge_review_comments(chat_id);
         });
     }
 
     /// Staged in `AppState` because the changes pane writes them.
-    fn staged_comments(&self, cx: &App) -> Vec<crate::comments::DiffComment> {
+    fn staged_comments(&self, cx: &App) -> Vec<crate::comments::ReviewComment> {
         self.state
             .read(cx)
-            .diff_comments(&self.current_key)
+            .review_comments(&self.current_key)
             .to_vec()
     }
 
@@ -4480,6 +4590,9 @@ impl Composer {
     /// Existing chats carry their own project, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
+        if state.review_comment_flush_pending(&self.current_key) {
+            return true;
+        }
         if state.selected_chat.is_some() {
             return false;
         }
@@ -4595,7 +4708,7 @@ impl Composer {
         // input as literal text.
         let key = self.current_key.clone();
         let comments = self.state.update(cx, |state, cx| {
-            let taken = state.take_diff_comments(&key);
+            let taken = state.take_review_comments(&key);
             if !taken.is_empty() {
                 cx.notify();
             }
@@ -5067,7 +5180,7 @@ impl Composer {
                             s.select_chat(None, cx);
                         }
                         for comment in &comments {
-                            s.add_diff_comment(&restore_key, comment.clone());
+                            s.add_review_comment(&restore_key, comment.clone());
                         }
                         cx.notify();
                     });
@@ -6263,6 +6376,25 @@ mod tests {
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
+    }
+
+    #[test]
+    fn dropped_mentions_are_separated_from_surrounding_text() {
+        let (inserted, cursor_advance) =
+            dropped_file_mention("fixnow", 3..3, "src/lib.rs", false).expect("valid drop");
+        assert_eq!(inserted, " [lib.rs](zeron-file:src/lib.rs) ");
+        assert_eq!(cursor_advance, inserted.len());
+
+        let (inserted, cursor_advance) =
+            dropped_file_mention("fix now", 3..3, "src/components", true).expect("valid drop");
+        assert_eq!(inserted, " [components](zeron-file:src/components/)");
+        assert_eq!(cursor_advance, inserted.len() + 1);
+    }
+
+    #[test]
+    fn dropped_mentions_reject_paths_outside_the_workspace() {
+        assert!(dropped_file_mention("", 0..0, "/tmp/file.rs", false).is_none());
+        assert!(dropped_file_mention("", 0..0, "../file.rs", false).is_none());
     }
 
     #[test]

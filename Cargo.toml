@@ -65,6 +65,7 @@ gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c
     "runtime_shaders",
 ] }
 gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui-base = { git = "https://github.com/jsgrrchg/gpui-component", rev = "edefc2fb645473f330488fbee2c421536a85c69a" }
 
 # diffs
 similar = "2"
