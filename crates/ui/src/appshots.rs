@@ -70,10 +70,27 @@ pub struct CapturedAppshot {
     pub window_title: Option<String>,
     pub accessibility: AccessibilitySnapshot,
     pub screenshot: StagedAttachment,
+    /// Pixel dimensions of the captured PNG. The composer uses these to size
+    /// the native image layer explicitly instead of relying on intrinsic
+    /// image layout, which can escape a clipped Appshot stage.
+    pub screenshot_dimensions: Option<(u32, u32)>,
     /// Presentation-only. The icon is never uploaded or serialized into the
     /// model context.
     pub app_icon: Option<Arc<gpui::Image>>,
     pub captured_at: DateTime<Utc>,
+}
+
+/// Read the width and height from a PNG's IHDR chunk without decoding the
+/// image. Appshot captures are always PNGs, so this keeps layout metadata
+/// cheap and available before GPUI decodes the image asynchronously.
+pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,9 +273,22 @@ mod tests {
                 name: "Safari Appshot.png".into(),
                 image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
             },
+            screenshot_dimensions: Some((1440, 900)),
             app_icon: None,
             captured_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn png_dimensions_reads_ihdr_and_rejects_invalid_images() {
+        let mut png = Vec::from(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".as_slice());
+        png.extend_from_slice(&1440_u32.to_be_bytes());
+        png.extend_from_slice(&900_u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((1440, 900)));
+
+        assert_eq!(png_dimensions(b"not a png"), None);
+        png[16..20].copy_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), None);
     }
 
     #[test]

@@ -227,6 +227,7 @@ pub(super) fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError
                 (window, png)
             }
         };
+        let screenshot_dimensions = super::png_dimensions(&png);
         let screenshot = stage_png(&app.name, png)?;
         let accessibility = if unsafe { AXIsProcessTrusted() } {
             accessibility_snapshot(app.pid)
@@ -240,6 +241,7 @@ pub(super) fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError
             window_title: window.title,
             accessibility,
             screenshot,
+            screenshot_dimensions,
             app_icon: app.icon_png.map(|bytes| {
                 std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
             }),

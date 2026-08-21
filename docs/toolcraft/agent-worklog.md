@@ -114,3 +114,20 @@ Tier 2: compile and test the affected Rust UI crate, then visually inspect the s
   metadata only and are never uploaded or serialized into prompts.
 - Verification tier: pure tray-height and prompt tests, full `zeron-ui` unit
   suite, macOS compile/build, and native visual/permission smoke testing.
+
+## 2026-08-21 — Appshots aspect-ratio and fade refinement
+
+- Product goal: make every Appshot read as one consistently sized composer
+  object even when source windows range from very wide to very tall.
+- Visible output: a fixed, clipped stage containing a bottom-aligned image,
+  with explicit aspect-ratio sizing, a native bottom edge-fade, the app icon
+  floating above that fade, and more air before the title.
+- Control inventory is unchanged: the tile still opens the lightbox and its
+  hover action removes it. No new settings, persistence, transport, export,
+  layer, or timeline behavior is introduced.
+- Renderer decision: retain the native GPUI image renderer, but stop depending
+  on its intrinsic sizing. Read dimensions from the captured PNG and assign
+  exact contained dimensions inside both preview-level and card-level clips.
+- Verification tier: pure PNG/aspect-ratio tests, full `zeron-ui` unit suite,
+  macOS build checks, and native composer inspection with landscape and
+  portrait captures.

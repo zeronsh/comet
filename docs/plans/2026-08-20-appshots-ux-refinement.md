@@ -12,3 +12,18 @@
 4. Update pure layout tests and permission-facing copy. Validate with
    `cargo test -p zeron-ui --lib`, `cargo check -p zeron-ui`,
    `cargo build -p zeron`, and `git diff --check`.
+
+## Composer visual normalization follow-up
+
+1. Record the PNG pixel dimensions in `crates/ui/src/appshots.rs` and
+   `appshots/macos.rs`, then compute an explicit contained display size for a
+   shared 208×132 image box in `crates/ui/src/composer.rs`.
+2. Make both the visual stage and the complete Appshot tile clipping
+   boundaries, bottom-align every aspect ratio, and apply a native bottom
+   edge-fade to the screenshot before layering the application icon.
+3. Increase the icon-to-label spacing while keeping one fixed-height,
+   horizontally scrolling tray. Capture, removal, preview, persistence,
+   transport, and permission controls remain unchanged.
+4. Add dimension-parser and landscape/portrait/square sizing tests, run the
+   `zeron-ui` test suite and macOS build checks, then inspect the result in the
+   signed `Zeron Dev.app`.

@@ -404,8 +404,23 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
 }
 
 pub const APPSHOT_TILE_WIDTH: f32 = 232.0;
-pub const APPSHOT_PREVIEW_HEIGHT: f32 = 140.0;
-pub const APPSHOT_TILE_HEIGHT: f32 = 168.0;
+pub const APPSHOT_PREVIEW_HEIGHT: f32 = 148.0;
+pub const APPSHOT_IMAGE_MAX_WIDTH: f32 = 208.0;
+pub const APPSHOT_IMAGE_MAX_HEIGHT: f32 = 132.0;
+pub const APPSHOT_TILE_HEIGHT: f32 = 192.0;
+
+/// Fit any source window into the shared Appshot stage without cropping.
+/// Returning exact dimensions also prevents GPUI's native image layer from
+/// falling back to its intrinsic pixel size while the image is decoding.
+pub fn appshot_contained_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    let Some((width, height)) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)
+    else {
+        return (APPSHOT_IMAGE_MAX_WIDTH, APPSHOT_IMAGE_MAX_HEIGHT);
+    };
+    let scale =
+        (APPSHOT_IMAGE_MAX_WIDTH / width as f32).min(APPSHOT_IMAGE_MAX_HEIGHT / height as f32);
+    (width as f32 * scale, height as f32 * scale)
+}
 
 pub fn appshot_strip_height(count: usize) -> f32 {
     if count == 0 {
@@ -3856,6 +3871,7 @@ impl Composer {
                 .map(str::to_owned)
                 .unwrap_or_else(|| appshot.app_name.clone())
                 .into();
+            let (image_width, image_height) = appshot_contained_size(appshot.screenshot_dimensions);
             let mut card = div()
                 .id(("composer-appshot", ix))
                 .group(group.clone())
@@ -3867,6 +3883,7 @@ impl Composer {
                 .flex_col()
                 .items_center()
                 .rounded(px(14.0))
+                .overflow_hidden()
                 .cursor_pointer()
                 .hover(|style| style.bg(crate::theme::ink(0.045)))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -3879,6 +3896,7 @@ impl Composer {
                         .id(("composer-appshot-preview", ix))
                         .w(px(APPSHOT_TILE_WIDTH))
                         .h(px(APPSHOT_PREVIEW_HEIGHT))
+                        .relative()
                         .flex_none()
                         .flex()
                         .items_end()
@@ -3886,15 +3904,27 @@ impl Composer {
                         .overflow_hidden()
                         .rounded(px(12.0))
                         .child(
-                            img(appshot.screenshot.image.clone())
-                                .w(px(APPSHOT_TILE_WIDTH))
-                                .h(px(APPSHOT_PREVIEW_HEIGHT))
-                                .object_fit(ObjectFit::Contain),
+                            div()
+                                .w(px(image_width))
+                                .h(px(image_height))
+                                .flex_none()
+                                .overflow_hidden()
+                                .rounded(px(4.0))
+                                .shadow_sm()
+                                .child(crate::edge_fade::edge_faded(
+                                    44.0,
+                                    false,
+                                    true,
+                                    img(appshot.screenshot.image.clone())
+                                        .w(px(image_width))
+                                        .h(px(image_height))
+                                        .object_fit(ObjectFit::Contain),
+                                )),
                         ),
                 )
                 .child(
                     div()
-                        .mt(px(6.0))
+                        .mt(px(20.0))
                         .max_w(px(APPSHOT_TILE_WIDTH - 20.0))
                         .truncate()
                         .text_center()
@@ -3907,7 +3937,7 @@ impl Composer {
                 card = card.child(crate::frost::layered(
                     div()
                         .absolute()
-                        .top(px(APPSHOT_PREVIEW_HEIGHT - 14.0))
+                        .top(px(APPSHOT_PREVIEW_HEIGHT - 22.0))
                         .left(px((APPSHOT_TILE_WIDTH - 28.0) / 2.0))
                         .size(px(28.0))
                         .rounded(px(7.0))
@@ -6715,6 +6745,26 @@ mod tests {
         assert_eq!(appshot_strip_height(0), 0.0);
         assert_eq!(appshot_strip_height(1), STRIP_PAD_TOP + APPSHOT_TILE_HEIGHT);
         assert_eq!(appshot_strip_height(2), appshot_strip_height(1));
+    }
+
+    #[test]
+    fn appshot_images_share_bounds_without_losing_aspect_ratio() {
+        let landscape = appshot_contained_size(Some((1600, 900)));
+        assert_eq!(landscape.0, APPSHOT_IMAGE_MAX_WIDTH);
+        assert!((landscape.1 - 117.0).abs() < 0.01);
+
+        let portrait = appshot_contained_size(Some((900, 1600)));
+        assert!((portrait.0 - 74.25).abs() < 0.01);
+        assert_eq!(portrait.1, APPSHOT_IMAGE_MAX_HEIGHT);
+
+        assert_eq!(
+            appshot_contained_size(Some((1000, 1000))),
+            (APPSHOT_IMAGE_MAX_HEIGHT, APPSHOT_IMAGE_MAX_HEIGHT)
+        );
+        assert_eq!(
+            appshot_contained_size(None),
+            (APPSHOT_IMAGE_MAX_WIDTH, APPSHOT_IMAGE_MAX_HEIGHT)
+        );
     }
 
     #[test]
