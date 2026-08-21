@@ -123,6 +123,11 @@ pub(crate) fn pull_request_badge(
     let model = ChangeRequestBadgeModel::from_summary(&summary);
     let color = model.tone.color(theme);
     let url = summary.url.clone();
+    let (provider_icon, provider_color) = match summary.provider.as_str() {
+        "github" => (crate::icons::GITHUB_MARK, gpui::rgb(0xF0F0F0).into()),
+        "bitbucket" => (crate::icons::BITBUCKET_MARK, gpui::rgb(0x2684FF).into()),
+        _ => (crate::icons::PULL_REQUEST, color),
+    };
     let tooltip_summary = summary;
     let composer = surface == ChangeRequestBadgeSurface::Composer;
 
@@ -133,7 +138,7 @@ pub(crate) fn pull_request_badge(
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(if composer { 5.0 } else { 0.0 }))
+        .gap(px(if composer { 5.0 } else { 3.0 }))
         .px(px(if composer { 7.0 } else { 4.0 }))
         .rounded(px(if composer { 6.0 } else { 4.0 }))
         .bg(color.opacity(0.08))
@@ -151,6 +156,14 @@ pub(crate) fn pull_request_badge(
                 .into()
         })
         .tooltip_show_delay(std::time::Duration::from_millis(350))
+        .when(surface == ChangeRequestBadgeSurface::Sidebar, |element| {
+            element.child(
+                crate::icons::icon(provider_icon)
+                    .size(px(9.0))
+                    .flex_none()
+                    .text_color(provider_color.opacity(0.9)),
+            )
+        })
         .when(composer, |element| {
             element.child(
                 crate::icons::icon(crate::icons::PULL_REQUEST)
