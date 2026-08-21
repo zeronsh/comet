@@ -450,9 +450,9 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(4.0))
+            // Match the search field and session-list inset so the selector
+            // shares one clean left edge with the rest of the sidebar.
             .px(px(Theme::SPACE_SM))
-            .pt(px(8.0))
-            .pb(px(4.0))
             .child(trigger)
             .child(add)
             .into_any_element()
