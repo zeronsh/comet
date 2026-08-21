@@ -323,6 +323,7 @@ mod tests {
             title: None,
             archived,
             settled: false,
+            pinned: false,
             cwd: None,
             branch: None,
             checkout_id: None,

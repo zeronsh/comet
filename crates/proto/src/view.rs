@@ -86,8 +86,9 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
 // Sort orders
 // ---------------------------------------------------------------------------
 
-/// Active-list order: pure recency (`last_message_at` desc, `created_at`
-/// fallback), id tiebreak so the sort is total. Deliberately NOT
+/// Active-list order: pinned threads first, then pure recency
+/// (`last_message_at` desc, `created_at` fallback), id tiebreak so the sort
+/// is total. Deliberately NOT
 /// attention-bucketed: status drives the DOT, never the position — bucketing
 /// meant that merely OPENING a completed session (completed → seen → idle)
 /// dropped its row under the pointer (user report: "their position in the
@@ -96,9 +97,14 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
 /// aggregates the space rows' urgency dot.
 pub fn sort_active(rows: &mut Vec<(ChatIndicator, &Chat)>) {
     rows.sort_by(|(_, a), (_, b)| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| {
+                let ka = a.last_message_at.unwrap_or(a.created_at);
+                let kb = b.last_message_at.unwrap_or(b.created_at);
+                kb.cmp(&ka)
+            })
+            .then_with(|| a.id.cmp(&b.id))
     });
 }
 

@@ -2311,6 +2311,18 @@ impl Shell {
         cx.notify();
     }
 
+    /// Pin / unpin a chat (floats above the Active list). Calls the
+    /// `SetChatPinned` mutation — only non-settled, non-archived chats may
+    /// be pinned.
+    pub(super) fn set_chat_pinned(&mut self, chat_id: String, pinned: bool, cx: &mut Context<Self>) {
+        self.close_chat_menu(cx);
+        self.mutate(
+            serde_json::json!({ "op": "setChatPinned", "chatId": chat_id, "pinned": pinned }),
+            cx,
+        );
+        cx.notify();
+    }
+
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -3819,6 +3831,27 @@ impl Shell {
         // promotions glide; cleared rows just go).
         let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
 
+        // Pinned section: sort_active floats pinned rows first, so they are a
+        // prefix of `keyed`. A "Pinned" header splits them from Active — but
+        // only when both sides exist (all-pinned or all-unpinned needs no
+        // boundary).
+        let pinned_count = {
+            let state = self.state.read(cx);
+            let pinned: std::collections::HashSet<&str> = state
+                .chats
+                .iter()
+                .filter(|c| c.pinned)
+                .map(|c| c.id.as_str())
+                .collect();
+            keyed
+                .iter()
+                .filter(|(k, _, _)| {
+                    k.strip_prefix("c:").is_some_and(|id| pinned.contains(id))
+                })
+                .count()
+        };
+        let has_split = pinned_count > 0 && pinned_count < keyed.len();
+
         // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
         // list changes (new activity resort, grouping flip), surviving rows
         // glide from their old y to the new one — layout is already at the new
@@ -3959,6 +3992,33 @@ impl Shell {
                 )
             });
 
+        // "Pinned" section header — same hairline style as Active. Only when
+        // a real boundary exists (some pinned, some not).
+        let pinned_header = if has_split {
+            Some(
+                div()
+                    .id("pinned-header")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pt(px(8.0))
+                    .pb(px(4.0))
+                    .px(px(2.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.45))
+                            .child("Pinned"),
+                    )
+                    .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.4))),
+            )
+        } else {
+            None
+        };
+
         // "Active" section header (t3code SidebarV2): label + hairline.
         // Only shows when there are active rows OR the archived section
         // is present (the header anchors the boundary).
@@ -3991,6 +4051,17 @@ impl Shell {
             )
         } else {
             None
+        };
+
+        // Split keyed rows into the Pinned prefix and the Active rest (only
+        // when the section boundary renders; otherwise one group).
+        let list_was_empty = list_items.is_empty();
+        let (pinned_items, active_items) = if has_split {
+            let mut items = list_items;
+            let rest = items.split_off(pinned_count.min(items.len()));
+            (items, rest)
+        } else {
+            (Vec::new(), list_items)
         };
 
         div()
@@ -4028,16 +4099,26 @@ impl Shell {
                             // No "Sessions" header (user request) — the list
                             // is the whole column; a little air stands in.
                             .pt(px(4.0))
+                            .when_some(pinned_header, |el, header| el.child(header))
+                            .when(!pinned_items.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .children(pinned_items),
+                                )
+                            })
                             .when_some(active_header, |el, header| el.child(header))
-                            .child(if !list_items.is_empty() {
+                            .child(if !active_items.is_empty() {
                                 div()
                                     .flex()
                                     .flex_col()
                                     .gap(px(2.0))
                                     .pb(px(Theme::SPACE_SM))
-                                    .children(list_items)
+                                    .children(active_items)
                                     .into_any_element()
-                            } else {
+                            } else if list_was_empty {
                                 div()
                                     .px(px(Theme::SPACE_SM))
                                     .pb(px(Theme::SPACE_SM))
@@ -4045,6 +4126,8 @@ impl Shell {
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from("No sessions yet"))
                                     .into_any_element()
+                            } else {
+                                div().into_any_element()
                             })
                             .children(archived_section),
                     ),
@@ -4824,15 +4907,20 @@ impl Shell {
 
         if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
             let chat_menu_closing = self.chat_menu.closing_since();
-            // Resolve whether this chat is currently settled (archived).
-            let is_settled = self
+            // Resolve the chat's shelf flags (settled = settled shelf,
+            // archived = hidden from sidebar). Pinned is only offered for
+            // chats still in the Active list.
+            let (is_settled, is_archived, is_pinned) = self
                 .state
                 .read(cx)
                 .chats
                 .iter()
                 .find(|c| c.id == chat_id)
-                .is_some_and(|c| c.archived);
+                .map(|c| (c.settled, c.archived, c.pinned))
+                .unwrap_or((false, false, false));
             let rename_id = chat_id.clone();
+            let pin_id = chat_id.clone();
+            let unpin_id = chat_id.clone();
             let settle_id = chat_id.clone();
             let unsettle_id = chat_id.clone();
             let archive_id = chat_id.clone();
@@ -4853,6 +4941,31 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                // Pin / Unpin: floats the thread above the Active list.
+                // Only offered for chats still in the Active list — settled
+                // and archived threads can't be pinned.
+                .when(!is_settled && !is_archived && is_pinned, |el| {
+                    el.child(
+                        popover::menu_row(&theme, false, format!("chat-menu-unpin-{chat_id}"))
+                            .id("chat-menu-unpin")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_chat_pinned(unpin_id.clone(), false, cx)
+                            }))
+                            .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                            .child(SharedString::from("Unpin")),
+                    )
+                })
+                .when(!is_settled && !is_archived && !is_pinned, |el| {
+                    el.child(
+                        popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                            .id("chat-menu-pin")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_chat_pinned(pin_id.clone(), true, cx)
+                            }))
+                            .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                            .child(SharedString::from("Pin")),
+                    )
+                })
                 // Settle / Unsettle (t3code SidebarV2): toggles the settled
                 // shelf visibility. Renders the action matching the current
                 // state — a settled chat shows Unsettle, an active one Settle.

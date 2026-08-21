@@ -2462,6 +2462,7 @@ mod tests {
             title: None,
             archived: false,
             settled: false,
+            pinned: false,
             cwd: None,
             branch: None,
             checkout_id: None,
@@ -2771,6 +2772,22 @@ mod tests {
         sort_active(&mut seen);
         let order_after: Vec<&str> = seen.iter().map(|(_, c)| c.id.as_str()).collect();
         assert_eq!(order, order_after);
+    }
+
+    #[test]
+    fn active_list_floats_pinned_above_unpinned() {
+        let a = chat("a", 0, Some(10));
+        let b = chat("b", 0, Some(20));
+        let mut pinned = chat("p", 0, Some(1));
+        pinned.pinned = true;
+        let mut rows = vec![
+            (ChatIndicator::Idle, &a),
+            (ChatIndicator::Idle, &b),
+            (ChatIndicator::Idle, &pinned),
+        ];
+        sort_active(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|(_, c)| c.id.as_str()).collect();
+        assert_eq!(order, ["p", "b", "a"], "pinned first, then recency");
     }
 
     #[test]

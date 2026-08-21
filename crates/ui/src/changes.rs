@@ -4010,6 +4010,7 @@ rename to new_name.rs
             title: None,
             archived: false,
             settled: false,
+            pinned: false,
             cwd: cwd.map(Into::into),
             branch: None,
             checkout_id: checkout.map(Into::into),

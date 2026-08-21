@@ -849,6 +849,7 @@ impl WorkspaceHost {
                 title: None,
                 archived: false,
             settled: false,
+            pinned: false,
                 cwd: Some(cwd.unwrap_or_else(|| {
                     space
                         .as_ref()
@@ -1022,6 +1023,11 @@ impl WorkspaceHost {
     /// Settle / unsettle a chat (sidebar "Settled" shelf).
     pub fn set_chat_settled(&self, chat_id: &str, settled: bool) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_settled(chat_id, settled))?)
+    }
+
+    /// Pin / unpin a chat (floats above the Active list).
+    pub fn set_chat_pinned(&self, chat_id: &str, pinned: bool) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_pinned(chat_id, pinned))?)
     }
 
     /// LWW full-config replace on the chat row (zeron `SetChatConfig` — the

@@ -96,6 +96,10 @@ pub struct Chat {
     /// entirely and only accessible from Settings → Archived.
     #[serde(default)]
     pub settled: bool,
+    /// Pinned threads float above the Active list. Only non-settled,
+    /// non-archived threads may be pinned.
+    #[serde(default)]
+    pub pinned: bool,
     pub cwd: Option<String>,
     pub branch: Option<String>,
     /// Canonical id of the repo checkout/worktree this chat operates in.

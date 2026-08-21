@@ -101,6 +101,9 @@ icon_assets![
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
+    // Hand-drawn pushpin in the Solar Linear style (like the terminal/plus/
+    // return ports) — the embedded set has no pin glyph. Chat pinning.
+    (PIN, "pin"),
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
     (LOGOUT_2, "logout-2"),
