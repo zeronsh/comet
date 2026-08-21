@@ -32,6 +32,7 @@ use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
 use crate::popover::{self, Loadable};
+use crate::pull_requests::{PullRequestsEvent, PullRequestsPage};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
@@ -40,6 +41,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::source_control::SourceControlPage;
 use crate::settings::{
     CHAT_PANEL_MIN, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
@@ -178,6 +180,7 @@ pub enum SettingsSection {
     Harnesses,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
+    SourceControl,
     Appearance,
     Notifications,
     Shortcuts,
@@ -185,10 +188,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
+        SettingsSection::SourceControl,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
@@ -202,6 +206,7 @@ impl SettingsSection {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
+            SettingsSection::SourceControl => "Source Control",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
@@ -214,6 +219,7 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    PullRequests,
     Settings(SettingsSection),
 }
 
@@ -241,6 +247,7 @@ pub enum RightSurface {
     Picker,
     Diff(u64),
     Terminal(u64),
+    PullRequest(u64),
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
@@ -302,6 +309,7 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
+    PullRequests,
     Settings(SettingsSection),
 }
 
@@ -852,6 +860,11 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    source_control_page: Option<Entity<SourceControlPage>>,
+    pull_requests_page: Option<Entity<PullRequestsPage>>,
+    pull_requests_sub: Option<Subscription>,
+    pull_request_surfaces: std::collections::HashMap<u64, zeron_proto::PullRequestListItem>,
+    pull_request_seq: u64,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
@@ -1064,6 +1077,7 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
+            Some("settings/source-control") => Route::Settings(SettingsSection::SourceControl),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -1095,6 +1109,7 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
+            Route::PullRequests => NavEntry::PullRequests,
             Route::Settings(section) => NavEntry::Settings(section),
         });
         Self {
@@ -1128,6 +1143,11 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            source_control_page: None,
+            pull_requests_page: None,
+            pull_requests_sub: None,
+            pull_request_surfaces: std::collections::HashMap::new(),
+            pull_request_seq: 0,
             shortcuts_sub: None,
             notifications_sub: None,
             chat_menu: popover::Popup::default(),
@@ -1502,6 +1522,9 @@ impl Shell {
     /// SPACE — one shared "" key made a canvas toggle read as global state
     /// (user report).
     fn panel_key(&self, cx: &App) -> String {
+        if matches!(self.route, Route::PullRequests) {
+            return "pull-requests".to_string();
+        }
         if self.active_chat.is_empty() {
             let space = self
                 .state
@@ -1521,7 +1544,8 @@ impl Shell {
     /// new-session canvas, where the titlebar carries no toggle to close it
     /// again (an earlier user request).
     fn right_pane_open(&self, cx: &App) -> bool {
-        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
+        (matches!(self.route, Route::PullRequests) || !self.active_chat.is_empty())
+            && self.panels.get(&self.panel_key(cx)).changes_open
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
@@ -1576,6 +1600,74 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_pull_request_surface(
+        &mut self,
+        item: zeron_proto::PullRequestListItem,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.panel_key(cx);
+        let from = self.right_target(cx);
+        let existing = self.pull_request_surfaces.iter().find_map(|(id, current)| {
+            (current.provider == item.provider
+                && current.repository == item.repository
+                && current.number == item.number)
+                .then_some(*id)
+        });
+        let id = if let Some(id) = existing {
+            self.pull_request_surfaces.insert(id, item);
+            id
+        } else {
+            self.pull_request_seq += 1;
+            let id = self.pull_request_seq;
+            self.pull_request_surfaces.insert(id, item);
+            id
+        };
+        let tabs = self.right_tabs.entry(key.clone()).or_default();
+        if !tabs.contains(&RightSurface::PullRequest(id)) {
+            tabs.push(RightSurface::PullRequest(id));
+        }
+        let was_open = self.right_pane_open(cx);
+        self.panels.update(&key, |panel| {
+            panel.changes_open = true;
+            panel.right_active = RightSurface::PullRequest(id);
+        });
+        if !was_open {
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        cx.notify();
+    }
+
+    fn close_active_pull_request_surface(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let active = self.panels.get(&key).right_active;
+        let RightSurface::PullRequest(id) = active else {
+            return;
+        };
+        self.close_pull_request_surface_id(id, cx);
+    }
+
+    fn close_pull_request_surface_id(&mut self, id: u64, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        if let Some(tabs) = self.right_tabs.get_mut(&key) {
+            tabs.retain(|surface| *surface != RightSurface::PullRequest(id));
+        }
+        self.pull_request_surfaces.remove(&id);
+        let next = self
+            .right_surface_rows(cx)
+            .first()
+            .map(|(surface, _)| *surface)
+            .unwrap_or(RightSurface::Picker);
+        self.panels.update(&key, |panel| panel.right_active = next);
+        if let Some(page) = self.pull_requests_page.clone() {
+            let next_item = match next {
+                RightSurface::PullRequest(id) => self.pull_request_surfaces.get(&id).cloned(),
+                _ => None,
+            };
+            page.update(cx, |page, cx| page.set_selection_silently(next_item, cx));
+        }
+        cx.notify();
+    }
+
     fn right_terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
         if let Some(terminal) = &self.right_terminal {
             return terminal.clone();
@@ -1617,6 +1709,12 @@ impl Shell {
                     .subagent_tabs
                     .get(id)
                     .map(|tab| (*surface, tab.title.clone())),
+                RightSurface::PullRequest(id) => self.pull_request_surfaces.get(id).map(|item| {
+                    (
+                        *surface,
+                        format!("PR #{} · {}", item.number, item.title).into(),
+                    )
+                }),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -1694,6 +1792,15 @@ impl Shell {
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
             RightSurface::Subagent(_) => {}
+            RightSurface::PullRequest(id) => {
+                if let Some(item) = self.pull_request_surfaces.get(&id).cloned()
+                    && let Some(page) = self.pull_requests_page.clone()
+                {
+                    page.update(cx, |page, cx| {
+                        page.set_selection_silently(Some(item), cx);
+                    });
+                }
+            }
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -1907,11 +2014,19 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
+            RightSurface::PullRequest(id) => {
+                self.close_pull_request_surface_id(id, cx);
+                return;
+            }
             RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
-                p.right_active = RightSurface::Picker;
+                p.right_active = self
+                    .right_tabs
+                    .get(&key)
+                    .and_then(|tabs| tabs.first().copied())
+                    .unwrap_or(RightSurface::Picker);
             }
         });
         cx.notify();
@@ -2089,6 +2204,14 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::PullRequests;
+        self.nav.push(NavEntry::PullRequests);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
@@ -2120,6 +2243,9 @@ impl Shell {
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
+            }
+            NavEntry::PullRequests => {
+                self.route = Route::PullRequests;
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
@@ -2159,6 +2285,16 @@ impl Shell {
                     self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
                 }
                 match &self.accounts_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::SourceControl => {
+                if self.source_control_page.is_none() {
+                    let state = self.state.clone();
+                    self.source_control_page = Some(cx.new(|cx| SourceControlPage::new(state, cx)));
+                }
+                match &self.source_control_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -2998,6 +3134,7 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
+            Route::PullRequests => self.render_session_title_bar(cx),
             Route::Settings(_) => {
                 let inner = div()
                     .size_full()
@@ -3336,7 +3473,7 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat | Route::PullRequests => self.render_chat_sidebar(&theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -3367,6 +3504,7 @@ impl Shell {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::SourceControl => icons::GIT_BRANCH,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
@@ -4025,6 +4163,36 @@ impl Shell {
                 )
             });
 
+        let pull_requests_row = div()
+            .id("pull-requests-nav")
+            .mx(px(Theme::SPACE_SM))
+            .mb(px(Theme::SPACE_XS))
+            .px(px(10.0))
+            .py(px(7.0))
+            .rounded(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(px(12.5))
+            .text_color(if matches!(self.route, Route::PullRequests) {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .when(matches!(self.route, Route::PullRequests), |el| {
+                el.bg(crate::theme::glass_selected_bg())
+            })
+            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.open_pull_requests(cx)))
+            .child(
+                icon(icons::PULL_REQUEST)
+                    .size(px(15.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(SharedString::from("Pull Requests"));
+
         // "Pinned" section header — same hairline style as Active. Only when
         // a real boundary exists (some pinned, some not).
         let pinned_header = if has_split {
@@ -4107,6 +4275,7 @@ impl Shell {
             // Search and project navigation are separate controls in the
             // sidebar: search gets its own breathing room, while the project
             // selector stays visually aligned with the session list below.
+            .child(pull_requests_row)
             .child(search_row)
             .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
@@ -5240,6 +5409,39 @@ impl Shell {
                 .into_any_element();
         }
 
+        if matches!(self.route, Route::PullRequests) {
+            if self.pull_requests_page.is_none() {
+                let state = self.state.clone();
+                let page = cx.new(|cx| PullRequestsPage::new(state, cx));
+                self.pull_requests_sub = Some(cx.subscribe(
+                    &page,
+                    |shell, _, event: &PullRequestsEvent, cx| match event {
+                        PullRequestsEvent::SelectionChanged(Some(item)) => {
+                            shell.open_pull_request_surface(item.clone(), cx);
+                        }
+                        PullRequestsEvent::SelectionChanged(None) => {
+                            shell.close_active_pull_request_surface(cx);
+                        }
+                    },
+                ));
+                self.pull_requests_page = Some(page);
+            }
+            let outlet = self
+                .pull_requests_page
+                .clone()
+                .map(|page| page.into_any_element())
+                .unwrap_or_else(|| Empty.into_any_element());
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
+                .into_any_element();
+        }
+
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
@@ -5731,7 +5933,7 @@ impl Shell {
     /// default, drag-resizable. Content is the ACTIVE surface — the Diff
     /// page (its options row + the lazy [`Changes`] viewer), an embedded
     /// terminal, or the "Open a surface" picker when no tabs exist.
-    fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_right_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
         let content: AnyElement = if self.right_pane_open(cx) {
@@ -5772,6 +5974,20 @@ impl Shell {
                         panel.select_tab_by_key(tab, cx);
                     });
                     panel.into_any_element()
+                }
+                RightSurface::PullRequest(id) => {
+                    match self.pull_request_surfaces.get(&id).cloned() {
+                        Some(item) => self
+                            .pull_requests_page
+                            .clone()
+                            .map(|page| {
+                                page.update(cx, |page, cx| {
+                                    page.render_detail_surface_for(&item, window, cx)
+                                })
+                            })
+                            .unwrap_or_else(|| gpui::Empty.into_any_element()),
+                        None => self.render_surface_picker(cx),
+                    }
                 }
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
                     let transcript = self
@@ -6111,6 +6327,7 @@ impl Shell {
             let icon_path = match surface {
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
                 RightSurface::Subagent(_) => icons::BOT,
+                RightSurface::PullRequest(_) => icons::PULL_REQUEST,
                 _ => icons::TERMINAL,
             };
             // A live subagent tab swaps its icon for the mini working
@@ -7244,7 +7461,7 @@ impl Render for Shell {
                     // reads None (the render hook below re-lands focus when the
                     // route returns to Chat; a lingering unmounted handle would
                     // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
+                    Route::PullRequests | Route::Settings(_) => window.blur(),
                 }
             }));
         }
@@ -7370,8 +7587,8 @@ impl Render for Shell {
                 // never renders it (zeron __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
-                let on_chat = matches!(self.route, Route::Chat);
-                let right_open = on_chat && self.right_pane_open(cx);
+                let on_surface_route = matches!(self.route, Route::Chat | Route::PullRequests);
+                let right_open = on_surface_route && self.right_pane_open(cx);
                 // Takeover mode derives its width from the viewport, so a
                 // manual drag handle would fight the expanded target.
                 let right_handle = (right_open && !self.right_pane_expanded).then(|| {
@@ -7389,8 +7606,8 @@ impl Render for Shell {
                     .bottom_0()
                     .left(px(-6.0))
                 });
-                let right: AnyElement = if on_chat {
-                    self.render_right_pane(cx)
+                let right: AnyElement = if on_surface_route {
+                    self.render_right_pane(window, cx)
                 } else {
                     Empty.into_any_element()
                 };
