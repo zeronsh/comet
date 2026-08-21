@@ -345,7 +345,7 @@ impl AccountsPage {
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(12.5))
+                        .text_size(crate::typography::ui_rems(12.5))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text)
                         .child(trigger_label),
@@ -400,7 +400,7 @@ impl AccountsPage {
                             el.child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(10.5))
+                                    .text_size(crate::typography::ui_rems(10.5))
                                     .text_color(theme.text_muted.opacity(0.35))
                                     .child(SharedString::from("You")),
                             )
@@ -706,7 +706,7 @@ impl AccountsPage {
             .flex_row()
             .items_center()
             .gap(px(8.0))
-            .text_size(px(11.5))
+            .text_size(crate::typography::ui_rems(11.5))
             .text_color(theme.text_muted.opacity(0.7))
             .child(
                 div()
@@ -837,7 +837,7 @@ impl AccountsPage {
                         .px(px(8.0))
                         .py(px(4.0))
                         .rounded(px(6.0))
-                        .text_size(px(11.5))
+                        .text_size(crate::typography::ui_rems(11.5))
                         .when(is_busy, |el| el.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.account_action(
@@ -871,7 +871,7 @@ impl AccountsPage {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.0))
+                    .text_size(crate::typography::ui_rems(12.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
                     .child(initial),
@@ -891,7 +891,7 @@ impl AccountsPage {
                                 div()
                                     .mt(px(6.0))
                                     .truncate()
-                                    .text_size(px(11.5))
+                                    .text_size(crate::typography::ui_rems(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(if account.switchable {
                                         "Usage unavailable"
@@ -942,7 +942,7 @@ impl AccountsPage {
                 div()
                     .id(id)
                     .mt(px(6.0))
-                    .text_size(px(12.0))
+                    .text_size(crate::typography::ui_rems(12.0))
                     .text_color(theme.text_muted.opacity(0.6))
                     .truncate()
                     .cursor_pointer()
@@ -989,14 +989,14 @@ impl AccountsPage {
                         div().mt(px(12.0)).child(
                             popover::dialog_field(self.code_input.clone().into_any_element())
                                 .font_family(theme.font_mono.clone())
-                                .text_size(px(13.0)),
+                                .text_size(crate::typography::ui_rems(13.0)),
                         ),
                     )
                     .when_some(error.clone(), |el, message| {
                         el.child(
                             div()
                                 .mt(px(8.0))
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(red_text)
                                 .child(message),
                         )
@@ -1075,7 +1075,7 @@ impl AccountsPage {
                                 ))
                                 .child(
                                     div()
-                                        .text_size(px(12.5))
+                                        .text_size(crate::typography::ui_rems(12.5))
                                         .text_color(theme.text_muted.opacity(0.7))
                                         .child(message.clone().unwrap_or_else(|| {
                                             SharedString::from("Waiting for the browser…")
@@ -1087,7 +1087,7 @@ impl AccountsPage {
                         el.child(
                             div()
                                 .mt(px(12.0))
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(red_text)
                                 .child(message),
                         )
@@ -1264,7 +1264,7 @@ impl Render for AccountsPage {
                                 .child(provider_mark(harness, &theme))
                                 .child(
                                     div()
-                                        .text_size(px(14.0))
+                                        .text_size(crate::typography::ui_rems(14.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text)
                                         .child(SharedString::from(name)),
@@ -1306,7 +1306,7 @@ impl Render for AccountsPage {
                         .child(
                             div()
                                 .mt(px(4.0))
-                                .text_size(px(11.5))
+                                .text_size(crate::typography::ui_rems(11.5))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from("Click to retry")),
                         )
@@ -1354,7 +1354,7 @@ impl Render for AccountsPage {
                                     .px(px(20.0))
                                     .py(px(32.0))
                                     .text_center()
-                                    .text_size(px(14.0))
+                                    .text_size(crate::typography::ui_rems(14.0))
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(empty_copy)),
                             )
@@ -1374,7 +1374,7 @@ impl Render for AccountsPage {
                                     .child(provider_mark(harness, &theme))
                                     .child(
                                         div()
-                                            .text_size(px(14.0))
+                                            .text_size(crate::typography::ui_rems(14.0))
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(theme.text)
                                             .child(SharedString::from(name)),
@@ -1428,7 +1428,7 @@ impl Render for AccountsPage {
                                 widgets::ghost_action(&theme)
                                     .id("accounts-refresh")
                                     .flex_none()
-                                    .text_size(px(12.5))
+                                    .text_size(crate::typography::ui_rems(12.5))
                                     .hover(|s| widgets::ghost_hover(&theme, s))
                                     .when(refreshing, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1466,7 +1466,7 @@ impl Render for AccountsPage {
                     .child(
                         div()
                             .mt(px(24.0))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .line_height(px(19.0))
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from(

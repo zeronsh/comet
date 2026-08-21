@@ -258,7 +258,7 @@ impl HarnessesPage {
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(12.5))
+                        .text_size(crate::typography::ui_rems(12.5))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.text)
                         .child(trigger_label),
@@ -313,7 +313,7 @@ impl HarnessesPage {
                             el.child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(10.5))
+                                    .text_size(crate::typography::ui_rems(10.5))
                                     .text_color(theme.text_muted.opacity(0.35))
                                     .child(SharedString::from("You")),
                             )

@@ -1,13 +1,17 @@
 //! UI settings persisted to a small JSON file in the data dir — pane widths and
 //! collapse flags (zeron persisted the same set in localStorage).
 //!
-//! Loaded once at boot; saved debounced by the shell ([`SAVE_DEBOUNCE_MS`]).
-//! Corrupt or missing files fall back to defaults; loaded values are clamped so a
-//! hand-edited file can't wedge the layout.
+//! Loaded once at boot and then owned by [`SettingsStore`], the only production
+//! writer. Frequent geometry changes are debounced; durable choices flush
+//! immediately through that same writer. Corrupt or missing files fall back to
+//! defaults, and loaded values are clamped so a hand-edited file can't wedge the
+//! layout.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
@@ -45,6 +49,130 @@ pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
 const FILE_NAME: &str = "ui-settings.json";
+
+/// Whether a settings mutation should wait for the normal coalescing window or
+/// reach disk before returning to the event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavePolicy {
+    Debounced,
+    Immediate,
+}
+
+/// The sole in-process owner and writer of `ui-settings.json`.
+///
+/// Mutations land in `current` before any timer starts. Replacing a pending
+/// task cancels its stale snapshot, and immediate mutations cancel the timer
+/// before flushing synchronously. The file is tiny, so keeping the atomic
+/// write on GPUI's foreground executor is preferable to allowing concurrent
+/// background writers that can finish out of order.
+pub struct SettingsStore {
+    current: UiSettings,
+    data_dir: PathBuf,
+    revision: u64,
+    saved_revision: u64,
+    save_task: Option<Task<()>>,
+}
+
+impl Global for SettingsStore {}
+
+impl SettingsStore {
+    fn snapshot(&self) -> (UiSettings, u64) {
+        (self.current.clone(), self.revision)
+    }
+
+    fn mark_saved(&mut self, revision: u64) -> bool {
+        self.saved_revision = self.saved_revision.max(revision);
+        self.saved_revision == self.revision
+    }
+}
+
+/// Install the settings loaded at boot as the process-wide source of truth.
+pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
+    cx.set_global(SettingsStore {
+        current: settings,
+        data_dir: data_dir.into(),
+        revision: 0,
+        saved_revision: 0,
+        save_task: None,
+    });
+}
+
+/// Latest settings, including mutations that are still inside the debounce
+/// window and therefore may not have reached disk yet.
+pub fn current(cx: &App) -> UiSettings {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.clone())
+        .unwrap_or_default()
+}
+
+/// Mutate the central settings value and schedule its single writer.
+pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSettings)) -> bool {
+    let Some(store) = cx.try_global::<SettingsStore>() else {
+        return false;
+    };
+    let before = store.current.clone();
+    let store = cx.global_mut::<SettingsStore>();
+    mutate(&mut store.current);
+    store.current = store.current.clone().clamped();
+    if store.current == before {
+        return false;
+    }
+    store.revision = store.revision.wrapping_add(1);
+    schedule(policy, cx);
+    true
+}
+
+/// Replace the central value from a view that owns a working copy, such as the
+/// shell's pane geometry state.
+pub fn replace(settings: UiSettings, policy: SavePolicy, cx: &mut App) -> bool {
+    update(policy, cx, |current| *current = settings)
+}
+
+fn schedule(policy: SavePolicy, cx: &mut App) {
+    let old_task = cx.global_mut::<SettingsStore>().save_task.take();
+    drop(old_task);
+
+    match policy {
+        SavePolicy::Immediate => flush(cx),
+        SavePolicy::Debounced => {
+            let task = cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(SAVE_DEBOUNCE_MS))
+                    .await;
+                cx.update(flush_latest);
+            });
+            cx.global_mut::<SettingsStore>().save_task = Some(task);
+        }
+    }
+}
+
+/// Persist the latest revision. Safe to call at shutdown; no task is spawned.
+pub fn flush(cx: &mut App) {
+    if !cx.has_global::<SettingsStore>() {
+        return;
+    }
+    let pending = cx.global_mut::<SettingsStore>().save_task.take();
+    drop(pending);
+    flush_latest(cx);
+}
+
+fn flush_latest(cx: &mut App) {
+    let Some(store) = cx.try_global::<SettingsStore>() else {
+        return;
+    };
+    if store.saved_revision == store.revision {
+        return;
+    }
+    let (settings, revision) = store.snapshot();
+    let data_dir = store.data_dir.clone();
+    match settings.save(&data_dir) {
+        Ok(()) => {
+            let current = cx.global_mut::<SettingsStore>().mark_saved(revision);
+            debug_assert!(current, "foreground settings write cannot be overtaken");
+        }
+        Err(err) => tracing::warn!(error = %err, revision, "failed to persist ui settings"),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -97,6 +225,11 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Interface and conversational-prose family. Device-local by design.
+    pub ui_font_family: crate::typography::UiFontFamily,
+    /// Base size for interface and conversational prose. Code-related surfaces
+    /// retain their fixed metrics.
+    pub ui_font_size: crate::typography::UiFontSize,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
 }
@@ -121,6 +254,8 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            ui_font_family: crate::typography::UiFontFamily::default(),
+            ui_font_size: crate::typography::UiFontSize::default(),
             diff_split: false,
         }
     }
@@ -318,6 +453,7 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.ui_font_size = self.ui_font_size.normalized();
         self
     }
 
@@ -398,10 +534,43 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
+            ui_font_size: crate::typography::UiFontSize::ALL[5],
             diff_split: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
+    }
+
+    #[test]
+    fn stale_revision_cannot_be_considered_the_latest_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore {
+            current: UiSettings::default(),
+            data_dir: dir.path().to_path_buf(),
+            revision: 0,
+            saved_revision: 0,
+            save_task: None,
+        };
+
+        store.current.sidebar_width = 300.0;
+        store.revision += 1;
+        let (stale, stale_revision) = store.snapshot();
+
+        store.current.ui_font_family = crate::typography::UiFontFamily::Installed("Arial".into());
+        store.revision += 1;
+        stale.save(dir.path()).unwrap();
+        assert!(!store.mark_saved(stale_revision));
+
+        let (latest, latest_revision) = store.snapshot();
+        latest.save(dir.path()).unwrap();
+        assert!(store.mark_saved(latest_revision));
+        let reloaded = UiSettings::load(dir.path());
+        assert_eq!(reloaded.sidebar_width, 300.0);
+        assert_eq!(
+            reloaded.ui_font_family,
+            crate::typography::UiFontFamily::Installed("Arial".into())
+        );
     }
 
     /// A settings file written before light mode existed has no `appearance`
@@ -427,6 +596,56 @@ mod tests {
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
         );
+    }
+
+    #[test]
+    fn settings_without_ui_font_default_to_geist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.ui_font_family,
+            crate::typography::UiFontFamily::Geist
+        );
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
+        assert_eq!(
+            loaded.ui_font_size,
+            crate::typography::UiFontSize::default()
+        );
+    }
+
+    #[test]
+    fn unsupported_ui_font_size_snaps_to_the_nearest_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"uiFontSize": 19, "soundEnabled": false}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.ui_font_size.pixels(), 18.0);
+        assert!(!loaded.sound_enabled);
+    }
+
+    #[test]
+    fn unknown_ui_font_falls_back_without_resetting_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "uiFontFamily": "futureSans"}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.ui_font_family,
+            crate::typography::UiFontFamily::Geist
+        );
+        assert_eq!(loaded.sidebar_width, 300.0);
     }
 
     #[test]

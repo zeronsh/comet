@@ -82,7 +82,7 @@ static CURRENT_APPEARANCE: AtomicU8 = AtomicU8::new(0);
 /// the theme was a compile-time constant, so their validity keys cover content
 /// only. Rather than thread the palette through every key, they compare this
 /// counter and drop everything when it moves.
-static THEME_GENERATION: AtomicU32 = AtomicU32::new(0);
+static STYLE_GENERATION: AtomicU32 = AtomicU32::new(0);
 
 /// The appearance the context-free paint helpers are painting for.
 pub fn current_appearance() -> Appearance {
@@ -92,9 +92,16 @@ pub fn current_appearance() -> Appearance {
     }
 }
 
-/// Monotonic id of the current palette — see [`THEME_GENERATION`].
-pub fn theme_generation() -> u32 {
-    THEME_GENERATION.load(Ordering::Relaxed)
+/// Monotonic id of the current resolved text style (palette + UI family/size).
+pub fn style_generation() -> u32 {
+    STYLE_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Invalidate caches that bake resolved text styles. Typography calls this
+/// only after an effective family transition; appearance changes bump it in
+/// [`set_current_appearance`].
+pub(crate) fn bump_style_generation() {
+    STYLE_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// [`CURRENT_APPEARANCE`] is process-wide, so under the parallel test runner
@@ -116,7 +123,7 @@ pub fn set_current_appearance(appearance: Appearance) {
         Appearance::Light => 1,
     };
     if CURRENT_APPEARANCE.swap(encoded, Ordering::Relaxed) != encoded {
-        THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+        bump_style_generation();
     }
 }
 
@@ -415,6 +422,8 @@ pub struct Theme {
     /// UI font family (bundling of Geist lands with asset work; until then the
     /// text system falls back to the system sans when the family is missing).
     pub font_sans: SharedString,
+    /// Fixed Geist chrome for code-adjacent surfaces and recovery controls.
+    pub font_sans_fixed: SharedString,
     /// Monospace family for code/terminal.
     pub font_mono: SharedString,
     /// Explicit system fallbacks, for callers that want to skip the lookup.
@@ -654,6 +663,7 @@ impl Theme {
             diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             font_sans: "Geist".into(),
+            font_sans_fixed: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
@@ -730,6 +740,7 @@ impl Theme {
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
             font_sans: "Geist".into(),
+            font_sans_fixed: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
@@ -744,12 +755,19 @@ impl Theme {
         }
     }
 
+    fn with_font_sans(mut self, family: SharedString) -> Self {
+        self.font_sans = family;
+        self
+    }
+
     /// Install the theme for `appearance` as the gpui global and point the
     /// context-free paint helpers at it. The **only** way the appearance should
     /// change — setting the global directly leaves [`current_appearance`] stale.
     pub fn install(appearance: Appearance, cx: &mut App) {
         set_current_appearance(appearance);
-        cx.set_global(Self::for_appearance(appearance));
+        let theme = Self::for_appearance(appearance)
+            .with_font_sans(crate::typography::effective_family_name(cx));
+        cx.set_global(theme);
     }
 
     /// Read the theme global.
@@ -1660,6 +1678,16 @@ mod tests {
         assert_eq!(current_appearance(), Appearance::Light);
         set_current_appearance(Appearance::Dark);
         assert_eq!(current_appearance(), Appearance::Dark);
+    }
+
+    #[test]
+    fn appearance_rebuild_preserves_selected_ui_family() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let theme = Theme::for_appearance(appearance).with_font_sans("Inter".into());
+            assert_eq!(theme.font_sans.as_ref(), "Inter");
+            assert_eq!(theme.font_sans_fixed.as_ref(), "Geist");
+            assert_eq!(theme.font_mono.as_ref(), "Geist Mono");
+        }
     }
 
     #[test]

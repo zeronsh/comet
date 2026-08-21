@@ -1570,6 +1570,10 @@ pub struct Transcript {
     /// frames reuse settled blocks' text+runs; the incremental parser's stable
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
+    /// Last UI typography generation reflected in `list` item measurements.
+    /// Family and size changes can alter prose wrapping without changing row
+    /// identity, so the virtual list must explicitly discard cached heights.
+    typography_generation: u32,
     highlights: HighlightStore,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
@@ -1756,6 +1760,7 @@ impl Transcript {
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
+            typography_generation: crate::typography::generation(cx),
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
@@ -3186,7 +3191,7 @@ impl Transcript {
                         .items_center()
                         .gap(px(Theme::SPACE_SM))
                         .pt(px(Theme::SPACE_LG))
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.danger)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
@@ -3235,7 +3240,7 @@ impl Transcript {
                 .items_center()
                 .gap(px(Theme::SPACE_SM))
                 .pt(px(Theme::SPACE_LG))
-                .text_size(px(11.0))
+                .text_size(crate::typography::ui_rems(11.0))
                 .child(crate::loaders::gradient_spinner(
                     "working-indicator",
                     &theme,
@@ -3245,7 +3250,7 @@ impl Transcript {
                 ))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .text_color(if queued {
                             theme.warning
                         } else {
@@ -3367,8 +3372,8 @@ impl Transcript {
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
+                                .text_size(crate::typography::ui_rems(14.0))
+                                .line_height(crate::typography::ui_rems(22.0))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
                                 .child(user_bubble_text(&row.id, text, mentions, &theme)),
@@ -3485,7 +3490,7 @@ impl Transcript {
         let copy_entry_id = row.entry_id.clone();
         let strip = row.timestamp.map(|ms| {
             let timestamp = div()
-                .text_size(px(12.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text_muted.opacity(0.55))
                 .child(SharedString::from(format_timestamp(ms, &chrono::Local)));
             let copy = copy_text.map(|text| {
@@ -4155,6 +4160,9 @@ impl Transcript {
         div()
             .flex()
             .flex_col()
+            // Tool summaries and cards are code-adjacent chrome. Detail bodies
+            // retain their explicit mono/diff typography below this boundary.
+            .font_family(theme.font_sans_fixed.clone())
             .when(collapses, |el| el.child(header))
             .child(body)
             .into_any_element()
@@ -4860,6 +4868,16 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let typography_generation = crate::typography::generation(cx);
+        if self.typography_generation != typography_generation {
+            self.typography_generation = typography_generation;
+            // `refresh_windows` re-lays out visible rows, but ListState keeps
+            // measured heights for virtualized rows outside the viewport.
+            // Mark every row unmeasured while retaining height hints and a
+            // proportional scroll anchor; GPUI will refresh each measurement
+            // as the row enters its layout range.
+            self.list.remeasure();
+        }
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);

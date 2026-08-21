@@ -19,12 +19,10 @@
 //! per-view prepaint cache for the frame, which is the only thing that forces
 //! already-laid-out elements to re-run their paint with the new palette.
 
-use std::path::{Path, PathBuf};
-
 use gpui::{App, Global, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
-use crate::settings::UiSettings;
+use crate::settings::{self, SavePolicy};
 use crate::theme::{Appearance, Theme};
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
@@ -59,9 +57,6 @@ impl AppearanceMode {
 pub struct AppearanceState {
     pub mode: AppearanceMode,
     pub system: Appearance,
-    /// Where `ui-settings.json` lives, so a menu action can persist the choice
-    /// without routing through the shell entity that normally owns settings.
-    pub data_dir: PathBuf,
 }
 
 impl Global for AppearanceState {}
@@ -78,14 +73,10 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
 /// Install the appearance globals and the matching theme. Call once at boot,
 /// before any window opens, so the first frame is already the right palette
 /// (installing later produces a visible dark-to-light flash).
-pub fn init(mode: AppearanceMode, data_dir: impl Into<PathBuf>, cx: &mut App) {
+pub fn init(mode: AppearanceMode, cx: &mut App) {
     let system = Appearance::from_window(cx.window_appearance());
     tracing::debug!(?mode, ?system, "appearance: initial");
-    cx.set_global(AppearanceState {
-        mode,
-        system,
-        data_dir: data_dir.into(),
-    });
+    cx.set_global(AppearanceState { mode, system });
     sync_ns_appearance(mode);
     Theme::install(resolve(mode, system), cx);
 }
@@ -108,23 +99,10 @@ pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
         return;
     }
     state.mode = mode;
-    let data_dir = state.data_dir.clone();
     apply(cx);
-    persist(mode, &data_dir);
-}
-
-/// Read-modify-write `ui-settings.json` for just the appearance key.
-///
-/// Deliberately a fresh load rather than a write of some cached struct: the
-/// shell holds its own `UiSettings` and saves it debounced, so writing a stale
-/// snapshot from here would silently roll back a pane resize the user made
-/// seconds earlier. Reloading keeps this to the one field we own.
-fn persist(mode: AppearanceMode, data_dir: &Path) {
-    let mut settings = UiSettings::load(data_dir);
-    settings.appearance = mode;
-    if let Err(err) = settings.save(data_dir) {
-        tracing::warn!(error = %err, "could not persist appearance");
-    }
+    settings::update(SavePolicy::Immediate, cx, |settings| {
+        settings.appearance = mode;
+    });
 }
 
 /// Subscribe a window to OS appearance changes. The returned [`Subscription`]

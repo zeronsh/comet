@@ -4358,6 +4358,9 @@ impl Render for Changes {
             .size_full()
             .flex()
             .flex_col()
+            // Changes is a code-adjacent surface: chrome stays Geist while
+            // paths, hunks, gutters, and source runs keep their mono overrides.
+            .font_family(theme.font_sans_fixed.clone())
             .when_some(error, |el, message| {
                 el.child(
                     div()

@@ -166,7 +166,7 @@ impl Render for ShortcutsPage {
                         .flex_col()
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from(id.label())),
@@ -174,7 +174,7 @@ impl Render for ShortcutsPage {
                         .child(
                             div()
                                 .mt(px(2.0))
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from(description(id))),
                         ),
@@ -183,7 +183,7 @@ impl Render for ShortcutsPage {
                     el.child(
                         div()
                             .id(("shortcut-reset", ix))
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .text_color(theme.text_muted.opacity(0.7))
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme.text))
@@ -206,7 +206,7 @@ impl Render for ShortcutsPage {
                         .flex()
                         .justify_center()
                         .font_family(theme.font_mono.clone())
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .cursor_pointer()
                         .map(|el| {
                             if is_recording {
@@ -313,7 +313,7 @@ impl Render for ShortcutsPage {
                             .mt(px(12.0))
                             .px(px(4.0))
                             .min_h(px(20.0))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_muted)
                             .child(helper),
                     ),

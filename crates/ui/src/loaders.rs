@@ -354,7 +354,7 @@ const HERO_ASCII: &str = include_str!("../assets/hero.txt");
 /// no letter-spacing at the pinned rev).
 pub fn loading_word(theme: &Theme) -> impl IntoElement {
     div()
-        .text_size(px(11.0))
+        .text_size(crate::typography::ui_rems(11.0))
         .text_color(theme.text_muted.opacity(0.7))
         .child(SharedString::from(
             "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",

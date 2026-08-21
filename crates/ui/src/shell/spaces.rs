@@ -330,7 +330,7 @@ impl Shell {
             .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .text_size(px(13.0))
+            .text_size(crate::typography::ui_rems(13.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(motion::hover_blend(
                 "spaces-filter",
@@ -383,7 +383,7 @@ impl Shell {
                         el.child(
                             div()
                                 .flex_none()
-                                .text_size(px(10.0))
+                                .text_size(crate::typography::ui_rems(10.0))
                                 .font_weight(gpui::FontWeight::NORMAL)
                                 .text_color(theme.text_muted.opacity(0.45))
                                 .child(tag),
@@ -530,7 +530,7 @@ impl Shell {
                             el.child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(10.0))
+                                    .text_size(crate::typography::ui_rems(10.0))
                                     .text_color(theme.text_muted.opacity(0.45))
                                     .child(tag),
                             )
@@ -719,7 +719,7 @@ impl Shell {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(12.0))
+                    .text_size(crate::typography::ui_rems(12.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted.opacity(0.5))
                     .child(label),
@@ -787,14 +787,14 @@ impl Shell {
                         )
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(crate::typography::ui_rems(10.0))
                                 .text_color(theme.text_muted)
                                 .child(SharedString::from("Unarchive")),
                         )
                         .into_any_element()
                 } else {
                     div()
-                        .text_size(px(11.0))
+                        .text_size(crate::typography::ui_rems(11.0))
                         .text_color(theme.text_muted.opacity(0.55))
                         .child(time_ago)
                         .into_any_element()
@@ -853,7 +853,7 @@ impl Shell {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .text_color(if hovered || is_selected {
                                     theme.text
                                 } else {
@@ -882,7 +882,7 @@ impl Shell {
                         .gap(px(10.0))
                         .px(px(10.0))
                         .rounded(px(6.0))
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .text_color(theme.text_muted.opacity(0.55))
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
@@ -1554,7 +1554,7 @@ impl Shell {
                 .items_center()
                 .gap(px(2.0))
                 .bg(crate::theme::ink(0.05))
-                .text_size(px(11.0))
+                .text_size(crate::typography::ui_rems(11.0))
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text_muted.opacity(0.7))
         };
@@ -1575,7 +1575,7 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .when(submit_busy || listing.is_none(), |el| el.opacity(0.6))
             .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
             .when(!submit_busy, |el| {
@@ -1618,7 +1618,7 @@ impl Shell {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(14.0))
+                    .text_size(crate::typography::ui_rems(14.0))
                     .child(search.clone().into_any_element()),
             )
             .child(submit_chip)
@@ -1673,7 +1673,7 @@ impl Shell {
                     .px(px(13.0))
                     .pt(px(10.0))
                     .pb(px(2.0))
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .font_family(theme.font_mono.clone())
                     .child({
                         let crumb = div()
@@ -1837,7 +1837,7 @@ impl Shell {
             div()
                 .px(px(14.0))
                 .py(px(16.0))
-                .text_size(px(12.5))
+                .text_size(crate::typography::ui_rems(12.5))
                 .text_color(theme.text_faint)
                 .child(SharedString::from(if query_empty {
                     "No folders here"
@@ -1948,7 +1948,7 @@ impl Shell {
                     .px(px(8.0))
                     .pt(px(2.0))
                     .pb(px(4.0))
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted.opacity(0.6))
                     .child(SharedString::from("Devices")),
@@ -1974,7 +1974,7 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .text_size(px(12.5))
+                    .text_size(crate::typography::ui_rems(12.5))
                     .cursor_pointer()
                     .when(is_active, |el| {
                         // The floating-card selection language: wash +
@@ -2079,7 +2079,7 @@ impl Shell {
                     .flex_row()
                     .items_start()
                     .gap(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .line_height(px(15.0))
                     .text_color(theme.text_muted.opacity(0.5))
                     .child(
@@ -2140,7 +2140,7 @@ impl Shell {
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(crate::typography::ui_rems(11.0))
                         .text_color(theme.danger)
                         .child(message),
                 )

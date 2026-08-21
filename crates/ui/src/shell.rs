@@ -41,8 +41,8 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    CHAT_PANEL_MIN, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    self, CHAT_PANEL_MIN, KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT,
+    SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -511,7 +511,7 @@ impl Render for SurfaceTabGhost {
             .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border_strong)
-            .text_size(px(11.5))
+            .text_size(crate::typography::ui_rems(11.5))
             .text_color(theme.text)
             .opacity(0.85)
             .child(div().truncate().child(self.title.clone()))
@@ -1020,7 +1020,6 @@ pub struct Shell {
     motion_active: std::cell::Cell<bool>,
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
-    save_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
     /// with nothing focused they go dead. Initial focus lands on the composer
@@ -1088,7 +1087,7 @@ impl Shell {
             }
         });
         let data_dir = boot.data_dir.clone();
-        let settings = UiSettings::load(&data_dir);
+        let settings = settings::current(cx);
         // Bind the customizable shortcuts from the persisted keymap.
         apply_keymap(cx, &settings.keymap);
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
@@ -1222,7 +1221,6 @@ impl Shell {
             motion_active: std::cell::Cell::new(false),
             splash: SplashPhase::Visible,
             splash_task: None,
-            save_task: None,
             focus_sub: None,
             _ticker: ticker,
             _state_observation: observation,
@@ -2074,34 +2072,14 @@ impl Shell {
         cx.notify();
     }
 
-    /// Debounced settings write: waits [`SAVE_DEBOUNCE_MS`], then persists the
-    /// latest snapshot on the background executor. Re-scheduling drops (cancels)
-    /// the previous timer.
+    /// Publish this view's working copy to the central settings store. The
+    /// store owns the single debounce task and the only production writer.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        let dir = self.data_dir.clone();
-        self.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(SAVE_DEBOUNCE_MS))
-                .await;
-            // Re-stamp the appearance from the global before writing. The View
-            // menu changes it through `appearance::set_mode`, which never touches
-            // this shell's in-memory copy — without this, the next pane resize
-            // would quietly write the boot-time appearance back over the user's
-            // choice.
-            let Ok(snapshot) = this.update(cx, |shell, cx| {
-                shell.settings.appearance = crate::appearance::mode(cx);
-                shell.settings.clone()
-            }) else {
-                return;
-            };
-            cx.background_executor()
-                .spawn(async move {
-                    if let Err(err) = snapshot.save(&dir) {
-                        tracing::warn!(error = %err, "failed to persist ui settings");
-                    }
-                })
-                .await;
-        }));
+        // Global-only controls can change while this shell copy is alive.
+        self.settings.appearance = crate::appearance::mode(cx);
+        self.settings.ui_font_family = crate::typography::requested(cx);
+        self.settings.ui_font_size = crate::typography::font_size(cx);
+        settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -3464,7 +3442,7 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .pt(px(12.0))
                             .pb(px(4.0))
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from("Settings")),
@@ -3481,7 +3459,7 @@ impl Shell {
                                 .rounded(px(8.0))
                                 .px(px(Theme::SPACE_SM))
                                 .py(px(6.0))
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .when(selected, |el| {
                                     // Same tokens as the main sidebar's session
                                     // rows — the two sidebars must feel alike.
@@ -3519,7 +3497,7 @@ impl Shell {
                         .rounded(px(8.0))
                         .px(px(Theme::SPACE_SM))
                         .py(px(6.0))
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
@@ -3627,7 +3605,7 @@ impl Shell {
                 )
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(crate::typography::ui_rems(10.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(if archived {
                             "Unarchive"
@@ -3664,7 +3642,7 @@ impl Shell {
                         .child(glyph)
                         .child(
                             div()
-                                .text_size(px(10.0))
+                                .text_size(crate::typography::ui_rems(10.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(status_color)
                                 .child(SharedString::from(label)),
@@ -3672,7 +3650,7 @@ impl Shell {
                         .into_any_element()
                 }
                 None => div()
-                    .text_size(px(10.0))
+                    .text_size(crate::typography::ui_rems(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(time_ago.clone())
                     .into_any_element(),
@@ -3783,7 +3761,7 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .line_height(px(14.0))
                             .text_color(subline)
                             .child(space_name),
@@ -3795,7 +3773,7 @@ impl Shell {
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .line_height(px(17.0))
                     .child(title),
             )
@@ -3830,7 +3808,7 @@ impl Shell {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.0))
+                                .text_size(crate::typography::ui_rems(11.0))
                                 .line_height(px(14.0))
                                 .text_color(subline)
                                 .child(branch),
@@ -4070,7 +4048,7 @@ impl Shell {
                                 div()
                                     .px(px(Theme::SPACE_SM))
                                     .pb(px(Theme::SPACE_SM))
-                                    .text_size(px(12.0))
+                                    .text_size(crate::typography::ui_rems(12.0))
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from("No sessions yet"))
                                     .into_any_element()
@@ -4102,7 +4080,7 @@ impl Shell {
                         .rounded(px(Theme::CONTROL_RADIUS))
                         .border_1()
                         .border_color(theme.danger)
-                        .text_size(px(11.0))
+                        .text_size(crate::typography::ui_rems(11.0))
                         .text_color(theme.danger)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -4178,7 +4156,7 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .text_size(px(11.0))
+            .text_size(crate::typography::ui_rems(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
             .child(div().flex_1().min_w_0().child(label));
@@ -4330,7 +4308,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(12.0))
+                    .text_size(crate::typography::ui_rems(12.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.bg)
                     .child(initial),
@@ -4344,7 +4322,7 @@ impl Shell {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(17.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text)
@@ -4354,7 +4332,7 @@ impl Shell {
                     .when_some(trigger_subline, |identity, subline| {
                         identity.child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(crate::typography::ui_rems(11.0))
                                 .line_height(px(15.0))
                                 .text_color(theme.text_muted)
                                 .child(subline),
@@ -4381,7 +4359,7 @@ impl Shell {
                         .px(px(8.0))
                         .pt(px(6.0))
                         .pb(px(4.0))
-                        .text_size(px(11.0))
+                        .text_size(crate::typography::ui_rems(11.0))
                         .text_color(theme.text_muted.opacity(0.7))
                         .truncate()
                         .child(menu_identity),
@@ -4757,7 +4735,7 @@ impl Shell {
                     card.child(
                         div()
                             .mt(px(10.0))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .line_height(px(17.0))
                             .text_color(theme.danger)
                             .child(error),
@@ -5142,7 +5120,7 @@ impl Shell {
                         .child(
                             div()
                                 .mt(px(24.0))
-                                .text_size(px(16.0))
+                                .text_size(crate::typography::ui_rems(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
                                 .child(SharedString::from("Add a project to get started")),
@@ -5150,7 +5128,7 @@ impl Shell {
                         .child(
                             div()
                                 .mt(px(6.0))
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .text_color(theme.text_muted.opacity(0.7))
                                 .child(SharedString::from(
                                     "A project is a folder on one of your devices.",
@@ -5199,7 +5177,7 @@ impl Shell {
                         .child(
                             div()
                                 .mt(px(12.0))
-                                .text_size(px(14.0))
+                                .text_size(crate::typography::ui_rems(14.0))
                                 .text_color(theme.text_muted.opacity(0.6))
                                 .child(helper),
                         ),
@@ -5305,7 +5283,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .text_color(theme.text)
                     .child("Drop images to attach")
                     .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.visible())
@@ -5407,13 +5385,13 @@ impl Shell {
                     .bg(wash)
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .text_color(theme.text_muted)
                             .child(SharedString::from("↓")),
                     )
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .text_color(theme.text)
                             .child(SharedString::from("Scroll to bottom")),
                     ),
@@ -5521,7 +5499,7 @@ impl Shell {
             .items_center()
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG + 8.0))
-            .text_size(px(11.0));
+            .text_size(crate::typography::ui_rems(11.0));
 
         let Some(chat_id) = state.selected_chat.clone() else {
             return strip.into_any_element();
@@ -5567,7 +5545,7 @@ impl Shell {
                 ))
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from("Sending…")),
                 )
@@ -5724,7 +5702,7 @@ impl Shell {
                 .child(icon(icon_path).size(px(15.0)).flex_none().text_color(muted))
                 .child(
                     div()
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(text)
                         .child(SharedString::from(title)),
@@ -5792,7 +5770,7 @@ impl Shell {
             .child(
                 div()
                     .mt(px(24.0))
-                    .text_size(px(18.0))
+                    .text_size(crate::typography::ui_rems(18.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from("Signed out")),
@@ -5801,7 +5779,7 @@ impl Shell {
                 div()
                     .mt(px(6.0))
                     .mb(px(24.0))
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
@@ -5812,7 +5790,7 @@ impl Shell {
                 card.child(
                     div()
                         .mb(px(16.0))
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .line_height(px(17.0))
                         .text_color(theme.danger)
                         .child(error),
@@ -6065,7 +6043,7 @@ impl Shell {
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.5))
+                        .text_size(crate::typography::ui_rems(11.5))
                         .text_color(if is_active {
                             theme.text
                         } else {
@@ -6280,7 +6258,7 @@ impl Shell {
                 .gap(px(Theme::SPACE_MD))
                 .child(
                     div()
-                        .text_size(px(14.0))
+                        .text_size(crate::typography::ui_rems(14.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(error.clone())),
                 )
@@ -6292,7 +6270,7 @@ impl Shell {
                         .rounded(px(8.0))
                         .border_1()
                         .border_color(theme.border)
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .text_color(theme.text)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.glass_hover()))
@@ -6324,7 +6302,7 @@ impl Shell {
                 .child(
                     div()
                         .mt(px(24.0))
-                        .text_size(px(18.0))
+                        .text_size(crate::typography::ui_rems(18.0))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
                         .child(SharedString::from("Log in to Zeron")),
@@ -6333,7 +6311,7 @@ impl Shell {
                     div()
                         .mt(px(6.0))
                         .mb(px(24.0))
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .line_height(px(19.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(
@@ -6350,7 +6328,7 @@ impl Shell {
                         .justify_center()
                         .rounded(px(6.0))
                         .bg(theme.text)
-                        .text_size(px(14.0))
+                        .text_size(crate::typography::ui_rems(14.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.on_solid)
                         .cursor_pointer()
@@ -6445,7 +6423,7 @@ impl Shell {
                     .child(
                         div()
                             .pb(px(8.0))
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from(
@@ -6463,7 +6441,7 @@ impl Shell {
                                 .border_1()
                                 .border_color(theme.border)
                                 .bg(theme.bg)
-                                .text_size(px(13.0))
+                                .text_size(crate::typography::ui_rems(13.0))
                                 .text_color(theme.text)
                                 .when(submitting, |el| el.opacity(0.5))
                                 .cursor_pointer()
@@ -6510,7 +6488,7 @@ impl Shell {
             .child(
                 div()
                     .mt(px(20.0))
-                    .text_size(px(18.0))
+                    .text_size(crate::typography::ui_rems(18.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text)
                     .child(SharedString::from("Create your workspace")),
@@ -6519,7 +6497,7 @@ impl Shell {
                 div()
                     .mt(px(6.0))
                     .mb(px(24.0))
-                    .text_size(px(13.0))
+                    .text_size(crate::typography::ui_rems(13.0))
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(blurb),
@@ -6541,7 +6519,7 @@ impl Shell {
                             .border_1()
                             .border_color(theme.border)
                             .bg(theme.bg)
-                            .text_size(px(13.0))
+                            .text_size(crate::typography::ui_rems(13.0))
                             .child(name_input),
                     )
                     .child(
@@ -6553,7 +6531,7 @@ impl Shell {
                             .items_center()
                             .rounded(px(6.0))
                             .bg(theme.text)
-                            .text_size(px(14.0))
+                            .text_size(crate::typography::ui_rems(14.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.on_solid)
                             .when(submitting, |el| el.opacity(0.5))
@@ -6572,7 +6550,7 @@ impl Shell {
                 el.child(
                     div()
                         .mt(px(16.0))
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .line_height(px(17.0))
                         .text_color(theme.danger_muted.opacity(0.9)) // red-300
                         .child(message),
@@ -6582,7 +6560,7 @@ impl Shell {
                 div().mt(px(24.0)).flex().flex_row().child(
                     div()
                         .id("org-signout")
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.text_muted.opacity(0.6))
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
@@ -6799,7 +6777,7 @@ fn windows_caption_button(
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(10.0))
+        .text_size(crate::typography::ui_rems(10.0))
         .text_color(theme.text)
         .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
         .active(move |style| style.bg(active_bg).text_color(active_fg))
@@ -7003,7 +6981,7 @@ impl Render for Shell {
             .bg(frost)
             .text_color(text)
             .font_family(font)
-            .text_size(px(14.0))
+            .text_size(crate::typography::ui_rems(14.0))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
