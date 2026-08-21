@@ -58,7 +58,9 @@ use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
-use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
+use zeron_rpc::{
+    LinkCache, RpcError, RpcReply, RpcService, capability_errors, methods, parse_params,
+};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -68,6 +70,7 @@ use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
+use crate::source_control::{ChangeRequestError, GitHubCli, OpenChangeRequestLookup};
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
@@ -397,6 +400,7 @@ pub struct EngineRpc {
     repos: Repos,
     terminals: Terminals,
     change_requests: CheckoutChangeRequests,
+    open_change_requests: std::sync::Arc<dyn OpenChangeRequestLookup>,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -434,6 +438,7 @@ impl EngineRpc {
             repos,
             terminals,
             change_requests,
+            open_change_requests: std::sync::Arc::new(GitHubCli::new()),
             diff_sync,
             uploads,
             agent_accounts,
@@ -466,6 +471,15 @@ impl EngineRpc {
     /// Attach the local→synced profile importer (synced runtimes only).
     pub fn with_local_import(mut self, importer: crate::local_import::LocalImporter) -> Self {
         self.local_import = Some(importer);
+        self
+    }
+
+    /// Replace the global change request source, primarily for host integration tests.
+    pub fn with_open_change_requests(
+        mut self,
+        lookup: std::sync::Arc<dyn OpenChangeRequestLookup>,
+    ) -> Self {
+        self.open_change_requests = lookup;
         self
     }
 
@@ -867,6 +881,20 @@ fn should_invalidate_link(error: &RpcError) -> bool {
     matches!(error, RpcError::Closed | RpcError::Transport(_))
 }
 
+fn change_request_rpc_error(error: ChangeRequestError) -> RpcError {
+    let code = match error {
+        ChangeRequestError::CliUnavailable => capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
+        ChangeRequestError::Authentication => capability_errors::PULL_REQUESTS_AUTHENTICATION,
+        ChangeRequestError::RateLimited => capability_errors::PULL_REQUESTS_RATE_LIMITED,
+        ChangeRequestError::Timeout => capability_errors::PULL_REQUESTS_TIMEOUT,
+        ChangeRequestError::Decode => capability_errors::PULL_REQUESTS_DECODE,
+        ChangeRequestError::RepositoryUnavailable
+        | ChangeRequestError::UnsupportedRepository
+        | ChangeRequestError::CommandFailed => capability_errors::PULL_REQUESTS_COMMAND_FAILED,
+    };
+    RpcError::Capability(code.into())
+}
+
 /// Reply deadline for a relay-forwarded unary call. The relay is WebSocket
 /// frames through a DO: a dropped frame (host socket replaced mid-call, DO
 /// restart) loses the reply SILENTLY — the DO's auto-pong keeps the client
@@ -915,6 +943,7 @@ fn forwardable(method: &str) -> bool {
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
+            | methods::LIST_OPEN_CHANGE_REQUESTS
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
@@ -1343,6 +1372,14 @@ impl RpcService for EngineRpc {
                     .map_err(|error| RpcError::Failed(error.to_string()))?
                     .filter_map(|status| async move { serde_json::to_value(status).ok() });
                 Ok(RpcReply::Stream(stream.boxed()))
+            }
+            methods::LIST_OPEN_CHANGE_REQUESTS => {
+                let items = self
+                    .open_change_requests
+                    .list_authored_open()
+                    .await
+                    .map_err(change_request_rpc_error)?;
+                RpcReply::value(&items)
             }
             // One-shot scoped capture for the Changes pane: `branch` diffs the
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the
@@ -1924,6 +1961,8 @@ mod tests {
         assert!(forwardable(methods::FETCH_ALL));
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(forwardable(methods::LIST_OPEN_CHANGE_REQUESTS));
+        assert!(!is_stream_method(methods::LIST_OPEN_CHANGE_REQUESTS));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —
@@ -1948,6 +1987,45 @@ mod tests {
             forward_deadline(methods::QUEUE_COMMAND),
             Duration::from_secs(30)
         );
+        assert_eq!(
+            forward_deadline(methods::LIST_OPEN_CHANGE_REQUESTS),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn pull_request_errors_are_stable_and_sanitized() {
+        for (error, expected) in [
+            (
+                ChangeRequestError::CliUnavailable,
+                capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
+            ),
+            (
+                ChangeRequestError::Authentication,
+                capability_errors::PULL_REQUESTS_AUTHENTICATION,
+            ),
+            (
+                ChangeRequestError::RateLimited,
+                capability_errors::PULL_REQUESTS_RATE_LIMITED,
+            ),
+            (
+                ChangeRequestError::Timeout,
+                capability_errors::PULL_REQUESTS_TIMEOUT,
+            ),
+            (
+                ChangeRequestError::Decode,
+                capability_errors::PULL_REQUESTS_DECODE,
+            ),
+            (
+                ChangeRequestError::CommandFailed,
+                capability_errors::PULL_REQUESTS_COMMAND_FAILED,
+            ),
+        ] {
+            assert!(matches!(
+                change_request_rpc_error(error),
+                RpcError::Capability(code) if code == expected
+            ));
+        }
     }
 
     #[test]
