@@ -834,7 +834,7 @@ impl Shell {
                             this.set_chat_settled(restore_id.clone(), false, cx);
                         }))
                         .child(
-                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                            crate::icons::icon(crate::icons::UNDO)
                                 .size(px(11.0))
                                 .flex_none()
                                 .text_color(theme.text_muted),

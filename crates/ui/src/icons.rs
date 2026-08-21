@@ -150,6 +150,8 @@ icon_assets![
     (HOME, "home"),
     (STOP, "stop"),
     (CHECK, "check"),
+    // Hand-drawn undo arrow in the same linear style as CHECK and RETURN.
+    (UNDO, "undo"),
     (COPY, "copy"),
     // Hand-drawn star pair in the Solar Linear style (like the terminal/
     // plus/return ports) — outline for the favorite affordance, bold for the
