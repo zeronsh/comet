@@ -167,6 +167,9 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    // Source-control provider marks used by Pull Requests rows.
+    (GITHUB_MARK, "github-mark"),
+    (BITBUCKET_MARK, "bitbucket-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
