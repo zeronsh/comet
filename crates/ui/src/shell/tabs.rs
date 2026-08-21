@@ -7,7 +7,206 @@
 
 use super::*;
 
+fn editor_icon(editor: &str) -> &'static str {
+    match editor {
+        "cursor" => crate::icons::EDITOR_CURSOR,
+        "code" => crate::icons::EDITOR_VSCODE,
+        "zed" => crate::icons::EDITOR_ZED,
+        "windsurf" => crate::icons::EDITOR_WINDSURF,
+        "idea" => crate::icons::EDITOR_INTELLIJ,
+        "pycharm" => crate::icons::EDITOR_PYCHARM,
+        "goland" => crate::icons::EDITOR_GOLAND,
+        "webstorm" => crate::icons::EDITOR_WEBSTORM,
+        "rustrover" => crate::icons::EDITOR_RUSTROVER,
+        _ => crate::icons::FOLDER,
+    }
+}
+
 impl Shell {
+    /// Titlebar split control for the currently selected thread checkout.
+    /// The primary action uses the first installed editor; the arrow exposes
+    /// every detected editor plus Finder.
+    fn render_editor_control(
+        &mut self,
+        path: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let editors = self.installed_editor_choices();
+        let preferred_editor = self.settings.preferred_editor.clone();
+        let default_editor = preferred_editor
+            .as_deref()
+            .filter(|preferred| {
+                preferred.is_empty() || editors.iter().any(|(id, _)| id == preferred)
+            })
+            .unwrap_or_else(|| editors.first().map(|(id, _)| *id).unwrap_or(""))
+            .to_string();
+        let menu_open = self.editor_menu.get().is_some();
+        let menu_closing = self.editor_menu.closing_since();
+        let has_editors = !editors.is_empty();
+        let default_label = if default_editor.is_empty() {
+            "Finder"
+        } else {
+            editors
+                .iter()
+                .find(|(id, _)| *id == default_editor.as_str())
+                .map(|(_, label)| *label)
+                .unwrap_or("Finder")
+        };
+        let default_icon = editor_icon(&default_editor);
+
+        let mut menu = popover::popover_card(theme)
+            .w(px(190.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.close_editor_menu(cx);
+            }))
+            .flex()
+            .flex_col()
+            .gap(px(2.0));
+
+        for (id, label) in editors {
+            let editor_id = id;
+            let editor_path = path.clone();
+            let row_id: SharedString = format!("session-editor-{editor_id}").into();
+            menu = menu.child(
+                popover::menu_row(theme, editor_id == default_editor.as_str(), row_id.clone())
+                    .id(row_id)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_preferred_editor(editor_id, cx);
+                        open_in_editor(&editor_path, editor_id);
+                        this.close_editor_menu(cx);
+                    }))
+                    .child(
+                        icon(editor_icon(editor_id))
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(div().flex_1().child(SharedString::from(label))),
+            );
+        }
+
+        if has_editors {
+            menu = menu.child(
+                div()
+                    .h(px(1.0))
+                    .mx(px(8.0))
+                    .bg(crate::theme::hairline(0.08)),
+            );
+        }
+        let finder_path = path.clone();
+        menu = menu.child(
+            popover::menu_row(theme, default_editor.is_empty(), "session-editor-finder")
+                .id("session-editor-finder")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_preferred_editor("", cx);
+                    open_in_editor(&finder_path, "");
+                    this.close_editor_menu(cx);
+                }))
+                .child(
+                    icon(crate::icons::FOLDER)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(div().flex_1().child(SharedString::from("Finder"))),
+        );
+
+        let primary_path = path.clone();
+        let primary_editor = default_editor.clone();
+        let mut control = div()
+            .id("session-open-editor")
+            .relative()
+            .flex_none()
+            .h(px(28.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(7.0))
+            .overflow_hidden()
+            .bg(theme.glass_hover().opacity(0.55));
+
+        control = control.child(
+            div()
+                .id("session-open-editor-main")
+                .h_full()
+                .px(px(9.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.glass_hover()))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(
+                        move |_this: &mut Shell,
+                              _: &gpui::MouseDownEvent,
+                              _: &mut Window,
+                              _: &mut Context<Shell>| {
+                            open_in_editor(&primary_path, &primary_editor);
+                        },
+                    ),
+                )
+                .child(
+                    icon(default_icon)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(SharedString::from(default_label)),
+                ),
+        );
+        control = control.child(
+            div()
+                .w(px(1.0))
+                .h(px(16.0))
+                .bg(crate::theme::hairline(0.12)),
+        );
+        control = control.child(
+            div()
+                .id("session-open-editor-menu-trigger")
+                .h_full()
+                .w(px(28.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.glass_hover()))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.editor_menu.note_trigger_press()),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.editor_menu.take_press_was_open() {
+                        this.close_editor_menu(cx);
+                    } else {
+                        this.editor_menu.open(());
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    icon(crate::icons::ALT_ARROW_DOWN)
+                        .size(px(13.0))
+                        .text_color(theme.text_muted),
+                ),
+        );
+
+        if menu_open {
+            control = control.child(popover::anchored_menu_below_gap(
+                "session-editor-menu",
+                menu.into_any_element(),
+                menu_closing,
+                8.0,
+            ));
+        }
+
+        control.into_any_element()
+    }
+
     /// Boot landing: the most recently active visible chat once the first
     /// chats frame has synced (manual selection wins; no chats → the
     /// new-session canvas shows).
@@ -90,15 +289,12 @@ impl Shell {
                         .unwrap_or("Unknown device");
                     // Resolve the absolute path to open: worktree path,
                     // chat cwd, or the space's folder path.
-                    let open_path = chat
-                        .cwd
-                        .clone()
-                        .or_else(|| {
-                            chat.space_id
-                                .as_deref()
-                                .and_then(|id| state.space_row(id))
-                                .map(|s| s.path.clone())
-                        });
+                    let open_path = chat.cwd.clone().or_else(|| {
+                        chat.space_id
+                            .as_deref()
+                            .and_then(|id| state.space_row(id))
+                            .map(|s| s.path.clone())
+                    });
                     (
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
@@ -281,50 +477,16 @@ impl Shell {
                                     .text_color(theme.text_muted.opacity(0.5))
                                     .child(target),
                             )
-                        })
-                        // "Open in Editor" button: opens with first
-                        // detected editor, or Finder if none found.
-                        .when_some(cwd_path.clone(), |el, path| {
-                            let editors = detected_editors();
-                            let first_editor = editors.first().map(|e| e.0).unwrap_or("");
-                            let first_label = editors.first().map(|e| e.1).unwrap_or("Finder");
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .h(px(26.0))
-                                    .px(px(6.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(4.0))
-                                    .rounded(px(6.0))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(crate::theme::wash(0.11)))
-                                    .on_mouse_down(
-                                        gpui::MouseButton::Left,
-                                        {
-                                            let p = path.clone();
-                                            cx.listener(move |_this: &mut Shell, _: &gpui::MouseDownEvent, _: &mut Window, _: &mut Context<Shell>| {
-                                                open_in_editor(&p, first_editor);
-                                            })
-                                        },
-                                    )
-                                    .child(
-                                        icon(crate::icons::FOLDER)
-                                            .size(px(13.0))
-                                            .text_color(theme.text_muted.opacity(0.6)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.text_muted.opacity(0.6))
-                                            .child(SharedString::from(first_label)),
-                                    ),
-                            )
                         }),
                 )
             })
             .child(div().flex_1())
+            .when(!takeover, |el| {
+                el.when_some(
+                    cwd_path.map(|path| self.render_editor_control(path, &theme, cx)),
+                    |el, control| el.child(control),
+                )
+            })
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE

@@ -831,6 +831,10 @@ pub struct Shell {
     right_terminal: Option<Entity<TerminalPanel>>,
     /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
     right_plus: popover::Popup<()>,
+    /// The current thread checkout's editor picker in the titlebar.
+    editor_menu: popover::Popup<()>,
+    /// Installed editor probes are stable for the lifetime of the shell.
+    installed_editors: Option<Vec<(&'static str, &'static str)>>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -1126,6 +1130,8 @@ impl Shell {
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
+            editor_menu: popover::Popup::default(),
+            installed_editors: None,
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
@@ -2181,6 +2187,32 @@ impl Shell {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.user_menu);
             cx.notify();
         }
+    }
+
+    /// Close the titlebar editor picker through the shared popover exit phase.
+    pub(super) fn close_editor_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.editor_menu);
+            cx.notify();
+        }
+    }
+
+    /// Probe editors once per shell. The menu can be rendered many times per
+    /// second, so probing process/app launchers directly from the render path
+    /// would be surprisingly expensive.
+    pub(super) fn installed_editor_choices(&mut self) -> Vec<(&'static str, &'static str)> {
+        if self.installed_editors.is_none() {
+            self.installed_editors = Some(detected_editors());
+        }
+        self.installed_editors.clone().unwrap_or_default()
+    }
+
+    /// Remember the editor selected from the titlebar menu for future
+    /// threads. An empty id intentionally means Finder.
+    pub(super) fn set_preferred_editor(&mut self, editor: &str, cx: &mut Context<Self>) {
+        self.settings.preferred_editor = Some(editor.to_string());
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     /// Close the session-row context menu through the exit animation.
@@ -7270,12 +7302,44 @@ fn nav_history_button(
     window_control_button(id, icon_path, theme, on_click).into_any_element()
 }
 
-/// A size-7 icon button for the main-panel header (zeron __root.tsx:
-/// `grid size-7 place-items-center rounded-md text-muted-foreground`).
+const KNOWN_EDITORS: &[(&str, &str, &str, &str)] = &[
+    ("cursor", "Cursor", "cursor", "Cursor"),
+    ("code", "VS Code", "code", "Visual Studio Code"),
+    ("zed", "Zed", "zed", "Zed"),
+    ("windsurf", "Windsurf", "windsurf", "Windsurf"),
+    ("idea", "IntelliJ IDEA", "idea", "IntelliJ IDEA"),
+    ("pycharm", "PyCharm", "pycharm", "PyCharm"),
+    ("goland", "GoLand", "goland", "GoLand"),
+    ("webstorm", "WebStorm", "webstorm", "WebStorm"),
+    ("rustrover", "RustRover", "rustrover", "RustRover"),
+];
+
+fn editor_spec(id: &str) -> Option<(&'static str, &'static str)> {
+    KNOWN_EDITORS
+        .iter()
+        .find(|(known_id, _, _, _)| *known_id == id)
+        .map(|(_, _, command, app)| (*command, *app))
+}
+
 /// Launch a folder in an editor (or Finder as fallback).
-/// `editor` can be a command name like "cursor", "code", "zed", or empty
-/// for the OS file manager.
+/// `editor` is one of the stable ids in [`KNOWN_EDITORS`], or empty for the
+/// OS file manager.
 pub fn open_in_editor(path: &str, editor: &str) {
+    // On macOS, opening the app bundle directly is more reliable than relying
+    // on an optional shell command being installed in PATH (notably for Zed).
+    #[cfg(target_os = "macos")]
+    if let Some((_, app)) = editor_spec(editor) {
+        let result = std::process::Command::new("open")
+            .args(["-a", app, path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(e) = result {
+            tracing::warn!(path, editor, error = %e, "failed to open editor app");
+        }
+        return;
+    }
+
     let (cmd, args): (&str, &[&str]) = match editor {
         "cursor" => ("cursor", &["."]),
         "code" | "vscode" => ("code", &["."]),
@@ -7340,27 +7404,29 @@ pub fn open_in_editor(path: &str, editor: &str) {
 }
 
 /// Probe which known editors are installed on this machine.
+///
+/// macOS checks registered application bundles as well as CLI launchers, so
+/// an editor such as Zed appears even when its shell command is not on PATH.
 pub fn detected_editors() -> Vec<(&'static str, &'static str)> {
     let mut editors: Vec<(&'static str, &'static str)> = Vec::new();
-    for (id, label, cmd) in [
-        ("cursor", "Cursor", "cursor"),
-        ("code", "VS Code", "code"),
-        ("zed", "Zed", "zed"),
-        ("windsurf", "Windsurf", "windsurf"),
-        ("idea", "IntelliJ IDEA", "idea"),
-        ("pycharm", "PyCharm", "pycharm"),
-        ("goland", "GoLand", "goland"),
-        ("webstorm", "WebStorm", "webstorm"),
-        ("rustrover", "RustRover", "rustrover"),
-    ] {
-        // Quick probe: spawn --version, check if it runs without error
-        if std::process::Command::new(cmd)
+    for (id, label, command, app) in KNOWN_EDITORS {
+        let command_installed = std::process::Command::new(command)
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok()
-        {
+            .is_ok_and(|status| status.success());
+        #[cfg(target_os = "macos")]
+        let app_installed = std::process::Command::new("open")
+            .args(["-Ra", *app])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        #[cfg(not(target_os = "macos"))]
+        let app_installed = false;
+
+        if command_installed || app_installed {
             editors.push((id, label));
         }
     }

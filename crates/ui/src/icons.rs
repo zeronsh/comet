@@ -167,6 +167,17 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    // Editor brand marks used by the thread-checkout launcher. The source
+    // marks are monochrome so titlebar/menu tinting follows the active theme.
+    (EDITOR_CURSOR, "editor-cursor"),
+    (EDITOR_VSCODE, "editor-vscode"),
+    (EDITOR_ZED, "editor-zed"),
+    (EDITOR_WINDSURF, "editor-windsurf"),
+    (EDITOR_INTELLIJ, "editor-intellij"),
+    (EDITOR_PYCHARM, "editor-pycharm"),
+    (EDITOR_GOLAND, "editor-goland"),
+    (EDITOR_WEBSTORM, "editor-webstorm"),
+    (EDITOR_RUSTROVER, "editor-rustrover"),
     // Source-control provider marks used by Pull Requests rows.
     (GITHUB_MARK, "github-mark"),
     (BITBUCKET_MARK, "bitbucket-mark"),

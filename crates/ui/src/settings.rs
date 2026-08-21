@@ -100,6 +100,10 @@ pub struct UiSettings {
     pub appearance: crate::appearance::AppearanceMode,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
+    /// Preferred editor id for opening thread checkouts. `None` follows the
+    /// first installed known editor; `Some("")` explicitly chooses Finder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_editor: Option<String>,
 }
 
 impl Default for UiSettings {
@@ -123,6 +127,7 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             diff_split: false,
+            preferred_editor: None,
         }
     }
 }
@@ -400,6 +405,7 @@ mod tests {
             },
             appearance: crate::appearance::AppearanceMode::Light,
             diff_split: true,
+            preferred_editor: Some("zed".into()),
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
