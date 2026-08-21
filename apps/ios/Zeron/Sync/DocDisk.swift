@@ -94,7 +94,9 @@ enum DocDisk {
                                                       includingPropertiesForKeys: [.contentModificationDateKey])
         else { return }
         let sessions = files.filter {
-            !$0.lastPathComponent.hasPrefix("ws3_") && !$0.lastPathComponent.hasPrefix("registry1_")
+            $0.pathExtension == "loro"  // never the registry blob or uploads/
+                && !$0.lastPathComponent.hasPrefix("ws3_")
+                && !$0.lastPathComponent.hasPrefix("registry1_")
         }
         guard sessions.count > keep else { return }
         let sorted = sessions.sorted {

@@ -221,6 +221,11 @@ export class RegistryRoom implements DurableObject {
       // body. LWW clocks make replayed batches apply zero ops, so
       // at-least-once delivery (including 0-RTT/early-data replays) is safe.
       const device = url.searchParams.get("device") ?? "";
+      // Pre-read cap (the WS path gets this for free from MAX_FRAME_BYTES):
+      // a legitimate batch is bounded well under this by MAX_BATCH_OPS ×
+      // MAX_OP_BYTES; anything larger only burns this room's own CPU.
+      const declared = Number(request.headers.get("content-length") ?? "0");
+      if (declared > 2 * 1024 * 1024) return json({ error: "too_large" }, 413);
       let frame: Record<string, unknown>;
       try {
         frame = (await request.json()) as Record<string, unknown>;

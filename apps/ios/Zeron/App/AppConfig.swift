@@ -43,20 +43,18 @@ final class AppConfig: @unchecked Sendable {
     }
 
     func updateTokens(_ new: AuthTokens) {
-        lock.lock(); defer { lock.unlock() }
-        tokens = new
+        lock.withLock {
+            tokens = new
+        }
     }
 
     /// Current bearer, refreshing the WorkOS access token when needed.
     func currentToken() async -> String? {
         switch mode {
         case .dev:
-            lock.lock(); defer { lock.unlock() }
-            return devBearer
+            return lock.withLock { devBearer }
         case .workos:
-            lock.lock()
-            let current = tokens
-            lock.unlock()
+            let current = lock.withLock { tokens }
             guard let current else { return nil }
             if !Self.isExpired(jwt: current.accessToken) {
                 return current.accessToken
@@ -69,31 +67,32 @@ final class AppConfig: @unchecked Sendable {
     /// under the lock as its last act, so a caller either joins a live
     /// refresh or starts a fresh one — never a second concurrent POST.
     private func refreshedToken(current: AuthTokens) async -> String? {
-        lock.lock()
-        if let existing = refreshTask {
-            lock.unlock()
-            return await existing.value
-        }
-        let task = Task<String?, Never> { [edgeURL, orgId] in
-            let client = AuthClient(baseURL: edgeURL)
-            let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
-                                                      organizationId: orgId)
-            if let refreshed {
-                self.updateTokens(refreshed)
-                Keychain.save(refreshed.accessToken, key: "accessToken")
-                Keychain.save(refreshed.refreshToken, key: "refreshToken")
-            } else {
-                roomLog.error("auth: token refresh failed; using expired access token (server will reject and rooms will redial)")
+        let task = lock.withLock {
+            if let existing = refreshTask {
+                return existing
             }
-            self.lock.lock()
-            self.refreshTask = nil
-            self.lock.unlock()
-            // Failure falls back to the expired token: let the server
-            // reject; the rooms' backoff redials retry through here.
-            return refreshed?.accessToken ?? current.accessToken
+
+            let task = Task<String?, Never> { [edgeURL, orgId] in
+                let client = AuthClient(baseURL: edgeURL)
+                let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
+                                                          organizationId: orgId)
+                if let refreshed {
+                    self.updateTokens(refreshed)
+                    Keychain.save(refreshed.accessToken, key: "accessToken")
+                    Keychain.save(refreshed.refreshToken, key: "refreshToken")
+                } else {
+                    roomLog.error("auth: token refresh failed; using expired access token (server will reject and rooms will redial)")
+                }
+                self.lock.withLock {
+                    self.refreshTask = nil
+                }
+                // Failure falls back to the expired token: let the server
+                // reject; the rooms' backoff redials retry through here.
+                return refreshed?.accessToken ?? current.accessToken
+            }
+            refreshTask = task
+            return task
         }
-        refreshTask = task
-        lock.unlock()
         return await task.value
     }
 
@@ -165,11 +164,14 @@ final class AppConfig: @unchecked Sendable {
         guard let token = await currentToken() else { return nil }
         var url = edgeURL.appending(path: "registry/\(orgId)/rows")
         var items = [URLQueryItem(name: "device", value: deviceId),
-                     URLQueryItem(name: "beat", value: "1"),
-                     URLQueryItem(name: "token", value: token)]
+                     URLQueryItem(name: "beat", value: "1")]
         if let since { items.append(URLQueryItem(name: "since", value: String(since))) }
         url.append(queryItems: items)
-        return URLRequest(url: url)
+        // Bearer header, never ?token=: HTTP supports headers (unlike WS
+        // upgrades), and query strings can reach request logs.
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return request
     }
 
     /// POST /registry/{orgId}/push — one op batch over plain HTTPS (LWW

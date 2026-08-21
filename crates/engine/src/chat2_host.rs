@@ -78,12 +78,25 @@ impl ChatDocSink for EngineChatSink {
         let Some(doc) = self.doc.upgrade() else {
             return;
         };
-        if let Err(err) = doc.doc().import(bytes) {
-            // Malformed remote bytes cost the row, never the doc (the same
-            // skip-not-fail rule as transcript reads). The cursor still
-            // advances: replaying a poison row forever is the wedge class.
-            tracing::warn!(chat = %self.chat_id, error = %err,
-                "chat2 sink: row import failed; skipping row");
+        match doc.doc().import(bytes) {
+            Ok(status) => {
+                if status.pending.is_some() {
+                    // Missing causal deps: loro parked these ops invisibly.
+                    // The client's cursor contiguity rule keeps `cursor`
+                    // honest (it never jumps a gap), so persisting is safe —
+                    // this warn is the tripwire that the 2026-08-19
+                    // empty-doc/advanced-cursor wedge shape was seen live.
+                    tracing::warn!(chat = %self.chat_id, cursor,
+                        "chat2 sink: row parked on missing deps (gap repair should follow)");
+                }
+            }
+            Err(err) => {
+                // Malformed remote bytes cost the row, never the doc (the same
+                // skip-not-fail rule as transcript reads). The cursor still
+                // advances: replaying a poison row forever is the wedge class.
+                tracing::warn!(chat = %self.chat_id, error = %err,
+                    "chat2 sink: row import failed; skipping row");
+            }
         }
         self.persist_with_cursor(cursor);
     }

@@ -40,8 +40,10 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 struct SpaceEntry {
     path: PathBuf,
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the folder watcher alive; dropped on entry close.
-    _watcher: Option<notify::RecommendedWatcher>,
+    /// Keeps the folder watcher alive; dropped on entry close. Filled
+    /// asynchronously — FSEvents registration blocks, so [`reconcile`] builds
+    /// it off the runtime and attaches it here once ready.
+    folder_watch: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 struct SpacesSyncInner {
@@ -122,11 +124,31 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             continue; // deviceId/path are immutable — nothing to refresh
         }
         let (kick_tx, kick_rx) = mpsc::unbounded_channel();
+        let entry = Arc::new(SpaceEntry {
+            path: PathBuf::from(&space.path),
+            kick_tx: kick_tx.clone(),
+            folder_watch: Mutex::new(None),
+        });
+        entries.insert(id.to_string(), entry.clone());
+        tokio::spawn(entry_task(
+            Arc::downgrade(inner),
+            id.to_string(),
+            Arc::downgrade(&entry),
+            kick_rx,
+        ));
+        let _ = kick_tx.send(()); // initial check (boot / first observed)
+
         // Non-recursive watcher on the space folder: `.git` appearing/vanishing
         // among the direct children is exactly the signal we need. Watch
-        // failures are fine — the repair tick still converges.
-        let watcher = {
-            let tx = kick_tx.clone();
+        // failures are fine — the repair tick still converges. Built off the
+        // runtime: FSEvents registration blocks, and reconcile runs on the
+        // spaces-watch task.
+        let weak = Arc::downgrade(&entry);
+        tokio::task::spawn_blocking(move || {
+            let Some(entry) = weak.upgrade() else {
+                return; // entry removed before the watcher was ready
+            };
+            let tx = entry.kick_tx.clone();
             let result =
                 notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                     let Ok(event) = event else { return };
@@ -141,34 +163,23 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
             match result {
                 Ok(mut watcher) => {
                     use notify::Watcher as _;
-                    match watcher.watch(Path::new(&space.path), notify::RecursiveMode::NonRecursive)
-                    {
-                        Ok(()) => Some(watcher),
+                    match watcher.watch(&entry.path, notify::RecursiveMode::NonRecursive) {
+                        Ok(()) => {
+                            *lock(&entry.folder_watch) = Some(watcher);
+                            // Close the check→attach gap: a `.git` change while
+                            // unwatched gets caught by this recheck.
+                            let _ = entry.kick_tx.send(());
+                        }
                         Err(err) => {
-                            tracing::debug!(path = %space.path, error = %err, "spaces: watch failed");
-                            None
+                            tracing::debug!(path = %entry.path.display(), error = %err, "spaces: watch failed");
                         }
                     }
                 }
                 Err(err) => {
                     tracing::debug!(error = %err, "spaces: watcher create failed");
-                    None
                 }
             }
-        };
-        let entry = Arc::new(SpaceEntry {
-            path: PathBuf::from(&space.path),
-            kick_tx: kick_tx.clone(),
-            _watcher: watcher,
         });
-        entries.insert(id.to_string(), entry.clone());
-        tokio::spawn(entry_task(
-            Arc::downgrade(inner),
-            id.to_string(),
-            Arc::downgrade(&entry),
-            kick_rx,
-        ));
-        let _ = kick_tx.send(()); // initial check (boot / first observed)
     }
 }
 

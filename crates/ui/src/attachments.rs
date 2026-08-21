@@ -641,8 +641,52 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
         },
-        _ => AttachmentSnapshot::Loading,
+        Some(CacheEntry::Loading { .. }) => AttachmentSnapshot::Loading,
+        None => {
+            // Queued-send alias: the host materializes `pending://{id}/{name}`
+            // at `{uploads}/{id8}-{name}` and rewrites the persisted ref to
+            // that ABSOLUTE path — one the sender can't know up front (it's
+            // the host's disk). The id8 basename prefix IS derivable though,
+            // so the send seeds the bytes under an alias and this fallback
+            // resolves the rewritten ref instantly instead of blanking the
+            // thumbnail into a skeleton while the bytes round-trip
+            // (2026-08-19 "photo disappears after it finishes sending").
+            if let Some(image) = upload_alias_id8(path)
+                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+                    Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
+                    _ => None,
+                })
+            {
+                cache.insert_loaded(key(device_id, path), image.clone());
+                return AttachmentSnapshot::Loaded(image);
+            }
+            AttachmentSnapshot::Loading
+        }
     }
+}
+
+/// The uploadId fragment a committed upload's basename starts with
+/// (`{id8}-{name}` per the engine's `Uploads::pending_target`). `None` when
+/// the path can't be a committed upload.
+fn upload_alias_id8(path: &str) -> Option<String> {
+    let base = std::path::Path::new(path).file_name()?.to_str()?;
+    let (id8, _) = base.split_at_checked(8)?;
+    (base.as_bytes().get(8) == Some(&b'-')
+        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+    .then(|| id8.to_string())
+}
+
+fn alias_key(device_id: &str, id8: &str) -> (String, String) {
+    key(device_id, &format!("upload-alias://{id8}"))
+}
+
+/// Seed the just-sent image under its upload identity so the persisted
+/// message's rewritten absolute ref (host-side path) resolves from the same
+/// local bytes — see the alias fallback in [`attachment_snapshot`].
+pub fn seed_attachment_alias(device_id: &str, upload_id: &str, name: &str, image: Arc<Image>) {
+    let id8: String = upload_id.chars().take(8).collect();
+    let (device, path) = alias_key(device_id, &id8);
+    store_loaded(&device, &path, name.to_string().into(), image);
 }
 
 /// Release gpui's decoded copies of evicted images: the asset-system entry

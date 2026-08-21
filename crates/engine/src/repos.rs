@@ -39,6 +39,9 @@ const DRIVE_LIST_MAX_ENTRIES: usize = 50;
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+const FILE_INDEX_TTL: Duration = Duration::from_secs(10);
+const FILE_INDEX_MAX_ENTRIES: usize = 250_000;
+const RANK_BUFFER: usize = 1_024;
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
 
@@ -90,7 +93,21 @@ struct ReposInner {
     device_id: String,
     worktrees_root: PathBuf,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    file_index: FileIndexCache,
 }
+
+struct IndexedPath {
+    path: String,
+    haystack: nucleo_matcher::Utf32String,
+    is_dir: bool,
+}
+
+struct FileIndex {
+    entries: Vec<IndexedPath>,
+    built: std::time::Instant,
+}
+
+type FileIndexCache = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<FileIndex>>>;
 
 #[derive(Clone)]
 pub struct Repos {
@@ -112,6 +129,7 @@ impl Repos {
                 device_id: device_id.to_string(),
                 worktrees_root,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
+                file_index: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -822,12 +840,14 @@ impl Repos {
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(cancelled.clone());
         let worker_cancelled = cancelled.clone();
+        let cache = self.inner.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("file-search".into())
             .spawn(move || {
                 let _gate = gate;
-                let _ = tx.send(search_files_blocking_with_cancel(
+                let _ = tx.send(search_files_cached(
+                    &cache.file_index,
                     &root,
                     &query,
                     &featured_paths,
@@ -1131,31 +1151,7 @@ fn unescape_mount_point(raw: &str) -> String {
     out
 }
 
-/// Case-insensitive subsequence score. Lower is better: adjacent and earlier
-/// characters win, while still allowing `cmp rs` to find `composer.rs`.
-fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
-    let candidate = candidate.to_lowercase();
-    query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .try_fold(0usize, |total, term| {
-            let mut at = 0;
-            let mut score = 0usize;
-            let mut previous_end = None;
-            for needle in term.chars() {
-                let found = candidate[at..].find(needle)? + at;
-                score += found;
-                if previous_end == Some(found) {
-                    score = score.saturating_sub(2);
-                }
-                at = found + needle.len_utf8();
-                previous_end = Some(at);
-            }
-            Some(total.saturating_add(score))
-        })
-}
-
-type RankedFileMatch = (Option<usize>, usize, String, bool);
+type RankedFileMatch = (Option<usize>, u32, String, bool);
 
 fn compare_file_matches(
     query: &str,
@@ -1167,7 +1163,7 @@ fn compare_file_matches(
         .is_none()
         .cmp(&featured_b.is_none())
         .then_with(|| featured_a.cmp(featured_b))
-        .then_with(|| score_a.cmp(score_b))
+        .then_with(|| score_b.cmp(score_a))
         .then_with(|| {
             empty_query
                 .then(|| path_a.split('/').count().cmp(&path_b.split('/').count()))
@@ -1191,14 +1187,160 @@ fn search_files_blocking(
     search_files_blocking_with_cancel(root, query, featured_paths, || false)
 }
 
-fn search_files_blocking_with_cancel<F: Fn() -> bool>(
+#[cfg(test)]
+fn search_files_blocking_with_cancel<F: Fn() -> bool + Sync>(
     root: &Path,
     query: &str,
     featured_paths: &[String],
     cancelled: F,
 ) -> Result<Vec<FileSearchMatch>, EngineError> {
-    let root = std::fs::canonicalize(root)
-        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))?;
+    let root = canonical_search_root(root)?;
+    let index = walk_file_index(&root, &cancelled)?;
+    Ok(rank_file_matches(&index, &root, query, featured_paths))
+}
+
+fn search_files_cached<F: Fn() -> bool + Sync>(
+    cache: &FileIndexCache,
+    root: &Path,
+    query: &str,
+    featured_paths: &[String],
+    cancelled: F,
+) -> Result<Vec<FileSearchMatch>, EngineError> {
+    let root = canonical_search_root(root)?;
+    let fresh = cache
+        .lock()
+        .ok()
+        .and_then(|indexes| indexes.get(&root).cloned())
+        .filter(|index| index.built.elapsed() < FILE_INDEX_TTL);
+    let index = match fresh {
+        Some(index) => index,
+        None => {
+            let index = std::sync::Arc::new(FileIndex {
+                entries: walk_file_index(&root, &cancelled)?,
+                built: std::time::Instant::now(),
+            });
+            if let Ok(mut indexes) = cache.lock() {
+                indexes.retain(|_, index| index.built.elapsed() < FILE_INDEX_TTL);
+                indexes.insert(root.clone(), index.clone());
+            }
+            index
+        }
+    };
+    if cancelled() {
+        return Err(EngineError::Other("file search cancelled".into()));
+    }
+    Ok(rank_file_matches(
+        &index.entries,
+        &root,
+        query,
+        featured_paths,
+    ))
+}
+
+fn canonical_search_root(root: &Path) -> Result<PathBuf, EngineError> {
+    std::fs::canonicalize(root)
+        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))
+}
+
+fn walk_file_index<F: Fn() -> bool + Sync>(
+    root: &Path,
+    cancelled: &F,
+) -> Result<Vec<IndexedPath>, EngineError> {
+    if cancelled() {
+        return Err(EngineError::Other("file search cancelled".into()));
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(12))
+        .unwrap_or(4);
+    let collected: std::sync::Mutex<Vec<IndexedPath>> = std::sync::Mutex::new(Vec::new());
+    let was_cancelled = AtomicBool::new(false);
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .threads(threads)
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+        .build_parallel()
+        .run(|| {
+            const BATCH: usize = 512;
+            struct Batch<'a> {
+                items: Vec<IndexedPath>,
+                sink: &'a std::sync::Mutex<Vec<IndexedPath>>,
+            }
+            impl Drop for Batch<'_> {
+                fn drop(&mut self) {
+                    if self.items.is_empty() {
+                        return;
+                    }
+                    if let Ok(mut all) = self.sink.lock() {
+                        all.append(&mut self.items);
+                    }
+                }
+            }
+            let mut batch = Batch {
+                items: Vec::with_capacity(BATCH),
+                sink: &collected,
+            };
+            let was_cancelled = &was_cancelled;
+            Box::new(move |entry| {
+                if was_cancelled.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
+                }
+                if cancelled() {
+                    was_cancelled.store(true, Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        tracing::debug!(%err, "file mention index skipped entry");
+                        return ignore::WalkState::Continue;
+                    }
+                };
+                let path = entry.path();
+                if path == root {
+                    return ignore::WalkState::Continue;
+                }
+                let Ok(relative) = path.strip_prefix(root) else {
+                    return ignore::WalkState::Continue;
+                };
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if relative == ".git" || relative.starts_with(".git/") {
+                    return ignore::WalkState::Continue;
+                }
+                batch.items.push(IndexedPath {
+                    haystack: nucleo_matcher::Utf32String::from(relative.as_str()),
+                    path: relative,
+                    is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
+                });
+                if batch.items.len() >= BATCH
+                    && let Ok(mut all) = batch.sink.lock()
+                {
+                    all.append(&mut batch.items);
+                    if all.len() >= FILE_INDEX_MAX_ENTRIES {
+                        return ignore::WalkState::Quit;
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+    if was_cancelled.load(Ordering::Relaxed) || cancelled() {
+        return Err(EngineError::Other("file search cancelled".into()));
+    }
+    let mut entries = collected
+        .into_inner()
+        .map_err(|_| EngineError::Other("file index poisoned".into()))?;
+    entries.truncate(FILE_INDEX_MAX_ENTRIES);
+    Ok(entries)
+}
+
+fn rank_file_matches(
+    entries: &[IndexedPath],
+    root: &Path,
+    query: &str,
+    featured_paths: &[String],
+) -> Vec<FileSearchMatch> {
     let featured: HashMap<String, usize> = featured_paths
         .iter()
         .filter_map(|path| {
@@ -1209,7 +1351,7 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
                 root.join(path)
             };
             let canonical = std::fs::canonicalize(full).ok()?;
-            let relative = canonical.strip_prefix(&root).ok()?;
+            let relative = canonical.strip_prefix(root).ok()?;
             Some(relative.to_string_lossy().replace('\\', "/"))
         })
         .enumerate()
@@ -1217,60 +1359,38 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
             paths.entry(path).or_insert(rank);
             paths
         });
-    let mut matches = Vec::new();
-    let walker = ignore::WalkBuilder::new(&root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
-        .build();
-    for entry in walker {
-        if cancelled() {
-            return Err(EngineError::Other("file search cancelled".into()));
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                tracing::debug!(%err, "file mention search walk skipped entry");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(&root) else {
+    let mut matcher = nucleo_matcher::Matcher::new({
+        let mut config = nucleo_matcher::Config::DEFAULT;
+        config.set_match_paths();
+        config
+    });
+    let pattern = nucleo_matcher::pattern::Pattern::parse(
+        query,
+        nucleo_matcher::pattern::CaseMatching::Smart,
+        nucleo_matcher::pattern::Normalization::Smart,
+    );
+    let mut matches: Vec<RankedFileMatch> = Vec::new();
+    for entry in entries {
+        let Some(score) = pattern.score(entry.haystack.slice(..), &mut matcher) else {
             continue;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if relative.starts_with(".git/") || relative == ".git" {
-            continue;
-        }
-        let Some(path_score) = fuzzy_score(query, &relative) else {
-            continue;
-        };
-        let score = relative
-            .rsplit('/')
-            .next()
-            .and_then(|name| fuzzy_score(query, name))
-            .unwrap_or_else(|| path_score.saturating_add(1_000));
         matches.push((
-            featured.get(&relative).copied(),
+            featured.get(&entry.path).copied(),
             score,
-            relative,
-            entry.file_type().is_some_and(|kind| kind.is_dir()),
+            entry.path.clone(),
+            entry.is_dir,
         ));
-        if matches.len() > FILE_SEARCH_MAX_RESULTS {
+        if matches.len() >= RANK_BUFFER {
             matches.sort_by(|a, b| compare_file_matches(query, a, b));
             matches.truncate(FILE_SEARCH_MAX_RESULTS);
         }
     }
     matches.sort_by(|a, b| compare_file_matches(query, a, b));
-    Ok(matches
+    matches.truncate(FILE_SEARCH_MAX_RESULTS);
+    matches
         .into_iter()
         .map(|(_, _, path, is_dir)| FileSearchMatch { path, is_dir })
-        .collect())
+        .collect()
 }
 
 /// Turn a generated chat title into the semantic portion of a Zeron branch
@@ -1409,6 +1529,23 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn score(query: &str, candidate: &str) -> Option<u32> {
+        let mut matcher = nucleo_matcher::Matcher::new({
+            let mut config = nucleo_matcher::Config::DEFAULT;
+            config.set_match_paths();
+            config
+        });
+        nucleo_matcher::pattern::Pattern::parse(
+            query,
+            nucleo_matcher::pattern::CaseMatching::Smart,
+            nucleo_matcher::pattern::Normalization::Smart,
+        )
+        .score(
+            nucleo_matcher::Utf32String::from(candidate).slice(..),
+            &mut matcher,
+        )
+    }
+
     #[test]
     fn linux_drives_take_media_and_mnt_mounts_system_first() {
         let mounts = "\
@@ -1495,9 +1632,9 @@ tmpfs /run tmpfs rw 0 0
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {
-        assert!(fuzzy_score("cmp rs", "crates/ui/src/composer.rs").is_some());
-        assert!(fuzzy_score("composer crates", "crates/ui/src/composer.rs").is_some());
-        assert!(fuzzy_score("xyz", "crates/ui/src/composer.rs").is_none());
+        assert!(score("cmp rs", "crates/ui/src/composer.rs").is_some());
+        assert!(score("composer crates", "crates/ui/src/composer.rs").is_some());
+        assert!(score("xyzq", "crates/ui/src/composer.rs").is_none());
     }
 
     #[test]
@@ -1565,6 +1702,19 @@ tmpfs /run tmpfs rw 0 0
             .position(|entry| entry.path == "composer/docs/readme.md")
             .unwrap();
         assert!(composer < path_only);
+    }
+
+    #[test]
+    fn cached_search_reuses_one_walk_within_the_ttl() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("alpha.rs"), "").unwrap();
+        let cache: FileIndexCache = std::sync::Mutex::new(HashMap::new());
+
+        let first = search_files_cached(&cache, root.path(), "alpha", &[], || false).unwrap();
+        assert_eq!(first.first().map(|m| m.path.as_str()), Some("alpha.rs"));
+        std::fs::write(root.path().join("beta.rs"), "").unwrap();
+        let second = search_files_cached(&cache, root.path(), "beta", &[], || false).unwrap();
+        assert!(second.is_empty(), "{second:?}");
     }
 
     #[test]

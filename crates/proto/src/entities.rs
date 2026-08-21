@@ -574,6 +574,24 @@ pub enum TerminalEvent {
     },
 }
 
+/// One in-flight queued-attachment transfer (the `WatchTransfers` stream):
+/// raw-byte progress of the engine-side relay leg pushing staged bytes to a
+/// remote host. An entry appears when a file's chunks start moving, updates
+/// per landed chunk, and disappears when the host commits it (or the attempt
+/// fails — the retry re-adds it). Keyed by the send-minted uploadId, so the
+/// sender's thumbnails can resolve their `pending://{uploadId}/…` refs to a
+/// real percent instead of an indeterminate spinner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub upload_id: String,
+    pub file_name: String,
+    /// Raw bytes the host has acknowledged so far.
+    pub done: u64,
+    /// Total raw bytes of the staged file.
+    pub total: u64,
+}
+
 /// Live edge-connectivity posture (the `WatchConnectivity` stream): the truth
 /// the connection pill, composer honesty, and queued-send badges render.
 /// Derived engine-side from the registry room's reconnect state, the OS

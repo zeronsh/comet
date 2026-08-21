@@ -49,7 +49,6 @@ pub struct GridSize {
     pub cols: u16,
     pub rows: u16,
 }
-
 impl GridSize {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
@@ -258,6 +257,14 @@ impl Emulator {
 
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Set the scrollback offset directly (0 = live bottom).
+    pub fn scroll_to_offset(&mut self, offset: usize) {
+        let target = offset.min(self.history_lines());
+        let current = self.display_offset();
+        let delta = (target as i64 - current as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        self.scroll(delta);
     }
 
     // ---- selection ----
@@ -539,6 +546,11 @@ mod tests {
         e.scroll(100);
         assert_eq!(e.display_offset(), 6);
         assert_eq!(e.row_text(0), "line1");
+        e.scroll_to_offset(3);
+        assert_eq!(e.display_offset(), 3);
+        assert_eq!(e.row_text(0), "line4");
+        e.scroll_to_offset(usize::MAX);
+        assert_eq!(e.display_offset(), 6);
         e.scroll_to_bottom();
         assert_eq!(e.display_offset(), 0);
         assert_eq!(e.row_text(0), "line7");

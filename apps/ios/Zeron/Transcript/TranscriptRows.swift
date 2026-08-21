@@ -53,7 +53,7 @@ enum TranscriptRowBuilder {
     /// "{entryId}#{partId}" so the streaming tail re-parses O(delta + tail);
     /// `completed` memoizes settled parts so they parse exactly once.
     static func rows(entries: [MessageEntry],
-                     pendingSends: [(messageId: String, text: String, at: Int64)],
+                     pendingSends: [PendingSend],
                      parsers: inout [String: IncrementalMarkdownParser],
                      completed: inout [String: CompletedParse]) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []

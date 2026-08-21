@@ -65,6 +65,10 @@ pub mod methods {
     /// current value first, then every change — the connection pill /
     /// composer-honesty / queued-badge feed. No params; IPC-only.
     pub const WATCH_CONNECTIVITY: &str = "WatchConnectivity";
+    /// In-flight queued-attachment transfers (`zeron_proto::TransferProgress`
+    /// list): current set first, then a fresh snapshot per landed chunk —
+    /// the sending thumbnail's percent-ring feed. No params; IPC-only.
+    pub const WATCH_TRANSFERS: &str = "WatchTransfers";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";

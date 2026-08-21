@@ -97,16 +97,20 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
 }
 
 /// Compact absolute reset moment (zeron settings.agents.tsx `formatReset`):
-/// a local clock time ("3:45 PM") when it lands within ~22h, else a short
-/// weekday ("Mon"); the caller prefixes "resets ". Pure given `now`.
+/// a local clock time ("3:45 PM") when it lands within ~22h, a short weekday
+/// ("Mon") within a week, else month + day ("Sep 14") — a weekday is noise
+/// when the window is a Codex free-tier MONTHLY reset weeks out. The caller
+/// prefixes "resets ". Pure given `now`.
 pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     use chrono::Local;
     let at = resets_at?;
     let local = at.with_timezone(&Local);
     Some(if at.signed_duration_since(now).num_hours() < 22 {
         format!("resets {}", local.format("%-I:%M %p"))
-    } else {
+    } else if at.signed_duration_since(now).num_hours() < 24 * 7 {
         format!("resets {}", local.format("%a"))
+    } else {
+        format!("resets {}", local.format("%b %-d"))
     })
 }
 
@@ -1529,13 +1533,23 @@ mod tests {
                 soon.with_timezone(&Local).format("%-I:%M %p")
             ))
         );
-        // Beyond: a short weekday ("resets Mon").
+        // Within a week: a short weekday ("resets Mon").
         let later = now + TimeDelta::days(3);
         assert_eq!(
             format_reset(Some(later), now),
             Some(format!(
                 "resets {}",
                 later.with_timezone(&Local).format("%a")
+            ))
+        );
+        // Beyond a week (Codex free tier resets ~monthly): month + day
+        // ("resets Sep 14") — a weekday 4 weeks out carries no information.
+        let monthly = now + TimeDelta::days(26);
+        assert_eq!(
+            format_reset(Some(monthly), now),
+            Some(format!(
+                "resets {}",
+                monthly.with_timezone(&Local).format("%b %-d")
             ))
         );
     }

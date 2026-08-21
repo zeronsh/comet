@@ -214,6 +214,7 @@ struct ComposerView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPicker = false
     @State private var uploading = false
+    @State private var uploadProgress: Double?
     @State private var uploadError: String?
     @State private var showModelPicker = false
     @State private var showTraitPicker = false
@@ -237,7 +238,10 @@ struct ComposerView: View {
     }
 
     var body: some View {
-        VStack(spacing: 6) {
+        // Subscribe to the connectivity pulse so the degraded caption follows
+        // the graced stream (1Hz only while something is degraded/pending).
+        let _ = model.connectivity.pulse
+        return VStack(spacing: 6) {
             if let uploadError {
                 Text(uploadError)
                     .font(Theme.sans(12))
@@ -245,6 +249,27 @@ struct ComposerView: View {
                     .lineLimit(2)
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if uploading, let uploadProgress {
+                Text("Uploading… \(Int(uploadProgress * 100))%")
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textMuted)
+                    .monospacedDigit()
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Pre-send honesty (composer.rs degraded notice, post-#170 copy):
+            // one quiet caption line, never a warning box — the send still
+            // works, it just queues.
+            if model.chatDeliveryDegraded(chat) {
+                Text(model.connectivity.state == .offline
+                    ? "Offline — messages will send when you're back online."
+                    : "Messages will send once the connection recovers.")
+                    .font(Theme.sans(11))
+                    .foregroundStyle(Theme.textFaint)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity)
             }
             ComposerShell(
                 draft: $text,
@@ -362,17 +387,49 @@ struct ComposerView: View {
             clearDraft()
             return
         }
-        // Upload first, send after: the refs trailer needs the committed
-        // paths, and the doc entry must never point at files that don't
-        // exist. The shell shows the spinner (`busy`) while chunks stream.
+        if model.hostSupportsQueuedAttachments(chat) {
+            // Queued flow (host ≥ 0.2.12): the send is a durable local write
+            // NOW — pending:// refs in the doc, bytes escorted afterwards
+            // with retry-forever — so an image send survives a dead link
+            // exactly like a text send does.
+            let transfers = staged.map {
+                AttachmentTransfer(uploadId: UUID().uuidString.lowercased(),
+                                   name: $0.name, data: $0.data)
+            }
+            for (transfer, att) in zip(transfers, staged) {
+                // Seed under the pending ref — the echo's thumbnail renders
+                // from local bytes while the upload crosses the relay.
+                AttachmentImageCache.shared.seed(
+                    deviceId: chat.deviceId,
+                    path: UploadStash.pendingRef(uploadId: transfer.uploadId, name: transfer.name),
+                    name: att.name, data: att.data)
+            }
+            store.sendWithTransfers(prompt: prompt, chat: chat, live: runLive,
+                                    transfers: transfers)
+            attachments = []
+            clearDraft()
+            return
+        }
+        // Legacy host-staged flow (host < 0.2.12): upload first, send after —
+        // the refs trailer needs the committed paths. Bounded by the
+        // whole-attachment deadline; progress narrates instead of a bare
+        // spinner (a lawful crawl must never read as a hang).
         uploading = true
         uploadError = nil
+        uploadProgress = 0
+        let progressBinding = $uploadProgress
         Task { @MainActor in
-            defer { uploading = false }
+            defer {
+                uploading = false
+                uploadProgress = nil
+            }
             do {
                 var paths: [String] = []
-                for att in staged {
-                    let path = try await store.uploadAttachment(name: att.name, data: att.data)
+                let total = staged.count
+                for (ix, att) in staged.enumerated() {
+                    let path = try await store.uploadAttachment(name: att.name, data: att.data) { fraction in
+                        progressBinding.wrappedValue = (Double(ix) + fraction) / Double(total)
+                    }
                     // Seed the cache so our own bubble renders from local
                     // bytes instead of a round-trip.
                     AttachmentImageCache.shared.seed(deviceId: chat.deviceId, path: path,

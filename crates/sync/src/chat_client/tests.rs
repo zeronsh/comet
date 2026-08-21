@@ -1208,3 +1208,152 @@ async fn os_offline_parks_dials_and_the_online_event_unparks_immediately() {
     );
     client.shutdown().await;
 }
+
+// ── row-gap contiguity + repair (2026-08-19 empty-doc/advanced-cursor wedge) ─
+
+/// A live broadcast can outrun the backfill during a join, delivering seq N
+/// while seq N-1 was never received. The old `cursor.max(seq)` advance
+/// stamped the cursor over the hole — the skipped row's dependents parked
+/// invisibly in loro's pending buffer and the doc read empty forever while
+/// the client polled `after=cursor` ("new session hangs, retry no-op"). The
+/// cursor must HOLD at the last contiguous seq and a backfill repair must
+/// close the gap.
+#[tokio::test(start_paused = true)]
+async fn live_row_gap_holds_cursor_and_repairs() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+
+    let server = tokio::spawn(async move {
+        let after = serve_join(
+            &mut end,
+            serde_json::json!({"headSeq": 1, "seqFloor": 0, "checkpointSeq": 0,
+                "checkpointSize": 0, "rowCount": 1, "rowBytes": 32}),
+            &[],
+            vec![(1, "dev-b", vec![0x01])],
+            false,
+        )
+        .await;
+        assert_eq!(after, 0);
+        // Live frame with a HOLE: seq 3 arrives, seq 2 never did.
+        send(
+            &end,
+            frame_type::ROW,
+            serde_json::json!({"seq": 3, "device": "dev-b", "batchId": "b3"}),
+            &[0x03],
+        )
+        .await;
+        // The client must answer with a backfill request from its HELD
+        // cursor (1) — not silently skip to 3.
+        let req = expect_kind(&mut end, frame_type::ROWS_REQ).await;
+        assert_eq!(
+            req.header["after"].as_u64().unwrap(),
+            1,
+            "repair starts at the honest cursor"
+        );
+        for (seq, bytes) in [(2u64, vec![0x02u8]), (3, vec![0x03])] {
+            send(
+                &end,
+                frame_type::ROW,
+                serde_json::json!({"seq": seq, "device": "dev-b", "batchId": format!("b{seq}")}),
+                &bytes,
+            )
+            .await;
+        }
+        send(
+            &end,
+            frame_type::ROWS_DONE,
+            serde_json::json!({"headSeq": 3}),
+            &[],
+        )
+        .await;
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds");
+    let end = server.await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.stats().cursor != 3 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gap repair never converged the cursor: {:?}",
+            client.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The gap row applied with the HELD cursor (1), never with 3; the
+    // repair rows then walked it up contiguously.
+    assert_eq!(
+        *lock(&sink.rows),
+        vec![
+            (vec![0x01], 1),
+            (vec![0x03], 1),
+            (vec![0x02], 2),
+            (vec![0x03], 3),
+        ],
+        "cursor held through the gap and walked by the repair"
+    );
+    drop(end);
+    client.shutdown().await;
+}
+
+/// A persisted cursor over a CHECKPOINT-LESS room gets amnesty to zero on
+/// the first join: if any past import parked (the wedge left on disk by the
+/// pre-fix race), the full refetch materializes it — bounded by the
+/// checkpoint threshold policy, and re-imports are no-ops.
+#[tokio::test(start_paused = true)]
+async fn checkpointless_amnesty_refetches_from_zero() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+
+    let server = tokio::spawn(async move {
+        let after = serve_join(
+            &mut end,
+            serde_json::json!({"headSeq": 3, "seqFloor": 0, "checkpointSeq": 0,
+                "checkpointSize": 0, "rowCount": 3, "rowBytes": 96}),
+            &[],
+            vec![
+                (1, "dev-b", vec![0x01]),
+                (2, "dev-b", vec![0x02]),
+                (3, "dev-b", vec![0x03]),
+            ],
+            false,
+        )
+        .await;
+        assert_eq!(after, 0, "amnesty must refetch the whole log");
+        end
+    });
+
+    // Persisted cursor 3 — the on-disk wedge shape (doc may have parked).
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        3,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds");
+    let end = server.await.unwrap();
+
+    assert_eq!(
+        *lock(&sink.rows),
+        vec![(vec![0x01], 1), (vec![0x02], 2), (vec![0x03], 3)],
+        "all rows re-imported from zero"
+    );
+    assert_eq!(client.stats().cursor, 3);
+    drop(end);
+    client.shutdown().await;
+}

@@ -43,6 +43,12 @@ final class DeviceRpcPending {
     var unaryCount: Int { unary.count }
     var streamCount: Int { streams.count }
 
+    /// Whether the request is still waiting — the timeout task checks this so
+    /// a deadline firing AFTER the reply landed can't tear down a live link.
+    func owns(id: UInt64) -> Bool {
+        unary[id] != nil || streams[id] != nil
+    }
+
     func registerUnary(id: UInt64, completion: @escaping UnaryCompletion) {
         unary[id] = completion
     }
@@ -154,12 +160,35 @@ final class DeviceRpcPending {
     }
 }
 
+/// Registry-presence verdict gating peer dials (workspace_host.rs
+/// PeerLiveness, PR #168): a `dark` verdict fails peer calls fast with ZERO
+/// dials; every ambiguity stays `unknown` so a rows-down/relay-up incident
+/// shape can never park the relay.
+enum PeerLiveness: Sendable {
+    case live
+    case dark
+    case unknown
+}
+
 actor DeviceRelayClient {
     static let rpcKind = "rpc"
     static let relayKind = " relay"  // leading space is intentional
+    /// End-to-end liveness frame (rpc/src/device_room.rs ECHO_KIND): the DO's
+    /// auto-pong answers from the EDGE, so a healthy client↔edge leg can mask
+    /// a dead edge↔host leg — the echo is answered by the HOST.
+    static let echoKind = "echo"
+    /// device_room.rs PING_INTERVAL (10s) / SILENCE_LEASE (25s — tolerates one
+    /// lost pong at +10/+20) / ECHO_DEADLINE (20s of host-echo silence on an
+    /// echo-capable host = zombie path → drop and redial).
+    static let pingIntervalNs: UInt64 = 10_000_000_000
+    static let silenceLeaseNs: UInt64 = 25_000_000_000
+    static let echoDeadlineNs: UInt64 = 20_000_000_000
 
     private let deviceId: String
     private let config: AppConfig
+    /// Presence-based dial gate, wired by the owning store (MainActor reads
+    /// the registry mirror). nil = never park (unknown).
+    private let liveness: (@MainActor @Sendable () -> PeerLiveness)?
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -167,16 +196,35 @@ actor DeviceRelayClient {
     private var nextId: UInt64 = 1
     private let pending = DeviceRpcPending()
     private var connected = false
+    /// Transport clock — any inbound (the DO's auto-pong included) counts.
+    private var lastInbound = DispatchTime.now()
+    /// Host-proof clock — echo replies and inbound RPC frames only.
+    private var lastHostProof = DispatchTime.now()
+    /// The host has echoed at least once on this link (feature detection:
+    /// old hosts keep transport-lease-only behavior).
+    private var echoSeen = false
 
-    init(deviceId: String, config: AppConfig) {
+    init(deviceId: String, config: AppConfig,
+         liveness: (@MainActor @Sendable () -> PeerLiveness)? = nil) {
         self.deviceId = deviceId
         self.config = config
+        self.liveness = liveness
     }
 
     // MARK: Lifecycle
 
     private func connect() async throws {
         if connected, socket != nil { return }
+        // Registry-dark dial parking: a device with positive stale-presence
+        // evidence fails fast with zero dials (it was 3-dial bursts every
+        // ~60s to a device offline for days). A live cached link above wins;
+        // unknown/ambiguous verdicts never park.
+        if let liveness {
+            let verdict = await liveness()
+            if case .dark = verdict {
+                throw RelayError.hostOffline
+            }
+        }
         guard let token = await config.currentToken() else { throw RelayError.notConnected }
         var components = URLComponents(url: config.edgeURL.appending(path: "device/\(deviceId)/ws"),
                                        resolvingAgainstBaseURL: false)!
@@ -193,6 +241,9 @@ actor DeviceRelayClient {
         socket = task
         task.resume()
         connected = true
+        lastInbound = .now()
+        lastHostProof = .now()
+        echoSeen = false
 
         receiveTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -209,11 +260,14 @@ actor DeviceRelayClient {
         }
         pingTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                try? await Task.sleep(nanoseconds: DeviceRelayClient.pingIntervalNs)
                 guard let self else { return }
-                await self.sendPing()
+                await self.keepaliveTick()
             }
         }
+        // One echo immediately on connect: feature detection + instant proof
+        // the edge↔host leg is real, not just our own client↔edge leg.
+        await sendEcho()
     }
 
     func close() {
@@ -229,8 +283,34 @@ actor DeviceRelayClient {
         pending.failAll(error: error)
     }
 
-    private func sendPing() async {
+    /// Keepalive + liveness in one 10s tick: judge the transport lease and
+    /// the host-echo deadline, then ride a text ping (DO transport lease) and
+    /// an echo frame (host proof) out together.
+    private func keepaliveTick() async {
+        guard socket != nil else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now - lastInbound.uptimeNanoseconds > Self.silenceLeaseNs {
+            roomLog.warning("relay \(self.deviceId, privacy: .public): socket silent past lease; dropping link")
+            teardown(error: .hostOffline)
+            return
+        }
+        // Echo enforcement is feature-detected: only a host that has echoed
+        // at least once on this link is held to the 20s deadline. This is
+        // what kills zombie paths where the DO's auto-pong keeps our leg
+        // looking healthy while the host's leg is dead.
+        if echoSeen, now - lastHostProof.uptimeNanoseconds > Self.echoDeadlineNs {
+            roomLog.warning("relay \(self.deviceId, privacy: .public): host echo silent; dropping zombie link")
+            teardown(error: .hostOffline)
+            return
+        }
         try? await socket?.send(.string("ping"))
+        await sendEcho()
+    }
+
+    private func sendEcho() async {
+        guard let socket else { return }
+        let frame = Self.encodeFrame(header: #"{"s":"echo","k":"echo"}"#, payload: Data())
+        try? await socket.send(.data(frame))
     }
 
     // MARK: RPC
@@ -313,7 +393,13 @@ actor DeviceRelayClient {
     }
 
     private func timeoutCall(id: UInt64) {
+        guard pending.owns(id: id) else { return }
         failRequest(id: id, error: .timeout)
+        // A lost reply on a socket the DO keeps auto-ponging is a zombie
+        // path (worktree-send hang, 2026-08-18): invalidate the link so the
+        // next call re-dials instead of hanging on the same dead leg.
+        roomLog.warning("relay \(self.deviceId, privacy: .public): call timed out; dropping link as suspect")
+        teardown(error: .notConnected)
     }
 
     /// A typed streaming ControlRpc call. Items remain registered until a
@@ -353,14 +439,23 @@ actor DeviceRelayClient {
     // MARK: Inbound
 
     private func handleInbound(_ message: URLSessionWebSocketTask.Message) {
+        lastInbound = .now()
         switch message {
         case .string:
-            return  // "pong"
+            return  // "pong" — transport lease refreshed; proves only OUR leg
         case .data(let data):
             guard let (header, payload) = Self.decodeFrame(data) else { return }
             switch header.k {
             case Self.rpcKind:
+                // An inbound RPC frame comes from the host — proof enough.
+                lastHostProof = .now()
+                echoSeen = true
                 handleRpcPayload(payload)
+            case Self.echoKind:
+                // The HOST echoed our keepalive back — the end-to-end path
+                // (client → edge → host → edge → client) is alive.
+                lastHostProof = .now()
+                echoSeen = true
             case Self.relayKind:
                 // {"error":"host_offline"|"host_closed"|...} — link down.
                 teardown(error: .hostOffline)

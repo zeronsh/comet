@@ -20,6 +20,9 @@ final class AppModel {
     var phase: Phase = .signedOut
     var workspace: WorkspaceStore?
     var demo: DemoDataset?
+    /// Graced connectivity truth — one stream every consumer inherits calm
+    /// from (home pill, composer notice, Queued/Failed badges).
+    let connectivity = ConnectivityCenter()
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
@@ -254,7 +257,27 @@ final class AppModel {
         let store = WorkspaceStore(config: config)
         workspace = store
         store.start()
+        startConnectivity()
         phase = .ready
+    }
+
+    /// Wire the graced-connectivity recompute over the live stores (the
+    /// engine's 1s compute_connectivity, phone edition).
+    private func startConnectivity() {
+        connectivity.registryConnected = { [weak self] in
+            guard let self, self.demo == nil, let workspace = self.workspace else { return true }
+            return workspace.connected
+        }
+        connectivity.chatRooms = { [weak self] in
+            guard let self else { return [] }
+            return self.sessionStores.compactMap { id, store in
+                store.roomActive ? (id: id, connected: store.connected) : nil
+            }
+        }
+        connectivity.hasPendingSends = { [weak self] in
+            self?.sessionStores.values.contains { !$0.pendingSends.isEmpty } ?? false
+        }
+        connectivity.start()
     }
 
     // MARK: Unified data accessors (demo or live — one path for views)
@@ -510,9 +533,24 @@ final class AppModel {
     /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after
     /// a suspension the workspace room in particular stayed dead while chat
     /// views reconnected on open, freezing sidebar rows and Working
-    /// indicators against perfectly live transcripts (2026-08-04).
+    /// indicators against perfectly live transcripts (2026-08-04). Also the
+    /// focus fast path (PR #168): probe {edge}/health (3s) and broadcast the
+    /// online event on success, so every PARKED backoff (not just the rooms
+    /// the kick reaches) lands a redial in ~1 RTT.
     func foregrounded() {
         kickAllRooms()
+        probeEdgeHealth()
+    }
+
+    private func probeEdgeHealth() {
+        guard let config, demo == nil else { return }
+        Task.detached {
+            var request = URLRequest(url: config.edgeURL.appending(path: "health"))
+            request.timeoutInterval = 3
+            guard let (_, response) = try? await URLSession.shared.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200 else { return }
+            OnlineBus.shared.notifyOnline()
+        }
     }
 
     private func kickAllRooms() {
@@ -563,6 +601,17 @@ final class AppModel {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
+            // net_path.rs semantics: only a definitive "unsatisfied" parks —
+            // requiresConnection/other stay optimistic (a confused monitor
+            // can only make us dial too much, never go silent). Every
+            // satisfied report also broadcasts online: satisfied→satisfied
+            // updates are interface handovers (wifi→cellular), and the old
+            // sockets are dead on the new path; redundant kicks are free
+            // because waiters drain stale events.
+            OnlineBus.shared.setPathOnline(path.status != .unsatisfied)
+            if path.status == .satisfied {
+                OnlineBus.shared.notifyOnline()
+            }
             // Interface set is part of the key: a satisfied→satisfied hop
             // (wifi→cellular) silently kills established sockets too.
             let key = path.status == .satisfied
@@ -570,6 +619,7 @@ final class AppModel {
                 : "down"
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.connectivity.setPathOffline(path.status == .unsatisfied)
                 let previous = self.lastPathKey
                 self.lastPathKey = key
                 // First callback reports the initial state — nothing to revive.
@@ -602,10 +652,57 @@ final class AppModel {
         }
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
+        store.hostLiveness = { [weak self] deviceId in
+            self?.workspace?.peerLiveness(deviceId) ?? .unknown
+        }
         sessionStores[chat.id] = store
         store.start()
         store.updateRoomGen(chat.roomGen)
         return store
+    }
+
+    // MARK: Delivery truth (state.rs chat_delivery_degraded / send_* ports)
+
+    /// Queued-attachment version gate (composer.rs QUEUED_ATTACHMENTS_MIN):
+    /// the host must defer commands with pending:// refs, or the send would
+    /// dispatch with unresolvable paths.
+    static let queuedAttachmentsMin = (0, 2, 12)
+
+    func hostSupportsQueuedAttachments(_ chat: Chat) -> Bool {
+        hostSupportsQueuedAttachmentsOn(deviceId: chat.deviceId)
+    }
+
+    func hostSupportsQueuedAttachmentsOn(deviceId: String) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceVersionAtLeast(deviceId, Self.queuedAttachmentsMin) ?? false
+    }
+
+    /// Whether a send to this chat would queue rather than deliver promptly:
+    /// OS offline, the chat's room degraded (graced), or the host device
+    /// presence-dark. Every chat is remote-hosted on the phone — there is no
+    /// "locally hosted, never degraded" branch.
+    func chatDeliveryDegraded(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        if connectivity.state == .offline { return true }
+        if let store = sessionStores[chat.id], store.roomActive {
+            if connectivity.degradedChats.contains(chat.id) { return true }
+        } else if connectivity.state != .connected {
+            return true
+        }
+        if !deviceOnline(chat.deviceId) { return true }
+        return false
+    }
+
+    /// The user-visible truth of a chat's oldest unadopted send. `failed`
+    /// (unadopted past the 2-minute grace, with a retry affordance) wins over
+    /// `queued` (pending on a degraded path); a healthy in-flight send reads
+    /// `sending`. nil = nothing pending.
+    func sendState(for chat: Chat, now: Int64 = nowMs()) -> SendState? {
+        guard demo == nil, let store = sessionStores[chat.id],
+              let oldest = store.pendingSends.map(\.started).min() else { return nil }
+        if now - oldest > undeliveredGraceMs { return .failed }
+        if chatDeliveryDegraded(chat) { return .queued }
+        return .sending
     }
 
     func releaseSessionStore(chatId: String) {
@@ -635,6 +732,9 @@ final class AppModel {
         for chat in overviewChats where sessionStores[chat.id] == nil {
             let store = SessionStore(chatId: chat.id, config: config)
             store.hostDeviceId = chat.deviceId
+            store.hostLiveness = { [weak self] deviceId in
+                self?.workspace?.peerLiveness(deviceId) ?? .unknown
+            }
             sessionStores[chat.id] = store
             store.start(holdDial: true)
             store.updateRoomGen(chat.roomGen)

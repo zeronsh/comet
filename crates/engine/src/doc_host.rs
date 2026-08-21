@@ -240,7 +240,19 @@ struct DocHostInner {
     /// publishes the edge posture on change (see `watch_connectivity`).
     connectivity: OnceLock<watch::Sender<zeron_proto::Connectivity>>,
     connectivity_started: AtomicBool,
+    /// In-flight queued-attachment transfers, published per landed chunk
+    /// (see `watch_transfers`). Entries live exactly as long as bytes are
+    /// moving: added when a file's push starts, removed on commit or failure
+    /// (a retry re-adds), so consumers can render a real percent while the
+    /// relay leg runs and fall back to indeterminate otherwise.
+    transfers: watch::Sender<Vec<zeron_proto::TransferProgress>>,
     connectivity_grace: Mutex<DegradeGrace>,
+    /// Command ids currently BETWEEN mark-processed and their resolution in a
+    /// drain. Distinguishes "executing right now" from "consumed by the
+    /// ledger but dead" (a crash between mark and resolve): the drain
+    /// terminalizes the latter as Rejected instead of leaving a forever-
+    /// Pending entry no retry could ever reach (2026-08-19 swallowed-send).
+    executing: Mutex<HashSet<String>>,
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
@@ -251,6 +263,44 @@ struct DocHostInner {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The queued-attachment transfers a command's `pending://` refs imply —
+/// shared by the retry escort and the retry re-issue.
+fn command_transfers(entry: &SessionCommandEntry) -> Vec<crate::uploads::AttachmentTransfer> {
+    let refs: Vec<String> = match &entry.payload {
+        SessionCommandPayload::Run { request, .. } => request
+            .attachments
+            .iter()
+            .filter(|p| crate::uploads::is_pending_ref(p))
+            .cloned()
+            .collect(),
+        SessionCommandPayload::Steer { prompt, .. } => crate::uploads::pending_refs_in(prompt),
+        _ => Vec::new(),
+    };
+    refs.iter()
+        .filter_map(|r| crate::uploads::parse_pending_ref(r))
+        .map(
+            |(upload_id, file_name)| crate::uploads::AttachmentTransfer {
+                upload_id: upload_id.to_string(),
+                file_name: file_name.to_string(),
+            },
+        )
+        .collect()
+}
+
+/// Retires a transfer's progress entry on drop — the one exit point for
+/// `push_attachments`' many returns (commit landed, chunk timeout, host
+/// refusal), so no failure path can leave a phantom ring behind.
+struct TransferProgressGuard<'a> {
+    host: &'a DocHost,
+    upload_id: &'a str,
+}
+
+impl Drop for TransferProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.host.transfer_progress_clear(self.upload_id);
+    }
 }
 
 /// How long raw degradation must persist before connectivity reports it.
@@ -512,7 +562,9 @@ impl DocHost {
                 uploads: OnceLock::new(),
                 connectivity: OnceLock::new(),
                 connectivity_started: AtomicBool::new(false),
+                transfers: watch::channel(Vec::new()).0,
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
+                executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
@@ -1866,6 +1918,38 @@ impl DocHost {
         });
     }
 
+    /// The in-flight queued-attachment transfer set: current entries first,
+    /// then a fresh snapshot per landed chunk (see `push_attachments`).
+    pub fn watch_transfers(&self) -> watch::Receiver<Vec<zeron_proto::TransferProgress>> {
+        self.inner.transfers.subscribe()
+    }
+
+    /// Publish one transfer's progress (upserted by uploadId).
+    fn transfer_progress_set(&self, upload_id: &str, file_name: &str, done: u64, total: u64) {
+        self.inner.transfers.send_modify(|list| {
+            match list.iter_mut().find(|t| t.upload_id == upload_id) {
+                Some(t) => {
+                    t.done = done;
+                    t.total = total;
+                }
+                None => list.push(zeron_proto::TransferProgress {
+                    upload_id: upload_id.to_string(),
+                    file_name: file_name.to_string(),
+                    done,
+                    total,
+                }),
+            }
+        });
+    }
+
+    /// Retire a transfer's progress entry (commit landed, or the attempt
+    /// failed and the retry will re-publish).
+    fn transfer_progress_clear(&self, upload_id: &str) {
+        self.inner.transfers.send_modify(|list| {
+            list.retain(|t| t.upload_id != upload_id);
+        });
+    }
+
     /// The connectivity stream: current posture first, then every change.
     /// Lazily starts a monitor — a 1s recompute over in-memory stats
     /// (atomics + small locks), published only when the value changes. The
@@ -2341,36 +2425,115 @@ impl DocHost {
         self.nudge_remote_host(chat_id);
         let commands = handle.doc.read_commands()?;
         let pending: Vec<SessionCommandEntry> = commands
-            .into_iter()
+            .iter()
             .filter(|c| {
                 c.status == SessionCommandStatus::Pending
                     && !self.inner.store.is_processed(&c.id).unwrap_or(false)
             })
+            .cloned()
             .collect();
         for entry in pending {
-            let refs: Vec<String> = match &entry.payload {
-                SessionCommandPayload::Run { request, .. } => request
-                    .attachments
-                    .iter()
-                    .filter(|p| crate::uploads::is_pending_ref(p))
-                    .cloned()
-                    .collect(),
-                SessionCommandPayload::Steer { prompt, .. } => {
-                    crate::uploads::pending_refs_in(prompt)
-                }
-                _ => Vec::new(),
-            };
-            let transfers: Vec<crate::uploads::AttachmentTransfer> = refs
-                .iter()
-                .filter_map(|r| crate::uploads::parse_pending_ref(r))
-                .map(
-                    |(upload_id, file_name)| crate::uploads::AttachmentTransfer {
-                        upload_id: upload_id.to_string(),
-                        file_name: file_name.to_string(),
-                    },
-                )
-                .collect();
+            let transfers = command_transfers(&entry);
             self.spawn_command_delivery(chat_id, entry, transfers);
+        }
+        // Dead attempts: a Run/Steer whose user message never landed and
+        // whose command can never execute again — Rejected (execute failed,
+        // or the dead-command sweep terminalized it), or consumed by the
+        // ledger with no outcome and not currently executing (crash between
+        // mark and resolve). Exactly-once is per command ID, so a
+        // user-driven retry mints a FRESH attempt: new id, same payload and
+        // message id (the executor's user-entry pre-write dedupes by message
+        // id). One re-issue per message — the LATEST attempt speaks for it.
+        let messages = handle.doc.read_entries().unwrap_or_default();
+        let message_landed = |mid: &str| messages.iter().any(|m| m.id == mid);
+        let mut latest_dead: HashMap<String, &SessionCommandEntry> = HashMap::new();
+        for c in &commands {
+            let Some(mid) = (match &c.payload {
+                SessionCommandPayload::Run { message_id, .. } => Some(message_id.as_str()),
+                SessionCommandPayload::Steer { message_id, .. } => message_id.as_deref(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if message_landed(mid) {
+                continue;
+            }
+            let dead = match c.status {
+                // Rejected: execute failed or the sweep terminalized a crash
+                // window. Expired: the entry outlived its TTL undelivered —
+                // an explicit user retry is exactly the consent to re-send.
+                SessionCommandStatus::Rejected | SessionCommandStatus::Expired => true,
+                SessionCommandStatus::Pending => {
+                    self.inner.store.is_processed(&c.id).unwrap_or(false)
+                        && !lock(&self.inner.executing).contains(&c.id)
+                }
+                _ => false,
+            };
+            if !dead {
+                continue;
+            }
+            // A LIVE pending attempt for the same message (queued or being
+            // escorted above) makes a re-issue a duplicate — skip.
+            let live_attempt = commands.iter().any(|o| {
+                o.id != c.id
+                    && o.status == SessionCommandStatus::Pending
+                    && !self.inner.store.is_processed(&o.id).unwrap_or(false)
+                    && match (&o.payload, &c.payload) {
+                        (
+                            SessionCommandPayload::Run { message_id: a, .. },
+                            SessionCommandPayload::Run { message_id: b, .. },
+                        ) => a == b,
+                        (
+                            SessionCommandPayload::Steer { message_id: a, .. },
+                            SessionCommandPayload::Steer { message_id: b, .. },
+                        ) => a == b,
+                        _ => false,
+                    }
+            });
+            if live_attempt {
+                continue;
+            }
+            match latest_dead.entry(mid.to_string()) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if c.issued_at > slot.get().issued_at {
+                        slot.insert(c);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(c);
+                }
+            }
+        }
+        for old in latest_dead.values() {
+            if old.status == SessionCommandStatus::Pending {
+                // Terminalize the consumed-but-dead original so the doc tells
+                // the truth and the next retry pass doesn't see it again.
+                self.resolve_command(
+                    &handle,
+                    &old.id,
+                    SessionCommandStatus::Rejected,
+                    Some("interrupted before completion — superseded by retry"),
+                );
+            }
+            let now = now_ms();
+            let reissue = SessionCommandEntry {
+                id: new_id(),
+                payload: old.payload.clone(),
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now,
+                based_on: messages.last().map(|m| CommandBasedOn {
+                    turn_id: Some(m.id.clone()),
+                    frontier: None,
+                }),
+                expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
+                status: SessionCommandStatus::Pending,
+                resolution: None,
+            };
+            tracing::info!(chat = %chat_id, old = %old.id, new = %reissue.id,
+                "retry re-issues a dead send attempt");
+            handle.doc.queue_command(&reissue)?;
+            let transfers = command_transfers(&reissue);
+            self.spawn_command_delivery(chat_id, reissue, transfers);
         }
         // Locally-hosted (or already-synced) commands: a drain pass is the
         // whole retry.
@@ -2419,19 +2582,29 @@ impl DocHost {
         if matches!(disposition, CommandDisposition::Skip) {
             return Ok("duplicate");
         }
-        // Claim BEFORE executing (the drain's own mark-before-execute rule).
-        if !self.inner.store.mark_processed(&entry.id)? {
+        // In-flight claim first (the drain's dead-command sweep must see this
+        // id as alive, not crashed, while the execute below runs).
+        if !lock(&self.inner.executing).insert(entry.id.clone()) {
             return Ok("duplicate");
         }
-        match disposition {
-            CommandDisposition::Skip => Ok("duplicate"),
-            CommandDisposition::Expired => Ok("expired"),
-            CommandDisposition::Superseded => Ok("superseded"),
-            CommandDisposition::Execute => {
-                self.execute(&sessions, &handle, &entry).await?;
-                Ok("executed")
-            }
-        }
+        // Claim BEFORE executing (the drain's own mark-before-execute rule).
+        let marked = self.inner.store.mark_processed(&entry.id);
+        let result = match marked {
+            Err(err) => Err(err.into()),
+            Ok(false) => Ok("duplicate"),
+            Ok(true) => match disposition {
+                CommandDisposition::Skip => Ok("duplicate"),
+                CommandDisposition::Expired => Ok("expired"),
+                CommandDisposition::Superseded => Ok("superseded"),
+                CommandDisposition::Execute => match self.execute(&sessions, &handle, &entry).await
+                {
+                    Ok(_) => Ok("executed"),
+                    Err(err) => Err(err),
+                },
+            },
+        };
+        lock(&self.inner.executing).remove(&entry.id);
+        result
     }
 
     /// One transfer attempt: chunked `UploadChunk` + `UploadCommit` straight
@@ -2462,6 +2635,16 @@ impl DocHost {
             let bytes = tokio::fs::read(&source)
                 .await
                 .map_err(|e| Permanent(format!("staged attachment missing: {e}")))?;
+            // Progress entry for the sender's thumbnail ring, updated per
+            // landed chunk. The guard retires it on EVERY exit — commit,
+            // timeout, refusal — so a dead attempt falls back to the
+            // indeterminate spinner and the retry re-publishes from 0.
+            let total = bytes.len() as u64;
+            self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, 0, total);
+            let _progress = TransferProgressGuard {
+                host: self,
+                upload_id: &transfer.upload_id,
+            };
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let mut start = 0usize;
             let mut seq = 0u64;
@@ -2487,6 +2670,10 @@ impl DocHost {
                 }
                 start = end;
                 seq += 1;
+                // b64 → raw: 4 chars carry 3 bytes; min-clamp absorbs the
+                // final chunk's padding overshoot.
+                let done = ((start as u64) * 3 / 4).min(total);
+                self.transfer_progress_set(&transfer.upload_id, &transfer.file_name, done, total);
                 if start >= b64.len() {
                     break;
                 }
@@ -2671,6 +2858,29 @@ impl DocHost {
                 }
             };
             let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            // Dead-command sweep: Pending in the doc, consumed by the ledger,
+            // and NOT mid-execution in this process — the crash window
+            // between mark-processed and the outcome write. Left alone it is
+            // a send no drain or retry can ever reach ("Sending…" forever,
+            // 2026-08-19); terminalize it so the truth lands in the doc and
+            // a user retry can mint a fresh attempt.
+            for c in &commands {
+                if c.status == SessionCommandStatus::Pending
+                    && !skipped.contains(&c.id)
+                    && is_processed(&c.id)
+                    && !lock(&self.inner.executing).contains(&c.id)
+                {
+                    tracing::warn!(chat = %handle.chat_id, command = %c.id,
+                        "command consumed but never resolved (crash mid-execute?); rejecting");
+                    self.resolve_command(
+                        handle,
+                        &c.id,
+                        SessionCommandStatus::Rejected,
+                        Some("interrupted before completion — retry to send again"),
+                    );
+                    skipped.insert(c.id.clone());
+                }
+            }
             let Some(entry) = commands
                 .iter()
                 .find(|c| {
@@ -2725,10 +2935,18 @@ impl DocHost {
                     continue;
                 }
             }
+            // In-flight claim: guards the dead-command sweep (an id in
+            // `executing` is alive, not crashed) and serializes racing
+            // drains on the same entry.
+            if !lock(&self.inner.executing).insert(entry.id.clone()) {
+                skipped.insert(entry.id.clone());
+                continue;
+            }
             // Mark BEFORE executing: a crash mid-execution must never double-run a
             // command whose side effect may already have happened.
             if let Err(err) = self.inner.store.mark_processed(&entry.id) {
                 tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
+                lock(&self.inner.executing).remove(&entry.id);
                 return;
             }
             match disposition {
@@ -2749,6 +2967,7 @@ impl DocHost {
                     self.resolve_command(handle, &entry.id, status, resolution.as_deref());
                 }
             }
+            lock(&self.inner.executing).remove(&entry.id);
         }
     }
 
@@ -3237,6 +3456,76 @@ fn encode_part_segment(part_id: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod transfer_progress_tests {
+    use super::{DocHost, DocHostConfig, TransferProgressGuard};
+    use std::sync::Arc;
+
+    fn host() -> (tempfile::TempDir, DocHost) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(zeron_sync::DocsStore::open(dir.path()).expect("store opens"));
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "dev-test".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        (dir, host)
+    }
+
+    #[test]
+    fn set_upserts_by_upload_id_and_clear_retires_only_its_entry() {
+        let (_dir, host) = host();
+        let rx = host.watch_transfers();
+        assert!(rx.borrow().is_empty());
+
+        host.transfer_progress_set("u1", "a.png", 0, 1_000);
+        host.transfer_progress_set("u2", "b.png", 0, 400);
+        host.transfer_progress_set("u1", "a.png", 300, 1_000);
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.len(), 2, "upsert must not duplicate u1");
+        let u1 = snapshot.iter().find(|t| t.upload_id == "u1").unwrap();
+        assert_eq!((u1.done, u1.total), (300, 1_000));
+
+        host.transfer_progress_clear("u1");
+        let snapshot = rx.borrow().clone();
+        assert_eq!(snapshot.len(), 1, "u2 must survive u1's retirement");
+        assert_eq!(snapshot[0].upload_id, "u2");
+    }
+
+    #[test]
+    fn guard_retires_the_entry_on_every_exit_path() {
+        let (_dir, host) = host();
+        let rx = host.watch_transfers();
+        host.transfer_progress_set("u1", "a.png", 0, 9);
+        {
+            let _guard = TransferProgressGuard {
+                host: &host,
+                upload_id: "u1",
+            };
+            assert_eq!(rx.borrow().len(), 1);
+            // An early return / error propagation drops the guard here.
+        }
+        assert!(
+            rx.borrow().is_empty(),
+            "a failed attempt must not leave a phantom ring behind"
+        );
+    }
+
+    #[test]
+    fn late_subscriber_sees_current_set_first() {
+        let (_dir, host) = host();
+        host.transfer_progress_set("u1", "a.png", 750, 1_000);
+        // watch_stream's contract: current value first, then changes — a UI
+        // attaching mid-transfer must render the ring immediately.
+        let rx = host.watch_transfers();
+        assert_eq!(rx.borrow().len(), 1);
+        assert_eq!(rx.borrow()[0].done, 750);
+    }
 }
 
 #[cfg(test)]

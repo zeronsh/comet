@@ -35,11 +35,19 @@ final class WorkspaceStore {
     /// client's 30s TTL, measured from RECEIPT — beats carry the sender's
     /// wall clock, which we never trust for freshness).
     static let presenceTtlMs: Int64 = 30_000
+    /// Dial-gate thresholds (workspace_host.rs PRESENCE_FRESH_MS /
+    /// DIAL_GATE_DARK_MS / DIAL_GATE_WARMUP_MS, PR #168).
+    static let presenceLiveFreshMs: Int64 = 45_000
+    static let dialGateDarkMs: Int64 = 5 * 60_000
+    static let dialGateWarmupMs: Int64 = 60_000
 
     @ObservationIgnored private var doc: RegistryDoc
     @ObservationIgnored private var client: RegistryClient?
     @ObservationIgnored private var saver: RegistrySaver?
     @ObservationIgnored private var presenceReceivedAt: [String: Int64] = [:]
+    /// When the registry room (re)joined — the dial-gate warm-up clock
+    /// restarts on every rejoin.
+    @ObservationIgnored private var registryJoinedAt: Int64?
     private let config: AppConfig
 
     init(config: AppConfig) {
@@ -214,6 +222,7 @@ final class WorkspaceStore {
         case .connected:
             let reconnected = !connected
             connected = true
+            registryJoinedAt = nowMs()
             if reconnected {
                 restartChangeRequestStreams(resetUnsupported: true)
             }
@@ -233,6 +242,7 @@ final class WorkspaceStore {
             presenceReceivedAt[device] = nowMs()
         case .disconnected:
             connected = false
+            registryJoinedAt = nil
             doc.markDisconnected()
         }
     }
@@ -259,6 +269,37 @@ final class WorkspaceStore {
         return nowMs() - received < Self.presenceTtlMs
     }
 
+    /// Dial-gate verdict (workspace_host.rs peer_liveness): `dark` requires
+    /// POSITIVE evidence of absence — a joined, warmed-up registry room and a
+    /// freshest heartbeat older than 5 minutes. Registry-down and every
+    /// ambiguity stay `unknown`, so a rows-down/relay-up incident shape can
+    /// never park the relay.
+    func peerLiveness(_ deviceId: String) -> PeerLiveness {
+        guard connected, let joinedAt = registryJoinedAt else { return .unknown }
+        let now = nowMs()
+        if let received = presenceReceivedAt[deviceId] {
+            if now - received < Self.presenceLiveFreshMs { return .live }
+            if now - received >= Self.dialGateDarkMs { return .dark }
+            return .unknown
+        }
+        // Never heard this session: only a warmed-up room may consult the
+        // durable device row's own stamp.
+        guard now - joinedAt >= Self.dialGateWarmupMs else { return .unknown }
+        if let seen = devices.first(where: { $0.id == deviceId })?.lastSeenAt,
+           now - seen >= Self.dialGateDarkMs {
+            return .dark
+        }
+        return .unknown
+    }
+
+    /// Version gates (state.rs device_version_at_least): unknown device or an
+    /// unparsable/unstamped version reads as "too old" → legacy behavior.
+    func deviceVersionAtLeast(_ deviceId: String, _ min: (Int, Int, Int)) -> Bool {
+        guard let raw = devices.first(where: { $0.id == deviceId })?.version,
+              let v = versionTriple(raw) else { return false }
+        return v >= min
+    }
+
     // MARK: Projection (rows → typed entities)
 
     private func project() {
@@ -269,7 +310,8 @@ final class WorkspaceStore {
                              name: f["name"]?.stringValue ?? id,
                              platform: f["platform"]?.stringValue ?? "",
                              lastSeenAt: f["lastSeenAt"]?.int64Value,
-                             createdAt: f["createdAt"]?.int64Value)
+                             createdAt: f["createdAt"]?.int64Value,
+                             version: f["version"]?.stringValue)
         }.sorted { $0.name < $1.name }
 
         spaces = doc.overlayRows(kind: "spaces").compactMap { row in
@@ -375,9 +417,23 @@ final class WorkspaceStore {
 
     private func relay(for deviceId: String) -> DeviceRelayClient {
         if let existing = relayClients[deviceId] { return existing }
-        let client = DeviceRelayClient(deviceId: deviceId, config: config)
+        let client = DeviceRelayClient(deviceId: deviceId, config: config,
+                                       liveness: { [weak self] in
+                                           self?.peerLiveness(deviceId) ?? .unknown
+                                       })
         relayClients[deviceId] = client
         return client
+    }
+
+    /// Chunked upload straight to a device (the legacy host-staged path for
+    /// hosts that predate queued attachments) — used by the new-session
+    /// canvas, where no SessionStore exists yet.
+    func uploadAttachment(deviceId: String, name: String, data: Data,
+                          uploadId: String,
+                          progress: (@MainActor @Sendable (Double) -> Void)? = nil) async throws -> String {
+        try await uploadAttachmentChunked(relay: relay(for: deviceId), name: name,
+                                          data: data, uploadId: uploadId,
+                                          progress: progress)
     }
 
     private func reconcileChangeRequestStreams() {

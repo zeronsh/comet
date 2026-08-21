@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.13"
+version = "0.2.19"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -57,14 +57,14 @@ loro-protocol = "0.3"
 # stopped vending CABackdropLayer for Selection — window blur went dead);
 # b68970e rasterizes BackdropBlur in the wgpu renderer (frosted floats on
 # Linux — the Metal path's snapshot/blur/composite, ported).
-gpui = { git = "https://github.com/wingleeio/zed", rev = "f8d8a90d914d26b68fb126040386fb08c2ada78a" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "f8d8a90d914d26b68fb126040386fb08c2ada78a", features = [
+gpui = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "f8d8a90d914d26b68fb126040386fb08c2ada78a" }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
 
 # diffs
 similar = "2"
@@ -106,6 +106,7 @@ pulldown-cmark = "0.12"
 unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 ignore = "0.4"
+nucleo-matcher = "0.3"
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

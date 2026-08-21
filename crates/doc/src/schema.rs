@@ -554,6 +554,24 @@ impl SessionDoc {
                     Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == part_id
                 );
                 if is_tool && id_matches {
+                    // Genus gate: subagent lifecycle only ever lands on a
+                    // SPAWN call. Mis-keyed tagged traffic (a driver bug —
+                    // claude's background shells settled through the
+                    // subagent subtype, 2026-08-20) must not decorate an
+                    // ordinary chip with a ref to a doc it never had.
+                    let is_spawn = part
+                        .get("call")
+                        .and_then(|v| match v {
+                            loro::ValueOrContainer::Value(v) => serde_json::to_value(v).ok(),
+                            _ => None,
+                        })
+                        .and_then(|j| {
+                            serde_json::from_value::<zeron_proto::ToolCall>(j).ok()
+                        })
+                        .is_some_and(|c| c.is_subagent_spawn());
+                    if !is_spawn {
+                        return Ok(false);
+                    }
                     if let Some(r) = subagent_ref {
                         part.insert("subagentRef", r)?;
                     }
@@ -1175,6 +1193,83 @@ mod tests {
                 assert_eq!(subagent_ref.as_deref(), Some("c1--sub--call_alpha"));
                 assert_eq!(subagent_status, &Some(SubagentStatus::Running));
                 assert_eq!(subagent_tail.as_deref(), Some("scanning"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_subagent_chip_refuses_non_spawn_parts() {
+        // The genus gate at the doc boundary: whatever id a driver keys its
+        // tagged traffic to, subagent lifecycle only ever lands on a SPAWN
+        // call (claude's background shells settled through the subagent
+        // subtype and turned Run chips into dead spawn links, 2026-08-20).
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let tool = |id: &str, call: zeron_proto::ToolCall| MessagePart::Tool {
+            id: id.into(),
+            call,
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let parts = vec![
+            tool(
+                "toolu_bash",
+                zeron_proto::ToolCall::Exec {
+                    command: "git clone …".into(),
+                },
+            ),
+            tool(
+                "toolu_spawn",
+                zeron_proto::ToolCall::Unknown {
+                    name: "Agent: scan".into(),
+                    input: None,
+                },
+            ),
+        ];
+        w.sync(&parts).unwrap();
+        assert!(
+            doc.update_subagent_chip(
+                "toolu_spawn",
+                Some("c1--sub--toolu_spawn"),
+                Some("running"),
+                None
+            )
+            .unwrap()
+        );
+        assert!(
+            !doc.update_subagent_chip(
+                "toolu_bash",
+                Some("c1--sub--toolu_bash"),
+                Some("done"),
+                None
+            )
+            .unwrap()
+        );
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Tool {
+                subagent_ref,
+                subagent_status,
+                ..
+            } => {
+                assert!(subagent_ref.is_none());
+                assert!(subagent_status.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match &entries[0].parts[1] {
+            MessagePart::Tool { subagent_ref, .. } => {
+                assert_eq!(subagent_ref.as_deref(), Some("c1--sub--toolu_spawn"));
             }
             other => panic!("{other:?}"),
         }

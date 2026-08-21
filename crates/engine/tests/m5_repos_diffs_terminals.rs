@@ -819,9 +819,12 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     assert_eq!(chat.checkout_id.as_deref(), Some(diff.checkout_id.as_str()));
 
     // File watcher path: another edit re-publishes without a manual kick.
+    // Normally the watcher carries this in a debounce; FSEvents is allowed to
+    // drop events, and a dropped one converges only on the repair tick, so the
+    // deadline clears REPAIR_INTERVAL rather than reading loss as failure.
     let before = diff.checksum.clone();
     std::fs::write(repo_dir.join("watched.txt"), "fresh untracked\n").expect("new file");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(150);
     loop {
         {
             let diffs = diffs_rx.borrow().clone();

@@ -291,6 +291,14 @@ struct Shared {
     /// past N≈25), and each ack immediately re-arms the clock until the
     /// queue empties.
     quota_blocked: bool,
+    /// A row/ack arrived with `seq > cursor + 1`: rows exist that this
+    /// client never received (live broadcast outran the backfill — the
+    /// mid-join race). The cursor must NOT skip the hole (skipped rows'
+    /// dependents park invisibly in loro's pending buffer and the doc
+    /// reads empty forever — the 2026-08-19 empty-doc/advanced-cursor
+    /// wedge); instead this flag asks the session loop for a rowsReq
+    /// backfill from the honest cursor.
+    gap_repair: bool,
 }
 
 /// `zeron sync` surface (plan: cursor / headSeq / floorLag / pendingPushes).
@@ -840,6 +848,22 @@ impl Actor {
             return SessionEnd::Reconnect;
         };
         lock(&self.shared).server = Some(state);
+        // Server behind our cursor = the room was reset/wiped. Detect on the
+        // RAW persisted cursor, BEFORE the amnesty below rewrites it —
+        // plan_catch_up treats the cursor as fresh; SURFACE the signal too:
+        // the host's re-seed recovery (chat-room.ts /reset) hangs off this
+        // event, and masking it was exactly how the s2 wedge class stayed
+        // invisible.
+        if lock(&self.shared).cursor > state.head_seq {
+            self.flags.server_resets.fetch_add(1, Relaxed);
+            tracing::warn!(
+                cursor = lock(&self.shared).cursor,
+                head_seq = state.head_seq,
+                "chat2: server lost state (headSeq < cursor) — treating as \
+                 fresh; host should re-seed via checkpoint"
+            );
+            let _ = self.events.send(ChatEvent::ServerReset);
+        }
         // Cursor amnesty, once per client: a cursor above the checkpoint seq
         // claims history the doc may have silently parked and dropped —
         // parked imports vanish on export while the cursor advances, and
@@ -847,15 +871,27 @@ impl Actor {
         // cursor 75 over a checkpoint-only doc, 2026-08-18). Clamp and
         // refetch: re-imports are no-ops and the trim policy bounds the
         // cost to the rows since the last checkpoint.
-        if state.checkpoint_size > 0 && !self.cursor_amnesty_done.swap(true, Relaxed) {
+        if !self.cursor_amnesty_done.swap(true, Relaxed) {
+            // Checkpoint-less rooms amnesty to ZERO: the same parked-import
+            // wedge (empty doc under an advanced cursor — 2026-08-19: a live
+            // broadcast mid-join outran the backfill and the cursor skipped
+            // the hole) with no checkpoint to clamp to. Refetching the whole
+            // log is bounded by the checkpoint threshold policy (a room
+            // past ~200 rows/512KB HAS a checkpoint) and re-imports are
+            // no-ops, so this is the cheap universal heal.
+            let clamp_to = if state.checkpoint_size > 0 {
+                state.checkpoint_seq
+            } else {
+                0
+            };
             let mut shared = lock(&self.shared);
-            if shared.cursor > state.checkpoint_seq {
+            if shared.cursor > clamp_to {
                 tracing::info!(
                     from = shared.cursor,
-                    to = state.checkpoint_seq,
-                    "chat2: cursor amnesty — refetching rows above the checkpoint"
+                    to = clamp_to,
+                    "chat2: cursor amnesty — refetching rows the doc may have parked"
                 );
-                shared.cursor = state.checkpoint_seq;
+                shared.cursor = clamp_to;
             }
         }
         let cursor = lock(&self.shared).cursor;
@@ -864,21 +900,6 @@ impl Actor {
             self.flags.rejoins.fetch_add(1, Relaxed);
         }
         let _ = self.events.send(ChatEvent::Connected);
-
-        // Server behind our cursor = the room was reset/wiped. plan_catch_up
-        // treats the cursor as fresh; SURFACE the signal too — the host's
-        // re-seed recovery (chat-room.ts /reset) hangs off this event, and
-        // masking it was exactly how the s2 wedge class stayed invisible.
-        if cursor > state.head_seq {
-            self.flags.server_resets.fetch_add(1, Relaxed);
-            tracing::warn!(
-                cursor,
-                head_seq = state.head_seq,
-                "chat2: server lost state (headSeq < cursor) — treating as \
-                 fresh; host should re-seed via checkpoint"
-            );
-            let _ = self.events.send(ChatEvent::ServerReset);
-        }
 
         // ── catch-up: checkpoint precision + row backfill ───────────────────
         // Same presence rule as `plan_catch_up`: SIZE, not seq — a seeded
@@ -890,11 +911,11 @@ impl Actor {
             CatchUpPlan::RowsOnly { after } => after,
             CatchUpPlan::CheckpointThenRows { after } => after,
         };
-        // Clamp the persisted cursor into the room's honest range (server
-        // reset detection happened in plan_catch_up via after==0).
-        if after < cursor {
-            lock(&self.shared).cursor = after;
-        }
+        // The plan's `after` IS the cursor now — down (server reset / amnesty
+        // already applied) or UP (a contained checkpoint covers the skipped
+        // span). Without the raise, the backfill's first row (`after + 1`)
+        // reads as a contiguity gap against a stale lower cursor.
+        lock(&self.shared).cursor = after;
         // Rows request goes out BEFORE any checkpoint fetch: the row backfill
         // streams over the socket while the checkpoint downloads over HTTP in
         // parallel, instead of serializing download → request → backfill. On
@@ -1033,6 +1054,12 @@ impl Actor {
         // ── steady state ────────────────────────────────────────────────────
         let mut last_frame = tokio::time::Instant::now();
         let mut probe_deadline: Option<tokio::time::Instant> = None;
+        // Row-gap repairs this session (see `Shared::gap_repair`): a live
+        // frame during the backfill above may already have flagged one.
+        let mut gap_repairs = 0u32;
+        if !self.maybe_repair_gap(&mut pipe, &mut gap_repairs).await {
+            return SessionEnd::Reconnect;
+        }
         loop {
             let quiet_probe_at = last_frame + self.tuning.probe_quiet;
             let deadline_at = probe_deadline
@@ -1052,6 +1079,9 @@ impl Actor {
                         return SessionEnd::Reconnect;
                     };
                     if !self.handle_frame(frame) {
+                        return SessionEnd::Reconnect;
+                    }
+                    if !self.maybe_repair_gap(&mut pipe, &mut gap_repairs).await {
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -1176,7 +1206,14 @@ impl Actor {
                             {
                                 let mut sh = lock(&shared);
                                 sh.pending.retain(|p| p.batch_id != b);
-                                sh.cursor = sh.cursor.max(seq);
+                                // Contiguity rule (see handle_frame ACK): an
+                                // own-push ack proves the server has rows up
+                                // to `seq`, not that WE have the interleaved
+                                // ones. The pull below starts at the honest
+                                // cursor and walks the gap.
+                                if seq <= sh.cursor + 1 {
+                                    sh.cursor = sh.cursor.max(seq);
+                                }
                                 let cursor = sh.cursor;
                                 drop(sh);
                                 sink.advance_cursor(cursor);
@@ -1259,10 +1296,21 @@ impl Actor {
                         else {
                             continue;
                         };
-                        sink.apply_row(&frame.payload, row.seq);
-                        let mut sh = lock(&shared);
-                        sh.cursor = sh.cursor.max(row.seq);
-                        drop(sh);
+                        // Pulls request `after = cursor`, so rows arrive
+                        // contiguous — but hold the rule anyway: a jump
+                        // (trimmed log, server surprise) must not stamp the
+                        // cursor over rows the doc never saw.
+                        let effective = {
+                            let mut sh = lock(&shared);
+                            if row.seq <= sh.cursor + 1 {
+                                sh.cursor = sh.cursor.max(row.seq);
+                            } else {
+                                tracing::warn!(seq = row.seq, cursor = sh.cursor,
+                                    "chat2: pull row gap; holding cursor");
+                            }
+                            sh.cursor
+                        };
+                        sink.apply_row(&frame.payload, effective);
                         applied = true;
                     }
                     frame_type::ROWS_DONE => {}
@@ -1274,6 +1322,36 @@ impl Actor {
             }
             busy.store(false, Relaxed);
         });
+    }
+
+    /// If a row/ack gap was flagged, request a backfill from the honest
+    /// cursor. Bounded per session: a gap the server can't fill (should be
+    /// impossible below the checkpoint floor) forces a redial, whose full
+    /// catch-up is the stronger repair.
+    async fn maybe_repair_gap(&self, pipe: &mut BinPipe, repairs: &mut u32) -> bool {
+        const MAX_GAP_REPAIRS_PER_SESSION: u32 = 3;
+        let (repair, after) = {
+            let mut shared = lock(&self.shared);
+            (std::mem::take(&mut shared.gap_repair), shared.cursor)
+        };
+        if !repair {
+            return true;
+        }
+        *repairs += 1;
+        if *repairs > MAX_GAP_REPAIRS_PER_SESSION {
+            tracing::warn!("chat2: gap repairs exhausted; redialing for a full catch-up");
+            return false;
+        }
+        tracing::info!(after, attempt = *repairs, "chat2: backfilling over a row gap");
+        let req = wire::encode(
+            frame_type::ROWS_REQ,
+            &wire::RowsReqHeader {
+                after,
+                exclude_own: false,
+            },
+            &[],
+        );
+        pipe.tx.send(req).await.is_ok()
     }
 
     async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
@@ -1310,10 +1388,26 @@ impl Actor {
                 // Own-device rows can still arrive (live relay of a racing
                 // second socket, or a server that ignored excludeOwn) — Loro
                 // re-import is a no-op; the cursor advance is what matters.
-                self.sink.apply_row(&frame.payload, row.seq);
-                let mut shared = lock(&self.shared);
-                shared.cursor = shared.cursor.max(row.seq);
-                drop(shared);
+                // CONTIGUITY RULE: the cursor claims "every row ≤ cursor is
+                // reflected in the doc", so it may only walk, never jump. A
+                // gap means rows we never received (live broadcast mid-join)
+                // — apply the bytes (loro parks dependents harmlessly), keep
+                // the honest cursor, and ask for a backfill repair.
+                let effective = {
+                    let mut shared = lock(&self.shared);
+                    if row.seq > shared.cursor + 1 {
+                        shared.gap_repair = true;
+                        tracing::warn!(
+                            seq = row.seq,
+                            cursor = shared.cursor,
+                            "chat2: row gap detected; holding cursor and requesting backfill"
+                        );
+                    } else {
+                        shared.cursor = shared.cursor.max(row.seq);
+                    }
+                    shared.cursor
+                };
+                self.sink.apply_row(&frame.payload, effective);
                 let _ = self.events.send(ChatEvent::Applied);
             }
             frame_type::ACK => {
@@ -1322,7 +1416,19 @@ impl Actor {
                 };
                 let mut shared = lock(&self.shared);
                 shared.pending.retain(|p| p.batch_id != ack.batch_id);
-                shared.cursor = shared.cursor.max(ack.seq);
+                // Same contiguity rule as ROW: our own batch landing at
+                // `seq` proves rows up to seq exist server-side, not that we
+                // HAVE the interleaved ones from other devices.
+                if ack.seq > shared.cursor + 1 {
+                    shared.gap_repair = true;
+                    tracing::warn!(
+                        seq = ack.seq,
+                        cursor = shared.cursor,
+                        "chat2: ack gap detected; holding cursor and requesting backfill"
+                    );
+                } else {
+                    shared.cursor = shared.cursor.max(ack.seq);
+                }
                 let cursor = shared.cursor;
                 // Quota drain: each grant immediately probes the next head
                 // batch (one-per-grant, never a full-queue burst).

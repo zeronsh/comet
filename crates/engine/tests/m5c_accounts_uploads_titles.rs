@@ -268,6 +268,120 @@ async fn claude_slot_swap_round_trip() {
 }
 
 #[tokio::test]
+async fn claude_account_switch_keeps_live_mcp_oauth() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+    let creds_file = config.claude_config_dir.join(".credentials.json");
+
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    // Alice's first snapshot includes a MCP token that will go stale.
+    std::fs::write(
+        &creds_file,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "token-alice",
+                "refreshToken": "refresh-token-alice",
+                "expiresAt": 4_102_444_800_000i64,
+            },
+            "mcpOAuth": { "github": { "accessToken": "stale-github" } },
+            "pluginSecrets": { "old": true },
+            "trustedDeviceToken": "alice-device",
+        })
+        .to_string(),
+    )
+    .expect("alice mcp creds");
+    let snapshot = accounts.list(false).await.expect("list alice");
+    let alice_id = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.email.as_deref() == Some("alice@example.com"))
+        .expect("alice listed")
+        .id
+        .clone();
+
+    // Bob becomes live; MCP tokens rotate while he is the active login.
+    write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
+    std::fs::write(
+        &creds_file,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "token-bob",
+                "refreshToken": "refresh-token-bob",
+                "expiresAt": 4_102_444_800_000i64,
+            },
+            "mcpOAuth": { "github": { "accessToken": "live-github" } },
+            "pluginSecrets": { "live": true },
+            "trustedDeviceToken": "bob-device",
+        })
+        .to_string(),
+    )
+    .expect("bob mcp creds");
+    accounts.list(false).await.expect("list bob");
+
+    accounts
+        .activate(HarnessId::ClaudeCode, &alice_id)
+        .await
+        .expect("activate alice");
+
+    let creds: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&creds_file).expect("creds readable"))
+            .expect("creds json");
+    assert_eq!(creds["claudeAiOauth"]["accessToken"], "token-alice");
+    assert_eq!(
+        creds["trustedDeviceToken"], "alice-device",
+        "account-bound device token stays with the slot"
+    );
+    assert_eq!(
+        creds["mcpOAuth"]["github"]["accessToken"], "live-github",
+        "live MCP OAuth must survive the switch, not Alice's stale snapshot"
+    );
+    assert_eq!(creds["pluginSecrets"]["live"], true);
+    assert!(
+        creds["pluginSecrets"].get("old").is_none(),
+        "slot plugin secrets must not clobber the live generation"
+    );
+}
+
+#[tokio::test]
+async fn claude_account_switch_keeps_mcp_when_target_slot_has_none() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+    let creds_file = config.claude_config_dir.join(".credentials.json");
+
+    // Alice saved via the oauth-only shape (new login / usage refresh).
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    let snapshot = accounts.list(false).await.expect("list alice");
+    let alice_id = snapshot.accounts[0].id.clone();
+
+    write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
+    std::fs::write(
+        &creds_file,
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "token-bob",
+                "refreshToken": "refresh-token-bob",
+                "expiresAt": 4_102_444_800_000i64,
+            },
+            "mcpOAuth": { "linear": { "accessToken": "live-linear" } },
+        })
+        .to_string(),
+    )
+    .expect("bob mcp creds");
+    accounts.list(false).await.expect("list bob");
+
+    accounts
+        .activate(HarnessId::ClaudeCode, &alice_id)
+        .await
+        .expect("activate alice");
+
+    let creds: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&creds_file).expect("creds readable"))
+            .expect("creds json");
+    assert_eq!(creds["claudeAiOauth"]["accessToken"], "token-alice");
+    assert_eq!(creds["mcpOAuth"]["linear"]["accessToken"], "live-linear");
+}
+
+#[tokio::test]
 async fn codex_slot_swap_and_api_key_detection() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (accounts, config) = test_accounts(tmp.path());

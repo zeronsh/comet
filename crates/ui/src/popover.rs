@@ -504,6 +504,29 @@ pub fn anchored_menu_above_at(
         .into_any_element()
 }
 
+pub fn full_width_menu_above(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
+    div()
+        .absolute()
+        .bottom_full()
+        .left_0()
+        .right_0()
+        .child(
+            gpui::deferred(menu_motion(
+                id.into(),
+                exit,
+                div().occlude().pb(px(6.0)).child(content),
+            ))
+            .priority(1),
+        )
+        .into_any_element()
+}
+
 /// [`anchored_menu_above`] right-aligned to the trigger's right edge (t3code
 /// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
 /// picker open leftward instead of running off the window).

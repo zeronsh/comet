@@ -626,6 +626,10 @@ pub struct AppState {
     pending_sends: HashMap<String, PendingSend>,
     /// The in-flight send's attachment upload, when it has one.
     upload_progress: Option<UploadProgress>,
+    /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
+    /// snapshots): real relay-leg progress for the sending thumbnail's
+    /// percent ring, present exactly while bytes are moving.
+    transfers: HashMap<String, (u64, u64)>,
     /// Written by the changes pane, read by the composer.
     diff_comments: HashMap<String, Vec<DiffComment>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
@@ -677,6 +681,7 @@ impl AppState {
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             upload_progress: None,
+            transfers: HashMap::new(),
             diff_comments: HashMap::new(),
             local_device_id: None,
             update: None,
@@ -1037,6 +1042,29 @@ impl AppState {
         Some(((done * 100) / progress.total).min(99) as u8)
     }
 
+    /// A `WatchTransfers` snapshot: the engine-side relay leg's in-flight
+    /// queued-attachment transfers, replacing the whole set each frame.
+    pub fn apply_transfers(&mut self, transfers: Vec<zeron_proto::TransferProgress>) {
+        self.transfers = transfers
+            .into_iter()
+            .map(|t| (t.upload_id, (t.done, t.total)))
+            .collect();
+    }
+
+    /// Percent of one queued attachment's relay transfer, by the uploadId
+    /// its `pending://{uploadId}/…` ref names. Same 99-clamp as
+    /// [`Self::upload_progress_percent`]: the last point belongs to the
+    /// commit, so "100% but still spinning" never shows. `None` when no
+    /// bytes are moving for that upload (staged-but-waiting, retry backoff,
+    /// or done) — the thumbnail falls back to its indeterminate spinner.
+    pub fn transfer_percent(&self, upload_id: &str) -> Option<u8> {
+        let (done, total) = self.transfers.get(upload_id)?;
+        if *total == 0 {
+            return None;
+        }
+        Some(((done.min(total) * 100) / total).min(99) as u8)
+    }
+
     /// Is a send still in flight for this chat (unacked)? Inside the grace
     /// window normally; while the chat's delivery path is degraded the
     /// overlay holds indefinitely — the truth IS "Queued", and silently
@@ -1303,6 +1331,7 @@ impl AppState {
         self.echoes.clear();
         self.pending_sends.clear();
         self.upload_progress = None;
+        self.transfers.clear();
         self.local_device_id = None;
         self.update = None;
         cx.notify();
@@ -1374,6 +1403,12 @@ impl AppState {
                 handle.clone(),
                 methods::WATCH_CONNECTIVITY,
                 AppState::apply_connectivity,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_TRANSFERS,
+                AppState::apply_transfers,
             ),
             spawn_watch(
                 cx,
@@ -2565,6 +2600,35 @@ mod tests {
         upgraded.version = Some("0.2.3".into());
         state.apply_devices(vec![upgraded]);
         assert!(state.change_requests.is_supported("remote"));
+    }
+
+    #[test]
+    fn transfer_percent_tracks_snapshots_by_upload_id() {
+        let mut s = AppState::new();
+        assert_eq!(s.transfer_percent("u1"), None);
+
+        let frame = |id: &str, done, total| zeron_proto::TransferProgress {
+            upload_id: id.into(),
+            file_name: "a.png".into(),
+            done,
+            total,
+        };
+        s.apply_transfers(vec![frame("u1", 430, 1_000), frame("u2", 0, 400)]);
+        assert_eq!(s.transfer_percent("u1"), Some(43));
+        assert_eq!(s.transfer_percent("u2"), Some(0));
+        assert_eq!(s.transfer_percent("other"), None);
+
+        // The last point belongs to the commit — never a stuck 100%; b64
+        // padding overshoot stays clamped too.
+        s.apply_transfers(vec![frame("u1", 1_000, 1_000), frame("u3", 12, 0)]);
+        assert_eq!(s.transfer_percent("u1"), Some(99));
+        // Zero-total renders indeterminate, not a division blowup.
+        assert_eq!(s.transfer_percent("u3"), None);
+        // Snapshots REPLACE: u2's transfer retired with its entry.
+        assert_eq!(s.transfer_percent("u2"), None);
+
+        s.apply_transfers(Vec::new());
+        assert_eq!(s.transfer_percent("u1"), None);
     }
 
     #[test]

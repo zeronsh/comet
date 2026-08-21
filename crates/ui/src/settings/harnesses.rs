@@ -7,12 +7,17 @@
 //! `ListHarnesses` probe and the `SetHarnessEnabled` writes at any registered
 //! device over the relay-forwarded RPCs.
 //!
-//! Only Claude Code and Codex ship enabled; the rest are opt-in. A harness
-//! whose CLI is missing on the target device renders dimmed with an install
-//! hint and its toggle inert — enabling an agent that can't run would only
-//! manufacture NotInstalled errors at send time. The engine enforces the same
-//! gate (plus "can't disable the last enabled harness") where the state
-//! lives, so a raced or stale toggle self-corrects from the RPC reply.
+//! Enablement follows DETECTION: every harness whose CLI probe passes is on
+//! unless the user switched it off, so installing an agent is all it takes
+//! for it to appear here and in the composer. A harness whose CLI is missing
+//! on the target device renders dimmed with an install hint and is never
+//! enabled (enabling an agent that can't run would only manufacture
+//! NotInstalled errors at send time); an ENABLED agent can always be turned
+//! OFF except the last one standing — the composer needs something to run.
+//! Catalogs from engines predating the detection model can still stamp
+//! enabled-but-uninstalled rows; the hint covers that too. The engine
+//! enforces the same gates where the state lives, so a raced or stale toggle
+//! self-corrects from the RPC reply.
 
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
@@ -346,9 +351,15 @@ impl HarnessesPage {
                 let installed = descriptor.installed;
                 let enabled = descriptor_enabled(&descriptor);
                 // The one enabled harness left can't be switched off — the
-                // composer needs something to run (mirrors the engine guard).
-                let last_enabled = enabled && enabled_count == 1;
-                let interactive = installed && !last_enabled;
+                // composer needs something to run — but only when it could
+                // actually run: an uninstalled last harness stays togglable
+                // (its hint says to turn it off) and the composer handles the
+                // resulting empty set (mirrors the engine guard).
+                let last_enabled = enabled && enabled_count == 1 && installed;
+                // Turning OFF never needs the CLI (a default-on agent the
+                // user doesn't want must not be stuck on because it isn't
+                // installed); turning ON still does.
+                let interactive = !last_enabled && (enabled || installed);
                 let (icon_path, tint) = crate::pickers::harness_brand_icon(harness);
                 let mut meta: Vec<gpui::AnyElement> = vec![
                     div()
@@ -359,10 +370,14 @@ impl HarnessesPage {
                     meta.push(
                         div()
                             .text_color(theme.warning_muted.opacity(0.9))
-                            .child(SharedString::from(format!(
-                                "Install the {} CLI to enable",
-                                cli_name(harness)
-                            )))
+                            .child(SharedString::from(if enabled {
+                                format!(
+                                    "{} CLI not installed — turn it off or install it",
+                                    cli_name(harness)
+                                )
+                            } else {
+                                format!("Install the {} CLI to enable", cli_name(harness))
+                            }))
                             .into_any_element(),
                     );
                 }

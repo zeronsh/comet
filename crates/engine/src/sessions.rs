@@ -67,9 +67,45 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
+/// Configuration baked into a live harness runtime. The steering mailbox only
+/// carries prompt text, so routing a request whose model/effort/sandbox changed
+/// would silently run it with the old process configuration. Such requests
+/// must replace the runtime and resume its harness-native session instead.
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeConfig {
+    harness_id: HarnessId,
+    model: Option<String>,
+    reasoning: Option<zeron_proto::ReasoningLevel>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+    cwd: String,
+    sandbox: zeron_proto::SandboxLevel,
+    auto_approve: bool,
+    worktree: Option<zeron_proto::WorktreeSpec>,
+}
+
+impl RuntimeConfig {
+    fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
+        Self {
+            harness_id,
+            model: request.model.clone(),
+            reasoning: request.reasoning,
+            model_options: request.model_options.clone(),
+            cwd: request.cwd.clone(),
+            sandbox: request.sandbox,
+            auto_approve: request.auto_approve,
+            worktree: request.worktree.clone(),
+        }
+    }
+
+    fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
+        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+    }
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -302,16 +338,17 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable,
+                h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
             )
         });
-        if let Some((run_id, steerable, steer_tx, ledger)) = routed {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
-            if steerable && steer_tx.try_send(message).is_ok() {
+            if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
                 // The run can vanish between the send and here (the idle
                 // reaper, a parked child death): the ledger entry below is
                 // the at-least-once guarantee — the run task's exit drain
@@ -350,8 +387,15 @@ impl SessionsEngine {
                 // below (write_user_message dedupes by id).
                 message_id = Some(user_id);
             }
+            if !same_runtime {
+                tracing::debug!(
+                    chat = %chat_id,
+                    "restarting live harness to apply changed run configuration"
+                );
+            }
             // Mailbox closed (runtime mid-teardown / non-steering harness) or
-            // the routed run died with the message reclaimed: replace it.
+            // the routed run died with the message reclaimed, or configuration
+            // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
         }
 
@@ -408,6 +452,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
                 cancel: cancel_tx,
@@ -1541,13 +1586,27 @@ async fn drive_run(
                 .iter()
                 .any(|p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id));
             let sink_known = subagents.contains_key(parent_tool_use_id);
+            // A Done with NO sink (a subagent that never streamed — codex
+            // turn ends can beat registration) is chip-only: minting a doc
+            // just to freeze it empty helps no one, and stamping the ref
+            // would link the chip to that never-created doc (an empty tab
+            // on click).
+            let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if chip_streaming {
-                if !sink_known {
+                if !sink_known && !done_only {
                     for p in folded.iter_mut() {
                         if let MessagePart::Tool {
-                            id, subagent_ref, ..
+                            id,
+                            call,
+                            subagent_ref,
+                            ..
                         } = p
                             && id == parent_tool_use_id
+                            // Genus gate: a subagent ref may only ever bind
+                            // to a SPAWN call — mis-keyed tagged traffic
+                            // must not turn an ordinary chip into a spawn
+                            // link (empty tab on click).
+                            && call.is_subagent_spawn()
                         {
                             *subagent_ref = Some(sub_id.clone());
                         }
@@ -1561,10 +1620,6 @@ async fn drive_run(
                 }
             }
             // Open the sink lazily; an open failure degrades to chip-only.
-            // A Done with NO sink (a subagent that never streamed — codex
-            // turn ends can beat registration) is chip-only: minting a doc
-            // just to freeze it empty helps no one.
-            let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
             if !sink_known && !done_only {
                 let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
                     Ok(handle) => Some(handle.doc_arc()),
@@ -2091,8 +2146,47 @@ async fn drive_run(
 }
 
 #[cfg(test)]
-mod subagent_id_tests {
-    use super::subagent_doc_id;
+mod tests {
+    use super::{RuntimeConfig, subagent_doc_id};
+    use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    fn request() -> RunRequest {
+        RunRequest {
+            prompt: "first".into(),
+            harness: None,
+            model: Some("grok-4.6".into()),
+            reasoning: Some(zeron_proto::ReasoningLevel::High),
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn live_routing_requires_the_same_runtime_configuration() {
+        let initial = request();
+        let config = RuntimeConfig::from_request(HarnessId::Grok, &initial);
+
+        let mut follow_up = initial.clone();
+        follow_up.prompt = "second".into();
+        follow_up.resume = Some("session-1".into());
+        assert!(config.can_route(HarnessId::Grok, &follow_up));
+
+        follow_up.model = Some("grok-4.5".into());
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        follow_up.model = initial.model.clone();
+
+        follow_up.reasoning = Some(zeron_proto::ReasoningLevel::Medium);
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        follow_up.reasoning = initial.reasoning;
+
+        follow_up.attachments.push("/tmp/image.png".into());
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+    }
 
     #[test]
     fn clean_tool_ids_ride_verbatim_and_fit_id_re() {

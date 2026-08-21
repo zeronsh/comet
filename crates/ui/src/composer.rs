@@ -64,6 +64,10 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 /// (scrollHeight rounds to 47 in the original) + the 2px hairline = 49. The
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
+/// `max-w-3xl`: stable outer width of the centered composer column.
+const COMPOSER_MAX_WIDTH: f32 = 768.0;
+/// Ignore subpixel noise when the shell reports the conversation width.
+const COMPOSER_WIDTH_EPSILON: f32 = 0.5;
 /// Below this pill input width the composer always expands.
 pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 /// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
@@ -79,8 +83,9 @@ pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 /// capacity — expanding and collapsing share no boundary, so a width right at
 /// the flip threshold can't oscillate between the two layouts.
 pub const COLLAPSE_HYSTERESIS: f32 = 32.0;
-/// During an interactive window resize the current mode is frozen until the
-/// measured widths have been stable this long.
+/// During an interactive resize, collapsing back to the compact mode waits
+/// until the measured widths have been stable this long. Expansion remains
+/// immediate so a narrowing panel never traps the controls in a compact row.
 pub const RESIZE_SETTLE_MS: u64 = 150;
 
 /// Compact↔expanded flip with hysteresis. `capacity` is the *compact-mode*
@@ -88,7 +93,7 @@ pub const RESIZE_SETTLE_MS: u64 = 150;
 /// container-width deltas while expanded — never the post-flip measured width,
 /// which differs per mode and would feed back into the decision):
 /// - a newline always expands;
-/// - while `resizing`, the current mode is kept (no flip until sizes settle);
+/// - while `resizing`, an expanded composer stays expanded until sizes settle;
 /// - a too-narrow pill (`capacity < MIN_COMPACT_INPUT_WIDTH`) always expands;
 /// - compact expands only when `text_width > capacity`; expanded collapses
 ///   only when `text_width < capacity - COLLAPSE_HYSTERESIS`.
@@ -102,17 +107,18 @@ pub fn composer_flip(
     if has_newline {
         return true;
     }
-    if resizing {
-        return expanded;
-    }
     if capacity < MIN_COMPACT_INPUT_WIDTH {
         return true;
     }
     if expanded {
-        text_width >= capacity - COLLAPSE_HYSTERESIS
+        resizing || text_width >= capacity - COLLAPSE_HYSTERESIS
     } else {
         text_width > capacity
     }
+}
+
+fn composer_width_changed(previous: Option<f32>, current: f32) -> bool {
+    previous.is_none_or(|previous| (current - previous).abs() > COMPOSER_WIDTH_EPSILON)
 }
 
 /// Caret blink half-period (standard textarea cadence: ~500ms on / 500ms off).
@@ -3374,8 +3380,12 @@ pub struct Composer {
     expanded_anchor: f32,
     /// Last input width seen in the current mode (resize detection).
     last_seen_width: f32,
-    /// Set while an interactive resize is in flight; mode is frozen until
-    /// widths have settled for [`RESIZE_SETTLE_MS`].
+    /// Stable outer composer width supplied by the shell. Unlike Taffy's
+    /// provisional input measurements, this changes only when the actual
+    /// conversation column changes and can safely drive a follow-up render.
+    last_available_width: Option<f32>,
+    /// Set while an interactive resize is in flight; collapse is deferred
+    /// until widths have settled for [`RESIZE_SETTLE_MS`].
     width_changed_at: Option<Instant>,
     settle_task: Option<Task<()>>,
     /// In-flight compact↔expanded morph (one per committed flip; manual
@@ -3400,6 +3410,25 @@ impl Composer {
     /// The picker entity, for the shell's canvas target selectors.
     pub fn pickers(&self) -> &Entity<Pickers> {
         &self.pickers
+    }
+
+    /// Feed the stable conversation-column width into responsive composer
+    /// controls. The text input's own width is unsuitable here because it
+    /// changes when the Traits label is replaced by the overflow dots.
+    pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let composer_width = width.clamp(0.0, COMPOSER_MAX_WIDTH);
+        let inner_width = (composer_width - 2.0 * Theme::SPACE_LG).max(0.0);
+        self.pickers.update(cx, |pickers, cx| {
+            pickers.set_composer_width(inner_width, cx);
+        });
+        if composer_width_changed(self.last_available_width, composer_width) {
+            self.last_available_width = Some(composer_width);
+            // The shell renders before this child, so this queues one more
+            // pass after the input has been laid out at its final width. That
+            // pass can consume the completed measurement without emitting an
+            // event from inside Taffy's multi-pass measurement callback.
+            cx.notify();
+        }
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -3484,6 +3513,7 @@ impl Composer {
             compact_capacity: 0.0,
             expanded_anchor: 0.0,
             last_seen_width: 0.0,
+            last_available_width: None,
             width_changed_at: None,
             settle_task: None,
             flip_morph: None,
@@ -3678,7 +3708,16 @@ impl Composer {
                             }))
                             .child(
                                 img(att.image.clone())
-                                    .size_full()
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the image's intrinsic aspect
+                                    // ratio over a percent height (gpui
+                                    // f8d8a90 repoint), so size_full let a
+                                    // tall photo grow past the frame — the
+                                    // rectangular overflow clip then squared
+                                    // the bottom corners (2026-08-19 report).
+                                    // 56−2 = frame minus its 1px borders.
+                                    .w(px(STRIP_THUMB - 2.0))
+                                    .h(px(STRIP_THUMB - 2.0))
                                     // Own radii — the frame's rounding only
                                     // clips rectangularly (7 = 8 - border).
                                     .rounded(px(7.0))
@@ -3950,8 +3989,8 @@ impl Composer {
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
         let mut card = crate::popover::popover_card(theme)
-            .w(px(380.0))
-            .max_h(px(280.0))
+            .w_full()
+            .max_h(px(320.0))
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if self.mention.loading && self.mention.results.is_empty() {
@@ -3987,24 +4026,20 @@ impl Composer {
         } else {
             for (ix, result) in self.mention.results.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
-                let path = result.path.clone();
-                let tooltip_path: SharedString = path.clone().into();
+                let (directory, name) = match result.path.rsplit_once('/') {
+                    Some((directory, name)) => (directory.to_string(), name.to_string()),
+                    None => (String::new(), result.path.clone()),
+                };
                 card = card.child(
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| MentionPathTooltip {
-                                path: tooltip_path.clone(),
-                                activation: ix as u64,
-                            })
-                            .into()
-                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.mention.active = Some(ix);
                             this.accept_mention(cx);
                         }))
                         .child(
                             div()
+                                .w_full()
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -4016,32 +4051,34 @@ impl Composer {
                                         crate::icons::DOCUMENT
                                     })
                                     .size(px(14.0))
+                                    .flex_none()
                                     .text_color(theme.text_muted),
                                 )
                                 .child(
                                     div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .truncate()
-                                        .text_size(px(12.5))
+                                        .flex_none()
+                                        .text_size(px(13.0))
                                         .text_color(theme.text)
-                                        .child(path),
-                                ),
+                                        .child(name),
+                                )
+                                .when(!directory.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .truncate()
+                                            .text_size(px(12.5))
+                                            .text_color(theme.text_muted)
+                                            .child(directory),
+                                    )
+                                }),
                         ),
                 );
             }
         }
-        let anchor = self
-            .input
-            .read(cx)
-            .visible_point_for_index(token.range.start)?;
-        // No exit phase: the completion popup tracks the token under the
-        // caret — a fade-out on every keystroke-driven dismissal would read
-        // as input lag, not polish.
-        Some(crate::popover::anchored_menu_above_at(
+        Some(crate::popover::full_width_menu_above(
             "file-mention-popup",
-            anchor,
             card.into_any_element(),
             None,
         ))
@@ -4051,7 +4088,6 @@ impl Composer {
         div()
             .relative()
             .child(self.input.clone())
-            .children(self.render_file_mention_popup(theme, cx))
             .children(self.render_slash_popup(theme, cx))
     }
 
@@ -4438,7 +4474,14 @@ impl Composer {
     /// Existing chats carry their own project, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
-        state.selected_chat.is_none() && state.selected_space_row().is_none()
+        if state.selected_chat.is_some() {
+            return false;
+        }
+        // New-chat canvas: needs a project AND a runnable agent. The
+        // no-agents check only fires once the catalog is loaded — offline
+        // and still-loading states must not block (the harness resolves from
+        // the remembered default and the engine reports real failures).
+        state.selected_space_row().is_none() || self.pickers.read(cx).no_agents_available()
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
@@ -4608,6 +4651,31 @@ impl Composer {
                 .collect()
         };
         let echo_text = attachments::with_attachments(&text, &echo_paths);
+        // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
+        // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
+        // path the sender can't predict, but whose id8 it minted. The alias
+        // keeps the thumbnail on the already-local bytes through that
+        // rewrite instead of blanking into a reload skeleton.
+        if queued_flow {
+            for (upload_id, att) in upload_ids.iter().zip(&staged) {
+                attachments::seed_attachment_alias(
+                    &device_id,
+                    upload_id,
+                    &att.name,
+                    att.image.clone(),
+                );
+                if let Some(local) = local_device_id.as_deref()
+                    && local != device_id
+                {
+                    attachments::seed_attachment_alias(
+                        local,
+                        upload_id,
+                        &att.name,
+                        att.image.clone(),
+                    );
+                }
+            }
+        }
         for (path, att) in echo_paths.iter().zip(&staged) {
             attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
             if let Some(local) = local_device_id.as_deref()
@@ -5441,8 +5509,9 @@ impl Composer {
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Steer => {
-                // Dimmed and inert while no project is picked (`send_blocked`
-                // also gates `on_submit`, so Enter is a no-op too).
+                // Dimmed and inert while no project is picked or no agent is
+                // runnable (`send_blocked` also gates `on_submit`, so Enter
+                // is a no-op too).
                 let blocked = self.send_blocked(cx);
                 div()
                     .id("composer-send")
@@ -5509,7 +5578,8 @@ impl Render for Composer {
         let measured_since_flip = epoch > self.flip_epoch && last_width > 0.0;
         if measured_since_flip {
             // A same-mode width change is an interactive window/pane resize:
-            // freeze the mode until sizes settle for RESIZE_SETTLE_MS.
+            // defer collapse until sizes settle for RESIZE_SETTLE_MS. Expansion
+            // remains live so compact controls never squeeze the input away.
             if self.last_seen_width > 0.0 && (last_width - self.last_seen_width).abs() > 0.5 {
                 self.width_changed_at = Some(now);
             }
@@ -5633,7 +5703,7 @@ impl Render for Composer {
         // Centered composer column (zeron `mx-auto w-full max-w-3xl`).
         let container = div()
             .w_full()
-            .max_w(px(768.0))
+            .max_w(px(COMPOSER_MAX_WIDTH))
             .mx_auto()
             .flex()
             .flex_col()
@@ -5949,11 +6019,16 @@ impl Render for Composer {
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(crate::frost::frosted(
-            26.0,
-            16.0,
-            motion::fade_quick("composer-input", body),
-        ));
+        let container = container.child(
+            div()
+                .relative()
+                .child(crate::frost::frosted(
+                    26.0,
+                    16.0,
+                    motion::fade_quick("composer-input", body),
+                ))
+                .children(self.render_file_mention_popup(&theme, cx)),
+        );
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
@@ -5994,6 +6069,14 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_outer_width_only_schedules_reflow_on_real_changes() {
+        assert!(composer_width_changed(None, 400.0));
+        assert!(!composer_width_changed(Some(400.0), 400.0));
+        assert!(!composer_width_changed(Some(400.0), 400.5));
+        assert!(composer_width_changed(Some(400.0), 400.51));
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {
@@ -6313,13 +6396,15 @@ mod tests {
     }
 
     #[test]
-    fn flip_frozen_during_interactive_resize() {
-        // While resizing, both modes hold even across their thresholds…
-        assert!(!composer_flip(false, 500.0, 300.0, false, true));
+    fn resize_expands_live_but_defers_collapse() {
+        // A compact composer expands immediately as its text or controls stop
+        // fitting, even while the divider is moving.
+        assert!(composer_flip(false, 500.0, 300.0, false, true));
+        assert!(composer_flip(false, 10.0, 150.0, false, true));
+        // An expanded composer waits for the drag to settle before collapsing,
+        // avoiding mode chatter while the user reverses direction.
         assert!(composer_flip(true, 0.0, 300.0, false, true));
-        // …including the narrow-column force-expand.
-        assert!(!composer_flip(false, 10.0, 150.0, false, true));
-        // Once settled, the same inputs flip.
+        // Once settled, the same wide layout may collapse.
         assert!(composer_flip(false, 500.0, 300.0, false, false));
         assert!(!composer_flip(true, 0.0, 300.0, false, false));
         assert!(composer_flip(false, 10.0, 150.0, false, false));

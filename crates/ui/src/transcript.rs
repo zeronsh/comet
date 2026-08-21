@@ -3,8 +3,8 @@
 //!
 //! Row model (docs/research/mugen-pretext.md §3):
 //! - one row per BLOCK: user message = one bubble row; assistant messages split
-//!   into one row per markdown top-level block, plus consecutive-tool groups and
-//!   input/error chips;
+//!   into one row per markdown top-level block, plus consecutive-tool groups
+//!   (agent/spawn chips split out so they never collapse) and input/error chips;
 //! - stable row ids `{msgId}#{partId}.{blockIx}` / `{msgId}#g{groupIx}` — LIVE
 //!   (streaming) entries split per block exactly like completed ones (the list
 //!   virtualizes them, so a fading live reply re-renders only its visible tail
@@ -33,9 +33,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
-    ListScrollEvent, ListState, ObjectFit, SharedString, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels,
+    Point, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun, Window, canvas,
+    div, img, list, prelude::*, px, quad,
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
@@ -60,6 +61,12 @@ pub const STICK_THRESHOLD_PX: f32 = 70.0;
 pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
+/// Text-selection edge scrolling runs only during a drag. A 24 ms cadence is
+/// smooth enough to track text while avoiding a permanent animation-frame loop
+/// on low-end devices.
+const SELECTION_SCROLL_TICK_MS: u64 = 24;
+const SELECTION_SCROLL_EDGE_PX: f32 = 36.0;
+const SELECTION_SCROLL_MAX_STEP_PX: f32 = 24.0;
 /// Vertical gap opening a new turn (new message entry).
 pub const GAP_TURN: f32 = 14.0;
 /// Vertical gap between blocks within a turn.
@@ -73,6 +80,40 @@ pub const MAX_CONTENT_WIDTH: f32 = 736.0;
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
 pub const CHIP_CARD_HEIGHT: f32 = 30.0;
+/// Inner height of the chip header: [`CHIP_CARD_HEIGHT`] is the card's
+/// border-box (explicit `h` in gpui includes the 1px border), so a 30px
+/// header inside a 30px bordered card clips 2px off the bottom and every
+/// glyph/icon reads high (user report).
+const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
+
+/// Signed list scroll step for a pointer near a viewport edge.
+///
+/// GPUI list offsets increase toward the document bottom. The quadratic ramp
+/// keeps entry into the edge zone gentle and reaches full speed at the edge.
+fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
+    let height = f32::from(bounds.size.height);
+    if height <= 0.0 {
+        return 0.0;
+    }
+    let edge = SELECTION_SCROLL_EDGE_PX.min(height / 3.0);
+    if edge <= 0.0 {
+        return 0.0;
+    }
+    let y = f32::from(position.y);
+    let top = f32::from(bounds.top());
+    let bottom = f32::from(bounds.bottom());
+    let scaled = |penetration: f32| {
+        let t = (penetration / edge).clamp(0.0, 1.0);
+        SELECTION_SCROLL_MAX_STEP_PX * t * t
+    };
+    if y < top + edge {
+        -scaled(top + edge - y)
+    } else if y > bottom - edge {
+        scaled(y - (bottom - edge))
+    } else {
+        0.0
+    }
+}
 const CHIPS_TOP_PAD: f32 = 2.0;
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
@@ -249,6 +290,35 @@ pub struct ToolItem {
     /// per-delta header rewrites read as noise). Never rendered; still
     /// fingerprinted so an old doc's chips re-splice correctly.
     pub subagent_tail: Option<SharedString>,
+}
+
+/// Subagent spawn chips — [`ToolCall::is_subagent_spawn`], the shared genus
+/// every driver decodes its spawn tool into. These stay out of the
+/// collapsible "Called N tools" wrap so a running subagent is visible
+/// without opening the fold.
+fn is_agent_call(call: &ToolCall) -> bool {
+    call.is_subagent_spawn()
+}
+
+/// The chip's GENUS is the call itself, never the ref: docs written before
+/// the claude-driver fix carry stray `subagent_ref`s on ordinary Run chips
+/// (a background shell's `task_notification` was mis-tagged as subagent
+/// traffic), and honoring the ref alone turned those Runs into spawn chips
+/// that opened empty, never-created subagent docs.
+fn is_agent_tool(item: &ToolItem) -> bool {
+    is_agent_call(&item.call)
+}
+
+/// A chip renders as the spawn LINK (whole-card click → subagent tab) only
+/// when an agent call has actually been bound to its doc.
+fn is_spawn_link(item: &ToolItem) -> bool {
+    is_agent_call(&item.call) && item.subagent_ref.is_some()
+}
+
+/// Ordinary tool groups fold behind a summary header; agent/spawn chips
+/// render as their own always-open row.
+fn tool_group_collapses(tools: &[ToolItem]) -> bool {
+    tools.iter().any(|t| !is_agent_tool(t))
 }
 
 /// A chip's expandable detail payload.
@@ -714,7 +784,9 @@ pub fn rows_for_entry(
         }];
     }
 
-    // Assistant/system: split parts into block rows, folding consecutive tools.
+    // Assistant/system: split parts into block rows, folding consecutive
+    // ordinary tools. Agent/spawn chips flush into their own group so they
+    // never share a collapse with Reads/Runs.
     let last_part_ix = entry.parts.len().saturating_sub(1);
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
@@ -758,7 +830,7 @@ pub fn rows_for_entry(
                 subagent_tail,
                 ..
             } => {
-                pending_group.push(ToolItem {
+                let item = ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
@@ -771,7 +843,21 @@ pub fn rows_for_entry(
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
-                });
+                };
+                // Agent chips don't share a fold with ordinary tools: flush
+                // whenever the genus flips so each group is uniform.
+                if pending_group
+                    .first()
+                    .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
+                {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_last_part_ix,
+                    );
+                }
+                pending_group.push(item);
                 group_last_part_ix = part_ix;
             }
             other => {
@@ -1475,6 +1561,11 @@ pub struct Transcript {
     /// One `on_next_frame` callback in flight at most.
     spring_scheduled: bool,
     scroll_anim: Option<Task<()>>,
+    /// Last pointer sample while markdown selection owns a left-button drag.
+    selection_drag_position: Option<Point<Pixels>>,
+    /// One-shot timer rescheduled only while the pointer remains in an edge
+    /// zone. Dropping it on mouse-up stops all selection scroll work.
+    selection_scroll_task: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
     /// Height of the shell's composer/status/terminal stack overlaying the
@@ -1640,6 +1731,8 @@ impl Transcript {
             spring_kick: false,
             spring_scheduled: false,
             scroll_anim: None,
+            selection_drag_position: None,
+            selection_scroll_task: None,
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
@@ -1847,6 +1940,93 @@ impl Transcript {
             })
             .ok();
         });
+    }
+
+    fn on_selection_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.dragging() || !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        self.selection_drag_position = Some(event.position);
+        if render::update_drag_at(event.position) {
+            cx.notify();
+        }
+        self.schedule_selection_scroll(cx);
+    }
+
+    fn on_selection_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_selection_scroll();
+        if let Some(_text) = crate::markdown::selection::end_active_drag() {
+            // X11 middle-click paste parity, including the case where the
+            // anchor row has virtualized away and cannot receive mouse-up.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            cx.write_to_primary(ClipboardItem::new_string(_text));
+        }
+    }
+
+    fn stop_selection_scroll(&mut self) {
+        self.selection_drag_position = None;
+        self.selection_scroll_task = None;
+    }
+
+    fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_task.is_some() || !crate::markdown::selection::is_dragging() {
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        if selection_scroll_step(self.list.viewport_bounds(), position) == 0.0 {
+            return;
+        }
+        self.selection_scroll_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECTION_SCROLL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |transcript, cx| {
+                transcript.selection_scroll_task = None;
+                transcript.step_selection_scroll(cx);
+            });
+        }));
+    }
+
+    fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if !crate::markdown::selection::is_dragging() {
+            self.stop_selection_scroll();
+            return;
+        }
+        let Some(position) = self.selection_drag_position else {
+            return;
+        };
+        let step = selection_scroll_step(self.list.viewport_bounds(), position);
+        if step == 0.0 {
+            return;
+        }
+
+        // Resolve against the registry painted after the previous step before
+        // moving it again. This is what lets a stationary edge pointer consume
+        // successive virtualized rows.
+        render::update_drag_at(position);
+        self.scroll_anim = None;
+        self.release_own_turn_hold();
+        self.pinned = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.list.scroll_by(px(step));
+        self.last_scroll_distance = self.distance_from_bottom();
+        self.show_jump_button = self.last_scroll_distance > SCROLL_BUTTON_THRESHOLD_PX;
+        cx.notify();
+        self.schedule_selection_scroll(cx);
     }
 
     /// Reserve the reply's space below a locally-sent prompt — EVERY send,
@@ -2745,15 +2925,33 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
-            // The in-flight send's upload progress belongs ON the thumbnail:
-            // only the un-refreshed echo carries synthetic `pending/` refs, so
-            // the pair (pending path, upload in flight) is exactly "this image
-            // is crossing the relay right now" (2026-08-18 user request).
-            let uploading = att
+            // The in-flight send's progress belongs ON the thumbnail
+            // (2026-08-18 user request). Two ref shapes mean "still
+            // crossing": the queued flow's `pending://` (bytes ship
+            // engine-side after the send; the host rewrites the ref to an
+            // absolute path once they land and the run starts) and the
+            // legacy echo's synthetic `pending/`. Percent sources, in order:
+            // this attachment's own relay transfer (`WatchTransfers`, by the
+            // uploadId its ref names — the leg that actually takes time),
+            // else the send-wide staging/legacy upload percent. Neither → the
+            // indeterminate spinner (staged-but-waiting, retry backoff, or
+            // committed-awaiting-rewrite), so the ring never shows a number
+            // that isn't a real transfer position (2026-08-20 report: the
+            // staging-only percent blinked out in ~100ms and lied about the
+            // slow part).
+            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let upload_id = att
                 .path
-                .starts_with("pending/")
-                .then(|| self.state.read(cx).upload_progress_percent())
-                .flatten();
+                .strip_prefix("pending://")
+                .and_then(|rest| rest.split_once('/'))
+                .map(|(id, _)| id);
+            let uploading = upload_id
+                .and_then(|id| self.state.read(cx).transfer_percent(id))
+                .or_else(|| {
+                    sending
+                        .then(|| self.state.read(cx).upload_progress_percent())
+                        .flatten()
+                });
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -2780,7 +2978,14 @@ impl Transcript {
                         }))
                         .child(
                             img(image.image.clone())
-                                .size_full()
+                                // EXPLICIT dims, not size_full: img layout
+                                // honors the intrinsic aspect ratio over a
+                                // percent height (gpui f8d8a90 repoint), so
+                                // size_full let a tall photo grow past the
+                                // frame and the rectangular overflow clip
+                                // squared the bottom corners (2026-08-19).
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
                                 // The IMG needs its own radii: the frame's
                                 // rounding only clips rectangularly, so the
                                 // sprite must round its own corners (7 = the
@@ -2788,15 +2993,25 @@ impl Transcript {
                                 .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
-                        .when_some(uploading, |el, pct| {
+                        .when(sending, |el| {
                             // The pulse read registers this entity for frames,
-                            // so the percent stays live even once the trailer's
+                            // so the overlay stays live even once the trailer's
                             // 30s pending-send bridge has lapsed.
                             let pulse = motion::pulse_wave(motion::pulse_delta(
                                 &motion::ZERON_PULSE,
                                 cx.entity_id(),
                                 cx,
                             ));
+                            let indicator: AnyElement = match uploading {
+                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
+                                None => crate::loaders::mini_gradient_spinner(
+                                    format!("att-sending-{row_id}-{aix}"),
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                )
+                                .into_any_element(),
+                            };
                             el.child(
                                 div()
                                     .absolute()
@@ -2806,7 +3021,7 @@ impl Transcript {
                                     .items_center()
                                     .justify_center()
                                     .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
-                                    .child(crate::loaders::upload_progress_ring(pct, 34.0)),
+                                    .child(indicator),
                             )
                         })
                         .into_any_element()
@@ -2887,8 +3102,8 @@ impl Transcript {
             }
             let state = self.state.read(cx);
             let last = state.sub_transcript(doc_id).last()?;
-            let live = last.status == Some(MessageStatus::Streaming)
-                || last.role == MessageRole::User;
+            let live =
+                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
             if !live {
                 return None;
             }
@@ -3488,7 +3703,10 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
-        let open = fold.open.unwrap_or(auto_open);
+        // Agent/spawn chips never fold: they are their own row, always open,
+        // no "Called N tools" header — a running subagent stays visible.
+        let collapses = tool_group_collapses(tools);
+        let open = !collapses || fold.open.unwrap_or(auto_open);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -3499,7 +3717,7 @@ impl Transcript {
                 // Spawn chips never expand — the subagent doc is the record
                 // of what the tool did, and an inline body would only repeat
                 // it. The whole chip is the "open that doc" click instead.
-                if tool.subagent_ref.is_some() {
+                if is_spawn_link(tool) {
                     return None;
                 }
                 // Among fetched blobs, the most recently REQUESTED one wins —
@@ -3521,11 +3739,7 @@ impl Transcript {
         // always answers "what exactly was this call?", output or not.
         let invocations: Vec<Option<Arc<ToolDetail>>> = tools
             .iter()
-            .map(|tool| {
-                tool.invocation
-                    .clone()
-                    .filter(|_| tool.subagent_ref.is_none())
-            })
+            .map(|tool| tool.invocation.clone().filter(|_| !is_spawn_link(tool)))
             .collect();
         // Fetch affordance under each open detail whose full payload is still
         // sidecar-only: `(ref, label)`. Diff offered first (the richer
@@ -3647,6 +3861,7 @@ impl Transcript {
             .h(px(26.0))
             .cursor_pointer()
             .text_size(px(12.0))
+            .line_height(px(18.0))
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
             // broke" (user report). Failures still show on the individual
@@ -3674,6 +3889,9 @@ impl Transcript {
             .child(
                 div()
                     .min_w_0()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
                     .truncate()
                     .child(SharedString::from(summary)),
             );
@@ -3687,9 +3905,8 @@ impl Transcript {
                 // Spawn chips are LINKS, not accordions: the click opens the
                 // subagent's transcript as a right-pane tab (the shell hosts
                 // the surface — the chip only announces which doc it indexes).
-                if let Some(doc_id) = &tool.subagent_ref {
+                if let Some(doc_id) = tool.subagent_ref.clone().filter(|_| is_spawn_link(tool)) {
                     let chat_id = self.chat_id.clone().unwrap_or_default();
-                    let doc_id = doc_id.clone();
                     let title = subagent_tab_title(&tool.call);
                     let frozen = matches!(
                         tool.subagent_status,
@@ -3706,6 +3923,7 @@ impl Transcript {
                                 frozen,
                             });
                         }),
+                        collapses,
                         theme,
                         cx.entity_id(),
                         cx,
@@ -3714,7 +3932,7 @@ impl Transcript {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
                 if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, theme, cx.entity_id(), cx);
+                    return tool_chip(tool, collapses, theme, cx.entity_id(), cx);
                 }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
@@ -3750,7 +3968,7 @@ impl Transcript {
                 let group_key = row_id.clone();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
-                    .ml(px(12.0))
+                    .when(collapses, |el| el.ml(px(12.0)))
                     .min_w_0()
                     .flex_1()
                     .flex()
@@ -3763,6 +3981,10 @@ impl Transcript {
                     .child(
                         div()
                             .id(key.clone())
+                            .h(px(CHIP_HEADER_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let entry =
@@ -3862,14 +4084,17 @@ impl Transcript {
                     .flex()
                     .flex_row()
                     // Guide rail: no fixed height — stretches to the card,
-                    // detail included.
-                    .child(
-                        div()
-                            .ml(px(12.0))
-                            .w(px(1.0))
-                            .flex_none()
-                            .bg(crate::theme::ink(0.08)),
-                    )
+                    // detail included. Agent-only groups skip it (no header
+                    // chevron for the rail to sit under).
+                    .when(collapses, |row| {
+                        row.child(
+                            div()
+                                .ml(px(12.0))
+                                .w(px(1.0))
+                                .flex_none()
+                                .bg(crate::theme::ink(0.08)),
+                        )
+                    })
                     .child(card)
                     .into_any_element()
             }));
@@ -3879,12 +4104,16 @@ impl Transcript {
         // content growth never tween, and a SETTLED fold renders at its static
         // height: leaving the tween armed replayed it on every remount, which
         // in a virtualized list means every scroll-back-into-view (only `open`
-        // toggles animate — composes with the stick spring).
-        let animating = fold.epoch > 0
+        // toggles animate — composes with the stick spring). Agent groups skip
+        // the fold entirely (always open, no header).
+        let animating = collapses
+            && fold.epoch > 0
             && fold
                 .toggled_at
                 .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
-        let body: AnyElement = if animating {
+        let body: AnyElement = if !collapses {
+            chips.into_any_element()
+        } else if animating {
             let from = fold.from;
             div()
                 .overflow_hidden()
@@ -3906,7 +4135,7 @@ impl Transcript {
         div()
             .flex()
             .flex_col()
-            .child(header)
+            .when(collapses, |el| el.child(header))
             .child(body)
             .into_any_element()
     }
@@ -4136,11 +4365,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
-        // Subagent spawns (the "Agent[: <description>]" Unknown convention
-        // every native driver uses) carry the bot, matching their tab.
-        ToolCall::Unknown { name, .. } if name == "Agent" || name.starts_with("Agent: ") => {
-            crate::icons::BOT
-        }
+        call if is_agent_call(call) => crate::icons::BOT,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -4273,7 +4498,7 @@ fn chip_header_row(
         theme.text_muted
     };
     div()
-        .h(px(CHIP_CARD_HEIGHT))
+        .h(px(CHIP_HEADER_HEIGHT))
         .w_full()
         .min_w_0()
         .flex()
@@ -4282,6 +4507,7 @@ fn chip_header_row(
         .gap(px(8.0))
         .px(px(8.0))
         .text_size(px(12.0))
+        .line_height(px(18.0))
         .child(
             // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
             // icon size-3).
@@ -4302,6 +4528,9 @@ fn chip_header_row(
         .child(
             div()
                 .flex_none()
+                .h(px(18.0))
+                .flex()
+                .items_center()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(tint)
                 .child(SharedString::from(label)),
@@ -4310,6 +4539,9 @@ fn chip_header_row(
             div()
                 .flex_1()
                 .min_w_0()
+                .h(px(18.0))
+                .flex()
+                .items_center()
                 .truncate()
                 .text_color(if failed {
                     theme.danger
@@ -4318,6 +4550,30 @@ fn chip_header_row(
                 })
                 .child(SharedString::from(detail)),
         )
+        .when_some(tool.call.subagent_model(), |row, model| {
+            // Which model the child runs on, when the spawn named one.
+            //
+            // In the trailing slot rather than suffixed onto the detail: the
+            // detail is the truncating slot, and the model is exactly what a
+            // reader scanning a fan-out of spawns wants left once the
+            // descriptions are cut.
+            //
+            // Bare faint text, NOT a filled pill: the tiles either side of it
+            // are AFFORDANCES (the spinner means running, the arrow opens the
+            // subagent), so giving a passive label the same chrome made the
+            // trailing edge read as three buttons — the loudest thing in the
+            // row was the one thing you cannot click.
+            row.child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(model.to_owned())),
+            )
+        })
         .when(running, |row| {
             // The sidebar working-row spinner, in the chip's trailing slot —
             // paint-local (fixed footprint), so it never moves the layout.
@@ -4432,9 +4688,11 @@ fn subagent_tab_title(call: &ToolCall) -> SharedString {
     "Subagent".into()
 }
 
-/// A plain (non-expandable) chip: guide rail + bordered card.
+/// A plain (non-expandable) chip: bordered card, plus the group guide rail
+/// when the chip lives under a collapsible header.
 fn tool_chip(
     tool: &ToolItem,
+    rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -4446,21 +4704,24 @@ fn tool_chip(
         .flex()
         .flex_row()
         .items_center()
-        // Guide rail: hairline centered under the header's chevron tile.
+        .when(rail, |row| {
+            row.child(
+                div()
+                    .ml(px(12.0))
+                    .h_full()
+                    .w(px(1.0))
+                    .flex_none()
+                    .bg(crate::theme::ink(0.08)),
+            )
+        })
         .child(
             div()
-                .ml(px(12.0))
-                .h_full()
-                .w(px(1.0))
-                .flex_none()
-                .bg(crate::theme::ink(0.08)),
-        )
-        .child(
-            div()
-                .ml(px(12.0))
+                .when(rail, |el| el.ml(px(12.0)))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
                 .flex_1()
+                .flex()
+                .items_center()
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
@@ -4474,11 +4735,13 @@ fn tool_chip(
 /// A spawn chip: same card as [`tool_chip`], but the WHOLE card is the
 /// "open the subagent tab" click (open-arrow tile in the trailing slot).
 /// No accordion — an inline body would only repeat the subagent's own
-/// transcript.
+/// transcript. The group guide rail is omitted for agent-only rows (no
+/// collapse header for it to hang from).
 fn subagent_chip(
     tool: &ToolItem,
     id: SharedString,
     on_open: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    rail: bool,
     theme: &Theme,
     view: gpui::EntityId,
     cx: &mut gpui::App,
@@ -4490,22 +4753,25 @@ fn subagent_chip(
         .flex()
         .flex_row()
         .items_center()
-        // Guide rail: hairline centered under the header's chevron tile.
-        .child(
-            div()
-                .ml(px(12.0))
-                .h_full()
-                .w(px(1.0))
-                .flex_none()
-                .bg(crate::theme::ink(0.08)),
-        )
+        .when(rail, |row| {
+            row.child(
+                div()
+                    .ml(px(12.0))
+                    .h_full()
+                    .w(px(1.0))
+                    .flex_none()
+                    .bg(crate::theme::ink(0.08)),
+            )
+        })
         .child(
             div()
                 .id(id)
-                .ml(px(12.0))
+                .when(rail, |el| el.ml(px(12.0)))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
                 .flex_1()
+                .flex()
+                .items_center()
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
@@ -4648,6 +4914,9 @@ impl Render for Transcript {
             .relative()
             .size_full()
             .min_h_0()
+            .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             // FIRST child ⇒ paints first: clears the frame's markdown text-
             // selection registry before any row's text elements re-register
             // (document paint order = selection order; see markdown/render.rs).
@@ -4679,6 +4948,24 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use zeron_doc::MessagePart;
+
+    #[test]
+    fn selection_scroll_ramps_at_viewport_edges() {
+        let bounds = Bounds::new(
+            gpui::point(px(10.0), px(20.0)),
+            gpui::size(px(300.0), px(200.0)),
+        );
+        assert_eq!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(120.0))),
+            0.0
+        );
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(20.0))) < 0.0);
+        assert!(selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0))) > 0.0);
+        assert!(
+            selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0)))
+                > selection_scroll_step(bounds, gpui::point(px(20.0), px(200.0)))
+        );
+    }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----
 
@@ -5022,6 +5309,174 @@ mod tests {
         };
         assert_eq!(tools.len(), 2);
         assert!(rows[0].turn_start && !rows[1].turn_start);
+    }
+
+    fn agent_part(id: &str, description: &str) -> MessagePart {
+        MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: format!("Agent: {description}"),
+                input: Some(serde_json::json!({ "description": description })),
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: Some(format!("chat--sub--{id}")),
+            subagent_status: Some(SubagentStatus::Running),
+            subagent_tail: None,
+        }
+    }
+
+    #[test]
+    fn agent_calls_split_out_of_ordinary_tool_groups() {
+        // Agent/spawn chips must not share a collapse with Reads/Runs: a
+        // lone Agent used to hide behind "Called 1 tool", and a mixed
+        // group hid the running subagent until the user opened the fold.
+        let entry = assistant(
+            "m-agent",
+            MessageStatus::Complete,
+            vec![
+                text_part("t0", "before"),
+                tool_part("a", "ls"),
+                tool_part("b", "pwd"),
+                agent_part("s1", "Map URL import ingest path"),
+                tool_part("c", "make"),
+                agent_part("s2", "Audit the fold path"),
+                agent_part("s3", "Verify the commit cadence"),
+                text_part("t1", "after"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            [
+                "m-agent#t0.0",
+                "m-agent#g0",
+                "m-agent#g1",
+                "m-agent#g2",
+                "m-agent#g3",
+                "m-agent#t1.0",
+            ]
+        );
+
+        let RowKind::ToolGroup { tools, auto_open } = &rows[1].kind else {
+            panic!("ordinary group expected")
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(tool_group_collapses(tools));
+        assert!(!*auto_open);
+
+        let RowKind::ToolGroup { tools, .. } = &rows[2].kind else {
+            panic!("agent group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(!tool_group_collapses(tools));
+        assert!(is_agent_tool(&tools[0]));
+
+        let RowKind::ToolGroup { tools, .. } = &rows[3].kind else {
+            panic!("ordinary group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(tool_group_collapses(tools));
+
+        let RowKind::ToolGroup { tools, .. } = &rows[4].kind else {
+            panic!("consecutive agents share a group")
+        };
+        assert_eq!(tools.len(), 2);
+        assert!(!tool_group_collapses(tools));
+        assert!(tools.iter().all(is_agent_tool));
+    }
+
+    #[test]
+    fn stray_subagent_ref_on_a_run_chip_stays_an_ordinary_tool() {
+        // Docs written before the claude-driver fix carry subagent refs on
+        // ordinary Run chips (a background shell's task_notification was
+        // mis-tagged as subagent traffic). The ref alone must not change the
+        // chip's genus: it folds with its neighbors and renders as a plain
+        // tool, never as a spawn link to a doc that was never created.
+        let mut stray = tool_part("b", "git clone …");
+        if let MessagePart::Tool {
+            subagent_ref,
+            subagent_status,
+            ..
+        } = &mut stray
+        {
+            *subagent_ref = Some("chat--sub--b".into());
+            *subagent_status = Some(SubagentStatus::Done);
+        }
+        let entry = assistant(
+            "m-stray",
+            MessageStatus::Complete,
+            vec![tool_part("a", "ls"), stray, tool_part("c", "make")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1, "one folded group, no agent split");
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("tool group expected")
+        };
+        assert_eq!(tools.len(), 3);
+        assert!(tool_group_collapses(tools));
+        assert!(tools.iter().all(|t| !is_agent_tool(t)));
+        assert!(tools.iter().all(|t| !is_spawn_link(t)));
+    }
+
+    #[test]
+    fn lone_completed_agent_stays_uncollapsed() {
+        let entry = assistant(
+            "m-lone",
+            MessageStatus::Complete,
+            vec![agent_part("s1", "scan repo")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        let RowKind::ToolGroup { tools, auto_open } = &rows[0].kind else {
+            panic!("agent group expected")
+        };
+        assert_eq!(tools.len(), 1);
+        assert!(!tool_group_collapses(tools), "no 'Called 1 tool' wrap");
+        assert!(
+            !*auto_open,
+            "auto_open is a streaming flag; agent rows ignore it at paint"
+        );
+    }
+
+    #[test]
+    fn pre_spawn_agent_name_is_enough_to_split() {
+        // Before the engine stamps subagent_ref the chip is already named
+        // "Agent: …" — that genus must split, or the spawn hides until the
+        // first tagged event.
+        let mut part = agent_part("s1", "scan repo");
+        if let MessagePart::Tool {
+            subagent_ref,
+            subagent_status,
+            ..
+        } = &mut part
+        {
+            *subagent_ref = None;
+            *subagent_status = None;
+        }
+        let entry = assistant(
+            "m-pre",
+            MessageStatus::Complete,
+            vec![tool_part("a", "ls"), part],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 2);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!()
+        };
+        assert!(tool_group_collapses(tools));
+        let RowKind::ToolGroup { tools, .. } = &rows[1].kind else {
+            panic!()
+        };
+        assert!(!tool_group_collapses(tools));
+        assert!(is_agent_call(&tools[0].call));
     }
 
     #[test]
