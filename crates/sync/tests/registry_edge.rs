@@ -29,6 +29,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         title: Some("live chat".into()),
         archived: false,
         settled: false,
+        pinned: false,
         cwd: Some("/tmp".into()),
         branch: None,
         checkout_id: None,

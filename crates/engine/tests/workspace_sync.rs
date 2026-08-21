@@ -653,6 +653,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 title: Some("Migrated chat".into()),
                 archived: false,
                 settled: false,
+                pinned: false,
                 cwd: Some("/tmp/legacy".into()),
                 branch: Some("main".into()),
                 checkout_id: None,

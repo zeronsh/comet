@@ -374,6 +374,10 @@ enum MutateParams {
     /// are hidden from the sidebar entirely.
     #[serde(rename_all = "camelCase")]
     SetChatSettled { chat_id: String, settled: bool },
+    /// Pin / unpin a chat — floats it above the Active list. Only
+    /// non-settled, non-archived chats may be pinned.
+    #[serde(rename_all = "camelCase")]
+    SetChatPinned { chat_id: String, pinned: bool },
     /// Full-config replace on the chat row (zeron `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -841,6 +845,11 @@ impl EngineRpc {
             MutateParams::SetChatSettled { chat_id, settled } => self
                 .workspace
                 .set_chat_settled(&chat_id, settled)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::SetChatPinned { chat_id, pinned } => self
+                .workspace
+                .set_chat_pinned(&chat_id, pinned)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatConfig { chat_id, config } => self

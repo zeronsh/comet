@@ -330,6 +330,7 @@ mod tests {
             title: None,
             archived: false,
             settled: false,
+            pinned: false,
             cwd: cwd.map(str::to_owned),
             branch: Some("feature/pr".into()),
             checkout_id: checkout.map(str::to_owned),

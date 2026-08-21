@@ -959,6 +959,21 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Pin / unpin a chat (floats above the Active list). Distinct from
+    /// `settled`/`archived` — pinned chats stay in the Active list.
+    pub fn set_chat_pinned(&mut self, chat_id: &str, pinned: bool) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("pinned", json!(pinned))]),
+        );
+        Ok(true)
+    }
+
     /// Flip the chat's sync room generation (docs/chat2-sync.md M2). The
     /// host calls this in the same breath as seeding the chat2 checkpoint;
     /// LWW per-field like every registry write, so the flip is per-chat and
