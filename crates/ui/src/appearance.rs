@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use gpui::{App, Global, Subscription, Window};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::t;
 use crate::settings::UiSettings;
 use crate::theme::{Appearance, Theme};
 
@@ -43,9 +44,9 @@ impl AppearanceMode {
     /// Menu/label text.
     pub fn label(self) -> &'static str {
         match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
+            Self::System => t("System"),
+            Self::Light => t("Light"),
+            Self::Dark => t("Dark"),
         }
     }
 

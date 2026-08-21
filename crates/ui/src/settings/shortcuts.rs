@@ -8,6 +8,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::i18n::{t, tf};
 use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -92,10 +93,10 @@ impl ShortcutsPage {
                 // (zeron settings.shortcuts.tsx: "… is already assigned to …").
                 if let Some(owner) = conflict_owner(&self.keymap, recording, &combo) {
                     self.conflict_notice = Some(
-                        format!(
-                            "{} is already assigned to {}.",
-                            display_combo(&combo),
-                            owner.label()
+                        tf!(
+                            "{combo} is already assigned to {owner}.",
+                            combo = display_combo(&combo),
+                            owner = owner.label()
                         )
                         .into(),
                     );
@@ -124,10 +125,10 @@ pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Opt
 /// `SHORTCUT_DEFINITIONS` descriptions, verbatim).
 fn description(id: ShortcutId) -> &'static str {
     match id {
-        ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
-        ShortcutId::ToggleChanges => "Show or hide changes for the current session.",
-        ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
-        ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
+        ShortcutId::ToggleSidebar => t("Show or hide sessions and settings navigation."),
+        ShortcutId::ToggleChanges => t("Show or hide changes for the current session."),
+        ShortcutId::ToggleTerminal => t("Show or hide the terminal for the current session."),
+        ShortcutId::NewSession => t("Open a blank session canvas to start a new session."),
     }
 }
 
@@ -143,7 +144,7 @@ impl Render for ShortcutsPage {
             let is_recording = recording == Some(id);
             let non_default = combo != id.default_combo();
             let chip_text: SharedString = if is_recording {
-                "Press keys…".into()
+                t("Press keys…").into()
             } else {
                 display_combo(&combo).into()
             };
@@ -192,7 +193,7 @@ impl Render for ShortcutsPage {
                                 this.recording = None;
                                 this.commit(cx);
                             }))
-                            .child(SharedString::from("Reset")),
+                            .child(SharedString::from(t("Reset"))),
                     )
                 })
                 .child(
@@ -238,11 +239,11 @@ impl Render for ShortcutsPage {
         // Helper line stays in the muted tone even for a rejected conflict —
         // the message names the specific clash (zeron settings.shortcuts.tsx).
         let helper: SharedString = if recording.is_some() {
-            "Press Escape to cancel.".into()
+            t("Press Escape to cancel.").into()
         } else if let Some(notice) = self.conflict_notice.clone() {
             notice
         } else {
-            "Shortcuts must be unique.".into()
+            t("Shortcuts must be unique.").into()
         };
 
         div()
@@ -266,7 +267,11 @@ impl Render for ShortcutsPage {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(widgets::page_header(&theme, "Keyboard shortcuts", None))
+                                    .child(widgets::page_header(
+                                        &theme,
+                                        t("Keyboard shortcuts"),
+                                        None,
+                                    ))
                                     .child(
                                         widgets::page_subtitle(
                                             &theme,
@@ -304,7 +309,7 @@ impl Render for ShortcutsPage {
                                             .size(px(14.0))
                                             .text_color(theme.text_muted),
                                     )
-                                    .child(SharedString::from("Restore defaults"))
+                                    .child(SharedString::from(t("Restore defaults")))
                             }),
                     )
                     .child(widgets::section_card(&theme).mt(px(32.0)).children(rows))

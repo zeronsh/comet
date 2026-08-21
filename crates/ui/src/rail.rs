@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
 
+use crate::i18n::tf;
 use crate::motion;
 use crate::popover;
 use crate::theme::Theme;
@@ -529,7 +530,10 @@ impl Transcript {
                                 div()
                                     .text_size(px(10.0))
                                     .text_color(theme.text_muted.opacity(0.7))
-                                    .child(SharedString::from(format!("{bucket_len} prompts"))),
+                                    .child(SharedString::from(tf!(
+                                        "{bucket_len} prompts",
+                                        bucket_len = bucket_len
+                                    ))),
                             )
                         });
                     // Mounted straight through deferred/anchored (not a popover

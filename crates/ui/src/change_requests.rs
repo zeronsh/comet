@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
 use zeron_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
 
+use crate::i18n::{t, tr};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +42,9 @@ impl ChangeRequestBadgeModel {
         use zeron_proto::ChangeRequestState;
 
         let (state_label, tone) = match summary.state {
-            ChangeRequestState::Open => ("Open", ChangeRequestBadgeTone::Open),
-            ChangeRequestState::Merged => ("Merged", ChangeRequestBadgeTone::Merged),
-            ChangeRequestState::Closed => ("Closed", ChangeRequestBadgeTone::Closed),
+            ChangeRequestState::Open => (tr("Open", "开放"), ChangeRequestBadgeTone::Open),
+            ChangeRequestState::Merged => (t("Merged"), ChangeRequestBadgeTone::Merged),
+            ChangeRequestState::Closed => (t("Closed"), ChangeRequestBadgeTone::Closed),
         };
         Self {
             number: format!("#{}", summary.number).into(),

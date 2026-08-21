@@ -9,6 +9,7 @@
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
+use crate::i18n::{t, tf};
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::FocusHandle;
 use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
@@ -314,7 +315,7 @@ impl Shell {
                         Some((tag.into(), offline)),
                     )
                 }
-                None => (SharedString::from("All projects"), None),
+                None => (SharedString::from(t("All projects")), None),
             }
         };
         let open = self.spaces_menu.is_open();
@@ -481,9 +482,12 @@ impl Shell {
             let state = self.state.read(cx);
             rows.iter()
                 .map(|row| match row {
-                    SpacesMenuRow::All => {
-                        (row.clone(), SharedString::from("All projects"), None, false)
-                    }
+                    SpacesMenuRow::All => (
+                        row.clone(),
+                        SharedString::from(t("All projects")),
+                        None,
+                        false,
+                    ),
                     SpacesMenuRow::Space(id) => match state.space_row(id) {
                         Some(space) => {
                             let (tag, offline) = state.space_device_tag(space, now);
@@ -496,9 +500,12 @@ impl Shell {
                         }
                         None => (row.clone(), SharedString::from("?"), None, false),
                     },
-                    SpacesMenuRow::AddSpace => {
-                        (row.clone(), SharedString::from("New project…"), None, false)
-                    }
+                    SpacesMenuRow::AddSpace => (
+                        row.clone(),
+                        SharedString::from(t("New project…")),
+                        None,
+                        false,
+                    ),
                 })
                 .collect()
         };
@@ -657,15 +664,21 @@ impl Shell {
                     branch,
                     change_request,
                 } = row;
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+                let time_ago: SharedString = crate::i18n::t_str(&format_time_ago(
+                    chat.last_message_at.unwrap_or(chat.created_at),
+                    now,
+                ))
+                .into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
                 let height = super::CHAT_ROW_HEIGHT;
                 let harness = chat.config.as_ref().map(|c| c.harness);
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        &chat
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| t("New session").into()),
                     )
                     .into(),
                     time_ago,
@@ -723,9 +736,9 @@ impl Shell {
         // filling the middle, chevron flipping open/closed. The count only
         // shows while collapsed — expanded, the rows speak for themselves.
         let label: SharedString = if open {
-            "Archived".into()
+            t("Archived").into()
         } else {
-            format!("Archived ({total})").into()
+            tf!("Archived ({total})", total = total).into()
         };
         let header = div()
             .id("archived-toggle")
@@ -771,11 +784,17 @@ impl Shell {
                 let hovered = self.archived_hover.as_deref() == Some(id.as_str());
                 let is_selected = selected.as_deref() == Some(id.as_str());
                 let title: SharedString = transcript::single_line(
-                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                    &chat
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| t("New session").into()),
                 )
                 .into();
-                let time_ago: SharedString =
-                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+                let time_ago: SharedString = crate::i18n::t_str(&format_time_ago(
+                    chat.last_message_at.unwrap_or(chat.created_at),
+                    now,
+                ))
+                .into();
                 let (mark, tint) = chat
                     .config
                     .as_ref()
@@ -815,7 +834,7 @@ impl Shell {
                             div()
                                 .text_size(px(10.0))
                                 .text_color(theme.text_muted)
-                                .child(SharedString::from("Unarchive")),
+                                .child(SharedString::from(t("Unarchive"))),
                         )
                         .into_any_element()
                 } else {
@@ -921,7 +940,10 @@ impl Shell {
                                 .size(px(14.0))
                                 .flex_none(),
                         )
-                        .child(SharedString::from(format!("Show {remaining} more"))),
+                        .child(SharedString::from(tf!(
+                            "Show {remaining} more",
+                            remaining = remaining
+                        ))),
                 );
             }
         }
@@ -1102,8 +1124,7 @@ impl Shell {
         if rows.is_empty() {
             let text = flow.search.read(cx).text().to_string();
             if text.starts_with('/') || text.starts_with('~') {
-                if let Some(target) =
-                    crate::pickers::typed_path_target(&text, flow.home.as_deref())
+                if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
                 {
                     self.add_space_descend(target, false, cx);
                 }
@@ -1538,7 +1559,7 @@ impl Shell {
         let device_name: SharedString = device
             .as_ref()
             .map(|d| d.name.clone())
-            .unwrap_or_else(|| "This device".to_string())
+            .unwrap_or_else(|| t("This device").to_string())
             .into();
         // The rail's active Locations row: the root that owns the browsed
         // path. Longest mount prefix wins; home outranks a drive covering it
@@ -1610,9 +1631,9 @@ impl Shell {
                         .size(px(11.0))
                         .text_color(theme.on_solid.opacity(0.8)),
                 )
-                .child(SharedString::from("Enter"))
+                .child(SharedString::from(t("Enter")))
             })
-            .when(submit_busy, |el| el.child(SharedString::from("Adding…")));
+            .when(submit_busy, |el| el.child(SharedString::from(t("Adding…"))));
         // Header and footer sit a shade DEEPER than the body (the shared
         // recessed-band tone) — the bands frame the folder list, which stays
         // on the brighter tint.
@@ -1680,12 +1701,9 @@ impl Shell {
                     (SharedString::from(d.name.clone()), mount, at_mount)
                 });
                 let folded = 1 + match (&drive_crumb, home.as_deref()) {
-                    (Some((_, mount, _)), _) => {
-                        mount.split('/').filter(|s| !s.is_empty()).count()
-                    }
+                    (Some((_, mount, _)), _) => mount.split('/').filter(|s| !s.is_empty()).count(),
                     (None, Some(h))
-                        if listing.path == h
-                            || listing.path.starts_with(&format!("{h}/")) =>
+                        if listing.path == h || listing.path.starts_with(&format!("{h}/")) =>
                     {
                         h.split('/').filter(|s| !s.is_empty()).count()
                     }
@@ -1856,7 +1874,7 @@ impl Shell {
                             let path = this.add_space.as_ref().and_then(|f| f.browser_path.clone());
                             this.load_space_folders(path, cx);
                         }))
-                        .child(SharedString::from("Retry")),
+                        .child(SharedString::from(t("Retry"))),
                 )
                 .into_any_element()
         } else if rows.is_empty() {
@@ -1866,9 +1884,9 @@ impl Shell {
                 .text_size(px(12.5))
                 .text_color(theme.text_faint)
                 .child(SharedString::from(if query_empty {
-                    "No folders here"
+                    t("No folders here")
                 } else {
-                    "No folders match"
+                    t("No folders match")
                 }))
                 .into_any_element()
         } else {
@@ -1977,7 +1995,7 @@ impl Shell {
                     .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("Devices")),
+                    .child(SharedString::from(t("Devices"))),
             )
             .children(devices.into_iter().enumerate().map(|(ix, dev)| {
                 let is_active = device.as_ref().is_some_and(|d| d.id == dev.id);
@@ -2115,8 +2133,9 @@ impl Shell {
                             .mt(px(1.0))
                             .text_color(theme.text_muted.opacity(0.5)),
                     )
-                    .child(div().min_w_0().child(SharedString::from(format!(
-                        "Showing folders from {device_name} only"
+                    .child(div().min_w_0().child(SharedString::from(tf!(
+                        "Showing folders from {device_name} only",
+                        device_name = device_name
                     )))),
             );
 
@@ -2156,11 +2175,11 @@ impl Shell {
                 &theme,
                 icons::ARROW_UP,
                 icons::ARROW_DOWN,
-                "Navigate",
+                t("Navigate"),
             ))
-            .child(popover::key_hint(&theme, icons::ARROW_LEFT, "Up"))
+            .child(popover::key_hint(&theme, icons::ARROW_LEFT, t("Up")))
             .child(popover::key_hint(&theme, icons::ARROW_RIGHT, "Open"))
-            .child(popover::key_hint_text(&theme, "tab", "Complete"))
+            .child(popover::key_hint_text(&theme, "tab", t("Complete")))
             .when_some(error, |el, message| {
                 el.child(
                     div()
@@ -2237,7 +2256,7 @@ impl Shell {
             .space_row(&space_id)
             .map(|s| s.display_name().to_string())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Project name", cx));
+        let input = cx.new(|cx| ComposerInput::new(t("Project name"), cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -2305,7 +2324,7 @@ impl Shell {
                             this.open_rename_space(rename_id.clone(), cx)
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                        .child(SharedString::from("Rename…")),
+                        .child(SharedString::from(t("Rename…"))),
                 )
                 .child(popover::menu_separator())
                 .child(
@@ -2322,7 +2341,7 @@ impl Shell {
                                 .size(px(16.0))
                                 .text_color(theme.danger),
                         )
-                        .child(SharedString::from("Remove…")),
+                        .child(SharedString::from(t("Remove…"))),
                 )
                 .into_any_element();
             overlays.push(popover::menu_at(
@@ -2345,7 +2364,7 @@ impl Shell {
                         cx.notify();
                     }
                 }))
-                .child(popover::dialog_title(&theme, "Rename project"))
+                .child(popover::dialog_title(&theme, t("Rename project")))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -2359,7 +2378,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "rename-space-cancel")
+                            popover::btn_ghost(&theme, t("Cancel"), "rename-space-cancel")
                                 .id("rename-space-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.rename_space_dialog = None;
@@ -2367,7 +2386,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Rename")
+                            popover::btn_primary(&theme, t("Rename"))
                                 .id("rename-space-save")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.submit_rename_space(cx)),
@@ -2385,25 +2404,30 @@ impl Shell {
                 (
                     space
                         .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "this project".into()),
+                        .unwrap_or_else(|| t("this project").into()),
                     space
                         .and_then(|s| state.device_name(&s.device_id))
-                        .unwrap_or("its device")
+                        .unwrap_or(t("its device"))
                         .to_string(),
                     state.chats_in_space(&space_id).len(),
                 )
             };
             let copy = if count == 1 {
-                format!(
-                    "Removing “{name}” permanently deletes its 1 session on {device}. This can’t be undone."
+                tf!(
+                    "Removing “{name}” permanently deletes its 1 session on {device}. This can’t be undone.",
+                    name = name,
+                    device = device
                 )
             } else {
-                format!(
-                    "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone."
+                tf!(
+                    "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone.",
+                    name = name,
+                    count = count,
+                    device = device
                 )
             };
             let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Remove project?"))
+                .child(popover::dialog_title(&theme, t("Remove project?")))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
                     div()
@@ -2413,7 +2437,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
+                            popover::btn_ghost(&theme, t("Cancel"), "delete-space-cancel")
                                 .id("delete-space-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.delete_space_confirm = None;
@@ -2421,7 +2445,7 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_danger(&theme, "Remove")
+                            popover::btn_danger(&theme, t("Remove"))
                                 .id("delete-space-confirm")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.delete_space(space_id.clone(), cx)

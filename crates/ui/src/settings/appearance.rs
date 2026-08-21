@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use crate::appearance::{self, AppearanceMode};
+use crate::i18n::{self, LanguageMode, t, tf, tr};
 use crate::settings::widgets;
 use crate::theme::{Appearance, Theme};
 
@@ -150,15 +151,54 @@ fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
         // Naming the resolved appearance makes "System" concrete — otherwise the
         // card says nothing about what you actually get right now.
         AppearanceMode::System => {
-            let resolved = if system.is_dark() { "dark" } else { "light" };
-            format!(
-                "Following the system appearance — currently {resolved}. Zeron switches with \
-                 macOS, including scheduled changes."
+            let resolved = if system.is_dark() {
+                tr("dark", "深色")
+            } else {
+                tr("light", "浅色")
+            };
+            tf!(
+                "Following the system appearance — currently {resolved}. Zeron switches with macOS, including scheduled changes.",
+                resolved = resolved
             )
             .into()
         }
-        AppearanceMode::Light => "Always light, whatever the system is set to.".into(),
-        AppearanceMode::Dark => "Always dark, whatever the system is set to.".into(),
+        AppearanceMode::Light => t("Always light, whatever the system is set to.").into(),
+        AppearanceMode::Dark => t("Always dark, whatever the system is set to.").into(),
+    }
+}
+
+fn language_preview(mode: LanguageMode) -> gpui::AnyElement {
+    let sample = match mode {
+        LanguageMode::System => "Aa 文",
+        LanguageMode::English => "Aa",
+        LanguageMode::Chinese => "文",
+    };
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(28.0))
+        .child(sample)
+        .into_any_element()
+}
+
+fn language_helper(mode: LanguageMode) -> SharedString {
+    match mode {
+        LanguageMode::System => {
+            let lang = if i18n::detect_system_preview_zh() {
+                "简体中文"
+            } else {
+                "English"
+            };
+            tf!(
+                "Follow the language of this device. Currently {lang}.",
+                lang = lang
+            )
+            .into()
+        }
+        LanguageMode::English => t("Zeron uses English.").into(),
+        LanguageMode::Chinese => "Zeron 使用简体中文。".into(),
     }
 }
 
@@ -186,12 +226,11 @@ impl Render for AppearancePage {
             .overflow_y_scroll()
             .child(
                 widgets::page_column()
-                    .child(widgets::page_header(&theme, "Appearance", None))
+                    .child(widgets::page_header(&theme, t("Appearance"), None))
                     .child(
                         widgets::page_subtitle(
                             &theme,
-                            "How zeron picks between light and dark. This setting stays on this \
-                             device.",
+                            t("How zeron picks between light and dark. This setting stays on this device."),
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
@@ -202,7 +241,7 @@ impl Render for AppearancePage {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(widgets::field_label(&theme, "Theme"))
+                            .child(widgets::field_label(&theme, t("Theme")))
                             .child(widgets::option_card_row().children(cards)),
                     )
                     .child(
@@ -212,6 +251,46 @@ impl Render for AppearancePage {
                             .text_color(theme.text_muted)
                             .line_height(px(18.0))
                             .child(helper(current, system)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(widgets::field_label(&theme, t("Language")))
+                            .child(
+                                widgets::option_card_row().children(
+                                    LanguageMode::ALL.into_iter().map(|mode| {
+                                        widgets::option_card(
+                                            &theme,
+                                            mode.label(),
+                                            mode == i18n::mode(),
+                                            language_preview(mode),
+                                        )
+                                        .id(SharedString::from(format!(
+                                            "language-{}",
+                                            match mode {
+                                                LanguageMode::System => "system",
+                                                LanguageMode::English => "en",
+                                                LanguageMode::Chinese => "zh",
+                                            }
+                                        )))
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            i18n::set_mode(mode, cx);
+                                            cx.notify();
+                                        }))
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(16.0))
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .line_height(px(18.0))
+                            .child(language_helper(i18n::mode())),
                     ),
             )
     }

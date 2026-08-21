@@ -28,6 +28,7 @@ use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use zeron_proto::HarnessId;
 use zeron_rpc::methods;
 
+use crate::i18n::{t, tf};
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
@@ -38,14 +39,14 @@ use crate::theme::Theme;
 /// with a description; the catalog descriptor doesn't carry one).
 pub fn blurb(harness: HarnessId) -> &'static str {
     match harness {
-        HarnessId::ClaudeCode => "Anthropic's coding agent, driven through the Claude Code CLI.",
-        HarnessId::Codex => "OpenAI's coding agent, driven through the Codex CLI.",
-        HarnessId::Cursor => "Cursor's coding agent, driven through the cursor-agent CLI.",
-        HarnessId::Grok => "xAI's Grok Build agent (grok CLI).",
-        HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
-        HarnessId::Pi => "The pi coding agent (pi CLI).",
-        HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
-        HarnessId::Mock => "Scripted test harness.",
+        HarnessId::ClaudeCode => t("Anthropic's coding agent, driven through the Claude Code CLI."),
+        HarnessId::Codex => t("OpenAI's coding agent, driven through the Codex CLI."),
+        HarnessId::Cursor => t("Cursor's coding agent, driven through the cursor-agent CLI."),
+        HarnessId::Grok => t("xAI's Grok Build agent (grok CLI)."),
+        HarnessId::Hermes => t("Nous Research's Hermes Agent (hermes CLI)."),
+        HarnessId::Pi => t("The pi coding agent (pi CLI)."),
+        HarnessId::Opencode => t("SST's opencode agent (opencode CLI)."),
+        HarnessId::Mock => t("Scripted test harness."),
     }
 }
 
@@ -213,7 +214,7 @@ impl HarnessesPage {
         let trigger_label: SharedString = selected
             .as_ref()
             .map(|d| d.name.clone().into())
-            .unwrap_or_else(|| SharedString::from("This device"));
+            .unwrap_or_else(|| SharedString::from(t("This device")));
         let emerald = theme.success;
         let open = self.device_menu_open;
 
@@ -287,7 +288,7 @@ impl HarnessesPage {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .child(popover::menu_heading(theme, "Devices"))
+                .child(popover::menu_heading(theme, t("Devices")))
                 .children(devices.into_iter().enumerate().map(|(ix, d)| {
                     let is_active = Some(d.id.as_str()) == effective.as_deref();
                     let is_local = local_id.as_deref() == Some(d.id.as_str());
@@ -315,7 +316,7 @@ impl HarnessesPage {
                                     .flex_none()
                                     .text_size(px(10.5))
                                     .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
+                                    .child(SharedString::from(t("You"))),
                             )
                         })
                         .child(
@@ -371,12 +372,15 @@ impl HarnessesPage {
                         div()
                             .text_color(theme.warning_muted.opacity(0.9))
                             .child(SharedString::from(if enabled {
-                                format!(
-                                    "{} CLI not installed — turn it off or install it",
-                                    cli_name(harness)
+                                tf!(
+                                    "{cli} CLI not installed — turn it off or install it",
+                                    cli = cli_name(harness)
                                 )
                             } else {
-                                format!("Install the {} CLI to enable", cli_name(harness))
+                                tf!(
+                                    "Install the {cli} CLI to enable",
+                                    cli = cli_name(harness)
+                                )
                             }))
                             .into_any_element(),
                     );
@@ -454,7 +458,7 @@ impl Render for HarnessesPage {
                                 page.load(cx);
                                 cx.notify();
                             }))
-                            .child(SharedString::from("Retry")),
+                            .child(SharedString::from(t("Retry"))),
                     )
                     .into_any_element()
             }
@@ -483,7 +487,7 @@ impl Render for HarnessesPage {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .child(widgets::page_header(&theme, "Agents", None))
+                            .child(widgets::page_header(&theme, t("Agents"), None))
                             .child(switcher),
                     )
                     .child(

@@ -37,6 +37,7 @@ const MODEL_SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 5.0;
 const MODEL_SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::i18n::{t, tf};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
@@ -198,11 +199,11 @@ pub fn clamp_reasoning(
 
 pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     match level {
-        ReasoningLevel::Minimal => "Minimal",
-        ReasoningLevel::Low => "Low",
-        ReasoningLevel::Medium => "Medium",
-        ReasoningLevel::High => "High",
-        ReasoningLevel::XHigh => "X-High",
+        ReasoningLevel::Minimal => t("Minimal"),
+        ReasoningLevel::Low => t("Low"),
+        ReasoningLevel::Medium => t("Medium"),
+        ReasoningLevel::High => t("High"),
+        ReasoningLevel::XHigh => t("X-High"),
         ReasoningLevel::Max => "Max",
         ReasoningLevel::Ultra => "Ultra",
         ReasoningLevel::Ultracode => "Ultracode",
@@ -523,7 +524,7 @@ pub struct Pickers {
 
 impl Pickers {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| ComposerInput::new("Search…", cx));
+        let search = cx.new(|cx| ComposerInput::new(t("Search…"), cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
                 // Typing in a filter resets the highlight to the top of the
@@ -898,7 +899,7 @@ impl Pickers {
         // reason).
         self.search_reset_muted = !self.search.read(cx).text().is_empty();
         self.search.update(cx, |input, cx| {
-            input.set_placeholder("Search…", cx);
+            input.set_placeholder(t("Search…"), cx);
             if !input.text().is_empty() {
                 input.set_text("", cx);
             }
@@ -938,28 +939,28 @@ impl Pickers {
                 self.switch_error = None; // stale mid-session failures don't linger
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search refs…", cx);
+                    input.set_placeholder(t("Search refs…"), cx);
                 });
                 window.focus(&handle, cx);
             }
             PickerKind::Space => {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search projects…", cx);
+                    input.set_placeholder(t("Search projects…"), cx);
                 });
                 window.focus(&handle, cx);
             }
             PickerKind::Device => {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search devices…", cx);
+                    input.set_placeholder(t("Search devices…"), cx);
                 });
                 window.focus(&handle, cx);
             }
             PickerKind::HarnessModel => {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search models…", cx);
+                    input.set_placeholder(t("Search models…"), cx);
                 });
                 window.focus(&handle, cx);
             }
@@ -1718,12 +1719,12 @@ impl Pickers {
     /// `resolveCurrentWorkspaceLabel`).
     fn checkout_label(&self) -> &'static str {
         match self.config.checkout {
-            CheckoutKind::NewWorktree => "New worktree",
+            CheckoutKind::NewWorktree => t("New worktree"),
             CheckoutKind::Local => {
                 if self.selected_ref_worktree().is_some() {
-                    "Current worktree"
+                    t("Current worktree")
                 } else {
-                    "Current checkout"
+                    t("Current checkout")
                 }
             }
         }
@@ -1733,8 +1734,10 @@ impl Pickers {
     /// created off it (t3code `getBranchTriggerLabel`); the bare name otherwise.
     fn ref_label(&self) -> SharedString {
         match (self.config.checkout, self.effective_ref_name()) {
-            (_, None) => SharedString::from("Select ref"),
-            (CheckoutKind::NewWorktree, Some(name)) => SharedString::from(format!("From {name}")),
+            (_, None) => SharedString::from(t("Select ref")),
+            (CheckoutKind::NewWorktree, Some(name)) => {
+                SharedString::from(tf!("From {name}", name = name))
+            }
             (CheckoutKind::Local, Some(name)) => SharedString::from(name),
         }
     }
@@ -1884,7 +1887,7 @@ impl Pickers {
                     .p(px(Theme::SPACE_SM))
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from("No devices match."))
+                    .child(SharedString::from(t("No devices match.")))
                     .into_any_element()
             } else {
                 div()
@@ -1919,7 +1922,7 @@ impl Pickers {
                                         .flex_none()
                                         .text_size(px(10.0))
                                         .text_color(theme.text_muted.opacity(0.45))
-                                        .child(SharedString::from("You")),
+                                        .child(SharedString::from(t("You"))),
                                 )
                             })
                             // Disconnected glyph, not the word (user request).
@@ -1960,9 +1963,9 @@ impl Pickers {
             // Distinguish "the filter ate everything" from "this device has
             // no projects yet" — the scoped list makes the latter common.
             let empty: &str = if self.search.read(cx).text().is_empty() {
-                "No projects on this device."
+                t("No projects on this device.")
             } else {
-                "No projects match."
+                t("No projects match.")
             };
             div()
                 .p(px(Theme::SPACE_SM))
@@ -2014,7 +2017,7 @@ impl Pickers {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(SharedString::from("New project…")),
+                    .child(SharedString::from(t("New project…"))),
             );
         div()
             .flex()
@@ -2337,7 +2340,7 @@ impl Pickers {
                 .as_deref()
                 .and_then(|id| state.device_name(id))
                 .map(str::to_string)
-                .unwrap_or_else(|| "This device".to_string())
+                .unwrap_or_else(|| t("This device").to_string())
                 .into();
             let offline = device_id
                 .as_deref()
@@ -2345,7 +2348,7 @@ impl Pickers {
             let project_label: SharedString = state
                 .selected_space_row()
                 .map(|s| s.display_name().to_string())
-                .unwrap_or_else(|| "No project".to_string())
+                .unwrap_or_else(|| t("No project").to_string())
                 .into();
             (device_label, project_label, offline)
         };
@@ -2439,9 +2442,9 @@ impl Pickers {
             };
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
             let (icon_path, label) = if is_worktree {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
+                (crate::icons::FOLDER_WITH_FILES, t("Worktree"))
             } else {
-                (crate::icons::FOLDER, "Local checkout")
+                (crate::icons::FOLDER, t("Local checkout"))
             };
             // Mirrors the draft chips: checkout hugs the left edge, ref the
             // right.
@@ -2474,7 +2477,7 @@ impl Pickers {
                     chat.branch
                         .clone()
                         .map(SharedString::from)
-                        .unwrap_or_else(|| SharedString::from("No ref")),
+                        .unwrap_or_else(|| SharedString::from(t("No ref"))),
                     &theme,
                 ));
             return Some(row().child(left).child(right).into_any_element());
@@ -2628,7 +2631,7 @@ impl Pickers {
                         // Projects/devices load nothing; no retry surface exists.
                         PickerKind::Space | PickerKind::Device => {}
                     }))
-                    .child(SharedString::from("Retry")),
+                    .child(SharedString::from(t("Retry"))),
             )
             .into_any_element()
     }
@@ -2831,7 +2834,7 @@ impl Pickers {
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No project selected"))
+                .child(SharedString::from(t("No project selected")))
                 .into_any_element();
         }
         let rows = self.filtered_ref_rows(cx);
@@ -2859,7 +2862,7 @@ impl Pickers {
                     .p(px(Theme::SPACE_SM))
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from("No refs found."))
+                    .child(SharedString::from(t("No refs found.")))
                     .into_any_element(),
                 Loadable::Ready(_) => {
                     let active = self.active;
@@ -2947,8 +2950,10 @@ impl Pickers {
                         .py(px(4.0))
                         .text_size(px(11.0))
                         .text_color(theme.text_faint)
-                        .child(SharedString::from(format!(
-                            "Showing {shown} of {total} refs"
+                        .child(SharedString::from(tf!(
+                            "Showing {shown} of {total} refs",
+                            shown = shown,
+                            total = total
                         ))),
                 ),
             );
@@ -2962,9 +2967,9 @@ impl Pickers {
         let theme = Theme::of(cx).clone();
         let has_worktree = self.selected_ref_worktree().is_some();
         let local_label: &'static str = if has_worktree {
-            "Current worktree"
+            t("Current worktree")
         } else {
-            "Current checkout"
+            t("Current checkout")
         };
         let local_icon = if has_worktree {
             crate::icons::FOLDER_WITH_FILES
@@ -2975,7 +2980,7 @@ impl Pickers {
             (CheckoutKind::Local, local_label, local_icon),
             (
                 CheckoutKind::NewWorktree,
-                "New worktree",
+                t("New worktree"),
                 crate::icons::FOLDER_WITH_FILES,
             ),
         ];
@@ -3365,11 +3370,11 @@ impl Pickers {
                 })
                 .collect()
         } else if searching {
-            vec![empty_list_note(&theme, "No models found")]
+            vec![empty_list_note(&theme, t("No models found"))]
         } else if favorites_view {
             vec![empty_list_note(
                 &theme,
-                "No starred models yet — hit a row's star",
+                t("No starred models yet — hit a row's star"),
             )]
         } else {
             match effective_models {
@@ -3467,7 +3472,7 @@ impl Pickers {
                     // (model list, device switcher); without it adjacent
                     // hover/selected washes fuse into one blob (user report).
                     .gap(px(2.0))
-                    .child(popover::menu_heading(&theme, "Reasoning"))
+                    .child(popover::menu_heading(&theme, t("Reasoning")))
                     .children(levels.into_iter().enumerate().map(|(ix, level)| {
                         let is_active = current == Some(level);
                         let is_default = default_level == Some(level);
@@ -3560,7 +3565,7 @@ fn default_badge(theme: &Theme) -> gpui::Div {
         .text_size(px(10.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.text_muted.opacity(0.6))
-        .child(SharedString::from("Default"))
+        .child(SharedString::from(t("Default")))
 }
 
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
@@ -3667,7 +3672,7 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
                 if !model.options.iter().any(|o| o.id == "contextWindow") {
                     model.options.push(zeron_proto::ModelOption {
                         id: "contextWindow".into(),
-                        label: "Context Window".into(),
+                        label: t("Context Window").into(),
                         choices: vec![
                             zeron_proto::ModelOptionChoice {
                                 id: "200k".into(),
@@ -3826,7 +3831,7 @@ impl Render for Pickers {
             match self.open_kind() {
                 Some(PickerKind::Branch) => {
                     self.search.update(cx, |input, cx| {
-                        input.set_placeholder("Search refs…", cx);
+                        input.set_placeholder(t("Search refs…"), cx);
                     });
                     let handle = self.search.read(cx).focus_handle(cx);
                     if handle.is_focused(window) {
@@ -3912,7 +3917,7 @@ impl Render for Pickers {
         let traits_label: SharedString = traits_set
             .clone()
             .map(SharedString::from)
-            .unwrap_or_else(|| SharedString::from("Traits"));
+            .unwrap_or_else(|| SharedString::from(t("Traits")));
 
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see

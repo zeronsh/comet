@@ -23,6 +23,7 @@ use zeron_proto::{
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::i18n::{t, tf};
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -169,9 +170,9 @@ impl LoginFlow {
             | LoginFlow::Browser { harness, .. } => *harness,
         };
         match harness {
-            HarnessId::Codex => "Add Codex account",
-            HarnessId::Cursor => "Connect Cursor",
-            _ => "Add Claude account",
+            HarnessId::Codex => t("Add Codex account"),
+            HarnessId::Cursor => t("Connect Cursor"),
+            _ => t("Add Claude account"),
         }
     }
 }
@@ -199,7 +200,7 @@ pub struct AccountsPage {
 impl AccountsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
-        let code_input = cx.new(|cx| ComposerInput::new("Paste the authorization code", cx));
+        let code_input = cx.new(|cx| ComposerInput::new(t("Paste the authorization code"), cx));
         let code_events = cx.subscribe(&code_input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_code(cx);
@@ -299,7 +300,7 @@ impl AccountsPage {
         let trigger_label: SharedString = selected
             .as_ref()
             .map(|d| d.name.clone().into())
-            .unwrap_or_else(|| SharedString::from("This device"));
+            .unwrap_or_else(|| SharedString::from(t("This device")));
         let emerald = theme.success;
         let open = self.device_menu.is_open();
 
@@ -374,7 +375,7 @@ impl AccountsPage {
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
-                .child(popover::menu_heading(theme, "Devices"))
+                .child(popover::menu_heading(theme, t("Devices")))
                 .children(devices.into_iter().enumerate().map(|(ix, d)| {
                     let is_active = Some(d.id.as_str()) == effective.as_deref();
                     let is_local = local_id.as_deref() == Some(d.id.as_str());
@@ -402,7 +403,7 @@ impl AccountsPage {
                                     .flex_none()
                                     .text_size(px(10.5))
                                     .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
+                                    .child(SharedString::from(t("You"))),
                             )
                         })
                         .child(
@@ -429,7 +430,7 @@ impl AccountsPage {
 
     fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.snapshot = Loadable::Error("Engine not connected".into());
+            self.snapshot = Loadable::Error(t("Engine not connected").into());
             return;
         };
         self.snapshot = Loadable::Loading;
@@ -532,7 +533,7 @@ impl AccountsPage {
                     }
                     Err(err) => {
                         page.login = None;
-                        page.error = Some(format!("Login failed to start: {err}").into());
+                        page.error = Some(tf!("Login failed to start: {err}", err = err).into());
                     }
                 }
                 cx.notify();
@@ -626,7 +627,7 @@ impl AccountsPage {
                             AgentLoginStatus::Error => {
                                 *error = Some(
                                     poll.message
-                                        .unwrap_or_else(|| "Login failed".to_string())
+                                        .unwrap_or_else(|| t("Login failed").to_string())
                                         .into(),
                                 );
                                 cx.notify();
@@ -642,8 +643,8 @@ impl AccountsPage {
                         },
                         None => {
                             let text = match &result {
-                                Err(err) => format!("Poll failed: {err}"),
-                                Ok(_) => "Poll failed: malformed reply".to_string(),
+                                Err(err) => tf!("Poll failed: {err}", err = err),
+                                Ok(_) => t("Poll failed: malformed reply").to_string(),
                             };
                             *error = Some(text.into());
                             cx.notify();
@@ -741,9 +742,9 @@ impl AccountsPage {
                     .w(px(64.0))
                     .flex_none()
                     .text_right()
-                    .child(SharedString::from(format!(
-                        "{}% used",
-                        (fraction * 100.0).round() as u32
+                    .child(SharedString::from(tf!(
+                        "{pct}% used",
+                        pct = (fraction * 100.0).round() as u32
                     ))),
             )
             .when_some(reset, |el, reset| {
@@ -776,7 +777,7 @@ impl AccountsPage {
             .email
             .clone()
             .or_else(|| account.display_name.clone())
-            .unwrap_or_else(|| "Unknown account".into())
+            .unwrap_or_else(|| t("Unknown account").into())
             .into();
         let initial: SharedString = email
             .chars()
@@ -793,7 +794,7 @@ impl AccountsPage {
             .items_center()
             .gap(px(6.0))
             .when(account.active, |el| {
-                el.child(widgets::badge_active(theme, "Active"))
+                el.child(widgets::badge_active(theme, t("Active")))
             })
             .when_some(account.plan_label.clone(), |el, plan| {
                 el.child(widgets::badge(theme, plan))
@@ -831,7 +832,11 @@ impl AccountsPage {
                     el.child(
                         crate::popover::btn_primary(
                             theme,
-                            if is_busy { "Switching…" } else { "Switch" },
+                            if is_busy {
+                                t("Switching…")
+                            } else {
+                                t("Switch")
+                            },
                         )
                         .id(("account-switch", ix))
                         .px(px(8.0))
@@ -894,9 +899,9 @@ impl AccountsPage {
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
                                     .child(SharedString::from(if account.switchable {
-                                        "Usage unavailable"
+                                        t("Usage unavailable")
                                     } else {
-                                        "Credentials unavailable"
+                                        t("Credentials unavailable")
                                     })),
                             )
                         } else {
@@ -1009,7 +1014,7 @@ impl AccountsPage {
                             .justify_end()
                             .gap(px(8.0))
                             .child(
-                                popover::btn_ghost(&theme, "Cancel", "login-cancel")
+                                popover::btn_ghost(&theme, t("Cancel"), "login-cancel")
                                     .id("login-cancel")
                                     .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
                             )
@@ -1017,9 +1022,9 @@ impl AccountsPage {
                                 popover::btn_primary(
                                     &theme,
                                     if submitting {
-                                        "Verifying…"
+                                        t("Verifying…")
                                     } else {
-                                        "Add account"
+                                        t("Add account")
                                     },
                                 )
                                 .id("login-submit-code")
@@ -1054,7 +1059,7 @@ impl AccountsPage {
                     .child(div().mt(px(8.0)).child(popover::dialog_body(&theme, body)))
                     .child(url_link(
                         "login-open-url-browser",
-                        "Reopen the sign-in page",
+                        t("Reopen the sign-in page"),
                         &start.url,
                         cx,
                     ))
@@ -1078,7 +1083,7 @@ impl AccountsPage {
                                         .text_size(px(12.5))
                                         .text_color(theme.text_muted.opacity(0.7))
                                         .child(message.clone().unwrap_or_else(|| {
-                                            SharedString::from("Waiting for the browser…")
+                                            SharedString::from(t("Waiting for the browser…"))
                                         })),
                                 ),
                         )
@@ -1096,7 +1101,7 @@ impl AccountsPage {
                         div().mt(px(16.0)).flex().flex_row().justify_end().child(
                             popover::btn_ghost(
                                 &theme,
-                                if has_error { "Close" } else { "Cancel" },
+                                if has_error { t("Close") } else { t("Cancel") },
                                 "login-cancel",
                             )
                             .id("login-cancel")
@@ -1308,7 +1313,7 @@ impl Render for AccountsPage {
                                 .mt(px(4.0))
                                 .text_size(px(11.5))
                                 .text_color(theme.text_muted)
-                                .child(SharedString::from("Click to retry")),
+                                .child(SharedString::from(t("Click to retry"))),
                         )
                         .into_any_element(),
                 ]
@@ -1392,7 +1397,7 @@ impl Render for AccountsPage {
                                                     .size(px(16.0))
                                                     .text_color(theme.text_muted),
                                             )
-                                            .child(SharedString::from("Add account")),
+                                            .child(SharedString::from(t("Add account"))),
                                     ),
                             )
                             .children(
@@ -1419,7 +1424,7 @@ impl Render for AccountsPage {
                             .flex_row()
                             .items_center()
                             .gap(px(10.0))
-                            .child(widgets::page_header(&theme, "Accounts", account_count))
+                            .child(widgets::page_header(&theme, t("Accounts"), account_count))
                             .child(div().flex_1())
                             .child(
                                 // `text-[12.5px]` + leading 16px Refresh icon,

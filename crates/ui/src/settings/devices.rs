@@ -13,6 +13,7 @@ use zeron_proto::WorkspaceScope;
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::i18n::{t, tf};
 use crate::popover;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -30,17 +31,17 @@ pub fn device_online(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bo
 /// Compact last-seen line. Pure.
 pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     let Some(at) = last_seen else {
-        return "never seen".to_string();
+        return t("never seen").to_string();
     };
     let secs = now.signed_duration_since(at).num_seconds();
     if secs < 60 {
-        "just now".to_string()
+        t("just now").to_string()
     } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
+        tf!("{n}m ago", n = secs / 60)
     } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
+        tf!("{n}h ago", n = secs / 3600)
     } else {
-        format!("{}d ago", secs / 86_400)
+        tf!("{n}d ago", n = secs / 86_400)
     }
 }
 
@@ -48,9 +49,11 @@ pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
 /// workspace and must not imply that account device metadata is already live.
 pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
     match scope {
-        Some(WorkspaceScope::Local) => "Manage device details stored in this local workspace.",
-        Some(WorkspaceScope::Synced) => "Manage device names and inspect synced device metadata.",
-        Some(WorkspaceScope::Development) | None => "Manage device names for this workspace.",
+        Some(WorkspaceScope::Local) => t("Manage device details stored in this local workspace."),
+        Some(WorkspaceScope::Synced) => {
+            t("Manage device names and inspect synced device metadata.")
+        }
+        Some(WorkspaceScope::Development) | None => t("Manage device names for this workspace."),
     }
 }
 
@@ -86,7 +89,7 @@ impl DevicesPage {
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| ComposerInput::new("Device name", cx));
+        let input = cx.new(|cx| ComposerInput::new(t("Device name"), cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -122,7 +125,7 @@ impl DevicesPage {
             let result = engine.client().call(methods::MUTATE, params).await;
             this.update(cx, |page, cx| {
                 if let Err(err) = result {
-                    page.error = Some(format!("Rename failed: {err}").into());
+                    page.error = Some(tf!("Rename failed: {err}", err = err).into());
                 }
                 cx.notify();
             })
@@ -156,7 +159,7 @@ impl DevicesPage {
         let dialog = self.rename.as_ref()?;
         let input = dialog.input.clone();
         let card = popover::dialog_card(&theme)
-            .child(popover::dialog_title(&theme, "Rename device"))
+            .child(popover::dialog_title(&theme, t("Rename device")))
             .child(
                 div()
                     .mt(px(12.0))
@@ -170,7 +173,7 @@ impl DevicesPage {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_ghost(&theme, "Cancel", "rename-cancel")
+                        popover::btn_ghost(&theme, t("Cancel"), "rename-cancel")
                             .id("rename-cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.rename = None;
@@ -178,7 +181,7 @@ impl DevicesPage {
                             })),
                     )
                     .child(
-                        popover::btn_primary(&theme, "Rename")
+                        popover::btn_primary(&theme, t("Rename"))
                             .id("rename-save")
                             .on_click(cx.listener(|this, _, _, cx| this.submit_rename(cx))),
                     ),
@@ -288,9 +291,9 @@ impl Render for DevicesPage {
                 if !online {
                     meta.push(
                         div()
-                            .child(SharedString::from(format!(
-                                "Last seen {}",
-                                format_last_seen(device.last_seen_at, now)
+                            .child(SharedString::from(tf!(
+                                "Last seen {when}",
+                                when = format_last_seen(device.last_seen_at, now)
                             )))
                             .into_any_element(),
                     );
@@ -299,9 +302,9 @@ impl Render for DevicesPage {
                 if let Some(created) = device.created_at {
                     meta.push(
                         div()
-                            .child(SharedString::from(format!(
-                                "Added {}",
-                                format_last_seen(Some(created), now)
+                            .child(SharedString::from(tf!(
+                                "Added {when}",
+                                when = format_last_seen(Some(created), now)
                             )))
                             .into_any_element(),
                     );
@@ -322,7 +325,7 @@ impl Render for DevicesPage {
                             this.copy_id(copy_id.clone(), cx);
                         }))
                         .child(SharedString::from(if id_copied {
-                            "Copied".to_string()
+                            t("Copied").to_string()
                         } else {
                             short_id(&device.id)
                         }))
@@ -347,9 +350,9 @@ impl Render for DevicesPage {
                                 .text_size(px(10.5))
                                 .text_color(theme.text_muted)
                                 .child(if workspace_scope == Some(WorkspaceScope::Local) {
-                                    "Local only"
+                                    t("Local only")
                                 } else {
-                                    "This device"
+                                    t("This device")
                                 }),
                         )
                     })
@@ -373,7 +376,7 @@ impl Render for DevicesPage {
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Rename")),
+                            .child(SharedString::from(t("Rename"))),
                     )
                     .into_any_element()
             })
@@ -388,7 +391,7 @@ impl Render for DevicesPage {
                     .text_center()
                     .text_size(px(14.0))
                     .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("No devices registered")),
+                    .child(SharedString::from(t("No devices registered"))),
             )
         } else {
             card.children(rows)
@@ -402,7 +405,7 @@ impl Render for DevicesPage {
                 widgets::page_column()
                     .child(widgets::page_header(
                         &theme,
-                        "Devices",
+                        t("Devices"),
                         (count > 0).then_some(count),
                     ))
                     .child(widgets::page_subtitle(

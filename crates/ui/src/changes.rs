@@ -45,6 +45,7 @@ use zeron_rpc::methods;
 use crate::comments::{self, CommentSide, DiffComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
+use crate::i18n::{t, tf};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -420,7 +421,7 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
             file.binary = true;
         } else if let Some(mode) = raw.strip_prefix("new mode ") {
             file.notices
-                .push(format!("Mode changed to {}", mode.trim()));
+                .push(tf!("Mode changed to {mode}", mode = mode.trim()));
         } else if let Some(new) = raw.strip_prefix("+++ ") {
             let new = new.trim();
             if new == "/dev/null" {
@@ -442,16 +443,16 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
 pub fn file_notices(file: &FileDiff) -> Vec<String> {
     let mut notices = Vec::new();
     match file.status {
-        FileStatus::Added => notices.push("New file".to_string()),
-        FileStatus::Deleted => notices.push("Deleted file".to_string()),
+        FileStatus::Added => notices.push(t("New file").to_string()),
+        FileStatus::Deleted => notices.push(t("Deleted file").to_string()),
         FileStatus::Renamed => {
             let from = file.old_path.as_deref().unwrap_or("?");
-            notices.push(format!("Renamed from {from}"));
+            notices.push(tf!("Renamed from {from}", from = from));
         }
         FileStatus::Modified => {}
     }
     if file.binary {
-        notices.push("Binary file — contents not shown".to_string());
+        notices.push(t("Binary file — contents not shown").to_string());
     }
     notices.extend(file.notices.iter().cloned());
     notices
@@ -478,8 +479,10 @@ pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
         budget -= hunk.lines.len();
         true
     });
-    file.notices.push(format!(
-        "Diff truncated — showing first {max_lines} of {total} lines"
+    file.notices.push(tf!(
+        "Diff truncated — showing first {max_lines} of {total} lines",
+        max_lines = max_lines,
+        total = total
     ));
     // The gutter fits what actually renders.
     file.max_line = file
@@ -707,9 +710,9 @@ pub fn diff_phase(resolved: Option<&CheckoutDiff>) -> DiffPhase {
 /// Header label: "N Uncommitted change(s)".
 pub fn uncommitted_label(count: usize) -> String {
     if count == 1 {
-        "1 Uncommitted change".to_string()
+        t("1 Uncommitted change").to_string()
     } else {
-        format!("{count} Uncommitted changes")
+        tf!("{count} Uncommitted changes", count = count)
     }
 }
 
@@ -742,11 +745,11 @@ impl DiffScope {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::WorkingTree => "Working tree",
-            Self::Branch => "Branch changes",
-            Self::LatestTurn => "Latest turn",
-            Self::History => "History",
-            Self::Commit => "Commit",
+            Self::WorkingTree => t("Working tree"),
+            Self::Branch => t("Branch changes"),
+            Self::LatestTurn => t("Latest turn"),
+            Self::History => t("History"),
+            Self::Commit => t("Commit"),
         }
     }
 
@@ -772,7 +775,7 @@ pub fn scope_label(scope: DiffScope, count: usize, base: Option<&str>) -> String
             None => format!("{count} Changed {files}"),
         },
         DiffScope::LatestTurn => format!("{count} Changed {files} this turn"),
-        DiffScope::History => "History".to_string(),
+        DiffScope::History => t("History").to_string(),
         DiffScope::Commit => format!("{count} Changed {files} in this commit"),
     }
 }
@@ -801,14 +804,14 @@ pub fn default_base_ref(branches: &[String], current: Option<&str>) -> Option<St
 /// Empty-state copy per scope.
 pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
     match scope {
-        DiffScope::WorkingTree => "No uncommitted changes".to_string(),
+        DiffScope::WorkingTree => t("No uncommitted changes").to_string(),
         DiffScope::Branch => match base {
-            Some(base) => format!("No changes vs {base}"),
-            None => "No branch changes".to_string(),
+            Some(base) => tf!("No changes vs {base}", base = base),
+            None => t("No branch changes").to_string(),
         },
-        DiffScope::LatestTurn => "No changes this turn".to_string(),
-        DiffScope::History => "No commits found".to_string(),
-        DiffScope::Commit => "Empty commit".to_string(),
+        DiffScope::LatestTurn => t("No changes this turn").to_string(),
+        DiffScope::History => t("No commits found").to_string(),
+        DiffScope::Commit => t("Empty commit").to_string(),
     }
 }
 
@@ -1515,7 +1518,8 @@ impl Changes {
                         // Stream ended (engine restart / reconnect): banner + retry.
                         if this
                             .update(cx, |changes, cx| {
-                                changes.error = Some("Diff stream interrupted — retrying".into());
+                                changes.error =
+                                    Some(t("Diff stream interrupted — retrying").into());
                                 cx.notify();
                             })
                             .is_err()
@@ -3384,9 +3388,9 @@ impl Changes {
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
                 .child(SharedString::from(if branches.is_empty() {
-                    "No branches"
+                    t("No branches")
                 } else {
-                    "No matching branches"
+                    t("No matching branches")
                 }))
                 .into_any_element()
         } else {
@@ -3493,7 +3497,7 @@ impl Changes {
                             .rounded(px(4.0))
                             .bg(theme.warning.opacity(0.08))
                             .text_color(theme.warning.opacity(0.75))
-                            .child(SharedString::from("Partial snapshot")),
+                            .child(SharedString::from(t("Partial snapshot"))),
                     )
                 })
                 .into_any_element(),
@@ -4053,7 +4057,7 @@ fn render_comment_draft(
                         .justify_end()
                         .gap(px(6.0))
                         .child(
-                            comment_action("cmt-cancel", "Cancel", false, theme)
+                            comment_action("cmt-cancel", t("Cancel"), false, theme)
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel_draft(cx))),
                         )
                         .child(
@@ -4258,13 +4262,13 @@ impl Render for Changes {
             .map(|message| {
                 if message.contains("no turn recorded") {
                     (
-                        SharedString::from("No turn recorded yet — send a message first"),
+                        SharedString::from(t("No turn recorded yet — send a message first")),
                         false,
                     )
                 } else if message.contains("unknown method") {
                     (
                         SharedString::from(
-                            "This chat's device is running an older Zeron — update it to view branch and turn diffs",
+                            t("This chat's device is running an older Zeron — update it to view branch and turn diffs"),
                         ),
                         false,
                     )

@@ -14,6 +14,7 @@ use gpui::{
     canvas, div, point, px,
 };
 
+use crate::i18n::tr;
 use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
 use crate::theme::Theme;
 
@@ -356,9 +357,10 @@ pub fn loading_word(theme: &Theme) -> impl IntoElement {
     div()
         .text_size(px(11.0))
         .text_color(theme.text_muted.opacity(0.7))
-        .child(SharedString::from(
+        .child(SharedString::from(tr(
             "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",
-        ))
+            "加\u{2009}载\u{2009}中",
+        )))
 }
 
 // Compile-time proof the specs referenced here stay wired to the catalog.

@@ -8,6 +8,7 @@
 
 use gpui::{Context, EventEmitter, SharedString, Window, div, prelude::*, px};
 
+use crate::i18n::t;
 use crate::icons;
 use crate::settings::widgets;
 use crate::theme::Theme;
@@ -64,13 +65,13 @@ impl Render for NotificationsPage {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Sounds"))
+                            .child(widgets::row_title(&theme, t("Sounds")))
                             .child(widgets::meta_line(
                                 &theme,
                                 vec![
                                     div()
                                         .child(SharedString::from(
-                                            "Chime when a run finishes or an agent asks a question.",
+                                            t("Chime when a run finishes or an agent asks a question."),
                                         ))
                                         .into_any_element(),
                                 ],
@@ -96,7 +97,7 @@ impl Render for NotificationsPage {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Desktop notifications"))
+                            .child(widgets::row_title(&theme, t("Desktop notifications")))
                             .child(widgets::meta_line(
                                 &theme,
                                 vec![
@@ -166,7 +167,7 @@ impl Render for NotificationsPage {
             .overflow_y_scroll()
             .child(
                 widgets::page_column()
-                    .child(widgets::page_header(&theme, "Notifications", None))
+                    .child(widgets::page_header(&theme, t("Notifications"), None))
                     .child(
                         widgets::page_subtitle(
                             &theme,

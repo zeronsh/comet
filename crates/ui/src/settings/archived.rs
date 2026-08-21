@@ -8,6 +8,7 @@ use gpui::{
 use zeron_proto::Chat;
 use zeron_rpc::methods;
 
+use crate::i18n::{t, tf};
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -57,7 +58,7 @@ impl ArchivedPage {
             this.update(cx, |page, cx| {
                 page.busy = None;
                 if let Err(err) = result {
-                    page.error = Some(format!("Unarchive failed: {err}").into());
+                    page.error = Some(tf!("Unarchive failed: {err}", err = err).into());
                 }
                 cx.notify();
             })
@@ -92,16 +93,16 @@ impl Render for ArchivedPage {
                 let title: SharedString = chat
                     .title
                     .clone()
-                    .unwrap_or_else(|| "Untitled session".into())
+                    .unwrap_or_else(|| t("Untitled session").into())
                     .into();
                 // Unknown device → no fragment at all (zeron renders the
                 // device span only when the name resolves).
                 let device: Option<SharedString> =
                     device_names.get(&chat.device_id).cloned().map(Into::into);
-                let time_ago: SharedString = crate::state::format_time_ago(
+                let time_ago: SharedString = crate::i18n::t_str(&crate::state::format_time_ago(
                     chat.last_message_at.unwrap_or(chat.created_at),
                     now,
-                )
+                ))
                 .into();
                 let location: Option<SharedString> =
                     crate::state::chat_location(&chat).map(Into::into);
@@ -229,9 +230,9 @@ impl Render for ArchivedPage {
                                     .text_color(theme.text_muted),
                             )
                             .child(SharedString::from(if is_busy {
-                                "Unarchiving…"
+                                t("Unarchiving…")
                             } else {
-                                "Unarchive"
+                                t("Unarchive")
                             })),
                     )
                     .into_any_element()
@@ -258,16 +259,16 @@ impl Render for ArchivedPage {
                     div()
                         .mt(px(12.0))
                         .text_size(px(14.0))
-                        .child(SharedString::from("Nothing archived")),
+                        .child(SharedString::from(t("Nothing archived"))),
                 )
                 .child(
                     div()
                         .mt(px(4.0))
                         .text_size(px(12.0))
                         .text_color(theme.text_muted.opacity(0.4))
-                        .child(SharedString::from(
+                        .child(SharedString::from(t(
                             "Right-click a session in the sidebar to archive it.",
-                        )),
+                        ))),
                 )
                 .into_any_element()
         } else {
@@ -288,12 +289,12 @@ impl Render for ArchivedPage {
                 widgets::page_column()
                     .child(widgets::page_header(
                         &theme,
-                        "Archived sessions",
+                        t("Archived sessions"),
                         (count > 0).then_some(count),
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Hidden from the sidebar, never deleted. Unarchiving puts a session back on its device.",
+                        t("Hidden from the sidebar, never deleted. Unarchiving puts a session back on its device."),
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(

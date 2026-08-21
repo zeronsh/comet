@@ -28,6 +28,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use crate::comments::DiffComment;
+use crate::i18n::t;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
@@ -1235,7 +1236,7 @@ impl AppState {
         let offline = !self.device_online(&space.device_id, now);
         let device = self
             .device_name(&space.device_id)
-            .unwrap_or("Unknown device");
+            .unwrap_or(t("Unknown device"));
         (format!("@ {device}"), offline)
     }
 

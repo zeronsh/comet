@@ -23,6 +23,7 @@ pub mod composer;
 pub mod edge_fade;
 pub mod frost;
 pub mod history;
+pub mod i18n;
 pub mod icons;
 pub mod loaders;
 pub mod markdown;
@@ -146,11 +147,9 @@ pub fn run_app(config: UiConfig) {
         // final one on the very first frame, or the window flashes the wrong
         // palette while settings load.
         let data_dir = config.boot().data_dir.clone();
-        appearance::init(
-            settings::UiSettings::load(&data_dir).appearance,
-            data_dir,
-            cx,
-        );
+        let ui_settings = settings::UiSettings::load(&data_dir);
+        appearance::init(ui_settings.appearance, data_dir.clone(), cx);
+        i18n::init(ui_settings.language, data_dir);
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);
