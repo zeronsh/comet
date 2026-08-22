@@ -4642,6 +4642,12 @@ impl Shell {
             .items_center()
             .justify_center()
             .cursor_pointer()
+            .on_hover(motion::hover_listener(id))
+            .bg(motion::hover_blend(
+                id,
+                theme.glass_hover().opacity(0.0),
+                theme.glass_hover().opacity(0.8),
+            ))
             .child(icon(path).size(px(14.0)).text_color(motion::hover_blend(
                 id,
                 theme.text_muted,
