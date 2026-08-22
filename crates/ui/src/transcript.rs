@@ -606,6 +606,14 @@ pub enum RowKind {
         tools: Arc<Vec<ToolItem>>,
         auto_open: bool,
     },
+    /// A reasoning part: collapsible "Thinking" block. Auto-open while it is
+    /// streaming (the live tail of a working reply), collapsed once settled —
+    /// a user toggle overrides either way (same follow-the-rule contract as
+    /// tool groups).
+    Thinking {
+        text: SharedString,
+        streaming: bool,
+    },
     InputChip {
         /// First question's header (chat-view.tsx `InputChip`: the resolved
         /// chip shows it; unresolved shows "Awaiting your answer…" — which
@@ -900,6 +908,27 @@ pub fn rows_for_entry(
                     group_last_part_ix,
                 );
                 match other {
+                    MessagePart::Reasoning { id: part_id, text } => {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        // Live only while it is the tail of a streaming reply —
+                        // once text or a tool follows, the thought is finished
+                        // even though the entry still streams.
+                        let live = streaming && part_ix == last_part_ix;
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(text.as_bytes()) << 1 | live as u64,
+                            turn_start: false,
+                            kind: RowKind::Thinking {
+                                text: text.clone().into(),
+                                streaming: live,
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                        });
+                    }
                     MessagePart::Text { id: part_id, text } => {
                         if text.trim().is_empty() {
                             continue;
@@ -1145,9 +1174,15 @@ pub fn top_gap_for(prev: Option<&Row>, row: &Row) -> f32 {
     });
     if same_part_markdown {
         render::MD_BLOCK_GAP
-    } else if matches!(row.kind, RowKind::ToolGroup { .. })
-        || prev.is_some_and(|row| matches!(row.kind, RowKind::ToolGroup { .. }))
-    {
+    } else if matches!(
+        row.kind,
+        RowKind::ToolGroup { .. } | RowKind::Thinking { .. }
+    ) || prev.is_some_and(|row| {
+        matches!(
+            row.kind,
+            RowKind::ToolGroup { .. } | RowKind::Thinking { .. }
+        )
+    }) {
         Theme::SPACE_MD
     } else {
         Theme::SPACE_SM
@@ -3906,6 +3941,9 @@ impl Transcript {
             RowKind::ToolGroup { tools, auto_open } => {
                 self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
             }
+            RowKind::Thinking { text, streaming } => {
+                self.render_thinking(&row.id, text.clone(), *streaming, &theme, cx)
+            }
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
@@ -4600,6 +4638,99 @@ impl Transcript {
             .when(collapses, |el| el.child(header))
             .child(body)
             .into_any_element()
+    }
+
+    /// The thinking block: the tool-group header recipe (chevron tile +
+    /// quiet 12px label) over a dimmed plain-text body along the guide rail.
+    /// Open follows the streaming rule until the user toggles; no tween —
+    /// the body mounts/unmounts at intrinsic height (thinking bodies have no
+    /// analytic height, and the block usually opens/closes off-screen at the
+    /// live tail anyway).
+    fn render_thinking(
+        &mut self,
+        row_id: &SharedString,
+        text: SharedString,
+        streaming: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fold = self.folds.get(row_id).copied().unwrap_or_default();
+        let open = fold.open.unwrap_or(streaming);
+        let label: SharedString = if streaming {
+            "Thinking…".into()
+        } else {
+            "Thought process".into()
+        };
+        let toggle_id = row_id.clone();
+        let header = div()
+            .id(SharedString::from(format!("{row_id}-hdr")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(4.0))
+            .h(px(26.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .line_height(px(18.0))
+            .text_color(theme.text_muted)
+            .hover(|s| s.text_color(theme.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_fold(toggle_id.clone(), 0.0, streaming);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .size(px(18.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .bg(crate::theme::ink(0.06))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(SharedString::from(if open { "▾" } else { "▸" })),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .truncate()
+                    .child(label),
+            );
+
+        let mut column = div().flex().flex_col().child(header);
+        if open {
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(
+                        // The tool groups' guide rail, so the open body reads
+                        // as "inside the fold".
+                        div()
+                            .ml(px(12.0))
+                            .w(px(1.0))
+                            .flex_none()
+                            .bg(crate::theme::ink(0.08)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .pl(px(14.0))
+                            .py(px(6.0))
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(theme.text_muted)
+                            .child(text),
+                    ),
+            );
+        }
+        column.into_any_element()
     }
 }
 

@@ -72,9 +72,10 @@ impl TranscriptFrame {
     }
 }
 
-/// When `next` is `prev` plus text appended to exactly one text part (same
-/// position, all other fields and parts identical), the change is a
-/// [`TextAppend`]. Any other difference falls back to a full upsert.
+/// When `next` is `prev` plus text appended to exactly one text-bodied part
+/// (text or reasoning; same position, all other fields and parts identical),
+/// the change is a [`TextAppend`]. Any other difference falls back to a full
+/// upsert.
 fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Option<TextAppend> {
     if prev.id != next.id
         || prev.role != next.role
@@ -91,10 +92,13 @@ fn try_text_append(prev: &SessionMessageEntry, next: &SessionMessageEntry) -> Op
         if p == n {
             continue;
         }
-        let (MessagePart::Text { id: pid, text: pt }, MessagePart::Text { id: nid, text: nt }) =
-            (p, n)
-        else {
-            return None;
+        let ((pid, pt), (nid, nt)) = match (p, n) {
+            (MessagePart::Text { id: pid, text: pt }, MessagePart::Text { id: nid, text: nt })
+            | (
+                MessagePart::Reasoning { id: pid, text: pt },
+                MessagePart::Reasoning { id: nid, text: nt },
+            ) => ((pid, pt), (nid, nt)),
+            _ => return None,
         };
         if pid != nid || !nt.starts_with(pt.as_str()) || append.is_some() {
             return None;
@@ -222,11 +226,15 @@ pub fn apply_transcript_frame(
                 let Some(target) = current.iter_mut().find(|e| e.id == entry) else {
                     return Err(TranscriptDesync(format!("missing append entry {entry}")));
                 };
-                let Some(MessagePart::Text { text: tail, .. }) = target
-                    .parts
-                    .iter_mut()
-                    .find(|p| matches!(p, MessagePart::Text { id, .. } if *id == part))
-                else {
+                let tail = target.parts.iter_mut().find_map(|p| match p {
+                    MessagePart::Text { id, text } | MessagePart::Reasoning { id, text }
+                        if *id == part =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                });
+                let Some(tail) = tail else {
                     return Err(TranscriptDesync(format!("missing append part {part}")));
                 };
                 tail.push_str(&text);
@@ -321,6 +329,30 @@ mod tests {
             other => panic!("expected delta, got {other:?}"),
         }
         apply(&[a.clone(), b0], &[a, b1]);
+    }
+
+    #[test]
+    fn streaming_reasoning_tick_is_a_text_append() {
+        let mut b0 = entry("b", "prompt");
+        b0.parts = vec![MessagePart::Reasoning {
+            id: "r0".into(),
+            text: "thinking".into(),
+        }];
+        let mut b1 = b0.clone();
+        b1.parts = vec![MessagePart::Reasoning {
+            id: "r0".into(),
+            text: "thinking more".into(),
+        }];
+        let frame = diff_transcript(std::slice::from_ref(&b0), std::slice::from_ref(&b1));
+        match &frame {
+            TranscriptFrame::Delta { upsert, append, .. } => {
+                assert!(upsert.is_empty(), "reasoning growth must ride the hot path");
+                assert_eq!(append.len(), 1);
+                assert_eq!(append[0].text, " more");
+            }
+            other => panic!("expected delta, got {other:?}"),
+        }
+        apply(&[b0], &[b1]);
     }
 
     #[test]

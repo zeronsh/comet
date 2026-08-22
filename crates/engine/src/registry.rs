@@ -496,11 +496,11 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
-    // opencode over ACP (`opencode acp`), same lazy pattern: the static
-    // descriptor mirrors AcpHarness::opencode() exactly. No steering
-    // extension (turn boundaries) and no effort ladder — opencode exposes no
-    // thought_level config over ACP today (effort stays per-model in its own
-    // config).
+    // opencode over its NATIVE HTTP/SSE protocol (the one the opencode
+    // desktop app speaks — `opencode serve` + the /global/event bus), same
+    // lazy pattern: the static descriptor mirrors OpencodeHarness exactly.
+    // Turn-boundary steering; the effort ladder rides model VARIANTS (the
+    // run sends the first advertised variant id for the picked level).
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Opencode,
@@ -517,8 +517,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
     );
     registry
 }

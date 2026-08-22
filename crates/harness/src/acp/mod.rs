@@ -3,7 +3,7 @@
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
 //! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`) and
-//! opencode ([`AcpHarness::opencode`], `opencode acp`) — plus pi
+//! plus pi
 //! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
 //! driver exists. Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
@@ -29,7 +29,6 @@
 
 mod normalize;
 mod subagent;
-mod subagent_opencode;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -54,25 +53,9 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
-use subagent_opencode::OpencodeTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-/// OpenCode loads its plugins and MCP configuration before it answers ACP.
-/// Plugin-heavy cold starts can take minutes, so model discovery and a real
-/// chat must share one generous startup budget instead of racing 10s vs 120s.
-const DEFAULT_OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
-const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "ZERON_OPENCODE_STARTUP_TIMEOUT_SECS";
-
-fn opencode_startup_timeout() -> Duration {
-    std::env::var(OPENCODE_STARTUP_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_OPENCODE_STARTUP_TIMEOUT)
-}
-
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -131,23 +114,10 @@ struct AcpAgentSpec {
     /// Agent-specific advice appended to the stall error chip: what a wedge
     /// usually means for THIS agent and what the user can check.
     stall_hint: &'static str,
-    /// The agent's ACP process doubles as its own HTTP server (opencode):
-    /// runs pass `--port <free>` and tail the `/event` SSE bus for subagent
-    /// transcripts, which never ride the ACP wire. A failed port pick (or a
-    /// server that never binds) degrades to chip + final output.
-    http_sidecar: bool,
 }
 
 fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
     text.to_owned()
-}
-
-/// A kernel-assigned free localhost port, released for the child to claim.
-fn free_localhost_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .ok()
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
@@ -285,7 +255,6 @@ fn grok_spec() -> AcpAgentSpec {
         stall_hint: "The agent process is likely wedged — a stale shared leader \
              process or a hung startup check; zeron launches it with --no-leader \
              and --no-auto-update to avoid both.",
-        http_sidecar: false,
     }
 }
 
@@ -351,7 +320,6 @@ fn hermes_spec() -> AcpAgentSpec {
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
-        http_sidecar: false,
     }
 }
 
@@ -408,106 +376,6 @@ fn pi_spec() -> AcpAgentSpec {
         prompt_complete_extension: false,
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
-        http_sidecar: false,
-    }
-}
-
-fn opencode_install_paths() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        dirs.push(home.join(".opencode").join("bin").join("opencode"));
-        dirs.push(home.join(".local").join("bin").join("opencode"));
-        dirs.push(home.join(".npm-global").join("bin").join("opencode"));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin/opencode"));
-    dirs.push(PathBuf::from("/usr/local/bin/opencode"));
-    dirs
-}
-
-fn opencode_spec() -> AcpAgentSpec {
-    AcpAgentSpec {
-        id: HarnessId::Opencode,
-        display_name: "OpenCode",
-        executable: "opencode",
-        env_override: "OPENCODE_EXECUTABLE",
-        args: &["acp"],
-        // The opencode-ai npm package ships a NATIVE platform binary (its
-        // `bin` entry is `opencode.exe` swapped in by postinstall), so the
-        // managed `node <entry>` adapter path can't launch it — the CLI
-        // itself is the ACP server, installed like grok/hermes.
-        npm_package: None,
-        extra_paths: opencode_install_paths,
-        cli_executable: "opencode",
-        cli_extra_paths: opencode_install_paths,
-        install_hint: "opencode (searched PATH, the login shell's PATH, ~/.opencode/bin, \
-             ~/.local/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
-             fnm/nvm/volta/pnpm/bun install dirs; install with \
-             `curl -fsSL https://opencode.ai/install | bash` or \
-             `npm install -g opencode-ai`, then `opencode auth login`; set \
-             OPENCODE_EXECUTABLE to override)",
-        // opencode routes models through its provider config (`opencode auth
-        // login` + opencode.json); the always-advertised OpenCode Zen frees
-        // anchor the static fallback. Ids the agent doesn't advertise are
-        // skipped by the config-option set (verified: the `model` config
-        // option lists every configured provider, no auth needed to probe).
-        models: || {
-            vec![
-                Model {
-                    id: "opencode/big-pickle".into(),
-                    label: "Big Pickle".into(),
-                    description: Some("OpenCode Zen's flagship coding model".into()),
-                    reasoning_levels: Vec::new(),
-                    options: Vec::new(),
-                },
-                Model {
-                    id: "opencode/deepseek-v4-flash-free".into(),
-                    label: "DeepSeek V4 Flash (free)".into(),
-                    description: Some("Free tier on OpenCode Zen".into()),
-                    reasoning_levels: Vec::new(),
-                    options: Vec::new(),
-                },
-            ]
-        },
-        // No `_session/steering` extension (1.18.18): turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
-        // Effort rides opencode's model VARIANTS: when the session's current
-        // model has variants (models.dev metadata, or `variants` in
-        // opencode.json), the session advertises an `effort` config option
-        // (category thought_level) whose values mirror them — verified live
-        // (1.18.18) end to end: set_config_option effort=high applies the
-        // variant's options to the provider request. Variant-less models
-        // (the Zen frees today) advertise no option and the run-start set
-        // skips, falling to the agent default — so the blanket ladder here
-        // is safe (pi precedent). The option is per-model and reactive;
-        // exact per-model ladders would need the sidecar's provider.list
-        // (model.variants) — follow-up.
-        reasoning_levels: &[
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
-        prompt_transform: identity_transform,
-        effort_values: default_effort_values,
-        ladder_extras: &[],
-        prompt_complete_extension: false,
-        // A failing model provider is INVISIBLE on this wire: opencode
-        // retries the provider stream forever without failing the
-        // session/prompt RPC, and neither session/update nor the /event bus
-        // carries the error (verified live, 1.18.18, unreachable provider —
-        // only ~/.local/share/opencode/log records the AI_APICallError
-        // retry loop). Fast provider rejections (e.g. a Zen model without a
-        // subscription) DO fail the RPC and surface as an error chip; total
-        // silence past the bound means the retry loop, so the watchdog is
-        // the only way the user ever learns.
-        prompt_stall: Some(Duration::from_secs(60)),
-        stall_hint: "The model provider is likely unreachable or rejecting \
-             requests — opencode retries these silently and never reports the \
-             failure. Check the model/provider setup (`opencode auth list`, \
-             opencode.json) or the opencode log \
-             (~/.local/share/opencode/log).",
-        http_sidecar: true,
     }
 }
 
@@ -622,15 +490,6 @@ impl AcpHarness {
     /// pi's RPC mode.
     pub fn pi() -> Self {
         Self::with_spec(pi_spec())
-    }
-
-    /// opencode (`opencode acp`) — SST's native ACP agent.
-    pub fn opencode() -> Self {
-        let startup_timeout = opencode_startup_timeout();
-        let mut harness = Self::with_spec(opencode_spec());
-        harness.handshake_timeout = startup_timeout;
-        harness.model_discovery_timeout = startup_timeout;
-        harness
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -1227,7 +1086,6 @@ impl Harness for AcpHarness {
                 Ok(self.models_cache.get().cloned().unwrap_or(models))
             }
             Ok(_) => Ok((self.spec.models)()),
-            Err(error) if self.spec.id == HarnessId::Opencode => Err(error),
             Err(_) => Ok((self.spec.models)()),
         }
     }
@@ -1244,18 +1102,7 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        // An http_sidecar agent (opencode) gets a per-run port: the default
-        // (4096) is shared, and a losing concurrent bind silently drops the
-        // server the subagent viz tails. The pick-then-release race is
-        // acceptable — a lost port only degrades transcripts to final output.
-        let sidecar_port = self.spec.http_sidecar.then(free_localhost_port).flatten();
-        let extra_args = match sidecar_port {
-            Some(port) => vec!["--port".to_owned(), port.to_string()],
-            None => Vec::new(),
-        };
-        let (mut child, stderr_tail) = self
-            .spawn_agent(Some(&request.cwd), true, &extra_args)
-            .await?;
+        let (mut child, stderr_tail) = self.spawn_agent(Some(&request.cwd), true, &[]).await?;
         let stdin = child
             .stdin
             .take()
@@ -1281,7 +1128,6 @@ impl Harness for AcpHarness {
             prompt_stall: self.spec.prompt_stall,
             stall_hint: self.spec.stall_hint,
             sessions_root: self.sessions_root.clone(),
-            sidecar_port,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
@@ -1313,8 +1159,6 @@ struct Session {
     stall_hint: &'static str,
     /// Sessions-root override for the subagent transcript tail (tests).
     sessions_root: Option<PathBuf>,
-    /// The http_sidecar port this run's agent was told to bind (opencode).
-    sidecar_port: Option<u16>,
     prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     interrupt_grace: Duration,
@@ -1613,21 +1457,15 @@ fn config_option_sets(
     sets
 }
 
-/// The per-agent subagent correlator: grok's spawn-tool + disk-tail tracker
-/// (inert for agents that never emit `subagent_*` updates), or opencode's
-/// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
-/// [`map_update`]; their tagged events flow from their own tasks.
-enum SubagentObserver {
-    Grok(SubagentTracker),
-    Opencode(OpencodeTracker),
-}
+/// The subagent correlator: grok's spawn-tool + disk-tail tracker (inert
+/// for agents that never emit `subagent_*` updates). It observes the raw
+/// updates ahead of [`map_update`]; its tagged events flow from its own
+/// tasks.
+struct SubagentObserver(SubagentTracker);
 
 impl SubagentObserver {
     fn observe(&mut self, update: &Value) {
-        match self {
-            SubagentObserver::Grok(tracker) => tracker.observe(update),
-            SubagentObserver::Opencode(tracker) => tracker.observe(update),
-        }
+        self.0.observe(update)
     }
 }
 
@@ -1959,7 +1797,6 @@ async fn run_session(session: Session) {
         prompt_stall,
         stall_hint,
         sessions_root,
-        sidecar_port,
         prompt_transform,
         effort_values,
         interrupt_grace,
@@ -2185,22 +2022,13 @@ async fn run_session(session: Session) {
         return;
     }
 
-    // Subagent correlation + transcript tails: opencode rides its sidecar
-    // event bus; everything else gets the grok tracker (inert for agents
-    // that never emit the `subagent_*` extension updates).
-    let mut subagents = if harness == HarnessId::Opencode {
-        SubagentObserver::Opencode(OpencodeTracker::new(
-            session_id.clone(),
-            event_tx.clone(),
-            sidecar_port.map(|p| format!("http://127.0.0.1:{p}")),
-        ))
-    } else {
-        SubagentObserver::Grok(SubagentTracker::new(
-            session_id.clone(),
-            event_tx.clone(),
-            sessions_root,
-        ))
-    };
+    // Subagent correlation + transcript tails: the grok tracker (inert for
+    // agents that never emit the `subagent_*` extension updates).
+    let mut subagents = SubagentObserver(SubagentTracker::new(
+        session_id.clone(),
+        event_tx.clone(),
+        sessions_root,
+    ));
 
     // ---- main loop --------------------------------------------------------
     // Prompt-completion settlement state (the prompt-complete extension):
@@ -3119,18 +2947,6 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn opencode_model_probe_and_chat_share_one_startup_budget() {
-        let harness = AcpHarness::opencode();
-        assert_eq!(
-            harness.model_discovery_timeout, harness.handshake_timeout,
-            "model discovery must not fail before the same OpenCode process would be considered hung"
-        );
-        if std::env::var_os(OPENCODE_STARTUP_TIMEOUT_ENV).is_none() {
-            assert_eq!(harness.handshake_timeout, DEFAULT_OPENCODE_STARTUP_TIMEOUT);
-        }
-    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {
