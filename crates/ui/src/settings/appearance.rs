@@ -10,7 +10,7 @@
 //! `set_mode` repaints every window, so this page has nothing of its own to hold.
 
 use gpui::{
-    AnyElement, Context, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*, px,
+    div, prelude::*, px, AnyElement, Context, Hsla, IntoElement, Render, SharedString, Window,
 };
 
 use crate::appearance::{self, AppearanceMode};
@@ -132,6 +132,51 @@ fn miniature_split() -> AnyElement {
         .into_any_element()
 }
 
+/// Frost presets: label → global glass opacity. `Off` paints the chrome opaque
+/// (the platform default outside macOS).
+const FROST_PRESETS: &[(&str, f32)] = &[
+    ("Off", 1.0),
+    ("Standard", 0.80),
+    ("Clear", 0.60),
+    ("Frosted", 0.40),
+];
+
+/// A miniature showing how frosted the chrome is at `alpha`: a vivid wallpaper
+/// stands in for the desktop, the sidebar strip paints the frost tint at
+/// `alpha`, and the content card stays opaque so the difference reads.
+fn glass_miniature(theme: &Theme, alpha: f32) -> AnyElement {
+    let tint = theme.glass_tint.unwrap_or(theme.surface);
+    let r = px(widgets::OPTION_CARD_RADIUS);
+    let wallpaper: Hsla = gpui::rgb(0x6a5acd).into();
+    div()
+        .size_full()
+        .rounded(r)
+        .overflow_hidden()
+        .flex()
+        .flex_row()
+        .bg(wallpaper)
+        .child(
+            // Sidebar strip — the frosted chrome.
+            div().w(px(44.0)).h_full().flex_none().bg(if alpha >= 1.0 {
+                theme.surface
+            } else {
+                tint.opacity(alpha)
+            }),
+        )
+        .child(
+            // Inset opaque content card.
+            div()
+                .flex_1()
+                .h_full()
+                .m(px(8.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.bg),
+        )
+        .into_any_element()
+}
+
 /// The preview graphic for a mode.
 ///
 /// The one place `Theme::light()`/`Theme::dark()` are legitimately built outside
@@ -201,6 +246,9 @@ impl Render for AppearancePage {
         let light_theme = state.and_then(|state| state.light_theme.clone());
         let dark_selected = crate::themes::resolve(dark_theme.as_deref(), Appearance::Dark).id;
         let light_selected = crate::themes::resolve(light_theme.as_deref(), Appearance::Light).id;
+        let frost = state
+            .map(|state| state.frost_alpha)
+            .unwrap_or_else(crate::settings::default_frost_alpha);
 
         let cards = AppearanceMode::ALL.into_iter().map(|mode| {
             widgets::option_card(&theme, mode.label(), mode == current, preview(mode))
@@ -271,6 +319,47 @@ impl Render for AppearancePage {
                                 &theme,
                                 cx,
                             ))),
+                    )
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(widgets::field_label(&theme, "Frost"))
+                            .child(
+                                widgets::option_card_row().children(FROST_PRESETS.iter().map(
+                                    |(label, alpha)| {
+                                        let label = *label;
+                                        let alpha = *alpha;
+                                        let selected = (frost - alpha).abs() < 0.001;
+                                        widgets::option_card(
+                                            &theme,
+                                            label,
+                                            selected,
+                                            glass_miniature(&theme, alpha),
+                                        )
+                                        .id(SharedString::from(format!("frost-{label}")))
+                                        .on_click(
+                                            cx.listener(move |_, _, _, cx| {
+                                                appearance::set_frost(alpha, cx);
+                                                cx.notify();
+                                            }),
+                                        )
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt(px(16.0))
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .line_height(px(18.0))
+                            .child(
+                                "How much of the desktop shows through the sidebar chrome. macOS \
+                                 only.",
+                            ),
                     ),
             )
     }

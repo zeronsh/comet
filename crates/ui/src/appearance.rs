@@ -64,6 +64,9 @@ pub struct AppearanceState {
     /// the stock palette (see [`themes::resolve`]).
     pub dark_theme: Option<String>,
     pub light_theme: Option<String>,
+    /// Global frost (glass) opacity, 0.0–1.0. Mirrors `ui-settings.json`;
+    /// `1.0` disables the frosted chrome.
+    pub frost_alpha: f32,
     /// Where `ui-settings.json` lives, so a menu action can persist the choice
     /// without routing through the shell entity that normally owns settings.
     pub data_dir: PathBuf,
@@ -92,6 +95,7 @@ pub fn init(settings: &UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
         system,
         dark_theme: settings.dark_theme.clone(),
         light_theme: settings.light_theme.clone(),
+        frost_alpha: settings.frost_alpha,
         data_dir: data_dir.into(),
     });
     sync_ns_appearance(mode);
@@ -99,10 +103,25 @@ pub fn init(settings: &UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     // and boot must not flash the stock theme before the user's choice lands.
     let wanted = resolve(mode, system);
     let entry = themes::resolve(theme_pref(wanted, cx).as_deref(), wanted);
-    Theme::install_theme(
-        Theme::from_colors(entry.colors.clone(), entry.id, entry.name, wanted),
-        cx,
-    );
+    Theme::install_theme(build_theme(entry, wanted, cx), cx);
+}
+
+/// Effective frost opacity: the user's setting on macOS, forced opaque (glass
+/// off) on platforms without vibrancy.
+fn effective_frost(cx: &App) -> f32 {
+    if !cfg!(target_os = "macos") {
+        return 1.0;
+    }
+    cx.try_global::<AppearanceState>()
+        .map(|s| s.frost_alpha)
+        .unwrap_or_else(crate::settings::default_frost_alpha)
+}
+
+/// Build the runtime theme for an entry, applying the global frost strength.
+fn build_theme(entry: &themes::ThemeEntry, appearance: Appearance, cx: &App) -> Theme {
+    let mut theme = Theme::from_colors(entry.colors.clone(), entry.id, entry.name, appearance);
+    theme.glass_alpha = effective_frost(cx);
+    theme
 }
 
 /// The persisted theme preference for `appearance`, if the globals exist.
@@ -158,6 +177,22 @@ pub fn set_theme(id: &str, appearance: Appearance, cx: &mut App) {
     persist_theme_and_mode(cx, &data_dir);
 }
 
+/// Change the global frost (glass) opacity and repaint. `1.0` = opaque chrome.
+pub fn set_frost(alpha: f32, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    let state = cx.global_mut::<AppearanceState>();
+    if (state.frost_alpha - alpha).abs() < f32::EPSILON {
+        return;
+    }
+    state.frost_alpha = alpha;
+    let data_dir = state.data_dir.clone();
+    apply(cx);
+    persist_theme_and_mode(cx, &data_dir);
+}
+
 /// Read-modify-write `ui-settings.json` for just the appearance keys.
 ///
 /// Deliberately a fresh load rather than a write of some cached struct: the
@@ -172,6 +207,7 @@ fn persist_theme_and_mode(cx: &App, data_dir: &Path) {
     settings.appearance = state.mode;
     settings.dark_theme = state.dark_theme.clone();
     settings.light_theme = state.light_theme.clone();
+    settings.frost_alpha = state.frost_alpha;
     if let Err(err) = settings.save(data_dir) {
         tracing::warn!(error = %err, "could not persist appearance");
     }
@@ -223,15 +259,18 @@ pub fn apply(cx: &mut App) {
     sync_ns_appearance(state.mode);
     let wanted = resolve(state.mode, state.system);
     let entry = themes::resolve(theme_pref(wanted, cx).as_deref(), wanted);
-    let changed = !cx
-        .try_global::<Theme>()
-        .is_some_and(|t| t.id == entry.id && t.appearance == wanted);
+    let frost = effective_frost(cx);
+    let changed = !cx.try_global::<Theme>().is_some_and(|t| {
+        t.id == entry.id && t.appearance == wanted && (t.glass_alpha - frost).abs() < f32::EPSILON
+    });
     if changed {
-        tracing::debug!(?wanted, theme = entry.id, "appearance: installing palette");
-        Theme::install_theme(
-            Theme::from_colors(entry.colors.clone(), entry.id, entry.name, wanted),
-            cx,
+        tracing::debug!(
+            ?wanted,
+            theme = entry.id,
+            frost,
+            "appearance: installing palette"
         );
+        Theme::install_theme(build_theme(entry, wanted, cx), cx);
         cx.refresh_windows();
     }
     // Unconditional, even when the palette did not move: this is the only thing

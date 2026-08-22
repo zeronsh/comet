@@ -11,9 +11,9 @@
 //! missing ids fall back to the stock palette so a settings file written by a
 //! newer build never breaks boot.
 
-use gpui::{Hsla, hsla};
+use gpui::{hsla, Hsla};
 
-use crate::theme::{Appearance, SyntaxPalette, ThemeColors, mix};
+use crate::theme::{mix, Appearance, SyntaxPalette, ThemeColors};
 
 mod catppuccin;
 mod rose_pine;

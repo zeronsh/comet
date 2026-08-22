@@ -42,6 +42,16 @@ pub const TERMINAL_MAX_VH: f32 = 0.55;
 pub const TERMINAL_ABS_MAX_HEIGHT: f32 = 2000.0;
 pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
+/// Default frost opacity. macOS has vibrancy (0.80 matches the pre-theme
+/// build's chrome); other platforms force `1.0` at apply time regardless.
+pub fn default_frost_alpha() -> f32 {
+    if cfg!(target_os = "macos") {
+        0.80
+    } else {
+        1.0
+    }
+}
+
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
@@ -104,6 +114,10 @@ pub struct UiSettings {
     /// Which theme paints for the light appearance. `None` = stock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub light_theme: Option<String>,
+    /// Global frost (glass) opacity, 0.0–1.0. `1.0` disables the frosted
+    /// chrome. Only macOS has vibrancy; elsewhere it is forced to `1.0`.
+    #[serde(default = "default_frost_alpha")]
+    pub frost_alpha: f32,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
     /// Preferred editor id for opening thread checkouts. `None` follows the
@@ -134,6 +148,7 @@ impl Default for UiSettings {
             appearance: crate::appearance::AppearanceMode::default(),
             dark_theme: None,
             light_theme: None,
+            frost_alpha: default_frost_alpha(),
             diff_split: false,
             preferred_editor: None,
         }
@@ -402,6 +417,7 @@ mod tests {
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             dark_theme: Some("zeron-dark".into()),
             light_theme: Some("catppuccin-latte".into()),
+            frost_alpha: 0.55,
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,

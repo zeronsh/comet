@@ -3,7 +3,7 @@
 
 use crate::theme::Appearance;
 
-use super::{PaletteSpec, ThemeEntry, build, hex};
+use super::{build, hex, PaletteSpec, ThemeEntry};
 
 pub fn entries() -> Vec<ThemeEntry> {
     vec![

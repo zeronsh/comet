@@ -1,9 +1,9 @@
-//! Catppuccin — Mocha (dark) and Latte (light).
+//! Catppuccin — Mocha & Frappé (dark) and Latte (light).
 //! https://github.com/catppuccin/catppuccin
 
 use crate::theme::Appearance;
 
-use super::{PaletteSpec, ThemeEntry, build, hex};
+use super::{build, hex, PaletteSpec, ThemeEntry};
 
 pub fn entries() -> Vec<ThemeEntry> {
     vec![
@@ -12,6 +12,12 @@ pub fn entries() -> Vec<ThemeEntry> {
             name: "Catppuccin Mocha",
             appearance: Appearance::Dark,
             colors: build(Appearance::Dark, mocha()),
+        },
+        ThemeEntry {
+            id: "catppuccin-frappe",
+            name: "Catppuccin Frappé",
+            appearance: Appearance::Dark,
+            colors: build(Appearance::Dark, frappe()),
         },
         ThemeEntry {
             id: "catppuccin-latte",
@@ -43,6 +49,30 @@ fn mocha() -> PaletteSpec {
         syntax_special: hex("#f5c2e7"), // pink
         syntax_string: hex("#a6e3a1"),  // green
         syntax_number: hex("#fab387"),  // peach
+    }
+}
+
+fn frappe() -> PaletteSpec {
+    PaletteSpec {
+        bg: hex("#303446"),              // base
+        surface: hex("#292c3c"),         // mantle
+        surface_card: hex("#414559"),    // surface0
+        surface_dialog: hex("#51576d"),  // surface1
+        surface_overlay: hex("#626880"), // surface2
+        text: hex("#c6d0f5"),
+        text_muted: hex("#a5adce"),     // subtext0
+        text_faint: hex("#838ba7"),     // overlay1
+        accent: hex("#babbf1"),         // lavender
+        danger: hex("#e78284"),         // red
+        warning: hex("#e5c890"),        // yellow
+        success: hex("#a6d189"),        // green
+        busy: hex("#f4b8e4"),           // pink
+        comment: hex("#737994"),        // overlay0
+        code: hex("#ca9ee6"),           // mauve
+        syntax_keyword: hex("#ca9ee6"), // mauve
+        syntax_special: hex("#f4b8e4"), // pink
+        syntax_string: hex("#a6d189"),  // green
+        syntax_number: hex("#ef9f76"),  // peach
     }
 }
 

@@ -32,9 +32,9 @@
 //!
 //! Installed as a gpui [`Global`] at boot; read with [`Theme::of`].
 
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
-use gpui::{App, Global, Hsla, SharedString, hsla};
+use gpui::{hsla, App, Global, Hsla, SharedString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeron_syntax::HighlightKind;
 
@@ -748,6 +748,11 @@ pub struct Theme {
     pub glass_tint: Option<Hsla>,
     /// `None` = the per-appearance recipe in [`Self::glass_overlay`].
     pub glass_overlay_tint: Option<Hsla>,
+    /// Frost opacity (0.0..1.0). `1.0` disables the frosted glass — the chrome
+    /// paints the opaque [`Self::surface`] instead. Defaults to the platform's
+    /// [`Self::GLASS_ALPHA`]; a global "frost strength" setting overrides it at
+    /// install time.
+    pub glass_alpha: f32,
 }
 
 impl Theme {
@@ -805,43 +810,18 @@ impl Theme {
     pub const TEXT_STACK_GAP: f32 = 1.0;
 
     /// The frost tint painted over the blurred window background (macOS glass).
-    /// Dark: darker than `surface`, matched to the reference vibrancy scrim
-    /// `hsl(0 0% 3%)`. Light: a near-white frost run heavier than dark's — see
-    /// [`Self::GLASS_ALPHA_LIGHT`]. On opaque platforms this IS the surface
-    /// tone (no tint swap).
+    /// Built-in palettes pin their sampled greys via [`Self::glass_tint`]; an
+    /// un-overridden theme derives its frost from its own [`Self::surface`].
+    /// On opaque platforms — or when [`Self::glass_alpha`] reaches `1.0` — this
+    /// IS the surface tone (no tint swap).
     pub fn glass(&self) -> Hsla {
-        match self.appearance {
-            Appearance::Dark => {
-                if Self::GLASS_ALPHA < 1.0 {
-                    self.frost_tint()
-                        .unwrap_or(self.surface)
-                        .opacity(Self::GLASS_ALPHA)
-                } else {
-                    self.surface
-                }
-            }
-            Appearance::Light => {
-                if Self::GLASS_ALPHA_LIGHT < 1.0 {
-                    // 0xfa, not the surface's 0xf4-ish grey: at 90% coverage
-                    // the tint IS the sidebar tone, and the darker grey read
-                    // as a dingy pane next to the white content card.
-                    // (Built-in palettes pin that grey via `glass_tint`; an
-                    // un-overridden theme falls back to its own surface.)
-                    self.frost_tint()
-                        .unwrap_or(self.surface)
-                        .opacity(Self::GLASS_ALPHA_LIGHT)
-                } else {
-                    self.surface
-                }
-            }
+        if self.glass_alpha >= 1.0 {
+            self.surface
+        } else {
+            self.glass_tint
+                .unwrap_or(self.surface)
+                .opacity(self.glass_alpha)
         }
-    }
-
-    /// The frost tint from the palette, when one is pinned. `None` means
-    /// "derive" — [`Self::glass`] falls back to [`Self::surface`], so a custom
-    /// theme gets coherent glass without knowing anything about vibrancy.
-    fn frost_tint(&self) -> Option<Hsla> {
-        self.glass_tint
     }
 
     /// Whether this appearance paints translucent chrome over the blurred
@@ -1067,6 +1047,7 @@ impl Theme {
             font_mono_fallback: system_mono().into(),
             glass_tint,
             glass_overlay_tint,
+            glass_alpha: Self::GLASS_ALPHA,
         }
     }
 
@@ -1501,7 +1482,8 @@ mod tests {
             srgb_u8(oklch_to_srgb(0.704, 0.191, 22.216)),
             [255, 100, 103]
         ); // red-400
-        assert_eq!(srgb_u8(oklch_to_srgb(0.828, 0.189, 84.429)), [255, 185, 0]); // amber-400
+        assert_eq!(srgb_u8(oklch_to_srgb(0.828, 0.189, 84.429)), [255, 185, 0]);
+        // amber-400
     }
 
     #[test]
@@ -2134,6 +2116,24 @@ mod tests {
         custom.glass_tint = None;
         let theme = Theme::from_colors(custom, "x", "X", Appearance::Dark);
         assert_eq!(theme.glass(), theme.surface.opacity(Theme::GLASS_ALPHA));
+    }
+
+    #[test]
+    fn glass_alpha_controls_frost_opacity() {
+        // Opaque platform: glass() is always the surface regardless of alpha.
+        if Theme::GLASS_ALPHA >= 1.0 {
+            assert_eq!(Theme::dark().glass(), Theme::dark().surface);
+            return;
+        }
+
+        let mut theme = Theme::dark();
+        theme.glass_alpha = 1.0; // Off
+        assert_eq!(theme.glass(), theme.surface);
+        assert!(!theme.is_glass());
+
+        theme.glass_alpha = 0.50;
+        assert_eq!(theme.glass(), theme.glass_tint.unwrap().opacity(0.50));
+        assert!(theme.is_glass());
     }
 
     #[test]
