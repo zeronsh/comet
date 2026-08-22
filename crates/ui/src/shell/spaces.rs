@@ -264,7 +264,7 @@ impl Shell {
             SpacesMenuRow::All => self.set_space_filter(None, cx),
             SpacesMenuRow::Space(id) => {
                 // NewThread mode: picking a project mints a thread there
-                // (the sidebar filter follows so the canvas targets it).
+                // without touching the sidebar filter.
                 let for_thread = self.spaces_menu.get().is_some_and(|menu| {
                     menu.purpose == SpacesMenuPurpose::NewThread
                 });
@@ -278,18 +278,15 @@ impl Shell {
         }
     }
 
-    /// Start a fresh session targeted at `space_id`: filter the sidebar to
-    /// it (the canvas' space context follows the filter) and open the
-    /// new-session canvas — [`Shell::land_in_space`] minus the just-added
-    /// bookkeeping.
+    /// Start a fresh session targeted at `space_id`: select the space (the
+    /// canvas' space context follows the selection) without touching the
+    /// sidebar filter, then open the new-session canvas.
     fn new_thread_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
-        self.settings.space_filter = Some(space_id.clone());
         self.state.update(cx, |s, cx| {
             s.select_space(Some(space_id), cx);
             s.select_chat(None, cx);
         });
-        self.schedule_save(cx);
         cx.notify();
     }
 
