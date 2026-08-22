@@ -302,12 +302,33 @@ async fn per_item_failures_surface_in_the_summary_and_leave_the_row_retryable() 
             .is_some()
     );
 
+    // The failed run records restart-durable retry intent.
+    let status = synced
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert!(
+        status.pending_retry,
+        "a failed run must persist pending-retry for the next boot"
+    );
+
     // Retry after clearing the obstruction: only the failed chat imports.
     std::fs::remove_file(&target_journals).expect("clear obstruction");
     let events = run_import(&synced);
     let (imported, skipped, errors) = raw_summary(&events);
     assert!(errors.is_empty(), "retry is clean: {errors:?}");
     assert_eq!((imported, skipped), (1, 1));
+
+    // A clean retry clears the persisted intent.
+    let status = synced
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert!(!status.pending_retry, "clean retry clears pending-retry");
 
     synced.shutdown().await;
 }
@@ -357,6 +378,146 @@ async fn marker_persistence_failure_is_an_import_error() {
         errors.iter().any(|e| e.contains("import marker")),
         "marker failure must be reported: {errors:?}"
     );
+    synced.shutdown().await;
+    drop(synced);
+
+    // Restarted status: with the marker unwritable nothing could persist, so
+    // pending is honestly false — but the availability scan still reports the
+    // un-imported local rows (the row import failed against nothing here, so
+    // dedupe finds them present; the bare fact asserted is that status
+    // answers and the manual "Import local work" route has its data).
+    let restarted = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let status = restarted
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status still answers with an obstructed marker");
+    assert!(!status.pending_retry, "nothing could be persisted");
+    restarted.shutdown().await;
+}
+
+/// Review point 1: a `?` exit from `run` (before the item loop) must still
+/// arm restart-durable retry intent, and the armed flag must survive a
+/// process restart.
+#[tokio::test]
+async fn top_level_import_error_arms_pending_retry_across_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (..) = seed_local(dir.path()).await;
+
+    // Corrupt the SOURCE store so `open_source` fails outright.
+    let source_db = dir
+        .path()
+        .join("profiles")
+        .join("local")
+        .join("docs.sqlite3");
+    std::fs::write(&source_db, b"not a sqlite database").expect("corrupt source");
+    for sidecar in ["docs.sqlite3-wal", "docs.sqlite3-shm"] {
+        let _ = std::fs::remove_file(dir.path().join("profiles").join("local").join(sidecar));
+    }
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let importer = synced.local_import.clone().expect("importer");
+    let result = importer.run(|_| {});
+    assert!(result.is_err(), "corrupt source must error the run");
+    assert!(
+        importer.status().expect("status").pending_retry,
+        "the top-level error must arm pending retry"
+    );
+    synced.shutdown().await;
+    drop(synced);
+
+    // Restart: a fresh runtime still reports it.
+    let restarted = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let status = restarted
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert!(status.pending_retry, "armed intent survives the restart");
+    assert_eq!(
+        (status.available_chats, status.available_spaces),
+        (0, 0),
+        "availability is best-effort zeros when the source is unreadable"
+    );
+    restarted.shutdown().await;
+}
+
+/// Review point 2: a retry that finds no local profile at all is a CLEAN
+/// terminal outcome — it must clear a previously armed flag instead of
+/// haunting every future boot.
+#[tokio::test]
+async fn clean_no_source_retry_clears_a_stale_pending_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_device, chat_doc, _) = seed_local(dir.path()).await;
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let importer = synced.local_import.clone().expect("importer");
+
+    // Arm the flag via a real failure (journal obstruction).
+    let target_journals = dir
+        .path()
+        .join("orgs")
+        .join("org1")
+        .join("user1")
+        .join("journals");
+    std::fs::remove_dir_all(&target_journals).expect("clear journals dir");
+    std::fs::write(&target_journals, b"obstruction").expect("plant obstruction");
+    let events = run_import(&synced);
+    assert!(!raw_summary(&events).2.is_empty(), "failure arms the flag");
+    assert!(importer.status().expect("status").pending_retry);
+    let _ = chat_doc;
+
+    // The user then deletes the local profile entirely.
+    std::fs::remove_dir_all(dir.path().join("profiles")).expect("remove local profile");
+
+    let events = run_import(&synced);
+    let (_, _, errors) = raw_summary(&events);
+    assert!(errors.is_empty(), "no-source retry is clean: {errors:?}");
+    assert!(
+        !importer.status().expect("status").pending_retry,
+        "the clean no-op must clear the armed flag"
+    );
+    synced.shutdown().await;
+}
+
+/// Review point 3 (engine half): marker state must not be hostage to the
+/// availability scan — an unreadable source store cannot hide a recorded
+/// pending retry from the boot probe.
+#[tokio::test]
+async fn status_reports_pending_retry_despite_unreadable_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (..) = seed_local(dir.path()).await;
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let importer = synced.local_import.clone().expect("importer");
+
+    // Arm via a journal-obstruction failure…
+    let target_journals = dir
+        .path()
+        .join("orgs")
+        .join("org1")
+        .join("user1")
+        .join("journals");
+    std::fs::remove_dir_all(&target_journals).expect("clear journals dir");
+    std::fs::write(&target_journals, b"obstruction").expect("plant obstruction");
+    run_import(&synced);
+    assert!(importer.status().expect("status").pending_retry);
+
+    // …then make the source store unreadable.
+    std::fs::write(
+        dir.path()
+            .join("profiles")
+            .join("local")
+            .join("docs.sqlite3"),
+        b"garbage",
+    )
+    .expect("corrupt source");
+    let status = importer
+        .status()
+        .expect("status must not fail on scan errors");
+    assert!(status.pending_retry, "marker state independent of the scan");
     synced.shutdown().await;
 }
 

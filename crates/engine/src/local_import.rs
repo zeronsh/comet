@@ -63,6 +63,10 @@ struct MarkerEntry {
     imported_at_ms: i64,
     imported_chats: usize,
     imported_spaces: usize,
+    /// The last run for this account ended with errors — the UI owes the
+    /// user a retry entry point even across an app restart.
+    #[serde(default)]
+    pending_retry: bool,
 }
 
 /// What the wizard needs to offer (or silently skip) the import step.
@@ -75,6 +79,10 @@ pub struct LocalImportStatus {
     pub available_spaces: usize,
     /// A completed import for this (org, user) is already on record.
     pub imported_before: bool,
+    /// The last recorded run for this (org, user) ended with errors and has
+    /// not been retried to completion — restart-durable, so a rebooted app
+    /// can restore the retry entry point.
+    pub pending_retry: bool,
 }
 
 /// Per-item progress for the wizard's progress step.
@@ -190,12 +198,15 @@ impl LocalImporter {
         }
     }
 
-    fn imported_before(&self) -> bool {
+    /// `(imported_before, pending_retry)` for this account, one locked read.
+    fn marker_state(&self) -> (bool, bool) {
         let _guard = marker_lock();
-        self.load_marker_locked()
+        let marker = self.load_marker_locked();
+        let entry = marker
             .imports
             .iter()
-            .any(|e| e.org_id == self.inner.org_id && e.user_id == self.inner.user_id)
+            .find(|e| e.org_id == self.inner.org_id && e.user_id == self.inner.user_id);
+        (entry.is_some(), entry.is_some_and(|e| e.pending_retry))
     }
 
     /// Record a completed import and re-arm the read-only uploads root for
@@ -207,7 +218,12 @@ impl LocalImporter {
     /// marker — so a crash or short write can never truncate the file and
     /// erase other accounts' grants. Failures propagate to the caller and end
     /// up in the import summary.
-    fn record_import(&self, chats: usize, spaces: usize) -> Result<(), EngineError> {
+    fn record_import(
+        &self,
+        chats: usize,
+        spaces: usize,
+        pending_retry: bool,
+    ) -> Result<(), EngineError> {
         let _guard = marker_lock();
         let mut marker = self.load_marker_locked();
         marker
@@ -219,8 +235,15 @@ impl LocalImporter {
             imported_at_ms: crate::now_ms(),
             imported_chats: chats,
             imported_spaces: spaces,
+            pending_retry,
         });
-        let bytes = serde_json::to_vec_pretty(&marker)
+        self.publish_marker_locked(&marker)
+    }
+
+    /// Atomic marker publish (caller holds [`marker_lock`]): write + fsync a
+    /// sibling temp file, rename over the marker.
+    fn publish_marker_locked(&self, marker: &Marker) -> Result<(), EngineError> {
+        let bytes = serde_json::to_vec_pretty(marker)
             .map_err(|err| EngineError::Other(format!("marker serialize: {err}")))?;
         let path = self.marker_path();
         let tmp = path.with_extension("json.tmp");
@@ -239,6 +262,40 @@ impl LocalImporter {
         })
     }
 
+    /// Flip only this account's `pending_retry` flag. Setting creates a
+    /// zero-count entry when none exists (the attempt is the fact worth
+    /// recording); clearing an absent entry is a no-op. Used to ARM intent
+    /// before the fallible import body runs — any exit that skips the final
+    /// [`Self::record_import`] (a `?` error, a marker-write failure at the
+    /// end) leaves the armed flag on disk, so a restarted app still restores
+    /// the retry entry point.
+    fn set_pending_retry(&self, pending: bool) -> Result<(), EngineError> {
+        let _guard = marker_lock();
+        let mut marker = self.load_marker_locked();
+        let entry = marker
+            .imports
+            .iter_mut()
+            .find(|e| e.org_id == self.inner.org_id && e.user_id == self.inner.user_id);
+        match (entry, pending) {
+            (Some(entry), _) => {
+                if entry.pending_retry == pending {
+                    return Ok(()); // no-op: don't churn the file
+                }
+                entry.pending_retry = pending;
+            }
+            (None, true) => marker.imports.push(MarkerEntry {
+                org_id: self.inner.org_id.clone(),
+                user_id: self.inner.user_id.clone(),
+                imported_at_ms: crate::now_ms(),
+                imported_chats: 0,
+                imported_spaces: 0,
+                pending_retry: true,
+            }),
+            (None, false) => return Ok(()),
+        }
+        self.publish_marker_locked(&marker)
+    }
+
     /// Open the local profile's stores read-only-ish. `None` when the device
     /// never ran a local profile (nothing to import).
     fn open_source(&self) -> Result<Option<(DocsStore, RegistryDoc)>, EngineError> {
@@ -254,15 +311,32 @@ impl LocalImporter {
         Ok(Some((store, registry)))
     }
 
-    /// What's importable right now (target-dedup applied).
+    /// What's importable right now (target-dedup applied). Marker state
+    /// (`imported_before`, `pending_retry`) is reported unconditionally: an
+    /// unreadable local store must not hide a recorded pending retry from the
+    /// boot probe, so availability scanning is best-effort (zeros on error).
     pub fn status(&self) -> Result<LocalImportStatus, EngineError> {
-        let imported_before = self.imported_before();
+        let (imported_before, pending_retry) = self.marker_state();
+        let (available_chats, available_spaces) = match self.scan_available() {
+            Ok(counts) => counts,
+            Err(err) => {
+                tracing::warn!(error = %err, "local-import availability scan failed");
+                (0, 0)
+            }
+        };
+        Ok(LocalImportStatus {
+            available_chats,
+            available_spaces,
+            imported_before,
+            pending_retry,
+        })
+    }
+
+    /// Source-side availability, target-deduplicated. Fallible: the local
+    /// store may be unreadable, which [`Self::status`] treats as zeros.
+    fn scan_available(&self) -> Result<(usize, usize), EngineError> {
         let Some((_, registry)) = self.open_source()? else {
-            return Ok(LocalImportStatus {
-                available_chats: 0,
-                available_spaces: 0,
-                imported_before,
-            });
+            return Ok((0, 0));
         };
         let mut available_chats = 0;
         for chat in registry.read_chats()? {
@@ -276,17 +350,31 @@ impl LocalImporter {
                 available_spaces += 1;
             }
         }
-        Ok(LocalImportStatus {
-            available_chats,
-            available_spaces,
-            imported_before,
-        })
+        Ok((available_chats, available_spaces))
     }
 
     /// Run the import, emitting [`ImportEvent`]s (the last is always
     /// `Summary`). Blocking (sqlite + fs) — callers run it off the async path.
+    ///
+    /// Pending-retry discipline: intent is ARMED on disk before any fallible
+    /// work and cleared only by a clean terminal outcome — so a `?` error, a
+    /// per-item failure, or a failed final marker write all leave the armed
+    /// flag for the next boot to restore. (If the arming write itself fails,
+    /// nothing can be persisted; the error still reaches the summary, and the
+    /// manual "Import local work" menu entry remains the recovery route.)
     pub fn run(&self, mut emit: impl FnMut(ImportEvent)) -> Result<(), EngineError> {
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(err) = self.set_pending_retry(true) {
+            errors.push(format!("import marker: {err}"));
+        }
+
         let Some((source_store, registry)) = self.open_source()? else {
+            // Clean terminal outcome: nothing to import (the local profile or
+            // its registry is gone). A stale armed flag from an earlier
+            // failure must not haunt every future boot.
+            if let Err(err) = self.set_pending_retry(false) {
+                errors.push(format!("import marker: {err}"));
+            }
             emit(ImportEvent::Start {
                 chats: 0,
                 spaces: 0,
@@ -298,12 +386,10 @@ impl LocalImporter {
                 skipped_spaces: 0,
                 journals_copied: 0,
                 ledger_rows_merged: 0,
-                errors: Vec::new(),
+                errors,
             });
             return Ok(());
         };
-
-        let mut errors: Vec<String> = Vec::new();
 
         // Spaces first: chats reference `space_id`, and viewers resolve the
         // reference as soon as the chat row lands.
@@ -375,7 +461,12 @@ impl LocalImporter {
                 .uploads
                 .add_read_only_root(&self.source_uploads());
         }
-        if let Err(err) = self.record_import(imported_chats, imported_spaces) {
+        // Terminal outcome: a clean run clears the armed flag via the full
+        // record; an errored run re-records it with the partial counts. If
+        // THIS write fails, the flag armed at the top of `run` is still on
+        // disk — the restart keeps its retry entry point either way.
+        let pending_retry = !errors.is_empty();
+        if let Err(err) = self.record_import(imported_chats, imported_spaces, pending_retry) {
             errors.push(format!("import marker: {err}"));
         }
 
