@@ -35,6 +35,7 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use gpui::{App, Global, Hsla, SharedString, hsla};
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 use zeron_syntax::HighlightKind;
 
 /// Which appearance the app is painting.
@@ -146,31 +147,56 @@ pub const INK_HAIRLINE_SCALE: f32 = 1.35;
 /// Paint-only syntax colors. The hues follow the Git history graph's lane
 /// palette (indigo, pink, emerald, amber, red, neutral), while light-mode
 /// variants are darkened enough to remain readable as text on white.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyntaxPalette {
+    #[serde(with = "hex_color")]
     pub comment: Hsla,
+    #[serde(with = "hex_color")]
     pub keyword: Hsla,
+    #[serde(with = "hex_color")]
     pub string: Hsla,
+    #[serde(with = "hex_color")]
     pub string_special: Hsla,
+    #[serde(with = "hex_color")]
     pub escape: Hsla,
+    #[serde(with = "hex_color")]
     pub number: Hsla,
+    #[serde(with = "hex_color")]
     pub boolean: Hsla,
+    #[serde(with = "hex_color")]
     pub type_name: Hsla,
+    #[serde(with = "hex_color")]
     pub type_builtin: Hsla,
+    #[serde(with = "hex_color")]
     pub constructor: Hsla,
+    #[serde(with = "hex_color")]
     pub function: Hsla,
+    #[serde(with = "hex_color")]
     pub function_builtin: Hsla,
+    #[serde(with = "hex_color")]
     pub macro_name: Hsla,
+    #[serde(with = "hex_color")]
     pub property: Hsla,
+    #[serde(with = "hex_color")]
     pub constant: Hsla,
+    #[serde(with = "hex_color")]
     pub variable: Hsla,
+    #[serde(with = "hex_color")]
     pub variable_special: Hsla,
+    #[serde(with = "hex_color")]
     pub parameter: Hsla,
+    #[serde(with = "hex_color")]
     pub operator: Hsla,
+    #[serde(with = "hex_color")]
     pub punctuation: Hsla,
+    #[serde(with = "hex_color")]
     pub tag: Hsla,
+    #[serde(with = "hex_color")]
     pub attribute: Hsla,
+    #[serde(with = "hex_color")]
     pub label: Hsla,
+    #[serde(with = "hex_color")]
     pub invalid: Hsla,
 }
 
@@ -282,9 +308,300 @@ fn git_graph_tone(mut color: Hsla) -> Hsla {
     color
 }
 
-/// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
+/// Serde support for [`Hsla`] as a hex string: `#RRGGBB` when opaque,
+/// `#RRGGBBAA` when translucent. Round-trips through gpui's [`gpui::Rgba`]
+/// `FromStr`, so any format it accepts parses.
+mod hex_color {
+    use gpui::{Hsla, Rgba};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(color: &Hsla, serializer: S) -> Result<S::Ok, S::Error> {
+        let rgba = Rgba::from(*color);
+        let [r, g, b, a] = [rgba.r, rgba.g, rgba.b, rgba.a].map(|v| (v * 255.0).round() as u8);
+        let hex = if a == 255 {
+            format!("#{r:02X}{g:02X}{b:02X}")
+        } else {
+            format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+        };
+        serializer.serialize_str(&hex)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Hsla, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let rgba = Rgba::try_from(text.as_str()).map_err(serde::de::Error::custom)?;
+        Ok(Hsla::from(rgba))
+    }
+
+    pub fn serialize_option<S: Serializer>(
+        color: &Option<Hsla>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match color {
+            Some(color) => serialize(color, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize_option<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Hsla>, D::Error> {
+        let text = Option::<String>::deserialize(deserializer)?;
+        match text {
+            None => Ok(None),
+            Some(text) => {
+                let rgba = Rgba::try_from(text.as_str()).map_err(serde::de::Error::custom)?;
+                Ok(Some(Hsla::from(rgba)))
+            }
+        }
+    }
+}
+
+/// One theme's palette as plain data — every paint token of [`Theme`], plus the
+/// optional glass overrides, serializable to JSON with hex colors.
+///
+/// This is the unit the registry and (later) on-disk custom themes traffic in;
+/// [`Theme`] itself stays the runtime view (adds fonts + appearance and the
+/// derived-glass methods).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeColors {
+    // ---- paint: neutral surfaces ----
+    #[serde(with = "hex_color")]
+    pub bg: Hsla,
+    #[serde(with = "hex_color")]
+    pub surface: Hsla,
+    #[serde(with = "hex_color")]
+    pub surface_raised: Hsla,
+    // ---- paint: elevation ladder ----
+    #[serde(with = "hex_color")]
+    pub surface_card: Hsla,
+    #[serde(with = "hex_color")]
+    pub surface_dialog: Hsla,
+    #[serde(with = "hex_color")]
+    pub surface_overlay: Hsla,
+    #[serde(with = "hex_color")]
+    pub element_hover: Hsla,
+    #[serde(with = "hex_color")]
+    pub element_active: Hsla,
+    #[serde(with = "hex_color")]
+    pub border: Hsla,
+    #[serde(with = "hex_color")]
+    pub border_strong: Hsla,
+    // ---- paint: text ----
+    #[serde(with = "hex_color")]
+    pub text: Hsla,
+    #[serde(with = "hex_color")]
+    pub text_muted: Hsla,
+    #[serde(with = "hex_color")]
+    pub text_faint: Hsla,
+    #[serde(with = "hex_color")]
+    pub text_dim: Hsla,
+    // ---- paint: high-contrast solid ----
+    #[serde(with = "hex_color")]
+    pub solid: Hsla,
+    #[serde(with = "hex_color")]
+    pub on_solid: Hsla,
+    // ---- paint: accents ----
+    #[serde(with = "hex_color")]
+    pub accent: Hsla,
+    #[serde(with = "hex_color")]
+    pub accent_strong: Hsla,
+    #[serde(with = "hex_color")]
+    pub on_accent: Hsla,
+    #[serde(with = "hex_color")]
+    pub danger: Hsla,
+    #[serde(with = "hex_color")]
+    pub danger_muted: Hsla,
+    #[serde(with = "hex_color")]
+    pub warning: Hsla,
+    #[serde(with = "hex_color")]
+    pub warning_muted: Hsla,
+    #[serde(with = "hex_color")]
+    pub success: Hsla,
+    #[serde(with = "hex_color")]
+    pub busy: Hsla,
+    #[serde(with = "hex_color")]
+    pub success_muted: Hsla,
+    // ---- paint: components ----
+    #[serde(with = "hex_color")]
+    pub surface_raised_hover: Hsla,
+    #[serde(with = "hex_color")]
+    pub band: Hsla,
+    #[serde(with = "hex_color")]
+    pub input_bg: Hsla,
+    #[serde(with = "hex_color")]
+    pub selection: Hsla,
+    #[serde(with = "hex_color")]
+    pub cursor: Hsla,
+    #[serde(with = "hex_color")]
+    pub caret: Hsla,
+    #[serde(with = "hex_color")]
+    pub danger_strong: Hsla,
+    // ---- paint: code & diff ----
+    #[serde(with = "hex_color")]
+    pub code_text: Hsla,
+    #[serde(with = "hex_color")]
+    pub code_wash: Hsla,
+    #[serde(serialize_with = "syntax_serialize", deserialize_with = "syntax_deserialize")]
+    pub syntax: SyntaxPalette,
+    #[serde(with = "hex_color")]
+    pub diff_add: Hsla,
+    #[serde(with = "hex_color")]
+    pub diff_del: Hsla,
+    #[serde(with = "hex_color")]
+    pub diff_hunk_bg: Hsla,
+    // ---- glass overrides ----
+    /// Frost tint over the blurred desktop. `None` derives from [`Self::surface`]
+    /// at the platform frost alpha; built-in palettes pin their sampled greys so
+    /// stock appearances stay pixel-identical.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "hex_color::serialize_option",
+        deserialize_with = "hex_color::deserialize_option"
+    )]
+    pub glass_tint: Option<Hsla>,
+    /// Translucent tint floating cards paint over their backdrop blur. `None`
+    /// keeps the per-appearance recipe in [`Theme::glass_overlay`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "hex_color::serialize_option",
+        deserialize_with = "hex_color::deserialize_option"
+    )]
+    pub glass_overlay_tint: Option<Hsla>,
+}
+
+fn syntax_serialize<S: Serializer>(syntax: &SyntaxPalette, serializer: S) -> Result<S::Ok, S::Error> {
+    syntax.serialize(serializer)
+}
+
+fn syntax_deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SyntaxPalette, D::Error> {
+    SyntaxPalette::deserialize(deserializer)
+}
+
+impl ThemeColors {
+    /// Stock dark palette. Surface tones are sampled straight from the
+    /// reference screenshots of the original app (docs/reference): main panel
+    /// `#060606`, shell/sidebar `#0d0d0d`. `glass_tint` pins the sampled
+    /// frost grey so stock dark stays pixel-identical to the pre-theme build.
+    pub fn stock_dark() -> Self {
+        Self {
+            bg: grey(6),       // main panel — sampled #060606
+            surface: grey(13), // shell / sidebar — sampled #0d0d0d
+            surface_raised: neutral(0.235),
+            surface_card: grey(0x0e),
+            surface_dialog: grey(0x10),
+            surface_overlay: grey(0x16),
+            element_hover: hsla(0.0, 0.0, 0.92, 0.11),
+            element_active: hsla(0.0, 0.0, 0.92, 0.16),
+            border: hsla(0.0, 0.0, 1.0, 0.08),
+            border_strong: hsla(0.0, 0.0, 1.0, 0.14),
+            text: neutral(0.922),       // ~neutral-200
+            text_muted: neutral(0.708), // ~neutral-400
+            text_faint: neutral(0.556), // ~neutral-500
+            text_dim: grey(0x98),
+            solid: neutral(0.922),                       // near-white plate
+            on_solid: grey(0x0e),                        // near-black label
+            accent: oklch(0.673, 0.182, 276.935),        // indigo-400
+            accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
+            on_accent: neutral(0.985),
+            danger: oklch(0.704, 0.191, 22.216),       // red-400
+            danger_muted: oklch(0.808, 0.114, 19.571), // red-300
+            warning: oklch(0.828, 0.189, 84.429),      // amber-400
+            warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
+            success: oklch(0.765, 0.177, 163.223),     // emerald-400
+            busy: oklch(0.718, 0.202, 349.761),        // pink-400
+            success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
+            surface_raised_hover: neutral(0.29),
+            band: band_for(Appearance::Dark),
+            input_bg: hsla(0.0, 0.0, 1.0, 0.03),
+            selection: hsla(0.66, 0.6, 0.55, 0.35),
+            cursor: hsla(0.0, 0.0, 1.0, 0.35),
+            caret: hsla(0.66, 0.7, 0.7, 1.0),
+            danger_strong: oklch(0.58, 0.16, 25.0),
+            code_text: oklch(0.811, 0.111, 293.571), // violet-300
+            code_wash: oklch(0.702, 0.183, 293.541).opacity(0.12), // violet-400/12
+            syntax: SyntaxPalette::dark(neutral(0.922), neutral(0.60), oklch(0.704, 0.191, 22.216)),
+            diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
+            diff_del: oklch(0.704, 0.191, 22.216),  // red-400
+            diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
+            glass_tint: Some(grey(8)),
+            glass_overlay_tint: None,
+        }
+    }
+
+    /// Stock light palette.
+    pub fn stock_light() -> Self {
+        Self {
+            bg: grey(0xff), // main panel — clean white
+            // Deeper than ~neutral-100 looks on paper: the content card is pure
+            // white and sits *inside* this surface, so too small a step leaves
+            // the whole window one flat sheet with a hairline drawn on it.
+            surface: neutral(0.968),
+            // A real grey, NOT white. This is the opaque-plate tone — user
+            // message bubbles, the jump-to-bottom pill — and those sit directly
+            // on the white content plane with no border or shadow to save them.
+            // White here made the user's own messages vanish into the page.
+            surface_raised: neutral(0.940),
+            surface_card: grey(0xff),
+            surface_dialog: grey(0xff),
+            surface_overlay: grey(0xff),
+            element_hover: hsla(0.0, 0.0, 0.10, 0.06),
+            element_active: hsla(0.0, 0.0, 0.10, 0.10),
+            border: hsla(0.0, 0.0, 0.0, 0.10),
+            border_strong: hsla(0.0, 0.0, 0.0, 0.17),
+            // ~neutral-850. Backing off from pure neutral-900 keeps the same
+            // perceived weight as the dark theme rather than maximum contrast.
+            text: neutral(0.25),
+            text_muted: neutral(0.439), // ~neutral-600 → ~7.7:1
+            text_faint: neutral(0.535),
+            text_dim: neutral(0.50),
+            solid: neutral(0.205),    // near-black plate, deeper than body text
+            on_solid: neutral(0.985), // near-white label
+            accent: oklch(0.511, 0.262, 276.966), // indigo-600
+            accent_strong: oklch(0.511, 0.262, 276.966), // indigo-600 fill
+            on_accent: neutral(0.985),
+            danger: oklch(0.577, 0.245, 27.325),        // red-600
+            danger_muted: oklch(0.505, 0.213, 27.518),  // red-700
+            warning: oklch(0.555, 0.163, 48.998),       // amber-700 — carries 12px text
+            warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
+            success: oklch(0.596, 0.145, 163.225),      // emerald-600
+            busy: oklch(0.592, 0.249, 0.584),           // pink-600
+            success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
+            // Opaque pills darken on hover here rather than brighten — same
+            // "brighten the plate, don't wash it out" rule, read the other way.
+            surface_raised_hover: neutral(0.900),
+            band: band_for(Appearance::Light),
+            input_bg: grey(0xff),
+            selection: hsla(0.66, 0.75, 0.62, 0.28),
+            cursor: hsla(0.0, 0.0, 0.0, 0.55),
+            caret: hsla(0.66, 0.78, 0.42, 1.0),
+            danger_strong: oklch(0.51, 0.20, 25.0),
+            code_text: oklch(0.491, 0.27, 292.581), // violet-700
+            code_wash: oklch(0.541, 0.281, 293.009).opacity(0.10), // violet-600/10
+            syntax: SyntaxPalette::light(neutral(0.25), neutral(0.48), oklch(0.505, 0.213, 27.518)),
+            diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
+            diff_del: oklch(0.577, 0.245, 27.325),  // red-600
+            diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
+            glass_tint: Some(grey(0xfa)),
+            glass_overlay_tint: None,
+        }
+    }
+}
+
+/// The app theme. Built from a [`ThemeColors`] palette plus fonts; the stock
+/// instances are [`Theme::dark`] and [`Theme::light`].
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// Registry id of the palette this theme was built from (e.g.
+    /// `"zeron-dark"`). Used to detect actual theme changes in
+    /// [`crate::appearance::apply`] and to persist the selection.
+    pub id: SharedString,
+    /// Human-readable name (Settings picker label).
+    pub name: SharedString,
     /// Which appearance these tokens were built for.
     pub appearance: Appearance,
 
@@ -420,6 +737,12 @@ pub struct Theme {
     /// Explicit system fallbacks, for callers that want to skip the lookup.
     pub font_sans_fallback: SharedString,
     pub font_mono_fallback: SharedString,
+
+    // ---- glass overrides (from the palette; see [`ThemeColors::glass_tint`]) ----
+    /// `None` = derived from [`Self::surface`] at the frost alpha.
+    pub glass_tint: Option<Hsla>,
+    /// `None` = the per-appearance recipe in [`Self::glass_overlay`].
+    pub glass_overlay_tint: Option<Hsla>,
 }
 
 impl Theme {
@@ -485,7 +808,9 @@ impl Theme {
         match self.appearance {
             Appearance::Dark => {
                 if Self::GLASS_ALPHA < 1.0 {
-                    grey(8).opacity(Self::GLASS_ALPHA)
+                    self.frost_tint()
+                        .unwrap_or(self.surface)
+                        .opacity(Self::GLASS_ALPHA)
                 } else {
                     self.surface
                 }
@@ -495,12 +820,23 @@ impl Theme {
                     // 0xfa, not the surface's 0xf4-ish grey: at 90% coverage
                     // the tint IS the sidebar tone, and the darker grey read
                     // as a dingy pane next to the white content card.
-                    grey(0xfa).opacity(Self::GLASS_ALPHA_LIGHT)
+                    // (Built-in palettes pin that grey via `glass_tint`; an
+                    // un-overridden theme falls back to its own surface.)
+                    self.frost_tint()
+                        .unwrap_or(self.surface)
+                        .opacity(Self::GLASS_ALPHA_LIGHT)
                 } else {
                     self.surface
                 }
             }
         }
+    }
+
+    /// The frost tint from the palette, when one is pinned. `None` means
+    /// "derive" — [`Self::glass`] falls back to [`Self::surface`], so a custom
+    /// theme gets coherent glass without knowing anything about vibrancy.
+    fn frost_tint(&self) -> Option<Hsla> {
+        self.glass_tint
     }
 
     /// Whether this appearance paints translucent chrome over the blurred
@@ -552,6 +888,9 @@ impl Theme {
     /// ghosting over whatever sat behind the popover, so light coverage
     /// steps up to keep rows on a known background.
     pub fn glass_overlay(&self) -> Hsla {
+        if let Some(tint) = self.glass_overlay_tint {
+            return tint;
+        }
         match self.appearance {
             Appearance::Dark => oklch(0.33, 0.0, 0.0).opacity(0.34),
             Appearance::Light => self.surface_overlay.opacity(0.85),
@@ -608,131 +947,121 @@ impl Theme {
         }
     }
 
-    /// Build the dark theme. The surface tones are sampled straight from the
-    /// reference screenshots of the original app (docs/reference): main panel
-    /// `#060606`, shell/sidebar `#0d0d0d`.
+    /// Build the dark theme from the stock palette (see [`ThemeColors::stock_dark`]).
     pub fn dark() -> Self {
-        Self {
-            appearance: Appearance::Dark,
-            bg: grey(6),       // main panel — sampled #060606
-            surface: grey(13), // shell / sidebar — sampled #0d0d0d
-            surface_raised: neutral(0.235),
-            surface_card: grey(0x0e),
-            surface_dialog: grey(0x10),
-            surface_overlay: grey(0x16),
-            element_hover: hsla(0.0, 0.0, 0.92, 0.11),
-            element_active: hsla(0.0, 0.0, 0.92, 0.16),
-            border: hsla(0.0, 0.0, 1.0, 0.08),
-            border_strong: hsla(0.0, 0.0, 1.0, 0.14),
-            text: neutral(0.922),       // ~neutral-200
-            text_muted: neutral(0.708), // ~neutral-400
-            text_faint: neutral(0.556), // ~neutral-500
-            text_dim: grey(0x98),
-            solid: neutral(0.922),                       // near-white plate
-            on_solid: grey(0x0e),                        // near-black label
-            accent: oklch(0.673, 0.182, 276.935),        // indigo-400
-            accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
-            on_accent: neutral(0.985),
-            danger: oklch(0.704, 0.191, 22.216),       // red-400
-            danger_muted: oklch(0.808, 0.114, 19.571), // red-300
-            warning: oklch(0.828, 0.189, 84.429),      // amber-400
-            warning_muted: oklch(0.924, 0.12, 95.746), // amber-200
-            success: oklch(0.765, 0.177, 163.223),     // emerald-400
-            busy: oklch(0.718, 0.202, 349.761),        // pink-400
-            success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
-            surface_raised_hover: neutral(0.29),
-            band: band_for(Appearance::Dark),
-            input_bg: hsla(0.0, 0.0, 1.0, 0.03),
-            selection: hsla(0.66, 0.6, 0.55, 0.35),
-            cursor: hsla(0.0, 0.0, 1.0, 0.35),
-            caret: hsla(0.66, 0.7, 0.7, 1.0),
-            danger_strong: oklch(0.58, 0.16, 25.0),
-            code_text: oklch(0.811, 0.111, 293.571), // violet-300
-            code_wash: oklch(0.702, 0.183, 293.541).opacity(0.12), // violet-400/12
-            syntax: SyntaxPalette::dark(neutral(0.922), neutral(0.60), oklch(0.704, 0.191, 22.216)),
-            diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
-            diff_del: oklch(0.704, 0.191, 22.216),  // red-400
-            diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
-            font_sans: "Geist".into(),
-            font_mono: "Geist Mono".into(),
-            font_sans_fallback: system_sans().into(),
-            font_mono_fallback: system_mono().into(),
-        }
+        Self::from_colors(
+            ThemeColors::stock_dark(),
+            crate::themes::STOCK_DARK,
+            "Zeron Dark",
+            Appearance::Dark,
+        )
     }
 
-    /// Build the light theme.
-    ///
-    /// Neutrals are the same oklch scale read from the other end, but the *roles*
-    /// are reassigned rather than mirrored (see the module docs): content plane
-    /// white, chrome grey, raised surfaces white-plus-shadow. Text tones are
-    /// picked to reproduce the dark theme's contrast ratios, and accents drop
-    /// from the 400 to the 600 step at identical hue so they clear WCAG AA on
-    /// white instead of glowing.
+    /// Build the light theme (see [`ThemeColors::stock_light`]).
     pub fn light() -> Self {
+        Self::from_colors(
+            ThemeColors::stock_light(),
+            crate::themes::STOCK_LIGHT,
+            "Zeron Light",
+            Appearance::Light,
+        )
+    }
+
+    /// Build a runtime theme from palette data. Fonts are app-level choices,
+    /// not palette — every theme shares the same families.
+    pub fn from_colors(colors: ThemeColors, id: &str, name: &str, appearance: Appearance) -> Self {
+        let ThemeColors {
+            bg,
+            surface,
+            surface_raised,
+            surface_card,
+            surface_dialog,
+            surface_overlay,
+            element_hover,
+            element_active,
+            border,
+            border_strong,
+            text,
+            text_muted,
+            text_faint,
+            text_dim,
+            solid,
+            on_solid,
+            accent,
+            accent_strong,
+            on_accent,
+            danger,
+            danger_muted,
+            warning,
+            warning_muted,
+            success,
+            busy,
+            success_muted,
+            surface_raised_hover,
+            band,
+            input_bg,
+            selection,
+            cursor,
+            caret,
+            danger_strong,
+            code_text,
+            code_wash,
+            syntax,
+            diff_add,
+            diff_del,
+            diff_hunk_bg,
+            glass_tint,
+            glass_overlay_tint,
+        } = colors;
         Self {
-            appearance: Appearance::Light,
-            bg: grey(0xff), // main panel — clean white
-            // Deeper than ~neutral-100 looks on paper: the content card is pure
-            // white and sits *inside* this surface, so too small a step leaves the
-            // whole window one flat sheet with a hairline drawn on it.
-            surface: neutral(0.968),
-            // A real grey, NOT white. This is the opaque-plate tone — user
-            // message bubbles, the jump-to-bottom pill — and those sit directly
-            // on the white content plane with no border or shadow to save them.
-            // White here made the user's own messages vanish into the page.
-            // Popovers do not use this; they have their own ladder below.
-            surface_raised: neutral(0.940),
-            surface_card: grey(0xff),
-            surface_dialog: grey(0xff),
-            surface_overlay: grey(0xff),
-            element_hover: hsla(0.0, 0.0, 0.10, 0.06),
-            element_active: hsla(0.0, 0.0, 0.10, 0.10),
-            border: hsla(0.0, 0.0, 0.0, 0.10),
-            border_strong: hsla(0.0, 0.0, 0.0, 0.17),
-            // ~neutral-850. Pure neutral-900 measures 17.9:1 on white — *more*
-            // contrast than dark mode's 16.1:1, which reads as harsh rather than
-            // crisp. Backing off to 0.25 lands at ~16:1: the same perceived
-            // weight as the dark theme, not the maximum available.
-            text: neutral(0.25),
-            text_muted: neutral(0.439), // ~neutral-600 → ~7.7:1
-            // A touch darker than dark mode's neutral-500 counterpart: the light
-            // sidebar is a real grey, and faint text has to clear its floor there
-            // too, not just on the white content plane.
-            text_faint: neutral(0.535),
-            text_dim: neutral(0.50),
-            solid: neutral(0.205),    // near-black plate, deeper than body text
-            on_solid: neutral(0.985), // near-white label
-            accent: oklch(0.511, 0.262, 276.966), // indigo-600
-            accent_strong: oklch(0.511, 0.262, 276.966), // indigo-600 fill
-            on_accent: neutral(0.985),
-            danger: oklch(0.577, 0.245, 27.325),        // red-600
-            danger_muted: oklch(0.505, 0.213, 27.518),  // red-700
-            warning: oklch(0.555, 0.163, 48.998),       // amber-700 — carries 12px text
-            warning_muted: oklch(0.473, 0.137, 46.201), // amber-800
-            success: oklch(0.596, 0.145, 163.225),      // emerald-600
-            busy: oklch(0.592, 0.249, 0.584),           // pink-600
-            success_muted: oklch(0.508, 0.118, 165.612), // emerald-700
-            // Opaque pills darken on hover here rather than brighten — same
-            // "brighten the plate, don't wash it out" rule, read the other way.
-            surface_raised_hover: neutral(0.900),
-            // A recessed strip on white needs far less ink than on near-black;
-            // the dark 16% would read as a bruise.
-            band: band_for(Appearance::Light),
-            input_bg: grey(0xff),
-            selection: hsla(0.66, 0.75, 0.62, 0.28),
-            cursor: hsla(0.0, 0.0, 0.0, 0.55),
-            caret: hsla(0.66, 0.78, 0.42, 1.0),
-            danger_strong: oklch(0.51, 0.20, 25.0),
-            code_text: oklch(0.491, 0.27, 292.581), // violet-700
-            code_wash: oklch(0.541, 0.281, 293.009).opacity(0.10), // violet-600/10
-            syntax: SyntaxPalette::light(neutral(0.25), neutral(0.48), oklch(0.505, 0.213, 27.518)),
-            diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
-            diff_del: oklch(0.577, 0.245, 27.325),  // red-600
-            diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
+            id: id.into(),
+            name: name.into(),
+            appearance,
+            bg,
+            surface,
+            surface_raised,
+            surface_card,
+            surface_dialog,
+            surface_overlay,
+            element_hover,
+            element_active,
+            border,
+            border_strong,
+            text,
+            text_muted,
+            text_faint,
+            text_dim,
+            solid,
+            on_solid,
+            accent,
+            accent_strong,
+            on_accent,
+            danger,
+            danger_muted,
+            warning,
+            warning_muted,
+            success,
+            busy,
+            success_muted,
+            surface_raised_hover,
+            band,
+            input_bg,
+            selection,
+            cursor,
+            caret,
+            danger_strong,
+            code_text,
+            code_wash,
+            syntax,
+            diff_add,
+            diff_del,
+            diff_hunk_bg,
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
             font_mono_fallback: system_mono().into(),
+            glass_tint,
+            glass_overlay_tint,
         }
     }
 
@@ -744,12 +1073,22 @@ impl Theme {
         }
     }
 
-    /// Install the theme for `appearance` as the gpui global and point the
-    /// context-free paint helpers at it. The **only** way the appearance should
-    /// change — setting the global directly leaves [`current_appearance`] stale.
+    /// Install the stock theme for `appearance`. See [`Self::install_theme`].
     pub fn install(appearance: Appearance, cx: &mut App) {
-        set_current_appearance(appearance);
-        cx.set_global(Self::for_appearance(appearance));
+        Self::install_theme(Self::for_appearance(appearance), cx);
+    }
+
+    /// Install a concrete theme as the gpui global and point the context-free
+    /// paint helpers at its appearance. The **only** way the palette should
+    /// change — setting the global directly leaves [`current_appearance`] stale.
+    pub fn install_theme(theme: Self, cx: &mut App) {
+        set_current_appearance(theme.appearance);
+        // Bump the generation even when the appearance did not move: caches
+        // keyed on content alone (the markdown renderer's cross-frame TextRun
+        // cache bakes an Hsla into every run) must drop on ANY palette swap,
+        // including dark-theme → different-dark-theme.
+        THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+        cx.set_global(theme);
     }
 
     /// Read the theme global.
@@ -1696,5 +2035,107 @@ mod tests {
         assert_eq!(Theme::HEADER_HEIGHT, 44.0); // h-11
         assert_eq!(Theme::STATUS_STRIP_HEIGHT, 24.0); // h-6
         assert_eq!(Theme::BUBBLE_RADIUS, 16.0);
+    }
+
+    #[test]
+    fn theme_colors_round_trip_through_json() {
+        // Hex quantizes to 1/255 and HSL↔RGB conversion rounds, so compare
+        // with a per-component tolerance instead of exact equality.
+        fn assert_close(label: &str, a: Hsla, b: Hsla) {
+            let eps = 0.005;
+            assert!((a.h - b.h).abs() < eps, "{label}: hue {} vs {}", a.h, b.h);
+            assert!((a.s - b.s).abs() < eps, "{label}: sat {} vs {}", a.s, b.s);
+            assert!(
+                (a.l - b.l).abs() < eps,
+                "{label}: lightness {} vs {}",
+                a.l,
+                b.l
+            );
+            assert!((a.a - b.a).abs() < eps, "{label}: alpha {} vs {}", a.a, b.a);
+        }
+
+        for stock in [ThemeColors::stock_dark(), ThemeColors::stock_light()] {
+            let json = serde_json::to_string(&stock).unwrap();
+            let parsed: ThemeColors = serde_json::from_str(&json).unwrap();
+            assert_close("bg", parsed.bg, stock.bg);
+            assert_close("surface", parsed.surface, stock.surface);
+            assert_close("accent", parsed.accent, stock.accent);
+            assert_close(
+                "element_hover",
+                parsed.element_hover,
+                stock.element_hover,
+            );
+            assert_close(
+                "syntax.keyword",
+                parsed.syntax.keyword,
+                stock.syntax.keyword,
+            );
+            assert_eq!(parsed.glass_tint, stock.glass_tint);
+            assert_eq!(parsed.glass_overlay_tint, stock.glass_overlay_tint);
+            // Hex, not floats — the file format humans read and edit.
+            assert!(json.contains("\"bg\":\"#"), "{json}");
+        }
+    }
+
+    #[test]
+    fn translucent_tokens_serialize_with_alpha_hex() {
+        // Dark input_bg is a 3% white wash — must not round-trip as opaque.
+        let json = serde_json::to_string(&ThemeColors::stock_dark()).unwrap();
+        assert!(json.contains("#FFFFFF08") || json.contains("#ffffff08"), "{json}");
+    }
+
+    #[test]
+    fn missing_fields_and_unknown_ids_fall_back_to_stock() {
+        use crate::themes;
+
+        // Omitted glass overrides parse back as None (derive, not pin).
+        let minimal = r##"{"bg":"#060606","surface":"#0d0d0d","surfaceRaised":"#3b3b3b","surfaceCard":"#0e0e0e","surfaceDialog":"#101010","surfaceOverlay":"#161616","elementHover":"#ebebeb1c","elementActive":"#ebebeb29","border":"#ffffff14","borderStrong":"#ffffff24","text":"#ebebeb","textMuted":"#b4b4b4","textFaint":"#8e8e8e","textDim":"#989898","solid":"#ebebeb","onSolid":"#0e0e0e","accent":"#7c86ff","accentStrong":"#5c6aff","onAccent":"#fbfbfb","danger":"#ff6467","dangerMuted":"#ffa199","warning":"#ffb900","warningMuted":"#ffe599","success":"#34d399","busy":"#f472b6","successMuted":"#6ee7b7","surfaceRaisedHover":"#4a4a4a","band":"#00000029","inputBg":"#ffffff08","selection":"#59b2f259","cursor":"#ffffff59","caret":"#b3d4fc","dangerStrong":"#e5484d","codeText":"#c4b5fd","codeWash":"#a78bfa1f","syntax":{"comment":"#999999","keyword":"#7c82d9","string":"#35c493","stringSpecial":"#e08cc9","escape":"#e08cc9","number":"#ffc53d","boolean":"#ffc53d","typeName":"#ffc53d","typeBuiltin":"#35c493","constructor":"#ffc53d","function":"#7c82d9","functionBuiltin":"#e08cc9","macroName":"#e08cc9","property":"#ffc53d","constant":"#35c493","variable":"#ebebeb","variableSpecial":"#e08cc9","parameter":"#ebebeb","operator":"#ebebeb","punctuation":"#ebebeb","tag":"#e08cc9","attribute":"#ffc53d","label":"#ffc53d","invalid":"#ff6467"},"diffAdd":"#34d399","diffDel":"#ff6467","diffHunkBg":"#8fa4e60d"}"##;
+        let parsed: ThemeColors = serde_json::from_str(minimal).unwrap();
+        assert_eq!(parsed.glass_tint, None);
+        assert_eq!(parsed.glass_overlay_tint, None);
+
+        // Unknown id and appearance mismatch both degrade to stock.
+        assert_eq!(themes::resolve(Some("nope"), Appearance::Dark).id, themes::STOCK_DARK);
+        assert_eq!(
+            themes::resolve(Some(themes::STOCK_LIGHT), Appearance::Dark).id,
+            themes::STOCK_DARK
+        );
+        assert_eq!(themes::resolve(None, Appearance::Light).id, themes::STOCK_LIGHT);
+    }
+
+    #[test]
+    fn built_in_glass_pins_sampled_tints_custom_derives_from_surface() {
+        if Theme::GLASS_ALPHA >= 1.0 {
+            // Opaque platform: frost is off; glass() IS the surface either way.
+            assert_eq!(Theme::dark().glass(), Theme::dark().surface);
+            return;
+        }
+        // Built-ins pin their sampled frost greys (pixel-identical to the
+        // pre-theme build).
+        assert_eq!(Theme::dark().glass(), grey(8).opacity(Theme::GLASS_ALPHA));
+        assert_eq!(
+            Theme::light().glass(),
+            grey(0xfa).opacity(Theme::GLASS_ALPHA_LIGHT)
+        );
+
+        // A palette without an override derives its frost from its own surface,
+        // so custom themes get coherent glass for free.
+        let mut custom = ThemeColors::stock_dark();
+        custom.glass_tint = None;
+        let theme = Theme::from_colors(custom, "x", "X", Appearance::Dark);
+        assert_eq!(theme.glass(), theme.surface.opacity(Theme::GLASS_ALPHA));
+    }
+
+    #[test]
+    fn glass_overlay_override_wins_recipe_stays_default() {
+        // Default (None): the per-appearance recipe — surface_overlay at 85%.
+        let stock = Theme::light();
+        assert_eq!(stock.glass_overlay(), stock.surface_overlay.opacity(0.85));
+
+        let mut colors = ThemeColors::stock_light();
+        let tint = hsla(0.55, 0.3, 0.4, 0.5);
+        colors.glass_overlay_tint = Some(tint);
+        let theme = Theme::from_colors(colors, "x", "X", Appearance::Light);
+        assert_eq!(theme.glass_overlay(), tint);
     }
 }

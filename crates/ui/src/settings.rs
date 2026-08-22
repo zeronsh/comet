@@ -98,6 +98,12 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Which theme paints for the dark appearance. `None` = stock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark_theme: Option<String>,
+    /// Which theme paints for the light appearance. `None` = stock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light_theme: Option<String>,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
     /// Preferred editor id for opening thread checkouts. `None` follows the
@@ -126,6 +132,8 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            dark_theme: None,
+            light_theme: None,
             diff_split: false,
             preferred_editor: None,
         }
@@ -392,6 +400,8 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            dark_theme: Some("zeron-dark".into()),
+            light_theme: Some("catppuccin-latte".into()),
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
