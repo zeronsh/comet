@@ -22,11 +22,11 @@ mod client;
 pub mod device_room;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
-    encode_device_frame,
+    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenSource, decode_device_frame,
+    device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
 
@@ -40,6 +40,17 @@ pub mod methods {
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
+    /// command entry (client-minted id and all) straight over the device-room
+    /// link when its chat2 rows can't reach the edge but the host's peer link
+    /// is alive. The host claims the id in its processed ledger before
+    /// executing, so the doc row arriving later dedupes to a no-op —
+    /// exactly-once by construction. Params `{chatId, entry}`.
+    pub const RELAY_COMMAND: &str = "RelayCommand";
+    /// User-driven delivery retry for a chat with unadopted queued sends:
+    /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
+    /// per pending command. Params `{chatId}`; IPC-only.
+    pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
@@ -50,6 +61,14 @@ pub mod methods {
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
     pub const SYNC_STATUS: &str = "SyncStatus";
+    /// Pushed edge-connectivity posture (`zeron_proto::Connectivity`):
+    /// current value first, then every change — the connection pill /
+    /// composer-honesty / queued-badge feed. No params; IPC-only.
+    pub const WATCH_CONNECTIVITY: &str = "WatchConnectivity";
+    /// In-flight queued-attachment transfers (`zeron_proto::TransferProgress`
+    /// list): current set first, then a fresh snapshot per landed chunk —
+    /// the sending thumbnail's percent-ring feed. No params; IPC-only.
+    pub const WATCH_TRANSFERS: &str = "WatchTransfers";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
@@ -96,6 +115,8 @@ pub mod methods {
     pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
+    /// The device's browse roots: home plus mounted drives/volumes.
+    pub const LIST_DRIVES: &str = "ListDrives";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
@@ -109,6 +130,8 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    /// Current pull request for one checkout, resolved on the checkout's host device.
+    pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
@@ -218,8 +241,43 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Mutex;
 
     struct TestService;
+
+    struct CancelAwareService {
+        dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RpcService for CancelAwareService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+                return Err(RpcError::UnknownMethod(method.into()));
+            }
+            let guard = DropSignal(self.dropped.lock().unwrap().take());
+            let stream = futures::stream::unfold(guard, |guard| async move {
+                let item = std::future::pending::<Option<(serde_json::Value, DropSignal)>>().await;
+                drop(guard);
+                item
+            });
+            Ok(RpcReply::Stream(stream.boxed()))
+        }
+    }
 
     #[async_trait]
     impl RpcService for TestService {
@@ -275,6 +333,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+    }
+
+    #[tokio::test]
+    async fn checked_stream_acknowledges_support_and_preserves_unknown_method() {
+        let client = memory_client(Arc::new(TestService));
+
+        let mut items = client
+            .subscribe_checked("Count", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        assert_eq!(items.recv().await, Some(serde_json::json!(0)));
+        assert_eq!(items.recv().await, None);
+
+        let error = match client
+            .subscribe_checked("FutureStream", serde_json::Value::Null)
+            .await
+        {
+            Ok(_) => panic!("old service must reject unknown stream"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RpcError::UnknownMethod(method) if method == "FutureStream"));
+    }
+
+    #[tokio::test]
+    async fn dropping_checked_subscription_cancels_pending_server_stream() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let client = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        }));
+        let stream = client
+            .subscribe_checked(
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("server stream cancelled")
+            .expect("drop signal");
     }
 
     #[tokio::test]

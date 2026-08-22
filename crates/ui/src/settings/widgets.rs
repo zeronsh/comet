@@ -7,6 +7,12 @@ use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
 use crate::theme::{Theme, ink};
 
+/// Shared typography for a settings component's title and description. The
+/// Shortcuts page established this compact rhythm; list-style settings reuse
+/// it instead of drifting by page.
+pub const ROW_TITLE_SIZE: f32 = 13.0;
+pub const ROW_DESCRIPTION_SIZE: f32 = 12.0;
+
 /// Centered page column: `mx-auto w-full max-w-3xl px-6 pb-16 pt-8`.
 pub fn page_column() -> gpui::Div {
     div()
@@ -201,29 +207,30 @@ pub fn row_tile(theme: &Theme, icon_path: &'static str) -> gpui::Div {
         )
 }
 
-/// Row title: `text-[13.5px] font-medium leading-tight`.
+/// Row title. These metrics intentionally match the Shortcuts rows, whose
+/// title/description rhythm is the reference for the other settings cards.
 pub fn row_title(theme: &Theme, title: impl Into<SharedString>) -> gpui::Div {
     div()
         .min_w_0()
         .truncate()
-        .text_size(px(13.5))
+        .text_size(px(ROW_TITLE_SIZE))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.text)
         .child(title.into())
 }
 
-/// The quiet meta line under a row title: `text-[11.5px]
+/// The quiet meta line under a row title: `text-[12px]
 /// text-muted-foreground/65` fragments joined by dots.
 pub fn meta_line(theme: &Theme, fragments: Vec<AnyElement>) -> gpui::Div {
     let mut line = div()
-        .mt(px(4.0))
+        .mt(px(Theme::TEXT_STACK_GAP))
         .flex()
         .flex_row()
         .flex_wrap()
         .items_center()
         .gap_x(px(8.0))
         .gap_y(px(2.0))
-        .text_size(px(11.5))
+        .text_size(px(ROW_DESCRIPTION_SIZE))
         .text_color(theme.text_muted.opacity(0.65));
     let mut first = true;
     for fragment in fragments {

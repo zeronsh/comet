@@ -172,6 +172,7 @@ impl TitleGenerator {
                 auto_approve: true,
                 attachments: Vec::new(),
                 resume: None,
+                worktree: None,
             };
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {

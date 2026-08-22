@@ -192,7 +192,7 @@ await devB.connect();
   let wsRejected = false;
   try { const c = new Client("devX", userB); await c.connect(); await c.waitClose(3000); wsRejected = true; } catch { wsRejected = true; }
   check("other user WS → rejected", wsRejected);
-  const cpB = await http(`/chat2/${chat}/checkpoint?seqCovered=1`, { method: "POST", user: userB, headers: { "x-chat2-frontier": "" }, body: new Uint8Array([1]) });
+  const cpB = await http(`/chat2/${chat}/checkpoint?seqCovered=1`, { method: "POST", user: userB, headers: { "x-chat2-frontier": Buffer.from([1, 2, 3]).toString("base64") }, body: new Uint8Array([1]) });
   check("other user checkpoint POST → 403", cpB.status === 403, `got ${cpB.status}`);
 }
 
@@ -213,12 +213,14 @@ const ckpt = new Uint8Array(randomBytes(300 * 1024));
   check("Range resume → 206 correct slice", part.status === 206 && part.headers.get("content-range") === `bytes 100000-${ckpt.length - 1}/${ckpt.length}` && eqBytes(partBytes, ckpt.subarray(100000)), `${part.status} ${part.headers.get("content-range")}`);
   const past = await http(`/chat2/${chat}/checkpoint`, { headers: { range: `bytes=${ckpt.length}-` } });
   check("Range past end → 416", past.status === 416, `got ${past.status}`);
-  const reg = await http(`/chat2/${chat}/checkpoint?seqCovered=4`, { method: "POST", headers: { "x-chat2-frontier": "" }, body: new Uint8Array([1]) });
+  const reg = await http(`/chat2/${chat}/checkpoint?seqCovered=4`, { method: "POST", headers: { "x-chat2-frontier": Buffer.from([1, 2, 3]).toString("base64") }, body: new Uint8Array([1]) });
   check("floor regression → 409", reg.status === 409 && (await reg.json()).error === "floor_regression");
-  const ahead = await http(`/chat2/${chat}/checkpoint?seqCovered=99`, { method: "POST", headers: { "x-chat2-frontier": "" }, body: new Uint8Array([1]) });
+  const ahead = await http(`/chat2/${chat}/checkpoint?seqCovered=99`, { method: "POST", headers: { "x-chat2-frontier": Buffer.from([1, 2, 3]).toString("base64") }, body: new Uint8Array([1]) });
   check("ahead of head → 409", ahead.status === 409 && (await ahead.json()).error === "ahead_of_head");
-  const empty = await http(`/chat2/${chat}/checkpoint?seqCovered=5`, { method: "POST", headers: { "x-chat2-frontier": "" }, body: new Uint8Array(0) });
+  const empty = await http(`/chat2/${chat}/checkpoint?seqCovered=5`, { method: "POST", headers: { "x-chat2-frontier": Buffer.from([1, 2, 3]).toString("base64") }, body: new Uint8Array(0) });
   check("empty checkpoint → 409", empty.status === 409);
+  const emptyFrontier = await http(`/chat2/${chat}/checkpoint?seqCovered=5`, { method: "POST", headers: { "x-chat2-frontier": "" }, body: new Uint8Array([1]) });
+  check(emptyFrontier.status === 400, "empty frontier on a content checkpoint rejected (parked-rows poison, 2026-08-18)");
   const badFrontier = await http(`/chat2/${chat}/checkpoint?seqCovered=5`, { method: "POST", headers: { "x-chat2-frontier": "!!!not-base64!!!" }, body: new Uint8Array([1]) });
   check("malformed frontier → 400", badFrontier.status === 400, `got ${badFrontier.status}`);
   const fresh = new Client("devC", userA);

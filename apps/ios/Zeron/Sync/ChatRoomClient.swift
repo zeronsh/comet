@@ -20,7 +20,7 @@ import os
 /// Sync must never fail silently (2026-07-31: a send that never left the
 /// device was indistinguishable from a working one — `try?` all the way
 /// down). Visible in Console.app / `log stream` under this subsystem.
-let roomLog = Logger(subsystem: "sh.zeron.Zeron", category: "sync")
+let roomLog = Logger(subsystem: "sh.zeron.ios", category: "sync")
 
 enum ChatRoomEvent: Sendable {
     /// Joined (or re-joined) and the initial catch-up (checkpoint if needed +
@@ -42,7 +42,11 @@ actor ChatRoomClient {
     static let probeQuietNs: UInt64 = 900_000_000_000  // 15min quiet-room probe
     static let livenessTickNs: UInt64 = 1_000_000_000
     static let backoffBaseMs = 250
-    static let backoffCapMs = 30_000
+    static let backoffCapMs = 16_000
+    /// Stability-gated backoff reset (chat_client.rs STABLE_RESET): only a
+    /// session that joined AND survived this long resets backoff to base —
+    /// reset-on-join let connect-and-die sockets hot-loop at 250ms forever.
+    static let stableResetNs: UInt64 = 30_000_000_000
     /// Re-push cadence after a `quota` rejection (server window is 60s).
     static let quotaRetryNs: UInt64 = 5_000_000_000
     /// Client-side push cap: the DO's per-row cap (1 MiB) minus frame-header
@@ -59,6 +63,15 @@ actor ChatRoomClient {
         var applyCheckpoint: @MainActor @Sendable (Data, UInt64) -> Bool
         var applyRow: @MainActor @Sendable (Data, UInt64) -> Void
         var advanceCursor: @MainActor @Sendable (UInt64) -> Void
+        /// Cursor amnesty: lower the cursor to the checkpoint seq (no-op if
+        /// already at or below). See the once-per-session clamp in
+        /// handleState/pullSync.
+        var clampCursor: @MainActor @Sendable (UInt64) -> Void
+        /// Assign the cursor outright — the catch-up plan's `after` IS the
+        /// cursor, down (server reset / amnesty) or UP (a contained
+        /// checkpoint covers the skipped span; without the raise the
+        /// backfill's first row reads as a contiguity gap).
+        var setCursor: @MainActor @Sendable (UInt64) -> Void
         var event: @MainActor @Sendable (ChatRoomEvent) -> Void
     }
 
@@ -74,15 +87,51 @@ actor ChatRoomClient {
     private let device: String
     private let urlProvider: @Sendable () async -> URL?
     private let checkpointRequest: @Sendable () async -> URLRequest?
+    /// GET /chat2/{id}/rows?after= — the HTTPS pull twin of the backfill.
+    private let rowsRequest: @Sendable (UInt64) async -> URLRequest?
+    /// POST /chat2/{id}/rows?batchId= — the HTTPS push twin.
+    private let pushRequest: @Sendable (String) async -> URLRequest?
     private let delegate: Delegate
 
     private var socket: URLSessionWebSocketTask?
+    private var pullTask: Task<Void, Never>?
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var livenessTask: Task<Void, Never>?
     private var quotaTask: Task<Void, Never>?
     private var pending: [PendingPush] = []
+    /// State frame received on the CURRENT socket — pushes are legal from
+    /// here (the server accepts them any time post-hello; batchId dedupe).
+    private var stateReceived = false
+    /// Non-nil while a checkpoint downloads in parallel with the row
+    /// backfill: row/rowsDone frames land here and replay after the import.
+    private var checkpointBuffer: [ChatWireFrame]?
+    /// One checkpoint download at a time, and it OUTLIVES socket redials: on
+    /// a saturated link the WS silence lease can trip mid-download (pongs
+    /// queue behind the blob), and discarding the bytes on every redial
+    /// looped a fresh-chat open forever (NLC Edge, 2026-08-17).
+    private var fetchInFlight = false
+    /// Once-per-client cursor amnesty (see handleState): a cursor above the
+    /// room's checkpoint is re-verified by refetching the rows above it.
+    private var cursorAmnestyDone = false
+    /// A row/ack arrived with `seq > cursor + 1`: rows exist that this client
+    /// never received (live broadcast outran the backfill — the mid-join
+    /// race). The cursor must NOT skip the hole (skipped rows' dependents
+    /// park invisibly in loro's pending buffer and the doc reads empty
+    /// forever — the 2026-08-19 empty-doc/advanced-cursor wedge); the flag
+    /// asks for a rowsReq backfill from the honest cursor.
+    private var gapRepair = false
+    /// Repairs this SESSION — exhaustion forces a redial (full catch-up).
+    private var gapRepairs = 0
+    /// Partial download preserved across fetch attempts (Range-resumed).
+    private var partialCheckpoint = Data()
+    private var partialCheckpointSeq: String?
+    /// Bytes moved on the checkpoint stream recently — download progress IS
+    /// liveness while it runs; the silence lease defers to it.
+    private var checkpointProgressAt: DispatchTime?
     private var joined = false
+    /// When the current session joined — feeds the stability-gated reset.
+    private var joinedAt: DispatchTime?
     private var closed = false
     private var generation = 0
     private var backoffMs = ChatRoomClient.backoffBaseMs
@@ -104,11 +153,15 @@ actor ChatRoomClient {
          device: String,
          urlProvider: @escaping @Sendable () async -> URL?,
          checkpointRequest: @escaping @Sendable () async -> URLRequest?,
+         rowsRequest: @escaping @Sendable (UInt64) async -> URLRequest?,
+         pushRequest: @escaping @Sendable (String) async -> URLRequest?,
          delegate: Delegate) {
         self.chatId = chatId
         self.device = device
         self.urlProvider = urlProvider
         self.checkpointRequest = checkpointRequest
+        self.rowsRequest = rowsRequest
+        self.pushRequest = pushRequest
         self.delegate = delegate
     }
 
@@ -117,12 +170,145 @@ actor ChatRoomClient {
     func start() {
         closed = false
         connect()
+        // Pull-first bootstrap + poll-while-unjoined: one HTTPS GET catches
+        // the doc up in ~1 RTT while the socket spends 4+ on TLS + upgrade +
+        // hello — and on networks that strip WS upgrades (airplane wifi) the
+        // 20s poll is the transport, delivering reads AND queued sends.
+        pullTask?.cancel()
+        pullTask = Task { [weak self] in
+            await self?.pullSync()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if await self.shouldPoll() { await self.pullSync() }
+            }
+        }
+    }
+
+    /// One HTTPS sync cycle: flush pending batches (POST — batchId dedupe
+    /// makes replays no-ops), then pull rows (GET) and apply them through the
+    /// exact frame path the socket uses. The airplane-wifi transport.
+    func pullSync() async {
+        guard !closed else { return }
+        // Push first, so a message typed on dead wifi leaves the device on
+        // this cycle rather than the next.
+        for push in pending {
+            guard var request = await pushRequest(push.batchId) else {
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): http push skipped — no URL (token unavailable)")
+                break
+            }
+            request.httpBody = push.bytes
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse else {
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): http push transport error; will retry")
+                break
+            }
+            if http.statusCode == 200,
+               let ack = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let seq = (ack["seq"] as? NSNumber)?.uint64Value {
+                pending.removeAll { $0.batchId == push.batchId }
+                // Contiguity rule (see the socket ACK path): a jump would
+                // stamp the cursor over interleaved rows we never pulled —
+                // hold, and this cycle's pull below walks the gap.
+                let cursor = await delegate.cursor()
+                if seq <= cursor + 1 {
+                    await delegate.advanceCursor(seq)
+                } else {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): http ack gap (seq=\(seq), cursor=\(cursor)); holding cursor")
+                }
+            } else if let err = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let code = err["error"] as? String,
+                      ["bad_push", "too_large", "empty"].contains(code) {
+                // Permanent verdict — and provably OUR edge's (a parsed error
+                // code, not a middlebox's arbitrary 4xx: captive portals
+                // answer POSTs with junk statuses, and retiring a real
+                // message batch on one would silently drop the send on
+                // exactly the networks this path exists for). Retire, same
+                // as the WS error-frame path; the ops stay in the local doc.
+                roomLog.error("chat2 \(self.chatId, privacy: .public): http push rejected (\(code, privacy: .public)); retiring batch")
+                pending.removeAll { $0.batchId == push.batchId }
+            } else {
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): http push http=\(http.statusCode); will retry")
+                break  // quota/transient/middlebox: retry next cycle
+            }
+        }
+        let after = await delegate.cursor()
+        guard let request = await rowsRequest(after) else {
+            roomLog.warning("chat2 \(self.chatId, privacy: .public): http pull skipped — no URL (token unavailable)")
+            return
+        }
+        let fetched = try? await URLSession.shared.data(for: request)
+        guard let (body, response) = fetched, let http = response as? HTTPURLResponse else {
+            roomLog.warning("chat2 \(self.chatId, privacy: .public): http pull transport error; will retry")
+            return
+        }
+        guard http.statusCode == 200 else {
+            roomLog.warning("chat2 \(self.chatId, privacy: .public): http pull http=\(http.statusCode); will retry")
+            return
+        }
+        // u32-LE length-prefixed frames: state first, then rows, rowsDone.
+        var frames: [ChatWireFrame] = []
+        var off = 0
+        while off + 4 <= body.count {
+            let len = body.subdata(in: off..<(off + 4)).withUnsafeBytes {
+                Int($0.loadUnaligned(as: UInt32.self).littleEndian)
+            }
+            off += 4
+            guard off + len <= body.count else { break }
+            if let frame = ChatWire.decode(body.subdata(in: off..<(off + len))) {
+                frames.append(frame)
+            }
+            off += len
+        }
+        guard let stateFrame = frames.first, stateFrame.kind == ChatFrameType.state,
+              let state = ChatStateHeader(stateFrame.header) else {
+            roomLog.error("chat2 \(self.chatId, privacy: .public): http pull body malformed (\(body.count)B, \(frames.count) frames)")
+            return
+        }
+        if !cursorAmnestyDone {
+            cursorAmnestyDone = true
+            await delegate.clampCursor(state.checkpointSize > 0 ? state.checkpointSeq : 0)
+        }
+        let planAfter = await delegate.cursor()
+        var contained = state.checkpointSize == 0
+        if !contained {
+            contained = await delegate.containsFrontier(stateFrame.payload)
+        }
+        if case .checkpointThenRows = chatPlanCatchUp(cursor: planAfter, state: state,
+                                                      frontierContained: contained) {
+            // The local doc lacks the checkpoint's frontier. Route through
+            // completeCheckpointFetch — NOT an inline fetch: the socket
+            // handshake may race this pull, see fetchInFlight set, skip its
+            // own fetch, and arm checkpointBuffer expecting the completion
+            // path to drain it. An inline fetch satisfied the guard but
+            // never drained, stranding every socket row in the buffer until
+            // the backfill deadline ("chat frozen", 2026-08-18).
+            guard !fetchInFlight else { return }  // socket's fetch owns it
+            fetchInFlight = true
+            await completeCheckpointFetch(seq: state.checkpointSeq)
+            guard !closed else { return }
+            guard await delegate.containsFrontier(stateFrame.payload) else {
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): http pull — frontier still missing after checkpoint; will retry")
+                return
+            }
+        }
+        guard !closed else { return }
+        for frame in frames.dropFirst()
+        where frame.kind == ChatFrameType.row || frame.kind == ChatFrameType.rowsDone {
+            await applyRowFrame(frame)
+        }
+    }
+
+    private func shouldPoll() -> Bool {
+        !closed && !joined
     }
 
     func stop() {
         closed = true
         generation += 1
         cancelTasks()
+        pullTask?.cancel()
+        pullTask = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         joined = false
@@ -143,7 +329,7 @@ actor ChatRoomClient {
             return
         }
         pending.append(PendingPush(batchId: UUID().uuidString.lowercased(), bytes: update))
-        if joined {
+        if stateReceived {
             Task { await self.pushPending() }
         }
     }
@@ -187,9 +373,13 @@ actor ChatRoomClient {
         generation += 1
         let gen = generation
         joined = false
+        stateReceived = false
+        checkpointBuffer = nil
         helloSentAt = nil
         backfillStartedAt = nil
         probeSentAt = nil
+        gapRepair = false
+        gapRepairs = 0
         lastProtocolRx = .now()
         for ix in pending.indices {
             pending[ix].inFlight = false
@@ -201,7 +391,7 @@ actor ChatRoomClient {
                 // confusing silent failure: everything cached renders,
                 // nothing syncs. Say so and back off.
                 roomLog.error("chat2 \(self.chatId, privacy: .public): no socket URL (token unavailable); backing off")
-                await self.scheduleReconnect(gen: gen)
+                self.scheduleReconnect(gen: gen)
                 return
             }
             await self.openSocket(url: url, gen: gen)
@@ -271,11 +461,21 @@ actor ChatRoomClient {
         socket?.cancel(with: .abnormalClosure, reason: nil)
         socket = nil
         cancelTasks()
+        // Stability-gated reset: only a session that survived ≥30s earns a
+        // fresh 250ms; a connect-and-die session keeps growing the backoff.
+        if let joinedAt,
+           DispatchTime.now().uptimeNanoseconds - joinedAt.uptimeNanoseconds
+               >= ChatRoomClient.stableResetNs {
+            backoffMs = ChatRoomClient.backoffBaseMs
+        }
+        joinedAt = nil
         let delay = backoffMs
         backoffMs = min(backoffMs * 2, ChatRoomClient.backoffCapMs)
         Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
-            await self.connect()
+            // Parked while the OS path is offline; cut short by any online
+            // event (a sibling dial success, path recovery, focus probe).
+            await OnlineBus.shared.waitBackoff(ms: delay)
+            self.connect()
         }
     }
 
@@ -284,7 +484,14 @@ actor ChatRoomClient {
     private func pingTick(gen: Int) async {
         guard gen == generation, let socket else { return }
         let silence = DispatchTime.now().uptimeNanoseconds - lastInbound.uptimeNanoseconds
-        if silence > ChatRoomClient.silenceLeaseNs {
+        // A checkpoint download that is still moving bytes owns the pipe —
+        // pongs queueing behind it are not a dead socket. The 120s backfill
+        // deadline stays as the true backstop.
+        let fetchMoving = checkpointProgressAt.map {
+            DispatchTime.now().uptimeNanoseconds - $0.uptimeNanoseconds
+                < ChatRoomClient.silenceLeaseNs
+        } ?? false
+        if silence > ChatRoomClient.silenceLeaseNs, !fetchMoving {
             roomLog.warning("chat2 \(self.chatId, privacy: .public): socket silent past lease; treating as dead")
             await onSocketError(gen: gen)
             return
@@ -350,34 +557,36 @@ actor ChatRoomClient {
         case ChatFrameType.state:
             await handleState(frame, gen: gen)
 
-        case ChatFrameType.row:
-            guard let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return }
-            // Own-device rows can still arrive (first-backfill redownload, a
-            // racing second socket) — Loro re-import is a no-op; the cursor
-            // advance is what matters.
-            await delegate.applyRow(frame.payload, seq)
-
-        case ChatFrameType.rowsDone:
-            guard backfillStartedAt != nil else { return }
-            backfillStartedAt = nil
-            let wasResumed = resumed
-            resumed = true
-            joined = true
-            backoffMs = ChatRoomClient.backoffBaseMs
-            roomLog.info("chat2 \(self.chatId, privacy: .public): joined (converged, resumed=\(wasResumed))")
-            await delegate.event(.connected)
-            // Anything pending (offline writes, reconnect re-pushes) goes
-            // now — the server's batchId dedupe makes replays exact no-ops.
-            await pushPending()
+        case ChatFrameType.row, ChatFrameType.rowsDone:
+            // Rows landing while a checkpoint downloads in parallel wait for
+            // the import (their seqs are all past the checkpoint; applying
+            // them first would advance the cursor past state the doc doesn't
+            // hold if the fetch then dies).
+            if checkpointBuffer != nil {
+                checkpointBuffer?.append(frame)
+                return
+            }
+            await applyRowFrame(frame)
+            await maybeRepairGap(gen: gen)
 
         case ChatFrameType.ack:
             guard let batchId = frame.header["batchId"] as? String,
                   let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return }
             pending.removeAll { $0.batchId == batchId }
-            await delegate.advanceCursor(seq)
+            // Contiguity rule, ack flavor: our own batch landing at `seq`
+            // proves rows up to seq exist SERVER-side, not that we have the
+            // interleaved ones from other devices.
+            let cursor = await delegate.cursor()
+            if seq > cursor + 1 {
+                gapRepair = true
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): ack gap (seq=\(seq), cursor=\(cursor)); holding cursor and requesting backfill")
+            } else {
+                await delegate.advanceCursor(seq)
+            }
             // A grant after a quota rejection: drain whatever the error
             // handler un-flagged (sparse mobile queues — no livelock risk).
             await pushPending()
+            await maybeRepairGap(gen: gen)
 
         case ChatFrameType.probeOk:
             break  // liveness proven; clocks already advanced above
@@ -418,29 +627,159 @@ actor ChatRoomClient {
         if !contained {
             contained = await delegate.containsFrontier(frame.payload)
         }
-        let plan = chatPlanCatchUp(cursor: cursor, state: state, frontierContained: contained)
+        // Cursor amnesty, once per client: a cursor above the checkpoint seq
+        // claims history the doc may have silently parked and dropped (the
+        // "Add Tweets" wedge). Clamp and refetch — no-op re-imports, KB cost,
+        // converts a lying cursor into a true one. Checkpoint-LESS rooms
+        // amnesty to ZERO (PR #172): the same parked-import wedge with no
+        // checkpoint to clamp to; refetching the whole log is bounded by the
+        // checkpoint threshold policy (a room past ~200 rows/512KB HAS a
+        // checkpoint), so this is the cheap universal heal for every
+        // already-wedged chat on disk.
+        if !cursorAmnestyDone {
+            cursorAmnestyDone = true
+            await delegate.clampCursor(state.checkpointSize > 0 ? state.checkpointSeq : 0)
+        }
+        let planCursor = await delegate.cursor()
+        let plan = chatPlanCatchUp(cursor: planCursor, state: state, frontierContained: contained)
+        stateReceived = true
         let after: UInt64
         switch plan {
         case .rowsOnly(let a):
             after = a
         case .checkpointThenRows(let a):
-            roomLog.info("chat2 \(self.chatId, privacy: .public): fetching checkpoint (seq=\(state.checkpointSeq), \(state.checkpointSize)B)")
-            guard let bytes = await fetchCheckpoint(), gen == generation, !closed else {
-                if gen == generation, !closed {
-                    roomLog.warning("chat2 \(self.chatId, privacy: .public): checkpoint fetch failed; redialing")
-                    await onSocketError(gen: gen)
-                }
-                return
-            }
-            guard await delegate.applyCheckpoint(bytes, state.checkpointSeq) else {
-                roomLog.error("chat2 \(self.chatId, privacy: .public): checkpoint import failed; redialing")
-                await onSocketError(gen: gen)
-                return
+            // Fetch in PARALLEL with the row backfill: the rows request goes
+            // out below immediately, rows landing mid-download buffer (see
+            // handleInbound), and the import + replay happen when the bytes
+            // arrive. On a thin link the checkpoint download IS the join
+            // time; serializing download → rows pushed "joined" back by the
+            // whole blob.
+            roomLog.info("chat2 \(self.chatId, privacy: .public): fetching checkpoint (seq=\(state.checkpointSeq), \(state.checkpointSize)B, rows in parallel)")
+            checkpointBuffer = []
+            // One download per chat, and it survives redials: a new session
+            // that still needs the checkpoint just re-arms the buffer and
+            // waits for the in-flight fetch to land.
+            if !fetchInFlight {
+                fetchInFlight = true
+                let seq = state.checkpointSeq
+                Task { await self.completeCheckpointFetch(seq: seq) }
             }
             after = a
         }
+        // The plan's `after` IS the cursor now — down (server reset /
+        // amnesty already applied) or UP (a contained checkpoint covers the
+        // skipped span). Without the raise, the backfill's first row
+        // (`after + 1`) reads as a contiguity gap against a stale cursor.
+        await delegate.setCursor(after)
         await send(ChatWire.encode(ChatFrameType.rowsReq,
                                    header: ["after": after, "excludeOwn": resumed]))
+        // Pending pushes go before catch-up completes: batchId dedupe makes
+        // replays no-ops and rows are CRDT-commutative, so a message written
+        // offline flushes ~2 RTTs after the socket lands instead of waiting
+        // out the whole checkpoint + backfill.
+        await pushPending()
+    }
+
+    /// Second half of the parallel checkpoint fetch: import the blob, then
+    /// replay the rows that buffered while it downloaded. Deliberately NOT
+    /// generation-guarded on the apply: the blob's content is socket-
+    /// independent (CRDT import, cursor advances via max), so a download
+    /// that outlived its socket still becomes progress — the next session's
+    /// frontier check finds it contained and joins RowsOnly instead of
+    /// starting the download over.
+    private func completeCheckpointFetch(seq: UInt64) async {
+        let bytes = await fetchCheckpoint()
+        fetchInFlight = false
+        checkpointProgressAt = nil
+        guard !closed else { return }
+        guard let bytes else {
+            // Redial only if a session is actually waiting on this blob
+            // (buffer armed) — a stale failure must not kill a healthy
+            // RowsOnly session that no longer needs it.
+            if checkpointBuffer != nil {
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): checkpoint fetch failed (partial kept); redialing")
+                checkpointBuffer = nil
+                await onSocketError(gen: generation)
+            }
+            return
+        }
+        guard await delegate.applyCheckpoint(bytes, seq), !closed else {
+            if !closed {
+                roomLog.error("chat2 \(self.chatId, privacy: .public): checkpoint import failed; redialing")
+                checkpointBuffer = nil
+                await onSocketError(gen: generation)
+            }
+            return
+        }
+        while let frame = checkpointBuffer?.first {
+            checkpointBuffer?.removeFirst()
+            await applyRowFrame(frame)
+            guard !closed else { return }
+        }
+        checkpointBuffer = nil
+        await maybeRepairGap(gen: generation)
+    }
+
+    /// One backfill/broadcast frame: a row, or the ROWS_DONE terminator.
+    /// Factored out so frames buffered during a parallel checkpoint fetch
+    /// replay through exactly the live path.
+    private func applyRowFrame(_ frame: ChatWireFrame) async {
+        if frame.kind == ChatFrameType.row {
+            guard let seq = (frame.header["seq"] as? NSNumber)?.uint64Value else { return }
+            // Own-device rows can still arrive (first-backfill redownload, a
+            // racing second socket) — Loro re-import is a no-op; the cursor
+            // advance is what matters.
+            //
+            // CONTIGUITY RULE (PR #172): the cursor claims "every row ≤
+            // cursor is reflected in the doc", so it may only walk, never
+            // jump. A gap means rows we never received (live broadcast
+            // mid-join) — apply the bytes (loro parks dependents
+            // harmlessly), hold the honest cursor, and ask for a backfill
+            // repair. Skipping the hole was the random new-session
+            // forever-hang: an empty doc under an advanced cursor.
+            let cursor = await delegate.cursor()
+            if seq > cursor + 1 {
+                gapRepair = true
+                roomLog.warning("chat2 \(self.chatId, privacy: .public): row gap (seq=\(seq), cursor=\(cursor)); holding cursor and requesting backfill")
+                await delegate.applyRow(frame.payload, cursor)
+            } else {
+                await delegate.applyRow(frame.payload, seq)
+            }
+            return
+        }
+        guard backfillStartedAt != nil else { return }
+        backfillStartedAt = nil
+        let wasResumed = resumed
+        resumed = true
+        joined = true
+        joinedAt = .now()
+        roomLog.info("chat2 \(self.chatId, privacy: .public): joined (converged, resumed=\(wasResumed))")
+        // One recovered socket un-parks the whole fleet's backoffs.
+        OnlineBus.shared.notifyOnline()
+        await delegate.event(.connected)
+        // Anything not yet in flight goes now — the server's batchId dedupe
+        // makes replays exact no-ops.
+        await pushPending()
+    }
+
+    /// If a row/ack gap was flagged, request a backfill from the honest
+    /// cursor. Bounded per session: a gap the server can't fill (should be
+    /// impossible below the checkpoint floor) forces a redial, whose full
+    /// catch-up is the stronger repair. The HTTP pull path needs no send —
+    /// its next cycle re-requests from the held cursor.
+    private func maybeRepairGap(gen: Int) async {
+        guard gapRepair, gen == generation, socket != nil, stateReceived else { return }
+        gapRepair = false
+        gapRepairs += 1
+        guard gapRepairs <= 3 else {
+            roomLog.warning("chat2 \(self.chatId, privacy: .public): gap repairs exhausted; redialing for a full catch-up")
+            await onSocketError(gen: gen)
+            return
+        }
+        let after = await delegate.cursor()
+        roomLog.info("chat2 \(self.chatId, privacy: .public): backfilling over a row gap (after=\(after), attempt \(self.gapRepairs))")
+        await send(ChatWire.encode(ChatFrameType.rowsReq,
+                                   header: ["after": after, "excludeOwn": false]))
     }
 
     private func handleErrorFrame(_ header: [String: Any], gen: Int) async {
@@ -481,7 +820,7 @@ actor ChatRoomClient {
     // MARK: Outbound
 
     private func pushPending() async {
-        guard joined else { return }
+        guard stateReceived else { return }
         for ix in pending.indices where !pending[ix].inFlight {
             pending[ix].inFlight = true
             let push = pending[ix]
@@ -512,10 +851,20 @@ actor ChatRoomClient {
     /// response with the checkpoint's seq, and a mid-download replacement
     /// restarts from 0 (a Range against a new blob would splice two blobs).
     private func fetchCheckpoint() async -> Data? {
-        var got = Data()
-        var seenSeq: String?
+        // Resume from any partial a previous attempt (even a previous
+        // SOCKET generation) left behind — starting a slow blob over from
+        // zero on every hiccup is how a thin link never converges.
+        var got = partialCheckpoint
+        var seenSeq: String? = partialCheckpointSeq
+        func keepPartial() {
+            partialCheckpoint = got
+            partialCheckpointSeq = seenSeq
+        }
         for _ in 0..<4 {
-            guard var request = await checkpointRequest() else { return nil }
+            guard var request = await checkpointRequest() else {
+                keepPartial()
+                return nil
+            }
             if !got.isEmpty {
                 request.setValue("bytes=\(got.count)-", forHTTPHeaderField: "Range")
             }
@@ -536,18 +885,27 @@ actor ChatRoomClient {
             case 206: break
             default:
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): checkpoint HTTP \(http.statusCode)")
+                keepPartial()
                 return nil
             }
             do {
                 for try await byte in stream {
                     got.append(byte)
+                    // Download progress is liveness (see pingTick) — stamp
+                    // it every 8KB, not every byte.
+                    if got.count & 0x1FFF == 0 {
+                        checkpointProgressAt = .now()
+                    }
                 }
+                partialCheckpoint = Data()
+                partialCheckpointSeq = nil
                 return got
             } catch {
                 // Mid-body drop: keep the bytes, resume via Range.
                 roomLog.warning("chat2 \(self.chatId, privacy: .public): checkpoint stream dropped at \(got.count)B; resuming")
             }
         }
+        keepPartial()
         return nil
     }
 }

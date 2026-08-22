@@ -32,7 +32,7 @@ pub struct HarnessDescriptor {
     pub installed: bool,
     /// Whether the listing device offers this harness (Settings → Agents).
     /// `None` — the catalog came from an engine predating the setting — means
-    /// "unknown": consumers fall back to [`default_enabled`] membership.
+    /// "unknown": consumers fall back to detection (see [`descriptor_enabled`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
@@ -41,18 +41,21 @@ fn default_installed() -> bool {
     true
 }
 
-/// The out-of-the-box enabled set: Claude Code and Codex only; every other
-/// harness is opt-in from Settings → Agents.
-pub fn default_enabled() -> Vec<HarnessId> {
-    vec![HarnessId::ClaudeCode, HarnessId::Codex]
+/// Whether detection alone may switch a harness on. The mock always "resolves"
+/// but is a test rig, and counting it would let the last real agent be turned
+/// off (the composer needs something it can actually run); the dev rig opts it
+/// in through `COMET_HARNESS=mock`, which bypasses enablement in the pickers.
+fn auto_enabled(id: HarnessId) -> bool {
+    id != HarnessId::Mock
 }
 
-/// A descriptor's effective enabled flag ([`default_enabled`] membership when
-/// the catalog predates the setting).
+/// A descriptor's effective enabled flag. `None` — a catalog from an engine
+/// predating the setting — falls back to detection, the same rule new devices
+/// start from (see [`HarnessRegistry::enabled_set`]).
 pub fn descriptor_enabled(descriptor: &HarnessDescriptor) -> bool {
     descriptor
         .enabled
-        .unwrap_or_else(|| default_enabled().contains(&descriptor.id))
+        .unwrap_or_else(|| descriptor.installed && auto_enabled(descriptor.id))
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -71,7 +74,13 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct HarnessPrefsFile {
-    /// `None` = the user never touched the setting → the default set.
+    /// The user's explicit opt-OUTS. Enablement otherwise follows detection,
+    /// so the file only records "no" — an agent installed later turns itself
+    /// on without a trip to Settings.
+    disabled: Vec<HarnessId>,
+    /// The allow-list written back when enablement was a fixed default set.
+    /// Read once, folded into `disabled`, and never written again.
+    #[serde(skip_serializing)]
     enabled: Option<Vec<HarnessId>>,
 }
 
@@ -139,11 +148,37 @@ impl HarnessRegistry {
             .prefs_path
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(path);
+        self.migrate_legacy_prefs();
     }
 
-    /// The enabled set in effect (the default set until the user edits it).
+    /// Fold a legacy allow-list into the opt-out shape: a registered harness
+    /// missing from it was a deliberate "no", so it stays off. Rewrites the
+    /// file once, which is what lets later installs auto-enable.
+    fn migrate_legacy_prefs(&self) {
+        let legacy = { self.prefs().enabled.take() };
+        let Some(legacy) = legacy else { return };
+        let registered: Vec<HarnessId> = self.order().iter().copied().collect();
+        let disabled: Vec<HarnessId> = registered
+            .into_iter()
+            .filter(|id| auto_enabled(*id) && !legacy.contains(id))
+            .collect();
+        self.prefs().disabled = disabled;
+        self.persist_prefs();
+    }
+
+    /// What this device offers: every harness whose CLI is FOUND, minus the
+    /// user's explicit opt-outs. Enablement follows detection, so installing
+    /// an agent is all it takes for it to appear in the composer.
     pub fn enabled_set(&self) -> Vec<HarnessId> {
-        self.prefs().enabled.clone().unwrap_or_else(default_enabled)
+        // Both guards drop before the installed probes run: `descriptors()`
+        // takes `slots` then `order`, so holding `order` across a probe (which
+        // takes `slots`) would invert the lock order.
+        let registered: Vec<HarnessId> = self.order().iter().copied().collect();
+        let disabled = self.prefs().disabled.clone();
+        registered
+            .into_iter()
+            .filter(|id| auto_enabled(*id) && !disabled.contains(id) && self.installed_for(*id))
+            .collect()
     }
 
     /// Whether this device's CLI probe passes for `id` (no spawn, no resolve).
@@ -157,26 +192,34 @@ impl HarnessRegistry {
 
     /// Flip one harness's enablement and persist. Refuses unknown harnesses,
     /// enabling one whose CLI is missing (the settings gate, enforced where
-    /// the state lives), and disabling the last enabled harness.
+    /// the state lives), and disabling the last enabled harness — under
+    /// detection-based enablement everything enabled is runnable, so the
+    /// last one standing is always worth protecting (the composer needs
+    /// something to run). A harness whose CLI is missing is never enabled
+    /// in the first place, so turning it off is a clean no-op.
     pub fn set_enabled(&self, id: HarnessId, on: bool) -> Result<(), String> {
         if !self.slots().contains_key(&id) {
             return Err(format!("unknown harness {id:?}"));
         }
+        if on && !auto_enabled(id) {
+            return Err(format!("{id:?} cannot be enabled from Settings"));
+        }
         if on && !self.installed_for(id) {
             return Err(format!("{id:?} CLI is not installed on this device"));
         }
-        let mut set = self.enabled_set();
-        match (on, set.contains(&id)) {
-            (true, false) => set.push(id),
+        let enabled = self.enabled_set();
+        match (on, enabled.contains(&id)) {
+            (true, false) => {
+                self.prefs().disabled.retain(|h| *h != id);
+            }
             (false, true) => {
-                if set.len() == 1 {
+                if enabled.len() == 1 {
                     return Err("cannot disable the last enabled harness".into());
                 }
-                set.retain(|h| *h != id);
+                self.prefs().disabled.push(id);
             }
             _ => return Ok(()),
         }
-        self.prefs().enabled = Some(set);
         self.persist_prefs();
         Ok(())
     }
@@ -334,8 +377,8 @@ pub fn default_registry() -> HarnessRegistry {
             name: "Claude Code".into(),
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
-            // Must mirror AcpHarness::claude()'s spec exactly — the
-            // descriptor-stability rule (see the codex test below).
+            // Must mirror ClaudeHarness exactly — the descriptor-stability
+            // rule (see the codex test below).
             reasoning_levels: vec![
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
@@ -346,8 +389,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::claude().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
     // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
     // exactly (`describe()` after the first resolve must not change the
@@ -373,13 +416,12 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::codex().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::CodexHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
-    // Cursor Agent over ACP (`cursor-agent acp`), same lazy pattern: the
-    // static descriptor mirrors AcpHarness::cursor() exactly. No steering
-    // extension (turn boundaries) and no effort ladder — Cursor bakes effort
-    // into the model id's bracket suffix instead of a `thought_level` option.
+    // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
+    // subagent transcripts), same lazy pattern: the static descriptor mirrors
+    // CursorHarness exactly. Turn-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Cursor,
@@ -390,8 +432,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::cursor().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::cursor()) as Arc<dyn Harness>)),
+        Box::new(|| zeron_harness::CursorHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
@@ -454,6 +496,30 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
+    // opencode over ACP (`opencode acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::opencode() exactly. No steering
+    // extension (turn boundaries) and no effort ladder — opencode exposes no
+    // thought_level config over ACP today (effort stays per-model in its own
+    // config).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Opencode,
+            name: "OpenCode".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -510,7 +576,8 @@ mod tests {
                 HarnessId::Cursor,
                 HarnessId::Grok,
                 HarnessId::Hermes,
-                HarnessId::Pi
+                HarnessId::Pi,
+                HarnessId::Opencode
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -544,6 +611,20 @@ mod tests {
         assert_eq!(hermes.display_name(), "Hermes");
         assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
         assert!(hermes.reasoning_levels().is_empty());
+        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
+        assert_eq!(opencode.id(), HarnessId::Opencode);
+        assert_eq!(opencode.display_name(), "OpenCode");
+        assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            opencode.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
@@ -563,7 +644,7 @@ mod tests {
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`
     /// fields must keep deserializing — installed, and enabled per the
-    /// default-set fallback (Claude Code yes, Grok no).
+    /// detection fallback.
     #[test]
     fn descriptor_without_new_fields_parses_with_fallbacks() {
         let parse = |id: &str| -> HarnessDescriptor {
@@ -581,8 +662,14 @@ mod tests {
         let claude = parse("claude-code");
         assert!(claude.installed);
         assert_eq!(claude.enabled, None);
+        // Unknown enablement follows detection: a found CLI is offered...
         assert!(descriptor_enabled(&claude));
-        assert!(!descriptor_enabled(&parse("grok")));
+        // ...and one this device never found is not.
+        let missing = HarnessDescriptor {
+            installed: false,
+            ..parse("grok")
+        };
+        assert!(!descriptor_enabled(&missing));
     }
 
     /// A registry slot for the tests below: installed probe fixed, factory
@@ -616,7 +703,8 @@ mod tests {
         test_slot(&registry, HarnessId::Grok, true);
         test_slot(&registry, HarnessId::Hermes, false);
 
-        // Default set stamped: Claude Code + Codex on, the rest off.
+        // Enablement follows detection: the three found CLIs are on with no
+        // prefs file at all, and the missing one is off.
         let flags: Vec<(HarnessId, Option<bool>)> = registry
             .descriptors()
             .into_iter()
@@ -627,7 +715,7 @@ mod tests {
             vec![
                 (HarnessId::ClaudeCode, Some(true)),
                 (HarnessId::Codex, Some(true)),
-                (HarnessId::Grok, Some(false)),
+                (HarnessId::Grok, Some(true)),
                 (HarnessId::Hermes, Some(false)),
             ]
         );
@@ -635,6 +723,7 @@ mod tests {
         // The gate: a missing CLI can't be enabled; unknown ids refuse.
         assert!(registry.set_enabled(HarnessId::Hermes, true).is_err());
         assert!(registry.set_enabled(HarnessId::Pi, true).is_err());
+        assert!(registry.set_enabled(HarnessId::Mock, true).is_err());
         // Installed CLIs toggle both ways; no-op flips are fine.
         registry.set_enabled(HarnessId::Grok, true).unwrap();
         registry.set_enabled(HarnessId::Grok, true).unwrap();
@@ -644,10 +733,131 @@ mod tests {
         assert!(registry.set_enabled(HarnessId::Grok, false).is_err());
         assert_eq!(registry.enabled_set(), vec![HarnessId::Grok]);
 
-        // A fresh registry over the same data dir reads the persisted set.
+        // A fresh registry over the same data dir reads the persisted opt-outs.
         let reloaded = HarnessRegistry::new();
         reloaded.load_prefs(dir.path());
+        test_slot(&reloaded, HarnessId::ClaudeCode, true);
+        test_slot(&reloaded, HarnessId::Codex, true);
+        test_slot(&reloaded, HarnessId::Grok, true);
         assert_eq!(reloaded.enabled_set(), vec![HarnessId::Grok]);
+    }
+
+    /// The point of following detection: an agent installed after the user has
+    /// already edited Settings turns itself on, while the ones they switched
+    /// off stay off. An allow-list can't express that — it can't tell "the
+    /// user said no" from "this wasn't installed yet".
+    #[test]
+    fn newly_found_harnesses_enable_themselves_without_reviving_opt_outs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        test_slot(&registry, HarnessId::Codex, true);
+        // Not installed yet — the probe flips when the user installs the CLI.
+        let found = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&found);
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::Grok,
+                name: "Grok".into(),
+                supports_steering: true,
+                steering_mode: SteeringMode::TurnBoundary,
+                reasoning_levels: vec![],
+                installed: true,
+                enabled: None,
+            },
+            Box::new(move || probe.load(Ordering::SeqCst)),
+            Box::new(|| Err(HarnessError::NotInstalled("test slot".into()))),
+        );
+        registry.set_enabled(HarnessId::Codex, false).unwrap();
+        assert_eq!(registry.enabled_set(), vec![HarnessId::ClaudeCode]);
+
+        // The CLI appears mid-session; no restart, no visit to Settings.
+        found.store(true, Ordering::SeqCst);
+        assert_eq!(
+            registry.enabled_set(),
+            vec![HarnessId::ClaudeCode, HarnessId::Grok]
+        );
+        // The opt-out survives the reload that picks the new agent up.
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        test_slot(&reloaded, HarnessId::ClaudeCode, true);
+        test_slot(&reloaded, HarnessId::Codex, true);
+        test_slot(&reloaded, HarnessId::Grok, true);
+        assert_eq!(
+            reloaded.enabled_set(),
+            vec![HarnessId::ClaudeCode, HarnessId::Grok]
+        );
+    }
+
+    /// The mock resolves on every machine, so detection alone would enable it
+    /// and let the last REAL agent be switched off — leaving a composer with
+    /// nothing runnable behind a guard that thinks it is covered.
+    #[test]
+    fn detection_never_enables_the_mock() {
+        let registry = default_registry();
+        let enabled = registry.enabled_set();
+        assert!(!enabled.contains(&HarnessId::Mock), "{enabled:?}");
+        let mock = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Mock)
+            .expect("mock slot");
+        assert!(mock.installed);
+        assert_eq!(mock.enabled, Some(false));
+    }
+
+    /// A prefs file from the fixed-default era is an allow-list: everything
+    /// registered and absent from it was a deliberate "no", so it converts to
+    /// opt-outs rather than silently re-enabling on the next launch.
+    #[test]
+    fn legacy_allow_list_migrates_to_opt_outs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("harness-prefs.json"),
+            r#"{ "enabled": ["claude-code"] }"#,
+        )
+        .unwrap();
+        let registry = HarnessRegistry::new();
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        test_slot(&registry, HarnessId::Codex, true);
+        test_slot(&registry, HarnessId::Grok, true);
+        registry.load_prefs(dir.path());
+        assert_eq!(registry.enabled_set(), vec![HarnessId::ClaudeCode]);
+
+        // The rewritten file is the new shape, and the legacy key is gone.
+        let text = std::fs::read_to_string(dir.path().join("harness-prefs.json")).unwrap();
+        assert!(!text.contains("enabled"), "{text}");
+        assert!(text.contains("codex") && text.contains("grok"), "{text}");
+        // An agent registered after the migration is new, not a past "no".
+        test_slot(&registry, HarnessId::Cursor, true);
+        assert_eq!(
+            registry.enabled_set(),
+            vec![HarnessId::ClaudeCode, HarnessId::Cursor]
+        );
+    }
+
+    /// The fresh-machine shape (#128): no CLIs installed at all. Under
+    /// detection-based enablement nothing is enabled to begin with — no
+    /// dimmed default toggles to dismiss — and switching an uninstalled
+    /// harness "off" is a clean no-op, not an error.
+    #[test]
+    fn machine_without_clis_enables_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        test_slot(&registry, HarnessId::ClaudeCode, false);
+        test_slot(&registry, HarnessId::Codex, false);
+
+        assert_eq!(registry.enabled_set(), Vec::<HarnessId>::new());
+        registry.set_enabled(HarnessId::Codex, false).unwrap();
+        registry.set_enabled(HarnessId::ClaudeCode, false).unwrap();
+        assert_eq!(registry.enabled_set(), Vec::<HarnessId>::new());
+
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.enabled_set(), Vec::<HarnessId>::new());
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`

@@ -24,7 +24,7 @@ fn str_field(v: &Value, key: &str) -> String {
 }
 
 /// Truncate on a char boundary, marking the cut so the UI can say "truncated".
-fn cap_text(text: &str, cap: usize) -> String {
+pub(crate) fn cap_text(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_owned();
     }
@@ -89,6 +89,12 @@ fn tool_diff(update: &Value) -> Option<ToolDiff> {
             DIFF_TEXT_CAP,
         ),
     })
+}
+
+/// The grok-native tool name stamped on a tool call's `_meta` (`x.ai/tool`,
+/// present on every grok tool_call — verified live, 1.0.4).
+pub(crate) fn xai_tool_name(update: &Value) -> Option<&str> {
+    update.get("_meta")?.get("x.ai/tool")?.get("name")?.as_str()
 }
 
 /// First location path (`locations: [{path, line?}]`), for read/edit calls.
@@ -261,6 +267,46 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
+        // Grok's subagent spawn: name the chip — and the subagent tab it
+        // opens — after the task, matching the claude driver's "Agent: {d}"
+        // (the bare tool name says nothing in a tab strip).
+        _ if xai_tool_name(update) == Some("spawn_subagent") => ToolCall::Unknown {
+            name: raw_str("description")
+                .map(|d| format!("Agent: {d}"))
+                .unwrap_or_else(|| "Agent".into()),
+            input: raw.cloned(),
+        },
+        // opencode's subagent spawn (`task` tool — rawInput carries
+        // description/prompt/subagent_type): same naming as grok's, so the
+        // chip and its subagent tab say what the agent is doing.
+        _ if raw.is_some_and(|r| r.get("subagent_type").is_some() && r.get("prompt").is_some()) => {
+            ToolCall::Unknown {
+                name: raw_str("description")
+                    .map(|d| format!("Agent: {d}"))
+                    .unwrap_or_else(|| "Agent".into()),
+                input: raw.cloned(),
+            }
+        }
+        // Its completion drops rawInput but keeps a title (the description),
+        // which would re-type the chip to a bare Unknown and cost it the
+        // Agent icon/label. The rawOutput metadata (child + parent session
+        // ids) still marks the spawn — keep the naming.
+        _ if update
+            .get("rawOutput")
+            .and_then(|r| r.get("metadata"))
+            .is_some_and(|m| {
+                m.get("sessionId").is_some() && m.get("parentSessionId").is_some()
+            }) =>
+        {
+            ToolCall::Unknown {
+                name: if title.is_empty() {
+                    "Agent".into()
+                } else {
+                    format!("Agent: {title}")
+                },
+                input: raw.cloned(),
+            }
+        }
         _ if raw_str("_toolName").as_deref() == Some("task") => ToolCall::Unknown {
             name: raw_str("description")
                 .filter(|d| d != "Subagent task")
@@ -413,35 +459,6 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
             })
         })
         .collect()
-}
-
-/// Cursor's `cursor/update_todos` and `cursor/create_plan` carry a `todos`
-/// array (`{id, content, status}`) instead of ACP's `plan`/`entries`. Both
-/// render as the same kind of chip; the caller picks a stable id so repeated
-/// updates refresh in place rather than stacking.
-pub(crate) fn cursor_todo_events(params: &Value, chip_id: &str) -> Vec<AgentEvent> {
-    let Some(todos) = params.get("todos").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let items = todos
-        .iter()
-        .map(|t| TodoItem {
-            text: str_field(t, "content"),
-            done: t.get("status").and_then(Value::as_str) == Some("completed"),
-        })
-        .collect();
-    vec![
-        AgentEvent::ToolCall {
-            id: chip_id.to_owned(),
-            call: ToolCall::Todo { items },
-        },
-        AgentEvent::ToolResult {
-            id: chip_id.to_owned(),
-            is_error: false,
-            output: None,
-            diff: None,
-        },
-    ]
 }
 
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
@@ -843,5 +860,48 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn opencode_task_keeps_agent_naming_across_frames() {
+        // The rawInput frame (in_progress) names the chip off the spawn args.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "in_progress",
+            "kind": "think",
+            "title": "Viz probe",
+            "rawInput": {
+                "description": "Viz probe",
+                "prompt": "run the probe",
+                "subagent_type": "general",
+            },
+        });
+        assert!(matches!(
+            map_update(&update).as_slice(),
+            [AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. }]
+                if name == "Agent: Viz probe"
+        ));
+        // The completion drops rawInput (title = the bare description); the
+        // rawOutput metadata still marks the spawn — naming survives.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "completed",
+            "title": "Viz probe",
+            "content": [{"type": "content", "content": {"type": "text",
+                "text": "<task id=\"ses_c\" state=\"completed\">\n<task_result>\nfinished\n</task_result>\n</task>"}}],
+            "rawOutput": {
+                "output": "<task id=\"ses_c\" state=\"completed\">\n<task_result>\nfinished\n</task_result>\n</task>",
+                "metadata": {"parentSessionId": "ses_p", "sessionId": "ses_c"},
+            },
+        });
+        assert!(matches!(
+            map_update(&update).as_slice(),
+            [
+                AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. },
+                AgentEvent::ToolResult { is_error: false, .. },
+            ] if name == "Agent: Viz probe"
+        ));
     }
 }

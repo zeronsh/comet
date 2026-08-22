@@ -20,7 +20,14 @@
 //! - scopes (t3code parity): *Working tree* rides the watch stream; *Branch
 //!   changes* (vs a selectable base ref, default branch preselected) and
 //!   *Latest turn* fetch one-shot `GetCheckoutDiff` captures, refreshed when
-//!   the watch checksum says the tree moved.
+//!   the watch checksum says the tree moved;
+//! - two layouts ([`DiffMode`], toolbar toggle, persisted): *unified* stacks
+//!   old and new; *split* pairs each hunk's deletions against its additions
+//!   into one row with two columns. Split is a pure re-flatten of the same
+//!   parse — the row model, virtualization, folds, and highlights are shared.
+//!   Its left column is inert: notes are cited against the post-change file,
+//!   so only the right column takes a `+` (already-staged old-side notes
+//!   still show their cards).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -35,6 +42,7 @@ use gpui::{
 use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
 use zeron_rpc::methods;
 
+use crate::comments::{self, CommentSide, DiffComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
 use crate::markdown::render;
@@ -59,7 +67,51 @@ pub const GUTTER_WIDTH: f32 = 36.0;
 pub const MARKER_WIDTH: f32 = 28.0;
 /// Width of the coloured accent bar on the left edge of +/− rows.
 pub const ACCENT_BAR_WIDTH: f32 = 3.0;
+/// The marker column in split mode: each half pays for its own, so it is
+/// narrower than [`MARKER_WIDTH`] to leave the code the room.
+pub const SPLIT_MARKER_WIDTH: f32 = 18.0;
+/// Hairline between the two split columns.
+pub const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 const DIFF_TEXT_SIZE: f32 = 12.0;
+
+/// How the diff is laid out. Persisted in `ui-settings.json` (`diffSplit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffMode {
+    /// One column: deletions above additions (the classic patch reading).
+    #[default]
+    Unified,
+    /// Two columns: old on the left, new on the right, paired per hunk.
+    Split,
+}
+
+impl DiffMode {
+    pub fn from_split(split: bool) -> Self {
+        if split { Self::Split } else { Self::Unified }
+    }
+
+    pub fn is_split(self) -> bool {
+        self == Self::Split
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Unified => Self::Split,
+            Self::Split => Self::Unified,
+        }
+    }
+}
+
+/// Read-modify-write `ui-settings.json` for just the split-diff key — a fresh
+/// load, for the reason [`crate::appearance`] documents: the shell holds its
+/// own `UiSettings` and saves it debounced, so writing a cached snapshot from
+/// here would roll back a pane resize made seconds earlier.
+fn persist_split(split: bool, data_dir: &std::path::Path) {
+    let mut settings = crate::settings::UiSettings::load(data_dir);
+    settings.diff_split = split;
+    if let Err(err) = settings.save(data_dir) {
+        tracing::warn!(error = %err, "could not persist diff layout");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Patch model + parser (pure)
@@ -442,10 +494,178 @@ pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
 /// Analytic expanded-body height — drives the 180 ms fold tween without
 /// measurement.
 pub fn body_height(file: &FileDiff) -> f32 {
-    let notices = file_notices(file).len() as f32 * NOTICE_HEIGHT;
-    let hunks = file.hunks.len() as f32 * HUNK_HEADER_HEIGHT;
-    let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
-    notices + hunks + lines as f32 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
+    body_height_with(file, &[], None, DiffMode::Unified)
+}
+
+pub fn body_height_with(
+    file: &FileDiff,
+    comments: &[DiffComment],
+    draft: Option<(CommentSide, u32)>,
+    mode: DiffMode,
+) -> f32 {
+    body_rows(0, file, comments, draft, mode)
+        .iter()
+        .map(|row| row.height(comments))
+        .sum()
+}
+
+/// One split row: indices into the hunk's lines for the left (old) and right
+/// (new) column. `None` on a side means that column is empty for this row.
+pub type LinePair = (Option<u32>, Option<u32>);
+
+/// Pair a hunk's lines into split rows.
+///
+/// A hunk reads as runs: context lines sit on both sides, and each run of
+/// deletions immediately followed by additions is a *change block* whose two
+/// sides line up index-for-index (the shape git already emits — an edited
+/// line's `-`/`+` are adjacent). The longer side's leftovers get one-sided
+/// rows, so a 3-for-1 rewrite is 1 paired row and 2 add-only rows rather than
+/// a ragged interleave. A deletion arriving after additions opens a new block
+/// (`-a +b -c +d` is two edits, not one four-line one).
+///
+/// Pure and index-only: the caller keeps owning the lines, and the result is
+/// small enough to live in the row model.
+pub fn split_pairs(lines: &[DiffLine]) -> Vec<LinePair> {
+    split_pairs_upto(lines, usize::MAX)
+}
+
+/// [`split_pairs`], stopping at `max_rows`.
+///
+/// The fold tween's stand-in builds only the slice its clip can reveal and
+/// re-renders every frame of the tween, so it must not pay to pair a 50k-line
+/// hunk to draw twenty rows of it. Bounding the *output* is not enough — the
+/// pending runs are bounded too, since a change block yields
+/// `max(dels, adds)` rows and so anything past the budget can only land past
+/// it as well.
+pub fn split_pairs_upto(lines: &[DiffLine], max_rows: usize) -> Vec<LinePair> {
+    /// The block being accumulated: the two sides' code lines, plus the
+    /// `\ No newline…` marker each side may end on.
+    #[derive(Default)]
+    struct Block {
+        dels: Vec<u32>,
+        adds: Vec<u32>,
+        del_meta: Vec<u32>,
+        add_meta: Vec<u32>,
+    }
+
+    fn flush(pairs: &mut Vec<LinePair>, block: &mut Block, max_rows: usize) {
+        let mut drain = |left: &mut Vec<u32>, right: &mut Vec<u32>| {
+            for ix in 0..left.len().max(right.len()) {
+                if pairs.len() >= max_rows {
+                    break;
+                }
+                pairs.push((left.get(ix).copied(), right.get(ix).copied()));
+            }
+            left.clear();
+            right.clear();
+        };
+        drain(&mut block.dels, &mut block.adds);
+        // Markers trail the code they annotate, and pair with each other — a
+        // modification where both files lost their final newline is one
+        // aligned row plus one marker row, not two one-sided rows plus two
+        // markers. They never share a row with code, so both render arms can
+        // treat a marker on either side as spanning the row.
+        drain(&mut block.del_meta, &mut block.add_meta);
+    }
+
+    let mut pairs = Vec::with_capacity(lines.len().min(max_rows));
+    let mut block = Block::default();
+    let mut pending_side: Option<LineKind> = None;
+    for (ix, line) in lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Del => {
+                // A marker already closes its side, so code arriving after one
+                // starts a fresh block — the marker row keeps its place in the
+                // file's order.
+                if !block.adds.is_empty()
+                    || !block.del_meta.is_empty()
+                    || !block.add_meta.is_empty()
+                {
+                    flush(&mut pairs, &mut block, max_rows);
+                }
+                let remaining = max_rows - pairs.len().min(max_rows);
+                if remaining == 0 {
+                    break;
+                }
+                if block.dels.len() < remaining {
+                    block.dels.push(ix as u32);
+                }
+                pending_side = Some(LineKind::Del);
+            }
+            LineKind::Add => {
+                // The old side's marker is the one case where a marker does
+                // not close the block: `-old`, marker, `+new` is one edit.
+                if !block.add_meta.is_empty() {
+                    flush(&mut pairs, &mut block, max_rows);
+                }
+                let remaining = max_rows - pairs.len().min(max_rows);
+                if remaining == 0 {
+                    break;
+                }
+                if block.adds.len() < remaining {
+                    block.adds.push(ix as u32);
+                }
+                pending_side = Some(LineKind::Add);
+            }
+            // `\ No newline at end of file` belongs to the side whose line it
+            // follows, so it must NOT close the block: git writes `-old`,
+            // marker, `+new`, marker for an edited last line, and treating
+            // either marker as a boundary would tear that edit apart. A marker
+            // after context describes the same line on both sides.
+            LineKind::Meta => match pending_side {
+                Some(LineKind::Del) => block.del_meta.push(ix as u32),
+                Some(LineKind::Add) => block.add_meta.push(ix as u32),
+                _ => {
+                    block.del_meta.push(ix as u32);
+                    block.add_meta.push(ix as u32);
+                }
+            },
+            // Context sits on both sides.
+            LineKind::Context => {
+                flush(&mut pairs, &mut block, max_rows);
+                if pairs.len() >= max_rows {
+                    break;
+                }
+                pairs.push((Some(ix as u32), Some(ix as u32)));
+                pending_side = Some(LineKind::Context);
+            }
+        }
+    }
+    flush(&mut pairs, &mut block, max_rows);
+    pairs.truncate(max_rows);
+    pairs
+}
+
+/// Every anchor a split row can *display* a card for, left column first.
+///
+/// Wider than what the row lets you write: only the right column takes a `+`
+/// (see the `SplitLine` render arm), but an old-side note staged from the
+/// unified layout must still show its card here, or toggling layouts would
+/// look like it dropped one. A context row names the same anchor on both
+/// sides, so the duplicate is dropped — the caller flattens, and two
+/// identical anchors would stage the card twice. A fixed array, not a `Vec`:
+/// this runs per row of every re-flatten.
+fn pair_anchors(lines: &[DiffLine], pair: LinePair) -> [Option<(CommentSide, u32)>; 2] {
+    let anchor = |ix: Option<u32>| {
+        ix.and_then(|ix| lines.get(ix as usize))
+            .and_then(line_anchor)
+    };
+    let (left, right) = (anchor(pair.0), anchor(pair.1));
+    if left == right {
+        [left, None]
+    } else {
+        [left, right]
+    }
+}
+
+/// A deletion only exists in the pre-change file; everything else is cited
+/// against the post-change file, which is what the agent edits.
+pub fn line_anchor(line: &DiffLine) -> Option<(CommentSide, u32)> {
+    match line.kind {
+        LineKind::Meta => None,
+        LineKind::Del => line.old_no.map(|no| (CommentSide::Old, no)),
+        _ => line.new_no.map(|no| (CommentSide::New, no)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +841,15 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
             false
         }
     }
+}
+
+fn comment_state_key(comments: &[DiffComment], draft: Option<&(String, CommentSide, u32)>) -> u64 {
+    let mut parts: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+    if let Some((path, side, line)) = draft {
+        parts.push(format!("draft:{path}:{}:{line}", side.tag()));
+    }
+    let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+    hash64(&refs)
 }
 
 fn hash64(parts: &[&str]) -> u64 {
@@ -822,6 +1051,23 @@ pub enum DiffRow {
         /// Flat index across the file's hunks — keys into the highlight slot.
         flat: u32,
     },
+    /// One split row: the two line indices [`split_pairs`] paired. Carrying
+    /// them inline keeps the pairing off the render path — it is computed
+    /// once, when the body is flattened.
+    SplitLine {
+        file: u32,
+        hunk: u32,
+        left: Option<u32>,
+        right: Option<u32>,
+    },
+    /// `card` indexes the file's own staged-comment slice, in staged order.
+    CommentCard {
+        file: u32,
+        card: u32,
+    },
+    CommentDraft {
+        file: u32,
+    },
     /// Trailing pad closing an expanded body ([`BODY_BOTTOM_PAD`]).
     BodyPad {
         file: u32,
@@ -834,14 +1080,62 @@ pub enum DiffRow {
     },
 }
 
-/// Rows an expanded body contributes (notices + hunk headers + lines + pad).
+impl DiffRow {
+    /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
+    /// height sum.
+    fn height(self, comments: &[DiffComment]) -> f32 {
+        match self {
+            DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
+            DiffRow::Notice { .. } => NOTICE_HEIGHT,
+            DiffRow::HunkHeader { .. } => HUNK_HEADER_HEIGHT,
+            DiffRow::Line { .. } | DiffRow::SplitLine { .. } => DIFF_LINE_HEIGHT,
+            DiffRow::CommentCard { card, .. } => comments
+                .get(card as usize)
+                .map(|comment| comments::card_height(&comment.body))
+                .unwrap_or(0.0),
+            DiffRow::CommentDraft { .. } => comments::DRAFT_CARD_HEIGHT,
+            DiffRow::BodyPad { .. } => BODY_BOTTOM_PAD,
+            DiffRow::FoldingBody { .. } => 0.0,
+        }
+    }
+}
+
+/// Capacity hint only — comment cards are not counted. Split pairs can only
+/// shrink the line count, so the unified count is a safe hint for both.
 pub fn body_row_count(file: &FileDiff) -> usize {
     let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
     file_notices(file).len() + file.hunks.len() + lines + 1
 }
 
-/// The steady-state body rows of one expanded file.
-pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
+pub fn body_rows(
+    file_ix: u32,
+    file: &FileDiff,
+    comments: &[DiffComment],
+    draft: Option<(CommentSide, u32)>,
+    mode: DiffMode,
+) -> Vec<DiffRow> {
+    fn push_cards(
+        rows: &mut Vec<DiffRow>,
+        file_ix: u32,
+        comments: &[DiffComment],
+        draft: Option<(CommentSide, u32)>,
+        anchors: &[Option<(CommentSide, u32)>],
+    ) {
+        for anchor in anchors.iter().flatten() {
+            for (ix, comment) in comments.iter().enumerate() {
+                if comment.anchor() == *anchor {
+                    rows.push(DiffRow::CommentCard {
+                        file: file_ix,
+                        card: ix as u32,
+                    });
+                }
+            }
+            if draft == Some(*anchor) {
+                rows.push(DiffRow::CommentDraft { file: file_ix });
+            }
+        }
+    }
+
     let mut rows = Vec::with_capacity(body_row_count(file));
     for notice in 0..file_notices(file).len() {
         rows.push(DiffRow::Notice {
@@ -849,21 +1143,38 @@ pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
             notice: notice as u32,
         });
     }
-    let mut flat = 0u32;
+    let mut hunk_flat = 0u32;
     for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
         rows.push(DiffRow::HunkHeader {
             file: file_ix,
             hunk: hunk_ix as u32,
         });
-        for line_ix in 0..hunk.lines.len() {
-            rows.push(DiffRow::Line {
-                file: file_ix,
-                hunk: hunk_ix as u32,
-                line: line_ix as u32,
-                flat,
-            });
-            flat += 1;
+        match mode {
+            DiffMode::Unified => {
+                for (line_ix, line) in hunk.lines.iter().enumerate() {
+                    rows.push(DiffRow::Line {
+                        file: file_ix,
+                        hunk: hunk_ix as u32,
+                        line: line_ix as u32,
+                        flat: hunk_flat + line_ix as u32,
+                    });
+                    push_cards(&mut rows, file_ix, comments, draft, &[line_anchor(line)]);
+                }
+            }
+            DiffMode::Split => {
+                for (left, right) in split_pairs(&hunk.lines) {
+                    rows.push(DiffRow::SplitLine {
+                        file: file_ix,
+                        hunk: hunk_ix as u32,
+                        left,
+                        right,
+                    });
+                    let anchors = pair_anchors(&hunk.lines, (left, right));
+                    push_cards(&mut rows, file_ix, comments, draft, &anchors);
+                }
+            }
         }
+        hunk_flat += hunk.lines.len() as u32;
     }
     rows.push(DiffRow::BodyPad { file: file_ix });
     rows
@@ -871,9 +1182,13 @@ pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
 
 /// Flatten all files into rows + each file's row span (header at
 /// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
-/// its header.
+/// its header. `comments` is the whole staged set; each file takes its own
+/// path's slice.
 pub fn flatten_rows(
     files: &[FileDiff],
+    comments: &[DiffComment],
+    draft: Option<(&str, CommentSide, u32)>,
+    mode: DiffMode,
     mut collapsed: impl FnMut(usize) -> bool,
 ) -> (Vec<DiffRow>, Vec<std::ops::Range<usize>>) {
     let mut rows = Vec::new();
@@ -882,7 +1197,15 @@ pub fn flatten_rows(
         let start = rows.len();
         rows.push(DiffRow::FileHeader { file: ix as u32 });
         if !collapsed(ix) {
-            rows.extend(body_rows(ix as u32, file));
+            let file_comments: Vec<DiffComment> = comments
+                .iter()
+                .filter(|comment| comment.path == file.path)
+                .cloned()
+                .collect();
+            let file_draft = draft
+                .filter(|(path, _, _)| *path == file.path)
+                .map(|(_, side, line)| (side, line));
+            rows.extend(body_rows(ix as u32, file, &file_comments, file_draft, mode));
         }
         ranges.push(start..rows.len());
     }
@@ -950,6 +1273,31 @@ struct RefMenu {
     _search_events: Subscription,
 }
 
+/// The line the pointer is on. Only one element per anchor ever takes the
+/// hover — the unified row, or a split row's right column — so the anchor
+/// alone identifies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoverRow {
+    path: String,
+    side: CommentSide,
+    line: u32,
+}
+
+struct CommentDraft {
+    /// Composer the note will stage onto, captured when the card opened. A
+    /// draft belongs to the checkout it was written over, so it must not
+    /// follow the user onto whatever chat is selected by commit time.
+    key: String,
+    path: String,
+    /// The file's pre-rename path, when it moved — carried onto the comment so
+    /// an `Old`-side citation names the file that line lives in.
+    old_path: Option<String>,
+    side: CommentSide,
+    line: u32,
+    input: Entity<ComposerInput>,
+    _events: Subscription,
+}
+
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
@@ -977,6 +1325,8 @@ pub struct Changes {
     list: ListState,
     /// What the pane diffs against (toolbar dropdown).
     scope: DiffScope,
+    /// Unified or side-by-side (toolbar toggle, persisted per user).
+    mode: DiffMode,
     /// Comparison ref for [`DiffScope::Branch`] — preset to the repo's
     /// default branch once the branch list lands.
     base_ref: Option<String>,
@@ -992,6 +1342,11 @@ pub struct Changes {
     scoped_task: Option<Task<()>>,
     scope_menu: Popup<()>,
     ref_menu: Popup<RefMenu>,
+    /// Only ever one: a second `+` moves the card rather than stacking two
+    /// half-written notes.
+    draft: Option<CommentDraft>,
+    hover: Option<HoverRow>,
+    comment_key: u64,
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
     history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
@@ -1013,8 +1368,16 @@ impl gpui::EventEmitter<ChangesEvent> for Changes {}
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let mode = DiffMode::from_split(
+            state
+                .read(cx)
+                .data_dir
+                .as_deref()
+                .is_some_and(|dir| crate::settings::UiSettings::load(dir).diff_split),
+        );
         Self {
             state,
+            mode,
             diffs: Vec::new(),
             started: false,
             error: None,
@@ -1042,6 +1405,9 @@ impl Changes {
             scoped_task: None,
             scope_menu: Popup::default(),
             ref_menu: Popup::default(),
+            draft: None,
+            hover: None,
+            comment_key: 0,
             history: None,
             history_count: None,
             history_fetch_button: None,
@@ -1480,6 +1846,7 @@ impl Changes {
 
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.discard_stale_draft(cx);
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
@@ -1505,6 +1872,7 @@ impl Changes {
         };
         let key = self.parse_key(&diff);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
+            self.sync_comment_rows(cx);
             return;
         }
         // Parse off the render path — patches run to megabytes.
@@ -1531,7 +1899,18 @@ impl Changes {
                 };
                 changes.folds.clear();
                 changes.highlights.clear();
-                let (rows, ranges) = flatten_rows(&files, |_| false);
+                let staged = changes.staged_comments(cx);
+                let draft = changes.draft_anchor();
+                let (rows, ranges) = flatten_rows(
+                    &files,
+                    &staged,
+                    draft
+                        .as_ref()
+                        .map(|(path, side, line)| (path.as_str(), *side, *line)),
+                    changes.mode,
+                    |_| false,
+                );
+                changes.comment_key = comment_state_key(&staged, draft.as_ref());
                 // The uniform hint keeps offsets for never-rendered rows
                 // sane (most rows ARE lines); real heights land as rows
                 // render.
@@ -1564,8 +1943,31 @@ impl Changes {
         };
         let body = range.start + 1..range.end;
         let delta = new_body.len() as isize - body.len() as isize;
-        self.list.splice(body.clone(), new_body.len());
-        self.rows.splice(body, new_body);
+        // Only splice the rows that moved: `ListState::splice` clamps the
+        // scroll anchor to the range start when the anchored row is inside it,
+        // so replacing a whole body jumped the pane to the top of the file.
+        let (prefix, suffix) = {
+            let old = &self.rows[body.clone()];
+            let prefix = old
+                .iter()
+                .zip(&new_body)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix = old[prefix..]
+                .iter()
+                .rev()
+                .zip(new_body[prefix..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (prefix, suffix)
+        };
+        if delta == 0 && prefix + suffix >= body.len() {
+            return;
+        }
+        let changed = body.start + prefix..body.end - suffix;
+        let mid: Vec<DiffRow> = new_body[prefix..new_body.len() - suffix].to_vec();
+        self.list.splice(changed.clone(), mid.len());
+        self.rows.splice(changed, mid);
         self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
         for r in &mut self.row_ranges[file_ix + 1..] {
             *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
@@ -1579,7 +1981,12 @@ impl Changes {
         let Some(file) = parsed.files.get(file_ix) else {
             return;
         };
-        let expanded_height = body_height(file);
+        let expanded_height = body_height_with(
+            file,
+            &self.comments_for(&file.path, cx),
+            self.draft_anchor_in(&file.path),
+            self.mode,
+        );
         let fold = self.folds.entry(file.path.clone()).or_default();
         let currently_collapsed = fold.collapsed;
         fold.from = if currently_collapsed {
@@ -1656,7 +2063,13 @@ impl Changes {
             let body = if fold.collapsed {
                 Vec::new()
             } else {
-                body_rows(file_ix as u32, file)
+                body_rows(
+                    file_ix as u32,
+                    file,
+                    &self.comments_for(&file.path, cx),
+                    self.draft_anchor_in(&file.path),
+                    self.mode,
+                )
             };
             self.replace_file_body(file_ix, body);
         }
@@ -1694,21 +2107,303 @@ impl Changes {
             fold.collapsed = collapse;
             fold.toggled_at = None;
         }
+        let staged = self.staged_comments(cx);
+        let draft = self.draft_anchor();
         for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
             let range = &self.row_ranges[file_ix];
             let body = range.start + 1..range.end;
             let new_len = if collapse {
                 0
             } else {
-                body_row_count(&files[file_ix])
+                let file = &files[file_ix];
+                let comments: Vec<DiffComment> = staged
+                    .iter()
+                    .filter(|comment| comment.path == file.path)
+                    .cloned()
+                    .collect();
+                body_rows(
+                    file_ix as u32,
+                    file,
+                    &comments,
+                    self.draft_anchor_in(&file.path),
+                    self.mode,
+                )
+                .len()
             };
             if body.len() != new_len {
                 self.list.splice(body, new_len);
             }
         }
-        let (rows, ranges) = flatten_rows(&files, |_| collapse);
+        let (rows, ranges) = flatten_rows(
+            &files,
+            &staged,
+            draft
+                .as_ref()
+                .map(|(path, side, line)| (path.as_str(), *side, *line)),
+            self.mode,
+            |_| collapse,
+        );
         self.rows = rows;
         self.row_ranges = ranges;
+        cx.notify();
+    }
+
+    /// Swap unified ⇄ split (toolbar toggle). The parse is untouched — only
+    /// the flattening changes — so this rebuilds the row model and re-anchors
+    /// the scroll onto whichever file was under the viewport's top edge (row
+    /// indices do not survive the re-pairing).
+    fn toggle_mode(&mut self, cx: &mut Context<Self>) {
+        self.mode = self.mode.toggled();
+        if let Some(dir) = self.state.read(cx).data_dir.clone() {
+            let split = self.mode.is_split();
+            cx.background_executor()
+                .spawn(async move { persist_split(split, &dir) })
+                .detach();
+        }
+        // A draft's `+` sits in a column that may not exist after the swap.
+        self.hover = None;
+        self.reflatten(cx);
+    }
+
+    fn reflatten(&mut self, cx: &mut Context<Self>) {
+        let Some(parsed) = &self.parsed else {
+            cx.notify();
+            return;
+        };
+        let files = parsed.files.clone();
+        let top = self.list.logical_scroll_top().item_ix;
+        let anchor_file = self
+            .row_ranges
+            .iter()
+            .position(|range| range.contains(&top));
+        let collapsed: Vec<bool> = files
+            .iter()
+            .map(|file| {
+                self.folds
+                    .get(&file.path)
+                    .is_some_and(|fold| fold.collapsed)
+            })
+            .collect();
+        let staged = self.staged_comments(cx);
+        let draft = self.draft_anchor();
+        let (rows, ranges) = flatten_rows(
+            &files,
+            &staged,
+            draft
+                .as_ref()
+                .map(|(path, side, line)| (path.as_str(), *side, *line)),
+            self.mode,
+            |ix| collapsed.get(ix).copied().unwrap_or(false),
+        );
+        self.list
+            .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+        self.rows = rows;
+        self.row_ranges = ranges;
+        if let Some(start) = anchor_file
+            .and_then(|ix| self.row_ranges.get(ix))
+            .map(|r| r.start)
+        {
+            self.list.scroll_to_reveal_item(start);
+        }
+        cx.notify();
+    }
+
+    /// Cloned because rendering borrows `self` mutably a moment later.
+    fn staged_comments(&self, cx: &App) -> Vec<DiffComment> {
+        let state = self.state.read(cx);
+        state.diff_comments(&state.composer_key()).to_vec()
+    }
+
+    fn comments_for(&self, path: &str, cx: &App) -> Vec<DiffComment> {
+        self.staged_comments(cx)
+            .into_iter()
+            .filter(|comment| comment.path == path)
+            .collect()
+    }
+
+    /// The parsed diff's pre-rename path for `path`, when the file moved.
+    fn old_path_of(&self, path: &str) -> Option<String> {
+        self.parsed
+            .as_ref()?
+            .files
+            .iter()
+            .find(|file| file.path == path)?
+            .old_path
+            .clone()
+    }
+
+    /// A draft belongs to the checkout it was opened over. Chat navigation
+    /// swaps both the diff under it and the composer it would stage onto, so
+    /// the half-written note is dropped rather than following the user across.
+    fn discard_stale_draft(&mut self, cx: &mut Context<Self>) {
+        let key = self.state.read(cx).composer_key();
+        if self.draft.as_ref().is_some_and(|draft| draft.key != key) {
+            self.draft = None;
+            self.sync_comment_rows(cx);
+            cx.notify();
+        }
+    }
+
+    fn draft_anchor(&self) -> Option<(String, CommentSide, u32)> {
+        self.draft
+            .as_ref()
+            .map(|draft| (draft.path.clone(), draft.side, draft.line))
+    }
+
+    fn draft_anchor_in(&self, path: &str) -> Option<(CommentSide, u32)> {
+        self.draft
+            .as_ref()
+            .filter(|draft| draft.path == path)
+            .map(|draft| (draft.side, draft.line))
+    }
+
+    fn sync_comment_rows(&mut self, cx: &mut Context<Self>) {
+        if self.parsed.is_none() {
+            return;
+        }
+        let staged = self.staged_comments(cx);
+        let draft = self.draft_anchor();
+        let key = comment_state_key(&staged, draft.as_ref());
+        if key == self.comment_key {
+            return;
+        }
+        self.comment_key = key;
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let files = parsed.files.clone();
+        for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
+            let file = &files[file_ix];
+            // A mid-tween stand-in is the settle sweep's to replace.
+            if self
+                .folds
+                .get(&file.path)
+                .is_some_and(|fold| fold.collapsed)
+            {
+                continue;
+            }
+            let range = &self.row_ranges[file_ix];
+            if self.rows.get(range.start + 1)
+                == Some(&DiffRow::FoldingBody {
+                    file: file_ix as u32,
+                })
+            {
+                continue;
+            }
+            let comments: Vec<DiffComment> = staged
+                .iter()
+                .filter(|comment| comment.path == file.path)
+                .cloned()
+                .collect();
+            let body = body_rows(
+                file_ix as u32,
+                file,
+                &comments,
+                self.draft_anchor_in(&file.path),
+                self.mode,
+            );
+            self.replace_file_body(file_ix, body);
+        }
+        cx.notify();
+    }
+
+    fn set_hover(
+        &mut self,
+        path: &str,
+        anchor: Option<(CommentSide, u32)>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = anchor.map(|(side, line)| HoverRow {
+            path: path.to_string(),
+            side,
+            line,
+        });
+        if next != self.hover {
+            self.hover = next;
+            cx.notify();
+        }
+    }
+
+    fn hovering(&self, path: &str, anchor: (CommentSide, u32)) -> bool {
+        self.hover
+            .as_ref()
+            .is_some_and(|hover| hover.path == path && (hover.side, hover.line) == anchor)
+    }
+
+    fn clear_hover_at(&mut self, path: &str, anchor: (CommentSide, u32), cx: &mut Context<Self>) {
+        if self.hovering(path, anchor) {
+            self.hover = None;
+            cx.notify();
+        }
+    }
+
+    fn open_draft(
+        &mut self,
+        path: String,
+        side: CommentSide,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| ComposerInput::new("Request a change…", cx));
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Submitted => this.commit_draft(cx),
+            ComposerInputEvent::Edited => cx.notify(),
+            _ => {}
+        });
+        let handle = input.read(cx).focus_handle(cx);
+        let key = self.state.read(cx).composer_key();
+        let old_path = self.old_path_of(&path);
+        self.draft = Some(CommentDraft {
+            key,
+            path,
+            old_path,
+            side,
+            line,
+            input,
+            _events: events,
+        });
+        window.focus(&handle, cx);
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn cancel_draft(&mut self, cx: &mut Context<Self>) {
+        self.draft = None;
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn commit_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        let body = draft.input.read(cx).text().trim().to_string();
+        if body.is_empty() {
+            self.sync_comment_rows(cx);
+            cx.notify();
+            return;
+        }
+        let comment =
+            DiffComment::new(draft.path, draft.side, draft.line, body).renamed_from(draft.old_path);
+        // `draft.key`, not the live one: the note stages onto the composer it
+        // was written against even if the selection moved under it.
+        let key = draft.key;
+        self.state.update(cx, |state, cx| {
+            state.add_diff_comment(&key, comment);
+            cx.notify();
+        });
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn remove_comment(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let key = state.composer_key();
+            state.remove_diff_comment(&key, id);
+            cx.notify();
+        });
+        self.sync_comment_rows(cx);
         cx.notify();
     }
 
@@ -1996,7 +2691,151 @@ impl Changes {
                     .as_deref()
                     .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                diff_line_row(line, spans, &theme, gutter_width(file_diff))
+                let gutter_px = gutter_width(file_diff);
+                let row = diff_line_row(line, spans, &theme, gutter_px);
+                let Some((side, line_no)) = line_anchor(line) else {
+                    return row;
+                };
+                let path = file_diff.path.clone();
+                let hovered = self.hovering(&path, (side, line_no));
+                let move_path = path.clone();
+                let leave_path = path.clone();
+                div()
+                    .id(("diff-line", ix))
+                    .w_full()
+                    .relative()
+                    .child(row)
+                    .when(hovered, |el| {
+                        el.child(positioned_adder(
+                            comment_adder_left(side, gutter_px),
+                            render_comment_adder(&path, side, line_no, &theme, cx),
+                        ))
+                    })
+                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                        this.set_hover(&move_path, Some((side, line_no)), cx);
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            this.clear_hover_at(&leave_path, (side, line_no), cx);
+                        }
+                    }))
+                    .into_any_element()
+            }
+            DiffRow::SplitLine {
+                file,
+                hunk,
+                left,
+                right,
+            } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
+                let Some(lines) = file_diff.hunks.get(hunk as usize).map(|h| &h.lines) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let gutter_px = gutter_width(file_diff);
+                // Same slot on both sides = a context row: one line, drawn in
+                // both columns.
+                let mirrored = left.is_some() && left == right;
+                let left = left.and_then(|slot| lines.get(slot as usize));
+                let right = right.and_then(|slot| lines.get(slot as usize));
+                // `\ No newline at end of file` is not code on one side — it
+                // is a note about the row, so it spans both columns. Pairing
+                // never puts a marker opposite code, so either side having one
+                // means the whole row is the marker.
+                if let Some(line) = [left, right]
+                    .into_iter()
+                    .flatten()
+                    .find(|line| line.kind == LineKind::Meta)
+                {
+                    return meta_line_row(&line.text, &theme, 2.0 * (ACCENT_BAR_WIDTH + gutter_px));
+                }
+                // Refcounted, not cloned per listener: a split row wires up to
+                // four of them, and this runs for every row in the viewport
+                // plus the list's overdraw, every frame.
+                let path: SharedString = file_diff.path.clone().into();
+                // A mirrored row's columns carry the same text and the same
+                // spans, so the runs are built once and shared — context is
+                // most of a diff, so this is most of the rows.
+                let shared_runs = mirrored
+                    .then(|| left.map(|line| line_runs(line, highlight.as_deref(), &theme)))
+                    .flatten();
+                let cell = |line: Option<&DiffLine>, old: bool| {
+                    line.map(|line| {
+                        let runs = shared_runs
+                            .clone()
+                            .unwrap_or_else(|| line_runs(line, highlight.as_deref(), &theme));
+                        let number = if old { line.old_no } else { line.new_no };
+                        split_line_cell(line, number, runs, &theme, gutter_px)
+                    })
+                };
+                // The left column is inert. It shows the pre-change file, and
+                // a deleted line is not there to be changed — a note on it
+                // would cite a line the agent cannot edit. Everything is cited
+                // against the new file, so only the right column takes a `+`.
+                // Cards for old-side notes still render (they are pushed by
+                // the row, not the column), so switching layouts never hides
+                // one that is already staged.
+                let left = cell(left, true)
+                    .map(IntoElement::into_any_element)
+                    .unwrap_or_else(|| split_filler().into_any_element());
+                let right = match (cell(right, false), right.and_then(line_anchor)) {
+                    (Some(cell), Some(anchor)) => {
+                        let (side, line_no) = anchor;
+                        let (move_path, leave_path) = (path.clone(), path.clone());
+                        cell.id(("split-new", ix))
+                            .when(self.hovering(&path, anchor), |el| {
+                                el.relative().child(positioned_adder(
+                                    split_adder_left(gutter_px),
+                                    render_comment_adder(&path, side, line_no, &theme, cx),
+                                ))
+                            })
+                            .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                                this.set_hover(&move_path, Some(anchor), cx);
+                            }))
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if !*hovered {
+                                    this.clear_hover_at(&leave_path, anchor, cx);
+                                }
+                            }))
+                            .into_any_element()
+                    }
+                    (Some(cell), None) => cell.into_any_element(),
+                    (None, _) => split_filler().into_any_element(),
+                };
+                split_row(left, right).into_any_element()
+            }
+            DiffRow::CommentCard { file, card } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let comments = self.comments_for(&file_diff.path, cx);
+                match comments.get(card as usize) {
+                    Some(comment) => render_comment_card(comment, &theme, cx),
+                    None => gpui::Empty.into_any_element(),
+                }
+            }
+            DiffRow::CommentDraft { file } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                match self
+                    .draft
+                    .as_ref()
+                    .filter(|draft| draft.path == file_diff.path)
+                {
+                    // Header cites the same path the staged card and the
+                    // prompt bullet will.
+                    Some(draft) => render_comment_draft(
+                        draft_cite_path(draft),
+                        draft.line,
+                        draft.input.clone(),
+                        &theme,
+                        cx,
+                    ),
+                    None => gpui::Empty.into_any_element(),
+                }
             }
             DiffRow::BodyPad { .. } => div().w_full().h(px(BODY_BOTTOM_PAD)).into_any_element(),
             DiffRow::FoldingBody { file } => {
@@ -2009,7 +2848,7 @@ impl Changes {
                 // Only the revealable slice is built — the tween never pays
                 // for lines it cannot show.
                 let cap = from.max(to).min(FOLD_TWEEN_MAX_PX);
-                let body = render_file_body_upto(file_diff, highlight, &theme, cap);
+                let body = render_file_body_upto(file_diff, highlight, &theme, cap, self.mode);
                 let clipped = div().w_full().overflow_hidden().child(body);
                 if fold.animating() {
                     clipped
@@ -2143,6 +2982,18 @@ impl Changes {
         icon_path: &'static str,
         theme: &Theme,
     ) -> gpui::Stateful<gpui::Div> {
+        Self::header_toggle(id, icon_path, false, theme)
+    }
+
+    /// [`Self::header_button`] with a latched look: an `active` toggle holds
+    /// the hover wash and the full text tone, so the pane says which layout
+    /// it is in without a label.
+    fn header_toggle(
+        id: &'static str,
+        icon_path: &'static str,
+        active: bool,
+        theme: &Theme,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
             .size(px(24.0))
@@ -2152,12 +3003,20 @@ impl Changes {
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .bg(motion::hover_blend(
-                id,
-                crate::theme::wash(0.0),
-                crate::theme::wash(0.14),
-            ))
-            .on_hover(motion::hover_listener(id))
+            // Latched: the blend is neither read nor driven, and its listener
+            // would dirty the whole window on every enter/leave for nothing.
+            .map(|el| {
+                if active {
+                    el.bg(crate::theme::wash(0.14))
+                } else {
+                    el.bg(motion::hover_blend(
+                        id,
+                        crate::theme::wash(0.0),
+                        crate::theme::wash(0.14),
+                    ))
+                    .on_hover(motion::hover_listener(id))
+                }
+            })
             .occlude()
             .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                 window.prevent_default()
@@ -2165,8 +3024,28 @@ impl Changes {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(14.0))
-                    .text_color(theme.text_muted.opacity(0.7)),
+                    .text_color(if active {
+                        theme.text
+                    } else {
+                        theme.text_muted.opacity(0.7)
+                    }),
             )
+    }
+
+    /// The unified ⇄ split layout toggle (both the scoped and the
+    /// commit-pinned toolbars carry it).
+    fn split_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        Self::header_toggle(
+            "changes-split",
+            crate::icons::SPLIT_COLUMNS,
+            self.mode.is_split(),
+            theme,
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            cx.stop_propagation();
+            this.toggle_mode(cx);
+        }))
+        .into_any_element()
     }
 
     /// The pane-header controls: scope dropdown, `{branch} → {base ⌄}` ref
@@ -2211,6 +3090,7 @@ impl Changes {
                         .text_color(theme.text)
                         .child(SharedString::from(commit.subject.clone())),
                 )
+                .child(self.split_toggle(&theme, cx))
                 .child(
                     Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2300,11 +3180,19 @@ impl Changes {
                 )
                 .into_any_element()
         } else {
-            Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_collapse_all(cx);
-                }))
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .child(self.split_toggle(&theme, cx))
+                .child(
+                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_collapse_all(cx);
+                        })),
+                )
                 .into_any_element()
         };
 
@@ -2665,18 +3553,11 @@ fn diff_line_row(
     gutter_px: f32,
 ) -> AnyElement {
     if line.kind == LineKind::Meta {
-        return div()
-            .h(px(DIFF_LINE_HEIGHT))
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .pl(px(ACCENT_BAR_WIDTH + 2.0 * gutter_px + MARKER_WIDTH + 12.0))
-            .text_size(px(10.5))
-            .text_color(theme.text_faint)
-            .italic()
-            .child(SharedString::from(line.text.clone()))
-            .into_any_element();
+        return meta_line_row(
+            &line.text,
+            theme,
+            ACCENT_BAR_WIDTH + 2.0 * gutter_px + MARKER_WIDTH + 12.0,
+        );
     }
 
     // Row tints sampled from the reference: ~5–6% washes over the pane tone.
@@ -2788,6 +3669,431 @@ fn diff_line_row(
         .into_any_element()
 }
 
+/// `\ No newline at end of file` and friends: a note about the row rather
+/// than code, so it is indented past the columns and never tinted. In split
+/// mode it spans both halves.
+fn meta_line_row(text: &str, theme: &Theme, pad_left: f32) -> AnyElement {
+    div()
+        .h(px(DIFF_LINE_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .pl(px(pad_left))
+        .text_size(px(10.5))
+        .text_color(theme.text_faint)
+        .italic()
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Split (side-by-side) rendering
+// ---------------------------------------------------------------------------
+
+/// The paint-only syntax runs for one diff line.
+fn line_runs(
+    line: &DiffLine,
+    highlights: Option<&DiffHighlights>,
+    theme: &Theme,
+) -> Vec<gpui::TextRun> {
+    let spans = highlights.map(|h| h.spans(line)).unwrap_or(&[]);
+    render::runs_for_syntax_line_with_plain(
+        &line.text,
+        spans,
+        &font(theme.font_mono.clone()),
+        theme.text.opacity(0.92),
+        theme,
+    )
+}
+
+/// One half of a split row: the same accent bar / gutter / marker / code
+/// columns a unified row uses, minus the second gutter — each half numbers
+/// only its own side. Takes prebuilt `runs` so a mirrored row can share one
+/// set across both columns.
+fn split_line_cell(
+    line: &DiffLine,
+    number: Option<u32>,
+    runs: Vec<gpui::TextRun>,
+    theme: &Theme,
+    gutter_px: f32,
+) -> gpui::Div {
+    let mut add_bg = add_color(theme);
+    add_bg.a = 0.055;
+    let mut del_bg = del_color(theme);
+    del_bg.a = 0.055;
+    let (marker, marker_color, row_bg, accent, number_color) = match line.kind {
+        LineKind::Add => (
+            "+",
+            add_color(theme),
+            Some(add_bg),
+            Some(add_color(theme).opacity(0.55)),
+            add_color(theme).opacity(0.9),
+        ),
+        LineKind::Del => (
+            "−",
+            del_color(theme),
+            Some(del_bg),
+            Some(del_color(theme).opacity(0.55)),
+            del_color(theme).opacity(0.9),
+        ),
+        _ => (
+            "·",
+            theme.text_faint.opacity(0.5),
+            None,
+            None,
+            theme.text_faint.opacity(0.8),
+        ),
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .overflow_hidden()
+        .flex()
+        .flex_row()
+        .items_center()
+        .when_some(row_bg, |el, bg| el.bg(bg))
+        .child(
+            div()
+                .w(px(ACCENT_BAR_WIDTH))
+                .h_full()
+                .flex_none()
+                .when_some(accent, |el, color| el.bg(color)),
+        )
+        .child(
+            div()
+                .w(px(gutter_px))
+                .flex_none()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .text_color(number_color)
+                .flex()
+                .justify_end()
+                .pr(px(8.0))
+                .child(SharedString::from(
+                    number.map(|n| n.to_string()).unwrap_or_default(),
+                )),
+        )
+        .child(
+            div()
+                .w(px(SPLIT_MARKER_WIDTH))
+                .flex_none()
+                .flex()
+                .justify_center()
+                .text_size(px(DIFF_TEXT_SIZE))
+                .text_color(marker_color)
+                .font_family(theme.font_mono.clone())
+                .child(SharedString::from(marker)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .pl(px(6.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(DIFF_TEXT_SIZE))
+                .whitespace_nowrap()
+                .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
+        )
+}
+
+/// The empty half of a one-sided split row — a pure-insert row has no old
+/// line, and vice versa. A flat wash, quieter than either tint, reads as
+/// "nothing here" without competing with the code beside it.
+fn split_filler() -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .bg(crate::theme::ink(0.03))
+}
+
+/// Compose the two halves with the centre hairline.
+fn split_row(left: AnyElement, right: AnyElement) -> gpui::Div {
+    div()
+        .h(px(DIFF_LINE_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_stretch()
+        .child(left)
+        .child(
+            div()
+                .w(px(SPLIT_DIVIDER_WIDTH))
+                .h_full()
+                .flex_none()
+                .bg(crate::theme::hairline(0.06)),
+        )
+        .child(right)
+}
+
+pub const COMMENT_ADDER_SIZE: f32 = 16.0;
+
+/// A split row's `+` only ever appears in the right column, which carries one
+/// gutter — so the offset is the same for every line. It is measured from the
+/// column, not the row: the halves are fluid, so the right one has no
+/// absolute left edge to measure from.
+pub fn split_adder_left(gutter_px: f32) -> f32 {
+    ACCENT_BAR_WIDTH + (gutter_px - COMMENT_ADDER_SIZE) / 2.0
+}
+
+/// A unified row carries both gutters side by side, and a deletion numbers in
+/// the first.
+pub fn comment_adder_left(side: CommentSide, gutter_px: f32) -> f32 {
+    let column = match side {
+        CommentSide::Old => 0.0,
+        CommentSide::New => gutter_px,
+    };
+    ACCENT_BAR_WIDTH + column + (gutter_px - COMMENT_ADDER_SIZE) / 2.0
+}
+
+fn positioned_adder(left: f32, adder: AnyElement) -> gpui::Div {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(0.0))
+        .h_full()
+        .flex()
+        .items_center()
+        .child(adder)
+}
+
+fn render_comment_adder(
+    path: &str,
+    side: CommentSide,
+    line: u32,
+    theme: &Theme,
+    cx: &Context<Changes>,
+) -> AnyElement {
+    let target = path.to_string();
+    div()
+        .id(SharedString::from(format!(
+            "cmt-add-{path}-{}-{line}",
+            side.tag()
+        )))
+        .size(px(COMMENT_ADDER_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .bg(theme.solid)
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_draft(target.clone(), side, line, window, cx);
+        }))
+        .child(
+            crate::icons::icon(crate::icons::PLUS)
+                .size(px(11.0))
+                .text_color(theme.on_solid),
+        )
+        .into_any_element()
+}
+
+fn render_comment_card(comment: &DiffComment, theme: &Theme, cx: &Context<Changes>) -> AnyElement {
+    let group: SharedString = format!("cmt-card-{}", comment.id).into();
+    let id = comment.id.clone();
+    div()
+        .group(group.clone())
+        .h(px(comments::card_height(&comment.body)))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .bg(crate::theme::ink(0.05))
+        // A bar, not a border: it must match ACCENT_BAR_WIDTH exactly or the
+        // card's edge steps in and out of the column.
+        .child(comment_accent_bar(theme.solid.opacity(0.35)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .px(px(Theme::SPACE_LG))
+                .py(px(comments::CARD_PAD_V / 2.0))
+                .child(
+                    div()
+                        .h(px(comments::CARD_HEADER_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                                .size(px(12.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(comment.location())),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("cmt-remove-{}", comment.id)))
+                                .flex_none()
+                                .size(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .opacity(0.0)
+                                .group_hover(group, |s| s.opacity(1.0))
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.remove_comment(&id, cx)),
+                                )
+                                .child(
+                                    crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        // Height is analytic, so an over-long body clips
+                        // inside the card rather than past the fold height.
+                        .overflow_hidden()
+                        .text_size(px(12.0))
+                        .line_height(px(comments::CARD_LINE_HEIGHT))
+                        .text_color(theme.text_dim)
+                        .child(SharedString::from(comment.body.clone())),
+                ),
+        )
+        .into_any_element()
+}
+
+fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
+    div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
+}
+
+/// Mirrors [`DiffComment::cite_path`] for the not-yet-staged note.
+fn draft_cite_path(draft: &CommentDraft) -> &str {
+    match draft.side {
+        CommentSide::Old => draft.old_path.as_deref().unwrap_or(&draft.path),
+        CommentSide::New => &draft.path,
+    }
+}
+
+/// Fixed height, so an open draft never fights the fold tween.
+fn render_comment_draft(
+    path: &str,
+    line: u32,
+    input: Entity<ComposerInput>,
+    theme: &Theme,
+    cx: &Context<Changes>,
+) -> AnyElement {
+    div()
+        .h(px(comments::DRAFT_CARD_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .bg(crate::theme::ink(0.08))
+        .child(comment_accent_bar(theme.solid.opacity(0.7)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .px(px(Theme::SPACE_LG))
+                .py(px(10.0))
+                .child(
+                    div()
+                        .h(px(comments::CARD_HEADER_HEIGHT))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                                .size(px(12.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("{path}:{line}"))),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(46.0))
+                        .flex_none()
+                        .overflow_hidden()
+                        .text_size(px(12.0))
+                        .child(input.into_any_element()),
+                )
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(6.0))
+                        .child(
+                            comment_action("cmt-cancel", "Cancel", false, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_draft(cx))),
+                        )
+                        .child(
+                            comment_action("cmt-commit", "Comment", true, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.commit_draft(cx))),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+fn comment_action(
+    id: &'static str,
+    label: &'static str,
+    primary: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(22.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .rounded(px(6.0))
+        .text_size(px(11.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .when(primary, |el| el.bg(theme.solid).text_color(theme.on_solid))
+        .when(!primary, |el| {
+            el.text_color(motion::hover_blend(id, theme.text_muted, theme.text))
+                .bg(motion::hover_blend(
+                    id,
+                    gpui::transparent_black(),
+                    theme.element_hover,
+                ))
+                .on_hover(motion::hover_listener(id))
+        })
+        .child(SharedString::from(label))
+}
+
 /// The expanded body of one file section: notices, hunk headers, +/-/context
 /// lines with a coloured accent bar, dual line-number gutters, a marker
 /// column, and paint-only syntax runs (zeron checkout-diff-sidebar).
@@ -2831,10 +4137,17 @@ fn render_file_body_upto(
     highlight: Option<Arc<DiffHighlights>>,
     theme: &Theme,
     max_px: f32,
+    mode: DiffMode,
 ) -> AnyElement {
     let mut children: Vec<AnyElement> = Vec::new();
     let mut y = 0.0f32;
     let gutter_px = gutter_width(file);
+    let spans_for = |line: &DiffLine| {
+        highlight
+            .as_deref()
+            .map(|highlights| highlights.spans(line))
+            .unwrap_or(&[])
+    };
 
     'build: {
         for notice in file_notices(file) {
@@ -2850,16 +4163,56 @@ fn render_file_body_upto(
             }
             children.push(hunk_header_row(&hunk.header, theme));
             y += HUNK_HEADER_HEIGHT;
-            for line in &hunk.lines {
-                if y >= max_px {
-                    break 'build;
+            match mode {
+                DiffMode::Unified => {
+                    for line in &hunk.lines {
+                        if y >= max_px {
+                            break 'build;
+                        }
+                        children.push(diff_line_row(line, spans_for(line), theme, gutter_px));
+                        y += DIFF_LINE_HEIGHT;
+                    }
                 }
-                let spans = highlight
-                    .as_deref()
-                    .map(|highlights| highlights.spans(line))
-                    .unwrap_or(&[]);
-                children.push(diff_line_row(line, spans, theme, gutter_px));
-                y += DIFF_LINE_HEIGHT;
+                DiffMode::Split => {
+                    // Pair only what the clip can still reveal: the unified
+                    // arm breaks out of a lazy walk, so the split arm must not
+                    // materialize the whole hunk first.
+                    let budget = ((max_px - y) / DIFF_LINE_HEIGHT).ceil().max(0.0) as usize;
+                    for (left, right) in split_pairs_upto(&hunk.lines, budget) {
+                        if y >= max_px {
+                            break 'build;
+                        }
+                        let line_at =
+                            |slot: Option<u32>| slot.and_then(|slot| hunk.lines.get(slot as usize));
+                        let cell = |line: Option<&DiffLine>, old: bool| match line {
+                            Some(line) => split_line_cell(
+                                line,
+                                if old { line.old_no } else { line.new_no },
+                                line_runs(line, highlight.as_deref(), theme),
+                                theme,
+                                gutter_px,
+                            )
+                            .into_any_element(),
+                            None => split_filler().into_any_element(),
+                        };
+                        let (left, right) = (line_at(left), line_at(right));
+                        let marker = [left, right]
+                            .into_iter()
+                            .flatten()
+                            .find(|line| line.kind == LineKind::Meta);
+                        children.push(match marker {
+                            Some(line) => meta_line_row(
+                                &line.text,
+                                theme,
+                                2.0 * (ACCENT_BAR_WIDTH + gutter_px),
+                            ),
+                            None => {
+                                split_row(cell(left, true), cell(right, false)).into_any_element()
+                            }
+                        });
+                        y += DIFF_LINE_HEIGHT;
+                    }
+                }
             }
         }
     }
@@ -3162,7 +4515,7 @@ rename to new_name.rs
     #[test]
     fn rows_flatten_to_line_granularity() {
         let files = parse_patch(PATCH);
-        let (rows, ranges) = flatten_rows(&files, |_| false);
+        let (rows, ranges) = flatten_rows(&files, &[], None, DiffMode::Unified, |_| false);
         assert_eq!(ranges.len(), files.len());
         // Every file's span starts with its header…
         for (ix, range) in ranges.iter().enumerate() {
@@ -3189,13 +4542,245 @@ rename to new_name.rs
         assert_eq!(*main_rows.last().unwrap(), DiffRow::BodyPad { file: 0 });
 
         // A collapsed file contributes its header row only.
-        let (rows, ranges) = flatten_rows(&files, |ix| ix == 0);
+        let (rows, ranges) = flatten_rows(&files, &[], None, DiffMode::Unified, |ix| ix == 0);
         assert_eq!(ranges[0].len(), 1);
         assert_eq!(rows[ranges[1].start], DiffRow::FileHeader { file: 1 });
 
         // Notices lead the body: the added file carries "New file".
         let added_rows = &rows[ranges[1].clone()];
         assert_eq!(added_rows[1], DiffRow::Notice { file: 1, notice: 0 });
+    }
+
+    #[test]
+    fn split_pairs_align_edits_and_strand_the_rest() {
+        let files = parse_patch(PATCH);
+        // src/main.rs hunk 0: context, −1, +1, +1, context. The edited line
+        // pairs across; the extra addition is stranded on the right.
+        assert_eq!(
+            split_pairs(&files[0].hunks[0].lines),
+            vec![
+                (Some(0), Some(0)),
+                (Some(1), Some(2)),
+                (None, Some(3)),
+                (Some(4), Some(4)),
+            ]
+        );
+        // A pure add: every row is right-only, including the trailing
+        // no-newline Meta line — it belongs to the side it follows, and its
+        // row spans both columns at render.
+        assert_eq!(
+            split_pairs(&files[1].hunks[0].lines),
+            vec![(None, Some(0)), (None, Some(1)), (None, Some(2))]
+        );
+        // A pure delete strands the left.
+        assert_eq!(split_pairs(&files[2].hunks[0].lines), vec![(Some(0), None)]);
+        assert!(split_pairs(&[]).is_empty());
+
+        // `-a +b -c +d` is two one-line edits, not one four-line one: a
+        // deletion arriving after additions opens a new block.
+        let line = |kind| DiffLine {
+            kind,
+            old_no: Some(1),
+            new_no: Some(1),
+            text: String::new(),
+        };
+        let lines = [
+            line(LineKind::Del),
+            line(LineKind::Add),
+            line(LineKind::Del),
+            line(LineKind::Add),
+        ];
+        assert_eq!(
+            split_pairs(&lines),
+            vec![(Some(0), Some(1)), (Some(2), Some(3))]
+        );
+    }
+
+    #[test]
+    fn no_newline_markers_keep_their_edit_paired() {
+        // Both files lost their final newline: git writes the marker twice,
+        // once per side. Neither may split the edit into one-sided rows.
+        let both = "diff --git a/a.txt b/a.txt\n\
+             --- a/a.txt\n\
+             +++ b/a.txt\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             \\ No newline at end of file\n\
+             +new\n\
+             \\ No newline at end of file\n";
+        let files = parse_patch(both);
+        let lines = &files[0].hunks[0].lines;
+        assert_eq!(
+            lines.iter().map(|line| line.kind).collect::<Vec<_>>(),
+            vec![LineKind::Del, LineKind::Meta, LineKind::Add, LineKind::Meta]
+        );
+        // One aligned old/new row, then the two markers on one row of their
+        // own — four lines read as two rows, not four.
+        assert_eq!(
+            split_pairs(lines),
+            vec![(Some(0), Some(2)), (Some(1), Some(3))]
+        );
+        let full = split_pairs(lines);
+        for cap in 0..=full.len() + 2 {
+            assert_eq!(split_pairs_upto(lines, cap), full[..cap.min(full.len())]);
+        }
+
+        // Only the old file lacked one: the edit still pairs, and the lone
+        // marker takes a row on its own side.
+        let old_only = "diff --git a/a.txt b/a.txt\n\
+             --- a/a.txt\n\
+             +++ b/a.txt\n\
+             @@ -1 +1 @@\n\
+             -old\n\
+             \\ No newline at end of file\n\
+             +new\n";
+        let files = parse_patch(old_only);
+        assert_eq!(
+            split_pairs(&files[0].hunks[0].lines),
+            vec![(Some(0), Some(2)), (Some(1), None)]
+        );
+    }
+
+    #[test]
+    fn split_flattening_pairs_rows_and_keeps_heights_analytic() {
+        let files = parse_patch(PATCH);
+        let (rows, ranges) = flatten_rows(&files, &[], None, DiffMode::Split, |_| false);
+        assert_eq!(ranges.len(), files.len());
+        assert_eq!(ranges.last().unwrap().end, rows.len());
+
+        // src/main.rs: header, 2 hunk headers, 4 + 2 paired rows, pad — the
+        // same 8 lines, two columns.
+        let main_rows = &rows[ranges[0].clone()];
+        assert_eq!(main_rows.len(), 1 + 2 + (4 + 2) + 1);
+        assert_eq!(
+            main_rows[2],
+            DiffRow::SplitLine {
+                file: 0,
+                hunk: 0,
+                left: Some(0),
+                right: Some(0),
+            }
+        );
+        assert_eq!(
+            main_rows[4],
+            DiffRow::SplitLine {
+                file: 0,
+                hunk: 0,
+                left: None,
+                right: Some(3),
+            }
+        );
+        assert_eq!(*main_rows.last().unwrap(), DiffRow::BodyPad { file: 0 });
+        // Pairing only ever merges rows, so split is never the taller layout.
+        assert!(main_rows.len() < 1 + body_row_count(&files[0]));
+
+        // Heights stay analytic — the fold tween needs no measurement.
+        assert_eq!(
+            body_height_with(&files[0], &[], None, DiffMode::Split),
+            2.0 * HUNK_HEADER_HEIGHT + 6.0 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
+        );
+    }
+
+    #[test]
+    fn capped_pairing_agrees_with_the_full_pairing_and_stays_bounded() {
+        // The fold tween re-renders its stand-in every frame, so the capped
+        // walk must be a true prefix of the full one — not an approximation.
+        let lines = &parse_patch(PATCH)[0].hunks[0].lines;
+        let full = split_pairs(lines);
+        for cap in 0..=full.len() + 2 {
+            assert_eq!(split_pairs_upto(lines, cap), full[..cap.min(full.len())]);
+        }
+
+        // A huge single-sided run must not be materialized to yield a few
+        // rows: 20k deletions, 5 rows asked for, 5 rows built.
+        let many: Vec<DiffLine> = (0..20_000u32)
+            .map(|n| DiffLine {
+                kind: LineKind::Del,
+                old_no: Some(n + 1),
+                new_no: None,
+                text: String::new(),
+            })
+            .collect();
+        let capped = split_pairs_upto(&many, 5);
+        assert_eq!(capped.len(), 5);
+        assert!(
+            capped.capacity() < 100,
+            "capacity tracks the cap, not the hunk"
+        );
+        assert_eq!(capped[4], (Some(4), None));
+    }
+
+    #[test]
+    fn a_split_row_offers_each_column_its_own_anchor() {
+        let files = parse_patch(PATCH);
+        let lines = &files[0].hunks[0].lines;
+        // The paired edit cites the old line on the left, the new on the right.
+        assert_eq!(
+            pair_anchors(lines, (Some(1), Some(2))),
+            [Some((CommentSide::Old, 2)), Some((CommentSide::New, 2))]
+        );
+        // A context row names one anchor, not the same one twice — otherwise
+        // its card would be pushed into the body in duplicate. The caller
+        // flattens, so the dropped duplicate reads as an empty slot.
+        assert_eq!(
+            pair_anchors(lines, (Some(0), Some(0))),
+            [Some((CommentSide::New, 1)), None]
+        );
+        // A stranded side contributes nothing.
+        assert_eq!(
+            pair_anchors(lines, (None, Some(3))),
+            [None, Some((CommentSide::New, 3))]
+        );
+    }
+
+    #[test]
+    fn split_rows_carry_the_comments_of_both_columns() {
+        let files = parse_patch(PATCH);
+        // A context row must not stack the same card twice.
+        let comment = DiffComment::new("src/main.rs", CommentSide::New, 1, "why");
+        let rows = body_rows(0, &files[0], &[comment], None, DiffMode::Split);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, DiffRow::CommentCard { .. }))
+                .count(),
+            1
+        );
+
+        // Both sides of one paired row hang off that row, in column order.
+        let staged = vec![
+            DiffComment::new("src/main.rs", CommentSide::Old, 2, "left"),
+            DiffComment::new("src/main.rs", CommentSide::New, 2, "right"),
+        ];
+        let rows = body_rows(0, &files[0], &staged, None, DiffMode::Split);
+        let edit = rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::SplitLine { left: Some(1), .. }))
+            .unwrap();
+        assert_eq!(rows[edit + 1], DiffRow::CommentCard { file: 0, card: 0 });
+        assert_eq!(rows[edit + 2], DiffRow::CommentCard { file: 0, card: 1 });
+    }
+
+    #[test]
+    fn a_split_rows_right_column_is_never_a_deletion() {
+        // The invariant the `+` placement rests on: only the right column is
+        // hoverable, so every note a split row can start must cite the
+        // post-change file. Were a deletion ever to land on the right, that
+        // rule would quietly start filing notes against lines the agent
+        // cannot edit.
+        for file in parse_patch(PATCH) {
+            for hunk in &file.hunks {
+                for (_, right) in split_pairs(&hunk.lines) {
+                    let Some(line) = right.and_then(|ix| hunk.lines.get(ix as usize)) else {
+                        continue;
+                    };
+                    assert_ne!(line.kind, LineKind::Del, "{:?}", line);
+                    assert!(matches!(
+                        line_anchor(line),
+                        None | Some((CommentSide::New, _))
+                    ));
+                }
+            }
+        }
     }
 
     #[test]

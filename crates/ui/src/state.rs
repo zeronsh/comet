@@ -27,12 +27,18 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
+use crate::comments::DiffComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
-    AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+    AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
+    EngineInfo, HarnessId, Session, Space, WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+
+use crate::change_requests::{
+    ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
+};
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -402,9 +408,8 @@ impl EngineHandle {
                             Ok(_) => DeferredEngineState::Ready,
                             // EngineReady was added after EngineInfo. An older daemon
                             // that does not expose the barrier is already assembled.
-                            Err(RpcError::Failed(message))
-                                if message
-                                    == format!("unknown method: {}", methods::ENGINE_READY) =>
+                            Err(RpcError::UnknownMethod(method))
+                                if method == methods::ENGINE_READY =>
                             {
                                 DeferredEngineState::Ready
                             }
@@ -470,9 +475,7 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
         .await
     {
         Ok(info) => Ok(info),
-        Err(RpcError::Failed(message))
-            if message == format!("unknown method: {}", methods::ENGINE_INFO) =>
-        {
+        Err(RpcError::UnknownMethod(method)) if method == methods::ENGINE_INFO => {
             #[derive(serde::Deserialize)]
             #[serde(rename_all = "camelCase")]
             struct LocalDevice {
@@ -548,18 +551,30 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 /// A composer send whose doc command is queued but not yet executed by the
 /// chat's host device — cleared when the host writes the user message back
 /// into the transcript (same client-minted id as the [`AppState::echoes`]
-/// dedup), or after [`PENDING_SEND_TTL_MS`].
+/// dedup); past [`UNDELIVERED_GRACE_MS`] it surfaces as the explicit
+/// failed/retry state instead.
 #[derive(Debug, Clone)]
 struct PendingSend {
     message_id: String,
     started: DateTime<Utc>,
 }
 
-/// How long the send-in-flight overlay may hold before the synced status
-/// shows through again. Covers the queue → nudge → drain → sync round-trip
-/// to a remote host; when the host is offline the dot falls back to the
-/// truth after this.
-pub const PENDING_SEND_TTL_MS: i64 = 30_000;
+/// How long an unadopted send reads as Working/Sending (or Queued when the
+/// path is degraded) before flipping to the EXPLICIT failed state with a
+/// retry affordance. The old 30s overlay silently expired back to Idle with
+/// no visible trace of the send at all — the exact hole the 2026-08-19
+/// incident fell into.
+pub const UNDELIVERED_GRACE_MS: i64 = 120_000;
+
+/// A send's attachment-upload leg in flight. `done` is bumped by the upload
+/// task per completed chunk (binary bytes); the working label reads it every
+/// paint (the spinner already animates each frame), so no notify plumbing is
+/// needed. A slow upload renders as "Uploading… N%" instead of a
+/// hang-indistinguishable "Sending…" (2026-08-18 user report).
+pub struct UploadProgress {
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: u64,
+}
 
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
@@ -572,6 +587,9 @@ pub struct AppState {
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
+    /// Live edge posture (WatchConnectivity): drives the connection pill,
+    /// composer honesty ("will queue"), and the Queued send badges.
+    pub connectivity: zeron_proto::Connectivity,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
@@ -600,12 +618,24 @@ pub struct AppState {
     pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// The selected chat's opening `WatchDocMessages` reset has landed. An
+    /// empty transcript is otherwise indistinguishable from the pre-replay
+    /// gap after selection, where optimistic echoes may already be visible.
+    pub transcript_replayed: bool,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// The in-flight send's attachment upload, when it has one.
+    upload_progress: Option<UploadProgress>,
+    /// Engine-side queued-attachment transfers by uploadId (`WatchTransfers`
+    /// snapshots): real relay-leg progress for the sending thumbnail's
+    /// percent ring, present exactly while bytes are moving.
+    transfers: HashMap<String, (u64, u64)>,
+    /// Written by the changes pane, read by the composer.
+    diff_comments: HashMap<String, Vec<DiffComment>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -617,6 +647,17 @@ pub struct AppState {
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
+    change_requests: ChangeRequestClientState,
+    change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
+    /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
+    /// subagent tabs read these). Independent of `selected_chat`: a tab's
+    /// feed must survive chat switches — the tab itself is what scopes it.
+    sub_transcripts: HashMap<String, Vec<SessionMessageEntry>>,
+    /// One watch task per live subagent doc (single-flight per key).
+    /// Dropping a task cancels the engine-side watch and unpins the doc from
+    /// the engine LRU — closing a tab MUST go through
+    /// [`Self::unwatch_subagent_doc`].
+    sub_watch_tasks: HashMap<String, Task<()>>,
 }
 
 impl Default for AppState {
@@ -632,6 +673,7 @@ impl AppState {
             workspace_scope: None,
             auth: None,
             devices: Vec::new(),
+            connectivity: zeron_proto::Connectivity::default(),
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
@@ -640,18 +682,64 @@ impl AppState {
             selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
+            transcript_replayed: false,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            upload_progress: None,
+            transfers: HashMap::new(),
+            diff_comments: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
+            change_requests: ChangeRequestClientState::default(),
+            change_request_tasks: HashMap::new(),
+            sub_transcripts: HashMap::new(),
+            sub_watch_tasks: HashMap::new(),
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
         }
+    }
+
+    /// The selected chat, or `""` on the new-chat canvas. Identical to the
+    /// composer's own attachment/draft key, so a comment written before the
+    /// first send survives the chat being minted.
+    pub fn composer_key(&self) -> String {
+        self.selected_chat.clone().unwrap_or_default()
+    }
+
+    pub fn diff_comments(&self, key: &str) -> &[DiffComment] {
+        self.diff_comments
+            .get(key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn add_diff_comment(&mut self, key: &str, comment: DiffComment) {
+        self.diff_comments
+            .entry(key.to_string())
+            .or_default()
+            .push(comment);
+    }
+
+    pub fn remove_diff_comment(&mut self, key: &str, id: &str) {
+        if let Some(list) = self.diff_comments.get_mut(key) {
+            list.retain(|c| c.id != id);
+            if list.is_empty() {
+                self.diff_comments.remove(key);
+            }
+        }
+    }
+
+    pub fn take_diff_comments(&mut self, key: &str) -> Vec<DiffComment> {
+        self.diff_comments.remove(key).unwrap_or_default()
+    }
+
+    pub fn purge_diff_comments(&mut self, key: &str) {
+        self.diff_comments.remove(key);
     }
 
     // ---- reducers (pure) ----
@@ -666,6 +754,7 @@ impl AppState {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
             self.transcript.clear();
+            self.transcript_replayed = false;
             self.transcript_task = None;
         }
     }
@@ -706,6 +795,49 @@ impl AppState {
         }
     }
 
+    pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
+        self.connectivity = connectivity;
+    }
+
+    /// Is this chat's delivery path degraded — will a send QUEUE rather than
+    /// reach its executor promptly? Locally-hosted chats are never degraded
+    /// (a queued command executes on this device even fully offline). Remote
+    /// chats degrade when the OS says offline, when the chat's own edge room
+    /// is down, or when the host device has gone presence-dark.
+    pub fn chat_delivery_degraded(&self, chat_id: &str) -> bool {
+        use zeron_proto::ConnectivityState as S;
+        if self.connectivity.state == S::Disabled {
+            return false;
+        }
+        let Some(chat) = self.chats.iter().find(|c| c.id == chat_id) else {
+            // Unknown chat (a just-minted canvas send): only the global
+            // state can speak.
+            return self.connectivity.state == S::Offline;
+        };
+        if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
+            return false;
+        }
+        if self.connectivity.state == S::Offline {
+            return true;
+        }
+        let room_down = match self
+            .connectivity
+            .chats
+            .iter()
+            .find(|c| c.chat_id == chat_id)
+        {
+            Some(net) => !net.connected,
+            None => self.connectivity.state != S::Connected,
+        };
+        room_down || !self.device_online(&chat.device_id, Utc::now())
+    }
+
+    /// A send is queued: in flight AND its delivery path is degraded — the
+    /// honest badge is "Queued", not a Working spinner.
+    pub fn send_queued(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.send_pending(chat_id, now) && self.chat_delivery_degraded(chat_id)
+    }
+
     pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
         // A local-only workspace has no remote device identity to distinguish.
         // Keep the engine's legacy sentinel out of the UI while preserving real
@@ -717,7 +849,24 @@ impl AppState {
         {
             device.name = "Local".to_string();
         }
+        for device in &devices {
+            self.change_requests
+                .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
+        }
         self.devices = devices;
+    }
+
+    /// True when `device_id`'s engine (per its registry device row) is at
+    /// least `min`. Unknown devices and unstamped versions are conservatively
+    /// false — feature gates fall back to the legacy path rather than speak a
+    /// protocol the peer may not understand.
+    pub fn device_version_at_least(&self, device_id: &str, min: (u64, u64, u64)) -> bool {
+        self.devices
+            .iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.version.as_deref())
+            .and_then(version_triple)
+            .is_some_and(|v| v >= min)
     }
 
     /// First project on the composer's picked device (falling back through
@@ -767,6 +916,7 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.transcript_replayed = true;
         self.ack_pending_send_from_transcript();
     }
 
@@ -776,7 +926,11 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
+        let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        if is_reset {
+            self.transcript_replayed = true;
+        }
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -785,6 +939,44 @@ impl AppState {
         }
         self.ack_pending_send_from_transcript();
         Ok(())
+    }
+
+    /// A subagent doc's current transcript copy (empty until its watch's
+    /// replay frame lands, or its frozen snapshot is set).
+    pub fn sub_transcript(&self, doc_id: &str) -> &[SessionMessageEntry] {
+        self.sub_transcripts
+            .get(doc_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Watch a SUBAGENT doc (`WatchDocMessages` works for any doc id).
+    /// Single-flight per key; a frozen snapshot already in place wins — the
+    /// watch would race the (complete) blob with a possibly-purged live doc.
+    pub fn watch_subagent_doc(&mut self, doc_id: String, cx: &mut Context<Self>) {
+        if self.sub_watch_tasks.contains_key(&doc_id) {
+            return;
+        }
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.sub_transcripts.entry(doc_id.clone()).or_default();
+        let task = spawn_subagent_watch(cx, handle, doc_id.clone());
+        self.sub_watch_tasks.insert(doc_id, task);
+    }
+
+    /// Tab closed: drop the watch task (cancels the engine-side watch and
+    /// unpins the doc from the engine LRU) and the rows.
+    pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
+        self.sub_watch_tasks.remove(doc_id);
+        self.sub_transcripts.remove(doc_id);
+    }
+
+    /// Frozen-blob path: the finished subagent's uploaded transcript, no
+    /// watch needed (and any in-flight watch is superseded).
+    pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        self.sub_watch_tasks.remove(&doc_id);
+        self.sub_transcripts.insert(doc_id, entries);
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -831,11 +1023,86 @@ impl AppState {
         }
     }
 
-    /// Is a send still in flight for this chat (unacked, inside the TTL)?
+    /// Attachment upload starting: expose its progress to the working label.
+    pub fn begin_upload_progress(
+        &mut self,
+        total: u64,
+        done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.upload_progress = Some(UploadProgress { done, total });
+    }
+
+    /// Upload leg over (success or failure) — the label goes back to plain
+    /// send/working wording.
+    pub fn end_upload_progress(&mut self) {
+        self.upload_progress = None;
+    }
+
+    /// Percent of the in-flight attachment upload, clamped to 99 — the last
+    /// point belongs to the commit + queue, so "100% but still spinning"
+    /// never shows. `None` when no upload is in flight (or it's empty).
+    pub fn upload_progress_percent(&self) -> Option<u8> {
+        let progress = self.upload_progress.as_ref()?;
+        if progress.total == 0 {
+            return None;
+        }
+        let done = progress
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(progress.total);
+        Some(((done * 100) / progress.total).min(99) as u8)
+    }
+
+    /// A `WatchTransfers` snapshot: the engine-side relay leg's in-flight
+    /// queued-attachment transfers, replacing the whole set each frame.
+    pub fn apply_transfers(&mut self, transfers: Vec<zeron_proto::TransferProgress>) {
+        self.transfers = transfers
+            .into_iter()
+            .map(|t| (t.upload_id, (t.done, t.total)))
+            .collect();
+    }
+
+    /// Percent of one queued attachment's relay transfer, by the uploadId
+    /// its `pending://{uploadId}/…` ref names. Same 99-clamp as
+    /// [`Self::upload_progress_percent`]: the last point belongs to the
+    /// commit, so "100% but still spinning" never shows. `None` when no
+    /// bytes are moving for that upload (staged-but-waiting, retry backoff,
+    /// or done) — the thumbnail falls back to its indeterminate spinner.
+    pub fn transfer_percent(&self, upload_id: &str) -> Option<u8> {
+        let (done, total) = self.transfers.get(upload_id)?;
+        if *total == 0 {
+            return None;
+        }
+        Some(((done.min(total) * 100) / total).min(99) as u8)
+    }
+
+    /// Is a send still in flight for this chat (unacked)? Inside the grace
+    /// window normally; while the chat's delivery path is degraded the
+    /// overlay holds indefinitely — the truth IS "Queued", and silently
+    /// expiring back to Idle left a queued send with no visible trace at
+    /// all (the 30s→silence hole, 2026-08-19).
     pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
         self.pending_sends.get(chat_id).is_some_and(|p| {
-            now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS
+            now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                || self.chat_delivery_degraded(chat_id)
         })
+    }
+
+    /// The send has sat unadopted past the grace window: surface the
+    /// EXPLICIT failed state ("Not delivered — retry") instead of either
+    /// faking progress or silently forgetting the send ever happened.
+    pub fn send_undelivered(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() > UNDELIVERED_GRACE_MS
+        })
+    }
+
+    /// Retry pressed: restart the grace clock so the overlay returns to its
+    /// Sending/Queued phase while the re-kicked delivery runs.
+    pub fn retry_pending_send(&mut self, chat_id: &str, now: DateTime<Utc>) {
+        if let Some(p) = self.pending_sends.get_mut(chat_id) {
+            p.started = now;
+        }
     }
 
     /// When the in-flight send (if any, inside the TTL) was fired — the
@@ -847,7 +1114,8 @@ impl AppState {
         self.pending_sends
             .get(chat_id)
             .filter(|p| {
-                now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS
+                now.signed_duration_since(p.started).num_milliseconds() <= UNDELIVERED_GRACE_MS
+                    || self.chat_delivery_degraded(chat_id)
             })
             .map(|p| p.started)
     }
@@ -1033,6 +1301,12 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// Latest valid PR for a chat, rechecked against device, checkout, cwd and branch.
+    pub fn change_request_for_chat(&self, chat: &Chat) -> Option<&ChangeRequestSummary> {
+        self.change_requests
+            .change_request_for_chat(chat, &self.spaces)
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
@@ -1048,6 +1322,8 @@ impl AppState {
         self.engine = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
+        self.change_request_tasks.clear();
+        self.change_requests = ChangeRequestClientState::default();
         self.connection = ConnectionStatus::Connecting;
         self.workspace_scope = None;
         self.auth = None;
@@ -1063,8 +1339,11 @@ impl AppState {
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
+        self.transcript_replayed = false;
         self.echoes.clear();
         self.pending_sends.clear();
+        self.upload_progress = None;
+        self.transfers.clear();
         self.local_device_id = None;
         self.update = None;
         cx.notify();
@@ -1134,6 +1413,18 @@ impl AppState {
             spawn_watch(
                 cx,
                 handle.clone(),
+                methods::WATCH_CONNECTIVITY,
+                AppState::apply_connectivity,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_TRANSFERS,
+                AppState::apply_transfers,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
                 methods::WATCH_SPACES,
                 AppState::apply_spaces,
             ),
@@ -1153,6 +1444,7 @@ impl AppState {
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         self.watch_tasks = watch_tasks;
+        self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.
         self.connection = ConnectionStatus::Ready;
@@ -1161,6 +1453,34 @@ impl AppState {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
         }
         cx.notify();
+    }
+
+    fn reconcile_change_request_watches(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            self.change_request_tasks.clear();
+            return;
+        };
+        let targets = desired_watch_targets(&self.chats, &self.spaces, |device| {
+            !self.change_requests.is_supported(device)
+        });
+
+        self.change_request_tasks
+            .retain(|target, _| targets.contains(target));
+        self.change_requests.retain_targets(&targets);
+
+        let local_device_id = self.local_device_id.clone();
+        for target in targets {
+            if self.change_request_tasks.contains_key(&target) {
+                continue;
+            }
+            let task = spawn_change_request_watch(
+                cx,
+                handle.clone(),
+                target.clone(),
+                local_device_id.clone(),
+            );
+            self.change_request_tasks.insert(target, task);
+        }
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -1178,6 +1498,7 @@ impl AppState {
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
+        self.transcript_replayed = false;
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
@@ -1329,6 +1650,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 };
                 let alive = this.update(cx, |state, cx| {
                     state.apply_chats(parsed);
+                    state.reconcile_change_request_watches(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -1336,6 +1658,97 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
                 }
             }
             tracing::debug!("chats stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+pub use zeron_proto::version_triple;
+
+fn spawn_change_request_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    target: ChangeRequestWatchKey,
+    local_device_id: Option<String>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let params = watch_params(&target, local_device_id.as_deref());
+
+            let mut subscription = match handle
+                .client()
+                .subscribe_checked(methods::WATCH_CHECKOUT_CHANGE_REQUEST, params)
+                .await
+            {
+                Ok(subscription) => subscription,
+                Err(RpcError::UnknownMethod(_)) => {
+                    tracing::debug!(
+                        device = %target.device_id,
+                        "checkout change requests unsupported on device"
+                    );
+                    this.update(cx, |state, cx| {
+                        let engine_version = state
+                            .devices
+                            .iter()
+                            .find(|device| device.id == target.device_id)
+                            .and_then(|device| device.version.clone());
+                        state
+                            .change_requests
+                            .mark_unsupported(target.device_id.clone(), engine_version);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        device = %target.device_id,
+                        cwd = %target.cwd,
+                        error = %err,
+                        "checkout change request watch unavailable; retrying"
+                    );
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue;
+                }
+            };
+
+            while let Some(value) = subscription.recv().await {
+                let snapshot: CheckoutChangeRequestStatus = match serde_json::from_value(value) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        tracing::warn!(
+                            device = %target.device_id,
+                            cwd = %target.cwd,
+                            error = %err,
+                            "dropping malformed checkout change request frame"
+                        );
+                        continue;
+                    }
+                };
+                if this
+                    .update(cx, |state, cx| {
+                        state.change_requests.store(target.clone(), snapshot);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            // Preserve the latest successful snapshot during a transport gap.
+            tracing::debug!(
+                device = %target.device_id,
+                cwd = %target.cwd,
+                "checkout change request stream ended; resubscribing"
+            );
             if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
@@ -1383,6 +1796,9 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
                 };
                 let alive = this.update(cx, |state, cx| {
                     apply(state, parsed);
+                    if matches!(method, methods::WATCH_SPACES | methods::WATCH_DEVICES) {
+                        state.reconcile_change_request_watches(cx);
+                    }
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -1491,6 +1907,70 @@ fn spawn_transcript_watch(
             // Stream ended: engine restart, RPC drop, or chat purge. Retry;
             // the purge case is cleaned up by apply_chats dropping this task.
             tracing::debug!(%chat_id, "transcript stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+/// [`spawn_transcript_watch`]'s shape, writing into `sub_transcripts[doc_id]`
+/// instead of the selected chat's transcript. The apply guard is PER KEY:
+/// the map still holding the key (unwatch/snapshot both remove it), never
+/// `selected_chat` — a subagent tab outlives chat switches.
+fn spawn_subagent_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    doc_id: String,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": doc_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(%doc_id, error = %err, "subagent watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "malformed subagent frame; resubscribing");
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue 'resubscribe;
+                    }
+                };
+                let mut desync = false;
+                let alive = this.update(cx, |state, cx| {
+                    // A stale pump racing a snapshot/unwatch finds no key.
+                    if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
+                            tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
+                            desync = true;
+                        }
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+                if desync {
+                    continue 'resubscribe;
+                }
+            }
+            tracing::debug!(%doc_id, "subagent stream ended; resubscribing");
             if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
@@ -2016,8 +2496,7 @@ mod tests {
                 .client()
                 .call(methods::STOP_ENGINE, serde_json::json!({}))
                 .await,
-            Err(RpcError::Failed(message))
-                if message == format!("unknown method: {}", methods::STOP_ENGINE)
+            Err(RpcError::UnknownMethod(method)) if method == methods::STOP_ENGINE
         ));
     }
 
@@ -2118,7 +2597,80 @@ mod tests {
     }
 
     #[test]
-    fn send_pending_overlays_working_until_ttl() {
+    fn device_version_change_reenables_change_request_capability() {
+        let mut state = AppState::new();
+        state
+            .change_requests
+            .mark_unsupported("remote".into(), Some("0.2.2".into()));
+        let mut old = device("remote", "Remote");
+        old.version = Some("0.2.2".into());
+        state.apply_devices(vec![old]);
+        assert!(!state.change_requests.is_supported("remote"));
+
+        let mut upgraded = device("remote", "Remote");
+        upgraded.version = Some("0.2.3".into());
+        state.apply_devices(vec![upgraded]);
+        assert!(state.change_requests.is_supported("remote"));
+    }
+
+    #[test]
+    fn transfer_percent_tracks_snapshots_by_upload_id() {
+        let mut s = AppState::new();
+        assert_eq!(s.transfer_percent("u1"), None);
+
+        let frame = |id: &str, done, total| zeron_proto::TransferProgress {
+            upload_id: id.into(),
+            file_name: "a.png".into(),
+            done,
+            total,
+        };
+        s.apply_transfers(vec![frame("u1", 430, 1_000), frame("u2", 0, 400)]);
+        assert_eq!(s.transfer_percent("u1"), Some(43));
+        assert_eq!(s.transfer_percent("u2"), Some(0));
+        assert_eq!(s.transfer_percent("other"), None);
+
+        // The last point belongs to the commit — never a stuck 100%; b64
+        // padding overshoot stays clamped too.
+        s.apply_transfers(vec![frame("u1", 1_000, 1_000), frame("u3", 12, 0)]);
+        assert_eq!(s.transfer_percent("u1"), Some(99));
+        // Zero-total renders indeterminate, not a division blowup.
+        assert_eq!(s.transfer_percent("u3"), None);
+        // Snapshots REPLACE: u2's transfer retired with its entry.
+        assert_eq!(s.transfer_percent("u2"), None);
+
+        s.apply_transfers(Vec::new());
+        assert_eq!(s.transfer_percent("u1"), None);
+    }
+
+    #[test]
+    fn upload_progress_percent_clamps_and_clears() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut s = AppState::new();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        let done = Arc::new(AtomicU64::new(0));
+        s.begin_upload_progress(1_000, done.clone());
+        assert_eq!(s.upload_progress_percent(), Some(0));
+        done.store(430, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(43));
+        // The last point belongs to commit+queue — never show a stuck 100%.
+        done.store(1_000, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+        // Overshoot (b64 padding rounding) stays clamped.
+        done.store(1_002, Ordering::Relaxed);
+        assert_eq!(s.upload_progress_percent(), Some(99));
+
+        s.end_upload_progress();
+        assert_eq!(s.upload_progress_percent(), None);
+
+        // A zero-byte total renders as plain "Sending…", not a percent.
+        s.begin_upload_progress(0, Arc::new(AtomicU64::new(0)));
+        assert_eq!(s.upload_progress_percent(), None);
+    }
+
+    #[test]
+    fn send_pending_overlays_working_until_the_grace_window() {
         let now = Utc::now();
         let s_chat = chat("c", 0, Some(10)); // unseen, no session row
         let mut s = AppState::new();
@@ -2127,13 +2679,16 @@ mod tests {
         s.begin_pending_send("c", "m1", now);
         assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Working);
         assert_eq!(s.indicator_for("c", now), Indicator::Working);
-        // Time-bounded: an offline host must not leave an eternal spinner.
-        let later = now + TimeDelta::milliseconds(PENDING_SEND_TTL_MS + 1);
+        // Time-bounded: an offline host must not leave an eternal spinner —
+        // past the grace the overlay yields (and `send_undelivered` takes
+        // over with the explicit failed state).
+        let later = now + TimeDelta::milliseconds(UNDELIVERED_GRACE_MS + 1);
         assert_eq!(
             s.display_status_for(&s_chat, later),
             ChatIndicator::Completed
         );
         assert_eq!(s.indicator_for("c", later), Indicator::None);
+        assert!(s.send_undelivered("c", later));
     }
 
     #[test]
@@ -2468,6 +3023,27 @@ mod tests {
     }
 
     #[test]
+    fn transcript_replay_barrier_requires_the_opening_reset() {
+        let mut state = AppState::new();
+        assert!(!state.transcript_replayed);
+
+        state
+            .apply_transcript_frame(TranscriptFrame::Delta {
+                upsert: Vec::new(),
+                append: Vec::new(),
+                remove: Vec::new(),
+                count: 0,
+            })
+            .expect("empty delta");
+        assert!(!state.transcript_replayed);
+
+        state
+            .apply_transcript_frame(TranscriptFrame::Reset { reset: Vec::new() })
+            .expect("empty reset");
+        assert!(state.transcript_replayed);
+    }
+
+    #[test]
     fn gate_phases() {
         let user = UserProfile {
             id: "u".into(),
@@ -2683,5 +3259,108 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn version_triple_parses_and_gates_device_features() {
+        assert_eq!(version_triple("0.2.12"), Some((0, 2, 12)));
+        assert_eq!(version_triple("0.2.12-beta.1"), Some((0, 2, 12)));
+        assert_eq!(version_triple("1.0.0+build7"), Some((1, 0, 0)));
+        assert_eq!(version_triple("0.2"), None);
+        assert_eq!(version_triple("garbage"), None);
+
+        let mut s = AppState::default();
+        assert!(
+            !s.device_version_at_least("d1", (0, 2, 12)),
+            "unknown device conservatively fails the gate"
+        );
+        s.devices = vec![Device {
+            id: "d1".into(),
+            name: "laptop".into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: Some("0.2.12".into()),
+        }];
+        assert!(s.device_version_at_least("d1", (0, 2, 12)));
+        assert!(!s.device_version_at_least("d1", (0, 2, 13)));
+        s.devices[0].version = None;
+        assert!(
+            !s.device_version_at_least("d1", (0, 2, 12)),
+            "unstamped version conservatively fails the gate"
+        );
+    }
+
+    #[test]
+    fn delivery_degradation_and_queued_sends_tell_the_truth() {
+        use zeron_proto::{ChatConnectivity, ConnectivityState};
+        let now = Utc::now();
+        let mut s = AppState::default();
+        s.local_device_id = Some("local".into());
+        let mut remote = chat("c-remote", 0, None);
+        remote.device_id = "remote".into();
+        let mut local = chat("c-local", 0, None);
+        local.device_id = "local".into();
+        s.chats = vec![remote, local];
+        s.devices = vec![Device {
+            id: "remote".into(),
+            name: "vps".into(),
+            platform: "linux".into(),
+            last_seen_at: Some(now),
+            created_at: None,
+            version: None,
+        }];
+        s.connectivity.state = ConnectivityState::Connected;
+        s.connectivity.chats = vec![ChatConnectivity {
+            chat_id: "c-remote".into(),
+            connected: true,
+            pending_pushes: 0,
+        }];
+
+        // Healthy: nothing degraded.
+        assert!(!s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-local"));
+
+        // The chat's own room down → degraded even while globally Connected.
+        s.connectivity.chats[0].connected = false;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.connectivity.chats[0].connected = true;
+
+        // Host gone presence-dark → degraded (a send would queue at best).
+        s.devices[0].last_seen_at = Some(now - TimeDelta::minutes(10));
+        assert!(s.chat_delivery_degraded("c-remote"));
+        s.devices[0].last_seen_at = Some(now);
+
+        // OS offline: remote degrades; a locally-hosted chat NEVER does (the
+        // queued command executes on this device even fully offline).
+        s.connectivity.state = ConnectivityState::Offline;
+        assert!(s.chat_delivery_degraded("c-remote"));
+        assert!(!s.chat_delivery_degraded("c-local"));
+
+        // Local profile (Disabled): nothing degrades.
+        s.connectivity.state = ConnectivityState::Disabled;
+        assert!(!s.chat_delivery_degraded("c-remote"));
+
+        // Queued = pending send + degraded path — and degradation HOLDS the
+        // overlay past the grace window instead of silently expiring (the
+        // no-trace hole).
+        s.connectivity.state = ConnectivityState::Offline;
+        s.begin_pending_send("c-remote", "m1", now - TimeDelta::seconds(200));
+        assert!(s.send_pending("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        // Past the grace: the explicit failed state surfaces alongside.
+        assert!(s.send_undelivered("c-remote", now));
+        // Retry restarts the clock: back to Queued, no longer failed.
+        s.retry_pending_send("c-remote", now);
+        assert!(!s.send_undelivered("c-remote", now));
+        assert!(s.send_queued("c-remote", now));
+        // Path healed with a stale unacked send: the overlay expires after
+        // the grace rather than holding forever.
+        s.retry_pending_send("c-remote", now - TimeDelta::seconds(200));
+        s.connectivity.state = ConnectivityState::Connected;
+        assert!(!s.send_pending("c-remote", now));
+        assert!(!s.send_queued("c-remote", now));
+        // …but the explicit undelivered flag still tells the truth.
+        assert!(s.send_undelivered("c-remote", now));
     }
 }

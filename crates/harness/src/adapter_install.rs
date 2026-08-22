@@ -227,6 +227,90 @@ pub(crate) async fn ensure_installed(
     })
 }
 
+/// A zeron-owned shim script materialized INSIDE a managed install dir, for
+/// SDK packages with no bin entry (`@cursor/sdk`): the shim resolves the SDK
+/// from the sibling `node_modules`. Returns the shim path when the install is
+/// complete AND the shim contents match this build (a comet upgrade that
+/// changes the shim rewrites it in place).
+pub(crate) fn installed_shim(pin: &NpmPin, shim_name: &str, contents: &str) -> Option<PathBuf> {
+    let dir = install_dir(pin)?;
+    if !dir.join(OK_MARKER).exists() {
+        return None;
+    }
+    let shim = dir.join(shim_name);
+    match std::fs::read_to_string(&shim) {
+        Ok(existing) if existing == contents => Some(shim),
+        _ => {
+            std::fs::write(&shim, contents).ok()?;
+            Some(shim)
+        }
+    }
+}
+
+/// Like [`ensure_installed`], for a package consumed as a LIBRARY by a
+/// zeron-owned shim rather than through a bin entry. Installs the pin once,
+/// writes `contents` as `<install-dir>/<shim_name>`, and returns the shim
+/// path (spawn it via [`launch_for_entry`]).
+pub(crate) async fn ensure_installed_shim(
+    pin: NpmPin,
+    display_name: &str,
+    shim_name: &str,
+    contents: &str,
+) -> Result<PathBuf, HarnessError> {
+    if let Some(shim) = installed_shim(&pin, shim_name, contents) {
+        return Ok(shim);
+    }
+    let _guard = install_lock().lock().await;
+    if let Some(shim) = installed_shim(&pin, shim_name, contents) {
+        return Ok(shim);
+    }
+
+    let Some(npm) = find_npm() else {
+        return Err(HarnessError::NotInstalled(format!(
+            "npm (required to install the {display_name} SDK {}; searched \
+             PATH, the login shell's PATH, and fnm/nvm/volta/pnpm/bun install dirs)",
+            pin.spec()
+        )));
+    };
+    let root = adapters_root().ok_or_else(|| {
+        HarnessError::Install("cannot locate an adapters directory (HOME is unset)".into())
+    })?;
+    let final_dir = install_dir(&pin).expect("root resolved");
+    let tmp_dir = root.join(format!(
+        ".tmp-{}-{}-{}",
+        pin.dir_name(),
+        pin.version,
+        std::process::id()
+    ));
+    let cache_dir = root.join(".npm-cache");
+    let install = install_into(&npm, &pin, &tmp_dir, &cache_dir, display_name).await;
+    if let Err(e) = install {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+    std::fs::write(tmp_dir.join(shim_name), contents)?;
+    std::fs::write(tmp_dir.join(OK_MARKER), pin.version)?;
+    if let Some(parent) = final_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::rename(&tmp_dir, &final_dir).is_err() {
+        // Lost a cross-process race (or a stale dir): keep whatever is in
+        // place if it's complete, else replace it.
+        if !final_dir.join(OK_MARKER).exists() {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            std::fs::rename(&tmp_dir, &final_dir)?;
+        } else {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+    }
+    installed_shim(&pin, shim_name, contents).ok_or_else(|| {
+        HarnessError::Install(format!(
+            "install of {} finished but its shim did not resolve",
+            pin.spec()
+        ))
+    })
+}
+
 async fn install_into(
     npm: &Path,
     pin: &NpmPin,

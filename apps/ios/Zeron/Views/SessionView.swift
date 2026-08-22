@@ -162,8 +162,9 @@ struct SessionView: View {
                     // The strip reserves its 24pt whether or not a run is
                     // live, so the composer never shifts. It sits on the
                     // solid floor right where the transcript's fade completes.
-                    statusStrip(chat: chat, status: status)
-                        .allowsHitTesting(false)
+                    // Hit-testing stays off except for the retry affordance.
+                    statusStrip(chat: chat, status: status, store: store)
+                        .allowsHitTesting(model.sendState(for: chat) == .failed)
                     Group {
                         if let request = store.openInputRequest {
                             QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
@@ -217,10 +218,56 @@ struct SessionView: View {
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
     /// shows the sunrise spinner + rotating flavour word + elapsed; Errored
     /// shows "Run failed"; the strip always reserves its height so the
-    /// composer never shifts.
-    private func statusStrip(chat: Chat, status: SessionStatus?) -> some View {
+    /// composer never shifts. An unadopted send's truth takes precedence:
+    /// "Sending…" (healthy, within the 2-minute grace), "Queued — will send
+    /// automatically" (degraded path — no fake progress), or the explicit
+    /// "Not delivered — tap to retry" (transcript.rs retry_send).
+    private func statusStrip(chat: Chat, status: SessionStatus?, store: SessionStore) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 6) {
+                switch model.sendState(for: chat) {
+                case .failed?:
+                    Button {
+                        store.retryDelivery()
+                    } label: {
+                        Text("Not delivered — tap to retry")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.danger)
+                    }
+                    .buttonStyle(.plain)
+                case .queued?:
+                    Circle()
+                        .fill(Theme.warning)
+                        .frame(width: 5, height: 5)
+                    Text("Queued — will send automatically")
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.warning.opacity(0.9))
+                case .sending?:
+                    // The percent tracks the REAL relay transfer (escort
+                    // bytes committed to the host), not just local staging.
+                    if let progress = store.transferProgress {
+                        Text("Uploading… \(Int(progress * 100))%")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                            .monospacedDigit()
+                    } else {
+                        Text("Sending…")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                case nil:
+                    normalStatus(chat: chat, status: status)
+                }
+            }
+            .frame(height: 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 26)  // aligns with the composer's text start
+        }
+    }
+
+    @ViewBuilder
+    private func normalStatus(chat: Chat, status: SessionStatus?) -> some View {
+        Group {
                 switch status {
                 case .working:
                     WorkingSpinner()
@@ -240,10 +287,6 @@ struct SessionView: View {
                 default:
                     EmptyView()
                 }
-            }
-            .frame(height: 24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 26)  // aligns with the composer's text start
         }
     }
 

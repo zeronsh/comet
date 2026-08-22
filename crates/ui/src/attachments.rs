@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::TryStreamExt as _;
 use gpui::{
     AnyElement, BackgroundExecutor, Image, ImageFormat, ObjectFit, SharedString, Size,
     StyledImage as _, div, img, prelude::*, px,
@@ -29,9 +30,14 @@ use zeron_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
 pub const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
-/// Base64 chars per `UploadChunk` (zeron state.ts `UPLOAD_CHUNK` — sized for
-/// the relay when the target device is remote).
-pub const UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
+/// Base64 chars per `UploadChunk`, sized against the relay's hard ceiling:
+/// Cloudflare caps a WebSocket message at 1 MiB, and a chunk rides one relay
+/// frame (JSON envelope + uleb header add ~150 bytes) — 680 000 chars ≈
+/// 510 KB binary leaves ~35% headroom. Multiple of 4 so a slice of the
+/// whole-file base64 stays independently decodable. The old 60 000 (45 KB)
+/// made a 3 MB screenshot ~70 sequential round trips — each one a stall
+/// opportunity on a flaky link.
+pub const UPLOAD_CHUNK_B64_CHARS: usize = 680_000;
 /// state.ts `MAX_ATTACHMENT_READ_CHUNKS` — bounds the read-back loop.
 const MAX_READ_CHUNKS: usize = 1_000;
 
@@ -293,76 +299,149 @@ pub(crate) async fn call_with_timeout(
     }
 }
 
-/// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per 60KB
-/// slice (positional `seq` makes the cheap retry idempotent), then
+/// Chunks in flight at once. `seq` slots are idempotent engine-side, so
+/// completion order doesn't matter; a small window hides per-chunk latency
+/// without flooding the relay socket.
+const UPLOAD_CONCURRENCY: usize = 3;
+
+/// Whole-attachment deadline. Per-chunk timeouts + retries bound each CALL,
+/// but on a flapping link chunks that succeed on attempt 2-of-3 never trip
+/// the 3-consecutive-failure abort — an upload could lawfully crawl for hours
+/// reading "Sending…" (2026-08-18 user report). Scaled with size, capped:
+/// past this, fail the send with the banner instead of spinning.
+fn attachment_deadline(n_chunks: usize) -> Duration {
+    Duration::from_secs((120 + 15 * n_chunks as u64).min(900))
+}
+
+/// The `(seq, b64 byte-range)` plan for a file's chunks. An empty file still
+/// sends one empty chunk (the commit needs the uploadId staged).
+fn chunk_ranges(b64_len: usize) -> Vec<(u64, std::ops::Range<usize>)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut seq = 0u64;
+    loop {
+        let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64_len);
+        ranges.push((seq, start..end));
+        start = end;
+        seq += 1;
+        if start >= b64_len {
+            break;
+        }
+    }
+    ranges
+}
+
+/// Chunked upload: base64 the bytes, `UploadChunk{uploadId,seq,data}` per
+/// [`UPLOAD_CHUNK_B64_CHARS`] slice (positional `seq` makes the cheap retry
+/// idempotent), a few chunks in flight at once, then
 /// `UploadCommit{uploadId,fileName}` → the durable absolute path on the target
-/// device. Errors return the raw cause (the composer shows friendly copy).
+/// device. The caller mints `upload_id` — the queued-attachment flow derives
+/// its `pending://` refs from the same identity before the bytes move.
+/// `progress` (when given) accumulates uploaded BINARY bytes — the
+/// composer's "Uploading… N%" reads it every paint. Errors return the raw
+/// cause (the composer shows friendly copy).
 pub async fn upload_attachment(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
+    upload_id: &str,
     attachment: &StagedAttachment,
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<String, String> {
     let b64 = BASE64.encode(attachment.bytes());
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    let mut start = 0usize;
-    let mut seq = 0u64;
-    loop {
-        let end = (start + UPLOAD_CHUNK_B64_CHARS).min(b64.len());
+    let ranges = chunk_ranges(b64.len());
+    let deadline = executor.timer(attachment_deadline(ranges.len()));
+    let upload = async {
+        futures::stream::iter(ranges.iter().cloned().map(Ok::<_, String>))
+            .try_for_each_concurrent(UPLOAD_CONCURRENCY, |(seq, range)| {
+                let progress = progress.clone();
+                let upload_id = &upload_id;
+                let b64 = &b64;
+                async move {
+                    let params = with_target(
+                        serde_json::json!({
+                            "uploadId": upload_id,
+                            "seq": seq,
+                            "data": &b64[range.clone()],
+                        }),
+                        target_device_id,
+                    );
+                    // The first WINDOW (not just seq 0) gets the cold-dial
+                    // allowance — its chunks all start before the link is warm.
+                    let timeout = if seq < UPLOAD_CONCURRENCY as u64 {
+                        FIRST_CHUNK_TIMEOUT
+                    } else {
+                        CHUNK_TIMEOUT
+                    };
+                    // One transient blip must not abort the upload; `seq`
+                    // slots are idempotent engine-side, so a blind re-send is
+                    // safe (timeouts retry too).
+                    let mut attempt = 0u32;
+                    loop {
+                        match call_with_timeout(
+                            engine,
+                            executor,
+                            methods::UPLOAD_CHUNK,
+                            params.clone(),
+                            timeout,
+                        )
+                        .await
+                        {
+                            Ok(_) => break,
+                            Err(err) if attempt < 2 => {
+                                attempt += 1;
+                                // warn, not debug: the 2026-08-19 incident
+                                // ground through silent timeout/retry cycles
+                                // for minutes with a literally empty log —
+                                // degraded uploads must narrate.
+                                tracing::warn!(error = %err, seq, attempt, "upload chunk retry");
+                                // Stagger by seq so parallel chunks that failed
+                                // together don't re-collide in lockstep.
+                                executor
+                                    .timer(Duration::from_millis(50 * (attempt as u64) * (seq + 1)))
+                                    .await;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    if let Some(progress) = &progress {
+                        // b64 → binary bytes (final chunk's padding rounds up
+                        // by ≤2 bytes — irrelevant for a percentage).
+                        progress.fetch_add(
+                            (range.len() * 3 / 4) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    Ok(())
+                }
+            })
+            .await?;
         let params = with_target(
-            serde_json::json!({ "uploadId": upload_id, "seq": seq, "data": &b64[start..end] }),
+            serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
             target_device_id,
         );
-        let timeout = if seq == 0 {
-            FIRST_CHUNK_TIMEOUT
-        } else {
-            CHUNK_TIMEOUT
-        };
-        // One transient blip must not abort a ~400-chunk upload; `seq` slots
-        // are idempotent engine-side, so a blind re-send is safe (timeouts
-        // retry too, like the original's per-chunk `withTimeout` + retry ×2).
-        let mut attempt = 0u32;
-        loop {
-            match call_with_timeout(
-                engine,
-                executor,
-                methods::UPLOAD_CHUNK,
-                params.clone(),
-                timeout,
-            )
-            .await
-            {
-                Ok(_) => break,
-                Err(err) if attempt < 2 => {
-                    attempt += 1;
-                    tracing::debug!(error = %err, seq, "upload chunk retry");
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        start = end;
-        seq += 1;
-        if start >= b64.len() {
-            break;
-        }
+        let reply = call_with_timeout(
+            engine,
+            executor,
+            methods::UPLOAD_COMMIT,
+            params,
+            COMMIT_TIMEOUT,
+        )
+        .await?;
+        reply
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "upload commit returned no path".to_string())
+    };
+    futures::pin_mut!(upload);
+    match futures::future::select(upload, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => Err(format!(
+            "attachment upload exceeded {}s",
+            attachment_deadline(ranges.len()).as_secs()
+        )),
     }
-    let params = with_target(
-        serde_json::json!({ "uploadId": upload_id, "fileName": attachment.name }),
-        target_device_id,
-    );
-    let reply = call_with_timeout(
-        engine,
-        executor,
-        methods::UPLOAD_COMMIT,
-        params,
-        COMMIT_TIMEOUT,
-    )
-    .await?;
-    reply
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "upload commit returned no path".to_string())
 }
 
 /// A transcript image read back from the owning device.
@@ -562,8 +641,52 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
         },
-        _ => AttachmentSnapshot::Loading,
+        Some(CacheEntry::Loading { .. }) => AttachmentSnapshot::Loading,
+        None => {
+            // Queued-send alias: the host materializes `pending://{id}/{name}`
+            // at `{uploads}/{id8}-{name}` and rewrites the persisted ref to
+            // that ABSOLUTE path — one the sender can't know up front (it's
+            // the host's disk). The id8 basename prefix IS derivable though,
+            // so the send seeds the bytes under an alias and this fallback
+            // resolves the rewritten ref instantly instead of blanking the
+            // thumbnail into a skeleton while the bytes round-trip
+            // (2026-08-19 "photo disappears after it finishes sending").
+            if let Some(image) = upload_alias_id8(path)
+                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+                    Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
+                    _ => None,
+                })
+            {
+                cache.insert_loaded(key(device_id, path), image.clone());
+                return AttachmentSnapshot::Loaded(image);
+            }
+            AttachmentSnapshot::Loading
+        }
     }
+}
+
+/// The uploadId fragment a committed upload's basename starts with
+/// (`{id8}-{name}` per the engine's `Uploads::pending_target`). `None` when
+/// the path can't be a committed upload.
+fn upload_alias_id8(path: &str) -> Option<String> {
+    let base = std::path::Path::new(path).file_name()?.to_str()?;
+    let (id8, _) = base.split_at_checked(8)?;
+    (base.as_bytes().get(8) == Some(&b'-')
+        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+    .then(|| id8.to_string())
+}
+
+fn alias_key(device_id: &str, id8: &str) -> (String, String) {
+    key(device_id, &format!("upload-alias://{id8}"))
+}
+
+/// Seed the just-sent image under its upload identity so the persisted
+/// message's rewritten absolute ref (host-side path) resolves from the same
+/// local bytes — see the alias fallback in [`attachment_snapshot`].
+pub fn seed_attachment_alias(device_id: &str, upload_id: &str, name: &str, image: Arc<Image>) {
+    let id8: String = upload_id.chars().take(8).collect();
+    let (device, path) = alias_key(device_id, &id8);
+    store_loaded(&device, &path, name.to_string().into(), image);
 }
 
 /// Release gpui's decoded copies of evicted images: the asset-system entry
@@ -800,5 +923,46 @@ mod tests {
         assert_eq!(retry_delay(2), Duration::from_millis(8_000));
         assert_eq!(retry_delay(3), Duration::from_millis(15_000));
         assert_eq!(retry_delay(9), Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn upload_chunk_fits_the_relay_frame_ceiling() {
+        // Cloudflare caps a WebSocket message at 1 MiB; the chunk rides one
+        // relay frame with a small JSON envelope + uleb header.
+        assert!(UPLOAD_CHUNK_B64_CHARS + 1_024 < 1_048_576);
+        // A slice of the whole-file base64 must stay independently decodable.
+        assert_eq!(UPLOAD_CHUNK_B64_CHARS % 4, 0);
+    }
+
+    #[test]
+    fn chunk_ranges_cover_the_buffer_exactly() {
+        // Empty file: one empty chunk (the commit needs the id staged).
+        assert_eq!(chunk_ranges(0), vec![(0, 0..0)]);
+        // Exact multiple: no trailing empty chunk.
+        let exact = chunk_ranges(UPLOAD_CHUNK_B64_CHARS * 2);
+        assert_eq!(exact.len(), 2);
+        assert_eq!(exact[1], (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS * 2));
+        // Partial tail.
+        let partial = chunk_ranges(UPLOAD_CHUNK_B64_CHARS + 7);
+        assert_eq!(partial.len(), 2);
+        assert_eq!(
+            partial[1],
+            (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS + 7)
+        );
+        // Ranges tile the buffer: contiguous, in order, fully covering.
+        let mut expected_start = 0;
+        for (seq, range) in &partial {
+            assert_eq!(range.start, expected_start, "seq {seq} contiguous");
+            expected_start = range.end;
+        }
+        assert_eq!(expected_start, UPLOAD_CHUNK_B64_CHARS + 7);
+    }
+
+    #[test]
+    fn attachment_deadline_scales_and_caps() {
+        // A one-chunk screenshot fails within ~2 minutes, not hours.
+        assert_eq!(attachment_deadline(1), Duration::from_secs(135));
+        // A max-size upload is still bounded.
+        assert_eq!(attachment_deadline(1_000), Duration::from_secs(900));
     }
 }

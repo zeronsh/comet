@@ -361,8 +361,13 @@ struct NewSessionView: View {
     }
 
     /// Mint the chat per the checkout plan, queue the first run, swap to the
-    /// live session (composer.rs on-send: current checkout as-is, reuse the
-    /// picked ref's worktree, or CreateWorktree off the base first).
+    /// live session. The atomic ordering (PRs #159/#170): anything that can
+    /// FAIL stages before anything is created — a legacy attachment upload
+    /// aborts with no chat row anywhere — and nothing left in the pipeline
+    /// blocks on a relay RPC. A New-worktree plan rides the queued Run as a
+    /// WorktreeSpec the HOST materializes at drain time; the old
+    /// CreateWorktree-before-send was the one new-chat path that could hang
+    /// forever on a zombie link (the 2026-08-18 "Sending…" incident).
     private func send() {
         guard let space, canSend else { return }
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -371,22 +376,51 @@ struct NewSessionView: View {
                                 reasoning: reasoning, sandbox: "workspace-write")
         Task { @MainActor in
             var cwd: String?
-            var branch = selectedRef
+            let branch = selectedRef
+            var worktree: WorktreeSpec?
             switch checkoutKind {
             case .newWorktree:
-                if let base = selectedRef {
-                    guard let worktreePath = await model.createWorktree(space: space, base: base) else {
-                        busy = false
-                        return
-                    }
-                    cwd = worktreePath
-                    branch = base
-                }
+                // Base defaults to HEAD (PR #165): a branch list that never
+                // loaded over a flapping relay must not silently drop
+                // isolation. cwd stays the space folder — the old-host
+                // degradation path (run in main checkout, never hung).
+                worktree = WorktreeSpec(repoPath: space.path, base: selectedRef ?? "HEAD")
+                cwd = space.path
             case .local:
-                if let worktree = selectedRefRow?.worktreePath {
-                    cwd = worktree  // reuse the ref's existing checkout
+                if let reused = selectedRefRow?.worktreePath {
+                    cwd = reused  // reuse the ref's existing checkout
                 }
             }
+
+            let staged = attachments
+            let queued = model.hostSupportsQueuedAttachmentsOn(deviceId: space.deviceId)
+
+            // Legacy hosts (< 0.2.12) stage attachments FIRST — before the
+            // chat row or store exist — so an upload failure aborts with
+            // nothing created (no stranded empty chat in the sidebar).
+            var legacyPaths: [String] = []
+            if !staged.isEmpty, !queued, model.demo == nil {
+                guard let workspace = model.workspace else {
+                    busy = false
+                    return
+                }
+                do {
+                    for att in staged {
+                        let uploadId = UUID().uuidString.lowercased()
+                        let uploaded = try await workspace.uploadAttachment(
+                            deviceId: space.deviceId, name: att.name, data: att.data,
+                            uploadId: uploadId)
+                        AttachmentImageCache.shared.seed(deviceId: space.deviceId, path: uploaded,
+                                                         name: att.name, data: att.data)
+                        legacyPaths.append(uploaded)
+                    }
+                } catch {
+                    attachError = "Attachment upload failed — \(error.localizedDescription)"
+                    busy = false
+                    return
+                }
+            }
+
             guard let chatId = model.createChat(space: space, config: config,
                                                 branch: branch, cwd: cwd),
                   let chat = model.chat(id: chatId),
@@ -394,23 +428,27 @@ struct NewSessionView: View {
                 busy = false
                 return
             }
-            // Upload staged images now that the chat's store exists; the doc
-            // entry must never point at files that don't (ComposerView.send).
-            var paths: [String] = []
-            for att in attachments {
-                do {
-                    let path = try await store.uploadAttachment(name: att.name, data: att.data)
-                    AttachmentImageCache.shared.seed(deviceId: chat.deviceId, path: path,
-                                                     name: att.name, data: att.data)
-                    paths.append(path)
-                } catch {
-                    attachError = "Attachment upload failed — \(error.localizedDescription)"
-                    busy = false
-                    return
+            if queued, !staged.isEmpty {
+                // Queued flow: pending:// refs make the whole send a durable
+                // local write; the escort pushes bytes afterwards.
+                let transfers = staged.map {
+                    AttachmentTransfer(uploadId: UUID().uuidString.lowercased(),
+                                       name: $0.name, data: $0.data)
                 }
+                for (transfer, att) in zip(transfers, staged) {
+                    AttachmentImageCache.shared.seed(
+                        deviceId: chat.deviceId,
+                        path: UploadStash.pendingRef(uploadId: transfer.uploadId,
+                                                     name: transfer.name),
+                        name: att.name, data: att.data)
+                }
+                store.sendWithTransfers(prompt: prompt, chat: chat, live: false,
+                                        transfers: transfers, worktree: worktree)
+            } else {
+                store.sendRun(prompt: legacyPaths.isEmpty ? prompt
+                                  : withAttachments(text: prompt, paths: legacyPaths),
+                              chat: chat, attachments: legacyPaths, worktree: worktree)
             }
-            store.sendRun(prompt: paths.isEmpty ? prompt : withAttachments(text: prompt, paths: paths),
-                          chat: chat, attachments: paths)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             draft = ""
             attachments = []

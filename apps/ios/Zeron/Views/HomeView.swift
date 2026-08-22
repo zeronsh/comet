@@ -62,12 +62,41 @@ struct HomeView: View {
                             .padding(.leading, -10)
                         // In the bar, not the list: as a list row it appeared
                         // and vanished with the connection and shoved the
-                        // content down.
-                        if !model.connected {
-                            ProgressView()
-                                .controlSize(.mini)
-                                .tint(Theme.textMuted)
-                                .accessibilityLabel("Connecting")
+                        // content down. Degraded states are GRACED (4s of
+                        // continuous raw degradation before anything shows;
+                        // recovery hides instantly) and quiet — a bare
+                        // grayscale spinner or dot with a faint caption, no
+                        // surface, no border (shell.rs render_connection_pill).
+                        switch model.connectivity.state {
+                        case .offline:
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(Theme.warning)
+                                    .frame(width: 5, height: 5)
+                                Text("Offline — sends are saved")
+                                    .font(Theme.sans(11))
+                                    .foregroundStyle(Theme.textFaint)
+                            }
+                            .transition(.opacity)
+                        case .reconnecting:
+                            HStack(spacing: 5) {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .tint(Theme.textMuted)
+                                Text("Reconnecting…")
+                                    .font(Theme.sans(11))
+                                    .foregroundStyle(Theme.textFaint)
+                            }
+                            .transition(.opacity)
+                        case .connected:
+                            // Initial catch-up (within the grace): the old
+                            // quiet "connecting" spinner, gone on first sync.
+                            if !model.connected {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .tint(Theme.textMuted)
+                                    .accessibilityLabel("Connecting")
+                            }
                         }
                     }
                 }
@@ -233,14 +262,11 @@ struct HomeView: View {
                     .listRowSeparator(.hidden)
             }
             ForEach(chats) { chat in
-                Button {
+                // Location shows even when scoped — without it the row's
+                // first line is just a floating dot and a timestamp.
+                ChatRow(chat: chat, showLocation: true) {
                     path.append(.chat(chat.id))
-                } label: {
-                    // Location shows even when scoped — without it the row's
-                    // first line is just a floating dot and a timestamp.
-                    ChatRow(chat: chat, showLocation: true)
                 }
-                .buttonStyle(PressWashButtonStyle())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -279,12 +305,47 @@ struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
     var showLocation: Bool
+    let onSelect: () -> Void
 
     private var subline: Color { Theme.textMuted.opacity(0.5) }
 
     var body: some View {
+        // The 1Hz pulse (live only while something is degraded or pending)
+        // re-derives the send badge as its grace clocks advance.
+        let _ = model.connectivity.pulse
         let indicator = model.indicator(for: chat)
-        VStack(alignment: .leading, spacing: 2) {
+        let sendState = model.sendState(for: chat)
+        let pullRequest = model.changeRequest(for: chat)
+        ZStack(alignment: .bottomTrailing) {
+            Button(action: onSelect) {
+                content(indicator: indicator, sendState: sendState,
+                        reservesPullRequest: pullRequest != nil)
+            }
+            .buttonStyle(PressWashButtonStyle())
+            if let pullRequest {
+                PullRequestBadge(summary: pullRequest)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 6)
+                    .zIndex(1)
+            }
+        }
+    }
+
+    /// Undelivered-send override for the corner slot (shell.rs precedence:
+    /// Failed > Queued > the normal indicator). Suppresses the Working
+    /// spinner too — no fake progress on a send that hasn't left.
+    private func sendBadge(_ state: SendState) -> (label: String, color: Color)? {
+        switch state {
+        case .failed: return ("Failed", Theme.danger)
+        case .queued: return ("Queued", Theme.warning)
+        case .sending: return nil
+        }
+    }
+
+    private func content(indicator: ChatIndicator, sendState: SendState?,
+                         reservesPullRequest: Bool) -> some View {
+        let badge = sendState.flatMap(sendBadge)
+        return VStack(alignment: .leading, spacing: 2) {
             // Line 1: space @ device, status corner (time-ago when idle).
             HStack(spacing: 8) {
                 if showLocation {
@@ -297,7 +358,16 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
-                if indicator == .idle {
+                if let badge {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(badge.color)
+                            .frame(width: 6, height: 6)
+                        Text(badge.label)
+                            .font(Theme.sans(10, weight: .medium))
+                            .foregroundStyle(badge.color)
+                    }
+                } else if indicator == .idle {
                     Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
                         .font(Theme.sans(10, weight: .medium))
                         .foregroundStyle(subline)
@@ -329,10 +399,11 @@ struct ChatRow: View {
                         .truncationMode(.tail)
                 }
                 Spacer(minLength: 0)
-                if indicator == .working {
+                if indicator == .working, badge == nil {
                     MiniSpinner()
                 }
             }
+            .padding(.trailing, reservesPullRequest ? 46 : 0)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)

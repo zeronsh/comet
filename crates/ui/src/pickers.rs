@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
@@ -29,6 +30,11 @@ use zeron_rpc::methods;
 /// footer; a flat cap + "Showing X of Y refs" reads the same without
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
+const MODEL_SCROLLBAR_TRACK_INSET: f32 = 4.0;
+const MODEL_SCROLLBAR_HIT_WIDTH: f32 = 10.0;
+const MODEL_SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
+const MODEL_SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 5.0;
+const MODEL_SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
@@ -36,6 +42,23 @@ use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+
+/// Below this measured composer width, the traits summary yields its space to
+/// the prompt and becomes a compact overflow affordance. The model remains
+/// visible so the active agent is still identifiable at a glance.
+const COMPACT_TRAITS_ENTER_WIDTH: f32 = 400.0;
+const COMPACT_TRAITS_EXIT_WIDTH: f32 = 440.0;
+
+fn compact_traits_for_width(width: f32, currently_compact: bool) -> bool {
+    if width <= 0.0 {
+        return currently_compact;
+    }
+    if currently_compact {
+        width < COMPACT_TRAITS_EXIT_WIDTH
+    } else {
+        width < COMPACT_TRAITS_ENTER_WIDTH
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Catalog invalidation (Settings → Agents toggles)
@@ -310,6 +333,36 @@ pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
     hits.next().is_none().then_some(ix)
 }
 
+/// Interpret a palette query as a typed path jump: absolute (`/disk2/projects`)
+/// or home-relative (`~`, `~/github`). Returns the absolute path to browse,
+/// trailing slash trimmed. `home` is the device's resolved home — `None`
+/// until the first listing lands, when `~` can't expand yet. A query like
+/// `~foo` is a folder name, not a path.
+pub fn typed_path_target(query: &str, home: Option<&str>) -> Option<String> {
+    let query = query.trim();
+    if let Some(rest) = query.strip_prefix('~') {
+        let home = home?.trim_end_matches('/');
+        if rest.is_empty() {
+            return Some(home.to_string());
+        }
+        let rest = rest.strip_prefix('/')?.trim_end_matches('/');
+        return Some(if rest.is_empty() {
+            home.to_string()
+        } else {
+            format!("{home}/{rest}")
+        });
+    }
+    if query.starts_with('/') {
+        let trimmed = query.trim_end_matches('/');
+        return Some(if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        });
+    }
+    None
+}
+
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
@@ -355,6 +408,38 @@ struct ModelRowData {
     harness: HarnessId,
     harness_name: SharedString,
     model: Model,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModelScrollbarGrab {
+    grab_offset: f32,
+}
+
+/// Marker for GPUI's captured drag stream. The actual grab geometry stays in
+/// [`ModelScrollbarGrab`] so a track click can center the thumb first.
+struct ModelScrollbarDrag;
+
+/// Invisible drag preview: scrollbar drags manipulate the existing thumb.
+struct ModelScrollbarDragGhost;
+
+impl gpui::Render for ModelScrollbarDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        gpui::Empty
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelScrollbarMetrics {
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    max_scroll: f32,
+}
+
+impl ModelScrollbarMetrics {
+    fn travel(self) -> f32 {
+        (self.track_height - self.thumb_height).max(0.0)
+    }
 }
 
 /// Which picker popover is open.
@@ -403,12 +488,20 @@ pub struct Pickers {
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
     /// (`scroll_to_item`; the add-space palette standard).
     model_scroll: gpui::ScrollHandle,
+    /// Drag state for the floating model-list scrollbar.
+    model_scrollbar_drag: Option<ModelScrollbarGrab>,
+    /// The scrollbar is an on-demand affordance for the model-list surface.
+    model_list_hovered: bool,
+    model_scrollbar_hovered: bool,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     /// One-shot mute for the next Edited event's highlight reset — armed by
     /// [`Self::toggle`]'s programmatic clear (see the subscription).
     search_reset_muted: bool,
     focus: FocusHandle,
+    /// Responsive presentation chosen by the composer from its measured
+    /// width. This changes only the Traits trigger; its popover is unchanged.
+    compact_traits: bool,
     /// `ZERON_OPEN_PICKER` boot: keep claiming focus until it sticks, so
     /// keyboard nav drives the data-side-opened popover (headless rigs have
     /// no synthetic pointer, but synthetic keys do arrive).
@@ -554,9 +647,13 @@ impl Pickers {
             refs_space: None,
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
+            model_scrollbar_drag: None,
+            model_list_hovered: false,
+            model_scrollbar_hovered: false,
             search,
             search_reset_muted: false,
             focus: cx.focus_handle(),
+            compact_traits: false,
             boot_focus_pending: boot_open.is_some(),
             load_task: None,
             refs_task: None,
@@ -568,6 +665,18 @@ impl Pickers {
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
         }
+    }
+
+    /// Feed the composer's live measured width into the actions presentation.
+    /// Notify only on a threshold crossing so continuous resize does not cause
+    /// redundant child renders.
+    pub fn set_composer_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let compact = compact_traits_for_width(width, self.compact_traits);
+        if compact == self.compact_traits {
+            return;
+        }
+        self.compact_traits = compact;
+        cx.notify();
     }
 
     /// Persist the sticky defaults (best-effort; picks are rare and tiny).
@@ -712,6 +821,16 @@ impl Pickers {
             .map(|d| d.steering_mode)
     }
 
+    /// The catalog is loaded and offers nothing runnable — the no-agents
+    /// state (every enabled harness is missing its CLI, or nothing is
+    /// enabled). False while the catalog is still loading or failed
+    /// (nothing to conclude yet; offline sends must not be blocked on it).
+    pub fn no_agents_available(&self) -> bool {
+        self.harnesses
+            .ready()
+            .is_some_and(|list| offered_harnesses(list).is_empty())
+    }
+
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
         ResolvedRunConfig {
             harness: self.effective_harness(cx),
@@ -739,6 +858,9 @@ impl Pickers {
 
     /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
+        self.model_scrollbar_drag = None;
+        self.model_list_hovered = false;
+        self.model_scrollbar_hovered = false;
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
@@ -853,7 +975,10 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
-                self.prefetch_models(cx);
+                // Model discovery can recover after a slow/plugin-heavy ACP
+                // cold start. Revalidate on every open instead of pinning a
+                // timeout/fallback result until the application restarts.
+                self.prefetch_models(true, cx);
             }
             // Projects and devices are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device => {}
@@ -907,7 +1032,7 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                pickers.prefetch_models(cx);
+                pickers.prefetch_models(false, cx);
                 cx.notify();
             })
             .ok();
@@ -919,7 +1044,7 @@ impl Pickers {
     /// tabs) the lists are already there, instead of a per-selection
     /// "Loading models…" round-trip. Each `ensure_models` call is guarded by
     /// its slot state, so re-running this every catalog load/render is free.
-    fn prefetch_models(&mut self, cx: &mut Context<Self>) {
+    fn prefetch_models(&mut self, force: bool, cx: &mut Context<Self>) {
         let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
             Some(list) => offered_harnesses(list).iter().map(|d| d.id).collect(),
             None => Vec::new(),
@@ -932,25 +1057,29 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            self.ensure_models(harness, cx);
+            self.ensure_models(harness, force, cx);
         }
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
-        // the retry row clears the map to re-arm.
-        if self
-            .models
-            .get(&harness)
-            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
-        {
+    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
+        // Normal prefetches load absent/Idle slots once. Picker-open refreshes
+        // also retry Ready/Error slots, while an in-flight load is always
+        // reused. Ready rows stay visible until the replacement lands.
+        let reload = match self.models.get(&harness) {
+            None | Some(Loadable::Idle) => true,
+            Some(Loadable::Loading) => false,
+            Some(Loadable::Ready(_)) | Some(Loadable::Error(_)) => force,
+        };
+        if !reload {
             return;
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let target = self.space_target(cx);
-        self.models.insert(harness, Loadable::Loading);
+        if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
+            self.models.insert(harness, Loadable::Loading);
+        }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
@@ -959,7 +1088,34 @@ impl Pickers {
                     serde_json::Value::String(target.clone()),
                 );
             }
-            let result = engine.client().call(methods::LIST_MODELS, params).await;
+            // A plugin-heavy OpenCode cold start can fail once while caches,
+            // MCP servers, or plugin runtimes are still warming. Keep this
+            // single Loading slot alive for two retries so recovery requires
+            // no picker close/reopen and cannot launch duplicate probes.
+            let mut attempt = 1_u64;
+            let result = loop {
+                let result = engine
+                    .client()
+                    .call(methods::LIST_MODELS, params.clone())
+                    .await;
+                if result.is_ok() || harness != HarnessId::Opencode || attempt >= 3 {
+                    break result;
+                }
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        %error,
+                        attempt,
+                        "OpenCode model discovery failed; retrying automatically"
+                    );
+                }
+                if this.update(cx, |_, _| {}).is_err() {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(attempt * 2))
+                    .await;
+                attempt += 1;
+            };
             this.update(cx, |pickers, cx| {
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
@@ -1180,7 +1336,7 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
-        self.ensure_models(harness, cx);
+        self.ensure_models(harness, false, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -2002,6 +2158,7 @@ impl Pickers {
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
+        let compact_traits = kind == PickerKind::Traits && self.compact_traits;
         div()
             .id(id)
             .h(px(32.0))
@@ -2049,7 +2206,15 @@ impl Pickers {
                         .text_color(tint.unwrap_or(theme.text_muted)),
                 )
             })
-            .child(div().min_w_0().truncate().child(label))
+            .when(!compact_traits, |el| {
+                el.child(div().min_w_0().truncate().child(label))
+            })
+            .when(compact_traits, |el| {
+                el.w(px(32.0))
+                    .px_0()
+                    .justify_center()
+                    .child(div().text_size(px(11.0)).child("•••"))
+            })
             // The effort half of the combined model+effort chip (and the space
             // chip's "@ device" tag): muted, no icon — one button, two tones.
             // `tint` overrides the muted tone (the offline warning).
@@ -2234,14 +2399,17 @@ impl Pickers {
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.
-        let (space, session) = {
+        let (space, session, change_request) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
-            (space, session)
+            let change_request = session
+                .as_ref()
+                .and_then(|chat| state.change_request_for_chat(chat).cloned());
+            (space, session, change_request)
         };
         let row = || {
             // Symmetric: the container's 8px gap sits above the toolbar;
@@ -2291,7 +2459,16 @@ impl Pickers {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(4.0))
                 .min_w_0()
+                .when_some(change_request, |el, summary| {
+                    el.child(crate::change_requests::pull_request_badge(
+                        "composer-pull-request".into(),
+                        summary,
+                        crate::change_requests::ChangeRequestBadgeSurface::Composer,
+                        &theme,
+                    ))
+                })
                 .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch
@@ -2454,6 +2631,194 @@ impl Pickers {
                     .child(SharedString::from("Retry")),
             )
             .into_any_element()
+    }
+
+    fn model_scrollbar_metrics(&self) -> Option<ModelScrollbarMetrics> {
+        let bounds = self.model_scroll.bounds();
+        let viewport_height = f32::from(bounds.size.height);
+        // GPUI stores the maximum as a positive distance; only the live
+        // scroll offset is negative while content moves upward.
+        let max_scroll = f32::from(self.model_scroll.max_offset().y).max(0.0);
+        if viewport_height <= 0.0 || max_scroll <= 0.0 {
+            return None;
+        }
+        let track_height = (viewport_height - MODEL_SCROLLBAR_TRACK_INSET * 2.0).max(0.0);
+        if track_height <= 0.0 {
+            return None;
+        }
+        let content_height = viewport_height + max_scroll;
+        let thumb_height = (track_height * viewport_height / content_height)
+            .max(MODEL_SCROLLBAR_MIN_THUMB)
+            .min(track_height);
+        let current_scroll = (-f32::from(self.model_scroll.offset().y)).clamp(0.0, max_scroll);
+        let travel = (track_height - thumb_height).max(0.0);
+        Some(ModelScrollbarMetrics {
+            track_height,
+            thumb_top: travel * current_scroll / max_scroll,
+            thumb_height,
+            max_scroll,
+        })
+    }
+
+    fn model_scrollbar_to_pointer(
+        &mut self,
+        pointer_y: gpui::Pixels,
+        grab_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.model_scrollbar_metrics() else {
+            return;
+        };
+        let bounds = self.model_scroll.bounds();
+        let pointer_in_track = f32::from(pointer_y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
+        let thumb_top = (pointer_in_track - grab_offset).clamp(0.0, metrics.travel());
+        let scroll = if metrics.travel() <= 0.0 {
+            0.0
+        } else {
+            thumb_top / metrics.travel() * metrics.max_scroll
+        };
+        let offset = self.model_scroll.offset();
+        self.model_scroll
+            .set_offset(gpui::Point::new(offset.x, px(-scroll)));
+        cx.notify();
+    }
+
+    fn on_model_list_hover(
+        &mut self,
+        hovered: &bool,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.model_list_hovered == *hovered {
+            return;
+        }
+        self.model_list_hovered = *hovered;
+        if !*hovered && self.model_scrollbar_drag.is_none() {
+            self.model_scrollbar_hovered = false;
+        }
+        cx.notify();
+    }
+
+    fn on_model_scrollbar_hover(
+        &mut self,
+        hovered: &bool,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Keep the active treatment while a captured drag travels outside the
+        // model list; the hover callback quite correctly turns false there.
+        let active = *hovered || self.model_scrollbar_drag.is_some();
+        if self.model_scrollbar_hovered != active {
+            self.model_scrollbar_hovered = active;
+            cx.notify();
+        }
+    }
+
+    fn on_model_scrollbar_mouse_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.model_scrollbar_metrics() else {
+            return;
+        };
+        window.focus(&self.focus, cx);
+        let bounds = self.model_scroll.bounds();
+        let pointer_in_track =
+            f32::from(event.position.y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
+        let grab_offset = if (metrics.thumb_top..=metrics.thumb_top + metrics.thumb_height)
+            .contains(&pointer_in_track)
+        {
+            pointer_in_track - metrics.thumb_top
+        } else {
+            metrics.thumb_height / 2.0
+        };
+        self.model_scrollbar_drag = Some(ModelScrollbarGrab { grab_offset });
+        self.model_scrollbar_to_pointer(event.position.y, grab_offset, cx);
+        cx.stop_propagation();
+    }
+
+    fn on_model_scrollbar_drag_move(
+        &mut self,
+        event: &gpui::DragMoveEvent<ModelScrollbarDrag>,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.model_scrollbar_drag else {
+            return;
+        };
+        self.model_scrollbar_to_pointer(event.event.position.y, drag.grab_offset, cx);
+    }
+
+    fn on_model_scrollbar_mouse_up(
+        &mut self,
+        _event: &gpui::MouseUpEvent,
+        _window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.model_scrollbar_drag = None;
+        if !self.model_list_hovered {
+            self.model_scrollbar_hovered = false;
+        }
+        cx.notify();
+    }
+
+    fn render_model_scrollbar(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let dragging = self.model_scrollbar_drag.is_some();
+        if !self.model_list_hovered && !dragging {
+            return None;
+        }
+        let metrics = self.model_scrollbar_metrics()?;
+        let active = self.model_scrollbar_hovered || dragging;
+        let thumb_width = if active {
+            MODEL_SCROLLBAR_HOVER_THUMB_WIDTH
+        } else {
+            MODEL_SCROLLBAR_THUMB_WIDTH
+        };
+        Some(
+            div()
+                .id("model-scrollbar")
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(MODEL_SCROLLBAR_HIT_WIDTH))
+                .on_hover(cx.listener(Self::on_model_scrollbar_hover))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(Self::on_model_scrollbar_mouse_down),
+                )
+                .on_drag(ModelScrollbarDrag, |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| ModelScrollbarDragGhost)
+                })
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(Self::on_model_scrollbar_mouse_up),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(Self::on_model_scrollbar_mouse_up),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(MODEL_SCROLLBAR_TRACK_INSET + metrics.thumb_top))
+                        .right(px(2.0))
+                        // The thumb is an absolute child inside a fixed-width
+                        // hit rail, so hover expansion never reflows rows.
+                        .w(px(thumb_width))
+                        .h(px(metrics.thumb_height))
+                        .rounded(px(thumb_width / 2.0))
+                        .bg(theme.text_faint.opacity(if active { 0.68 } else { 0.5 })),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
@@ -2707,6 +3072,40 @@ impl Pickers {
         let searching = !query.is_empty();
         let favorites_view = !searching && self.model_rail == ModelRail::Favorites;
         let descriptors = self.rail_descriptors(cx);
+        // No-agents empty state: the catalog loaded but offers nothing
+        // runnable (every enabled harness is missing its CLI, or nothing is
+        // enabled) and there's no committed chat harness to force-include —
+        // guidance instead of an empty rail.
+        if descriptors.is_empty() {
+            return div()
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    crate::icons::icon(crate::icons::TERMINAL)
+                        .size(px(20.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from("No agents available")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .text_center()
+                        .child(SharedString::from(
+                            "Enable an installed agent in Settings → Agents, \
+                             or install an agent CLI.",
+                        )),
+                )
+                .into_any_element();
+        }
         let rows = self.visible_model_rows(cx);
         let active = self.active;
         let selected_id = self.selected_model(cx).map(|m| m.id.clone());
@@ -2994,6 +3393,7 @@ impl Pickers {
             }
         };
 
+        let model_scrollbar = self.render_model_scrollbar(&theme, cx);
         let pane = div()
             .flex_1()
             .min_w_0()
@@ -3007,18 +3407,28 @@ impl Pickers {
             })
             .child(search_row)
             .child(
-                div().flex_1().min_h_0().py(px(6.0)).child(
-                    div()
-                        .id("model-menu-scroll")
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .px(px(6.0))
-                        .overflow_y_scroll()
-                        .track_scroll(&model_scroll)
-                        .children(list_children),
-                ),
+                div()
+                    .id("model-list-scroll-host")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .py(px(6.0))
+                    .on_hover(cx.listener(Self::on_model_list_hover))
+                    .child(
+                        div()
+                            .id("model-menu-scroll")
+                            .size_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .px(px(6.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&model_scroll)
+                            .children(list_children),
+                    )
+                    // Absolute child: the hit rail and thumb float above the
+                    // scroll content without consuming any list width.
+                    .children(model_scrollbar),
             );
 
         div()
@@ -3293,6 +3703,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Nous Research's mark (the Hermes product icon), monochrome.
         HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
+        // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
+        HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
     }
 }
 
@@ -3328,26 +3740,29 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
 }
 
 /// What the composer actually offers: [`visible_harnesses`] narrowed to the
-/// catalog device's enabled set (Settings → Agents — per-device state, so a
-/// space on another device follows THAT device's toggles). The dev-rig mock
-/// opt-in survives the filter, and a catalog where nothing is enabled (or
-/// that predates the flag entirely and defaults empty) falls back to
-/// everything visible rather than an empty rail.
+/// catalog device's enabled set AND installed CLIs (Settings → Agents is
+/// per-device state, so a space on another device follows THAT device's
+/// toggles; a default-enabled agent whose CLI is missing would only
+/// manufacture NotInstalled errors at send). The dev-rig mock opt-in
+/// survives the filter. There is NO fallback: a catalog where nothing is
+/// both enabled and installed offers nothing, and the composer surfaces the
+/// no-agents empty state + blocks new sends — resurrecting descriptors that
+/// can only fail with NotInstalled is the #128 bug.
 pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
     offered_harnesses_impl(list, mock_harness_enabled())
 }
 
 fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
-    let visible = visible_harnesses_impl(list, allow_mock);
-    let offered: Vec<HarnessDescriptor> = visible
-        .iter()
+    visible_harnesses_impl(list, allow_mock)
+        .into_iter()
         .filter(|d| {
-            zeron_engine::registry::descriptor_enabled(d) || (allow_mock && d.id == HarnessId::Mock)
+            d.installed
+                && (zeron_engine::registry::descriptor_enabled(d)
+                    || (allow_mock && d.id == HarnessId::Mock))
         })
-        .cloned()
-        .collect();
-    if offered.is_empty() { visible } else { offered }
+        .collect()
 }
+
 
 /// Attach the (single) open popover overlay to its trigger chip.
 fn attach_overlay(
@@ -3435,7 +3850,7 @@ impl Render for Pickers {
         // the chip reads "Fable 5" (a concrete pick) before any popover
         // opens, and rail switches inside the picker are instant.
         self.ensure_harnesses(false, cx);
-        self.prefetch_models(cx);
+        self.prefetch_models(false, cx);
         // A popover opened data-side (ZERON_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(
@@ -3449,7 +3864,13 @@ impl Render for Pickers {
         // harness reads from the brand mark beside it. Never "Default model":
         // before the catalog lands the remembered label (or the configured id)
         // names the pick; the loaded list then resolves it to a concrete row.
-        let model_label: SharedString = {
+        // No-agents state: nothing runnable resolved (and the catalog is
+        // loaded, so that's a conclusion, not a loading gap) — the chip says
+        // so instead of wearing a brand mark for an agent that can't run.
+        let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
+        let model_label: SharedString = if no_agents {
+            SharedString::from("No agents available")
+        } else {
             let loaded = self.selected_model(cx).map(|m| m.label.clone());
             let label = loaded.or_else(|| {
                 let remembered = self
@@ -3468,13 +3889,14 @@ impl Render for Pickers {
             });
             label.map(SharedString::from).unwrap_or_default()
         };
-        let harness_icon: (&'static str, Option<gpui::Hsla>) = self
-            .effective_harness(cx)
-            .map(harness_brand_icon)
-            .unwrap_or((
+        let harness_icon: (&'static str, Option<gpui::Hsla>) = match self.effective_harness(cx) {
+            Some(harness) => harness_brand_icon(harness),
+            None if no_agents => (crate::icons::TERMINAL, Some(theme.text_muted)),
+            None => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
-            ));
+            ),
+        };
         let explicit_options = self.explicit_options(cx);
         let traits_set = traits_summary(
             self.selected_model(cx),
@@ -3597,6 +4019,9 @@ impl Render for Pickers {
             .items_center()
             .justify_between()
             .gap(px(Theme::SPACE_SM))
+            // GPUI dispatches this captured stream while the thumb is dragged,
+            // including when the pointer has left the model popover.
+            .on_drag_move(cx.listener(Self::on_model_scrollbar_drag_move))
             .child(left)
             .child(right)
     }
@@ -3606,6 +4031,24 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn traits_trigger_compacts_only_at_narrow_measured_widths() {
+        assert!(!compact_traits_for_width(0.0, false));
+        assert!(compact_traits_for_width(
+            COMPACT_TRAITS_ENTER_WIDTH - 1.0,
+            false
+        ));
+        assert!(!compact_traits_for_width(COMPACT_TRAITS_ENTER_WIDTH, false));
+        // The small gap between entry and exit prevents chatter if the divider
+        // jitters around the boundary, without delaying restoration on a wide
+        // composer.
+        assert!(compact_traits_for_width(
+            COMPACT_TRAITS_EXIT_WIDTH - 1.0,
+            true
+        ));
+        assert!(!compact_traits_for_width(COMPACT_TRAITS_EXIT_WIDTH, true));
+    }
 
     fn bare_model(id: &str, label: &str) -> Model {
         Model {
@@ -3854,6 +4297,29 @@ mod tests {
     }
 
     #[test]
+    fn typed_path_target_expands_absolute_and_home_paths() {
+        let home = Some("/home/wing");
+        assert_eq!(typed_path_target("/disk2/", home), Some("/disk2".into()));
+        assert_eq!(
+            typed_path_target("/disk2/projects", home),
+            Some("/disk2/projects".into())
+        );
+        assert_eq!(typed_path_target("/", home), Some("/".into()));
+        assert_eq!(typed_path_target("~", home), Some("/home/wing".into()));
+        assert_eq!(typed_path_target("~/", home), Some("/home/wing".into()));
+        assert_eq!(
+            typed_path_target("~/github/", home),
+            Some("/home/wing/github".into())
+        );
+        // `~x` is a folder name; relative queries are searches, not paths.
+        assert_eq!(typed_path_target("~x", home), None);
+        assert_eq!(typed_path_target("src", home), None);
+        // `~` can't expand before the device's home is known.
+        assert_eq!(typed_path_target("~/github", None), None);
+        assert_eq!(typed_path_target("/disk2", None), Some("/disk2".into()));
+    }
+
+    #[test]
     fn browser_navigation_reducer() {
         let listing = FolderListing {
             path: "/home/w".into(),
@@ -3991,12 +4457,12 @@ mod tests {
                 descriptor(HarnessId::Grok, "Grok", grok),
             ]
         };
-        // A catalog from an engine predating the flag (all None) falls back
-        // to default-set membership: Claude Code + Codex only.
+        // A catalog from an engine predating the flag (all None) follows its
+        // installed probes, so every detected real harness is offered.
         let offered = offered_harnesses_impl(&catalog(None, None, None), false);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![HarnessId::ClaudeCode, HarnessId::Codex]
+            vec![HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Grok]
         );
         // The device's flags win: Grok on, Codex off; catalog order holds.
         let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), Some(true)), false);
@@ -4004,15 +4470,62 @@ mod tests {
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
             vec![HarnessId::ClaudeCode, HarnessId::Grok]
         );
-        // The dev-rig mock opt-in survives the enabled filter.
+        // The dev-rig mock opt-in survives the enabled filter (and Grok's
+        // unknown flag still resolves through its installed probe).
         let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), None), true);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![HarnessId::Mock, HarnessId::ClaudeCode]
+            vec![HarnessId::Mock, HarnessId::ClaudeCode, HarnessId::Grok]
         );
-        // Nothing enabled falls back to the visible list, not an empty rail.
+        // Nothing enabled offers nothing — the composer renders the
+        // no-agents empty state instead of resurrecting disabled agents.
         let offered =
             offered_harnesses_impl(&catalog(Some(false), Some(false), Some(false)), false);
-        assert_eq!(offered.len(), 3);
+        assert!(offered.is_empty());
+        // So does a legacy catalog whose installed probes all failed: never
+        // resurface unrunnable agents just to avoid an empty picker.
+        let mut missing = catalog(None, None, None);
+        missing.iter_mut().for_each(|d| d.installed = false);
+        assert!(offered_harnesses_impl(&missing, false).is_empty());
+    }
+
+    #[test]
+    fn offered_harnesses_require_an_installed_cli() {
+        let descriptor =
+            |id: HarnessId, name: &str, enabled: Option<bool>, installed: bool| HarnessDescriptor {
+                id,
+                name: name.into(),
+                supports_steering: true,
+                steering_mode: zeron_proto::SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed,
+                enabled,
+            };
+        // Enabled-but-missing-CLI agents stay out of the rail; an installed
+        // enabled one rides along. A live engine no longer stamps that
+        // combination (enablement follows detection), but a catalog from an
+        // older engine still can — the filter is the cross-version defense.
+        let catalog = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude Code", Some(true), false),
+            descriptor(HarnessId::Codex, "Codex", Some(true), false),
+            descriptor(HarnessId::Grok, "Grok", Some(true), true),
+        ];
+        let offered = offered_harnesses_impl(&catalog, false);
+        assert_eq!(
+            offered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![HarnessId::Grok]
+        );
+        // Nothing enabled AND installed: an empty offered set — the fresh
+        // machine where the default-enabled Claude/Codex have no CLIs (#128).
+        // No fallback: offering them again would only manufacture
+        // NotInstalled errors at send; the composer shows the no-agents
+        // state and blocks new sends instead.
+        let catalog = vec![
+            descriptor(HarnessId::ClaudeCode, "Claude Code", Some(true), false),
+            descriptor(HarnessId::Codex, "Codex", Some(false), false),
+            descriptor(HarnessId::Grok, "Grok", Some(false), true),
+        ];
+        let offered = offered_harnesses_impl(&catalog, false);
+        assert!(offered.is_empty());
     }
 }

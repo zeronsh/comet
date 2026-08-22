@@ -249,6 +249,7 @@ impl Transcript {
     ///   measurement correcting the estimate just re-enters the timeline;
     /// - once the target row is measured the glide is pixel-exact.
     pub fn scroll_to_row(&mut self, target: usize, cx: &mut Context<Self>) {
+        self.begin_scroll_navigation();
         if motion::reduced_motion(cx) {
             self.list_state().scroll_to(ListOffset {
                 item_ix: target,

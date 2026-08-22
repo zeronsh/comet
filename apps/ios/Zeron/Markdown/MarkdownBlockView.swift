@@ -80,10 +80,12 @@ extension [InlineRun] {
                 var piece = AttributedString(run.text)
                 piece.font = Theme.mono(size - 1.5)
                 piece.foregroundColor = Theme.inlineCodeText
-                result = result + Text(piece).customAttribute(InlineCodeAttribute())
+                let code = Text(piece).customAttribute(InlineCodeAttribute())
+                result = Text("\(result)\(code)")
             } else {
-                result = result + Text([run].attributed(size: size, weight: weight,
-                                                        baseColor: baseColor))
+                let styled = Text([run].attributed(size: size, weight: weight,
+                                                   baseColor: baseColor))
+                result = Text("\(result)\(styled)")
             }
         }
         return result
@@ -113,7 +115,8 @@ extension [InlineRun] {
                     var piece = AttributedString(slice)
                     piece.font = Theme.mono(size - 1.5)
                     piece.foregroundColor = Theme.inlineCodeText.opacity(segment.alpha)
-                    result = result + Text(piece).customAttribute(InlineCodeAttribute())
+                    let code = Text(piece).customAttribute(InlineCodeAttribute())
+                    result = Text("\(result)\(code)")
                 } else {
                     var sliced = run
                     sliced.text = slice
@@ -124,7 +127,7 @@ extension [InlineRun] {
                             attr[r.range].foregroundColor = base.opacity(segment.alpha)
                         }
                     }
-                    result = result + Text(attr)
+                    result = Text("\(result)\(Text(attr))")
                 }
             }
             offset += chars.count

@@ -18,8 +18,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use zeron_proto::{
-    FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage, GitHistoryRef,
-    GitHistoryRefKind, Repo, RepoRef, Worktree,
+    DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage,
+    GitHistoryRef, GitHistoryRefKind, Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -32,10 +32,16 @@ const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
+/// Cap on returned drives (a machine with more mounts than this is a server
+/// farm, not a laptop picking a project folder).
+const DRIVE_LIST_MAX_ENTRIES: usize = 50;
 /// File mentions should remain responsive even in very large checkouts.
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+const FILE_INDEX_TTL: Duration = Duration::from_secs(10);
+const FILE_INDEX_MAX_ENTRIES: usize = 250_000;
+const RANK_BUFFER: usize = 1_024;
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
 
@@ -87,7 +93,21 @@ struct ReposInner {
     device_id: String,
     worktrees_root: PathBuf,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    file_index: FileIndexCache,
 }
+
+struct IndexedPath {
+    path: String,
+    haystack: nucleo_matcher::Utf32String,
+    is_dir: bool,
+}
+
+struct FileIndex {
+    entries: Vec<IndexedPath>,
+    built: std::time::Instant,
+}
+
+type FileIndexCache = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<FileIndex>>>;
 
 #[derive(Clone)]
 pub struct Repos {
@@ -109,6 +129,7 @@ impl Repos {
                 device_id: device_id.to_string(),
                 worktrees_root,
                 file_searches: std::sync::Mutex::new(HashMap::new()),
+                file_index: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -819,12 +840,14 @@ impl Repos {
         let cancelled = std::sync::Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(cancelled.clone());
         let worker_cancelled = cancelled.clone();
+        let cache = self.inner.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("file-search".into())
             .spawn(move || {
                 let _gate = gate;
-                let _ = tx.send(search_files_blocking_with_cancel(
+                let _ = tx.send(search_files_cached(
+                    &cache.file_index,
                     &root,
                     &query,
                     &featured_paths,
@@ -876,6 +899,23 @@ impl Repos {
             Ok(Err(_)) => Err(EngineError::Other("folder listing worker exited".into())),
             Err(_) => Err(EngineError::Other(
                 "folder listing timed out on the device".into(),
+            )),
+        }
+    }
+
+    // ── ListDrives ──────────────────────────────────────────────────────────
+
+    /// Mounted drives/volumes — the browse roots beyond home. Same disposable
+    /// worker + wall-clock ceiling as `ListFolders`: a dead network mount can
+    /// wedge the probe (macOS `canonicalize` stats each volume), and that must
+    /// fail this listing, not the runtime.
+    pub async fn list_drives(&self) -> Result<Vec<DriveEntry>, EngineError> {
+        let worker = disposable_worker("drive-list", list_drives_blocking);
+        match tokio::time::timeout(FOLDER_LIST_TIMEOUT, worker).await {
+            Ok(Some(drives)) => Ok(drives),
+            Ok(None) => Err(EngineError::Other("drive listing worker exited".into())),
+            Err(_) => Err(EngineError::Other(
+                "drive listing timed out on the device".into(),
             )),
         }
     }
@@ -941,31 +981,177 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     })
 }
 
-/// Case-insensitive subsequence score. Lower is better: adjacent and earlier
-/// characters win, while still allowing `cmp rs` to find `composer.rs`.
-fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
-    let candidate = candidate.to_lowercase();
-    query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .try_fold(0usize, |total, term| {
-            let mut at = 0;
-            let mut score = 0usize;
-            let mut previous_end = None;
-            for needle in term.chars() {
-                let found = candidate[at..].find(needle)? + at;
-                score += found;
-                if previous_end == Some(found) {
-                    score = score.saturating_sub(2);
-                }
-                at = found + needle.len_utf8();
-                previous_end = Some(at);
-            }
-            Some(total.saturating_add(score))
-        })
+/// The blocking drive walk. Best-effort everywhere: the list is navigation
+/// sugar for the folder browser, so an unreadable source means fewer rows,
+/// never an error (home always remains reachable without it).
+fn list_drives_blocking() -> Vec<DriveEntry> {
+    #[cfg(target_os = "macos")]
+    let drives = macos_drives();
+    #[cfg(target_os = "linux")]
+    let drives = linux_drives(&std::fs::read_to_string("/proc/mounts").unwrap_or_default());
+    #[cfg(windows)]
+    let drives = windows_drives();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let drives = Vec::new();
+    finish_drives(drives)
 }
 
-type RankedFileMatch = (Option<usize>, usize, String, bool);
+/// `/Volumes` holds every mounted volume; the boot volume is a symlink to `/`,
+/// which `canonicalize` resolves — so the system drive arrives under its real
+/// name ("Macintosh HD") and the fallback "System" row never shows on macOS.
+#[cfg(target_os = "macos")]
+fn macos_drives() -> Vec<DriveEntry> {
+    let mut drives: Vec<DriveEntry> = Vec::new();
+    if let Ok(read) = std::fs::read_dir("/Volumes") {
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            // Follows the symlink — a dangling one (mid-eject) drops out here.
+            if !path.is_dir() {
+                continue;
+            }
+            let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+            drives.push(DriveEntry {
+                name,
+                path: resolved.to_string_lossy().to_string(),
+            });
+        }
+    }
+    drives
+}
+
+/// Top-level directories the FHS (or its de-facto extensions) owns. A
+/// depth-one mount point OUTSIDE this set is a user-created drive root
+/// (`/disk2`, `/data`, `/tank`) — the system's own split partitions
+/// (`/boot`, a separate `/var` or `/home`) are plumbing, not drives.
+#[cfg(any(target_os = "linux", test))]
+const FHS_TOP_LEVEL: &[&str] = &[
+    "bin",
+    "boot",
+    "dev",
+    "efi",
+    "etc",
+    "home",
+    "lib",
+    "lib32",
+    "lib64",
+    "libx32",
+    "lost+found",
+    "media",
+    "mnt",
+    "nix",
+    "opt",
+    "proc",
+    "root",
+    "run",
+    "sbin",
+    "snap",
+    "srv",
+    "sys",
+    "tmp",
+    "usr",
+    "var",
+];
+
+/// Mounted drives from `/proc/mounts`: the conventional removable locations
+/// (`/media`, `/run/media`, `/mnt` — udisks, WSL drive letters, manual
+/// mounts, whatever the filesystem) plus block-device partitions mounted at
+/// custom top-level paths like `/disk2` (PR #144 feedback) — `/dev/*`
+/// sources at depth-one non-FHS points, minus squashfs/erofs images (snaps).
+/// Plus "System" for `/`: anything mounted deeper stays reachable by
+/// browsing from the root, and the palette accepts typed paths besides.
+#[cfg(any(target_os = "linux", test))]
+fn linux_drives(mounts: &str) -> Vec<DriveEntry> {
+    let mut drives: Vec<DriveEntry> = Vec::new();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some(point), fstype) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let point = unescape_mount_point(point);
+        let conventional = point.starts_with("/media/")
+            || point.starts_with("/run/media/")
+            || point == "/mnt"
+            || point.starts_with("/mnt/");
+        let custom_block = source.starts_with("/dev/")
+            && !matches!(fstype, Some("squashfs") | Some("erofs"))
+            && point
+                .strip_prefix('/')
+                .is_some_and(|p| !p.is_empty() && !p.contains('/') && !FHS_TOP_LEVEL.contains(&p));
+        if !conventional && !custom_block {
+            continue;
+        }
+        let name = point
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Drive")
+            .to_string();
+        drives.push(DriveEntry { name, path: point });
+    }
+    drives.push(DriveEntry {
+        name: "System".into(),
+        path: "/".into(),
+    });
+    drives
+}
+
+/// Probe the drive letters. `exists` on a wedged network letter can hang —
+/// covered by the caller's disposable-worker timeout.
+#[cfg(windows)]
+fn windows_drives() -> Vec<DriveEntry> {
+    ('A'..='Z')
+        .filter_map(|letter| {
+            let path = format!("{letter}:\\");
+            std::path::Path::new(&path).exists().then(|| DriveEntry {
+                name: format!("{letter}:"),
+                path,
+            })
+        })
+        .collect()
+}
+
+/// Dedupe by mount point (first mention wins — the named row beats a
+/// late generic duplicate), system root first, then name order, capped.
+fn finish_drives(mut drives: Vec<DriveEntry>) -> Vec<DriveEntry> {
+    let mut seen = HashSet::new();
+    drives.retain(|d| seen.insert(d.path.clone()));
+    drives.sort_by(|a, b| {
+        (a.path != "/")
+            .cmp(&(b.path != "/"))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    drives.truncate(DRIVE_LIST_MAX_ENTRIES);
+    drives
+}
+
+/// `/proc/mounts` octal-escapes whitespace in mount points (`\040` = space).
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mount_point(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let digits: String = chars.clone().take(3).collect();
+            if digits.len() == 3
+                && let Ok(code) = u8::from_str_radix(&digits, 8)
+            {
+                out.push(code as char);
+                chars.nth(2);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+type RankedFileMatch = (Option<usize>, u32, String, bool);
 
 fn compare_file_matches(
     query: &str,
@@ -977,7 +1163,7 @@ fn compare_file_matches(
         .is_none()
         .cmp(&featured_b.is_none())
         .then_with(|| featured_a.cmp(featured_b))
-        .then_with(|| score_a.cmp(score_b))
+        .then_with(|| score_b.cmp(score_a))
         .then_with(|| {
             empty_query
                 .then(|| path_a.split('/').count().cmp(&path_b.split('/').count()))
@@ -1001,14 +1187,160 @@ fn search_files_blocking(
     search_files_blocking_with_cancel(root, query, featured_paths, || false)
 }
 
-fn search_files_blocking_with_cancel<F: Fn() -> bool>(
+#[cfg(test)]
+fn search_files_blocking_with_cancel<F: Fn() -> bool + Sync>(
     root: &Path,
     query: &str,
     featured_paths: &[String],
     cancelled: F,
 ) -> Result<Vec<FileSearchMatch>, EngineError> {
-    let root = std::fs::canonicalize(root)
-        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))?;
+    let root = canonical_search_root(root)?;
+    let index = walk_file_index(&root, &cancelled)?;
+    Ok(rank_file_matches(&index, &root, query, featured_paths))
+}
+
+fn search_files_cached<F: Fn() -> bool + Sync>(
+    cache: &FileIndexCache,
+    root: &Path,
+    query: &str,
+    featured_paths: &[String],
+    cancelled: F,
+) -> Result<Vec<FileSearchMatch>, EngineError> {
+    let root = canonical_search_root(root)?;
+    let fresh = cache
+        .lock()
+        .ok()
+        .and_then(|indexes| indexes.get(&root).cloned())
+        .filter(|index| index.built.elapsed() < FILE_INDEX_TTL);
+    let index = match fresh {
+        Some(index) => index,
+        None => {
+            let index = std::sync::Arc::new(FileIndex {
+                entries: walk_file_index(&root, &cancelled)?,
+                built: std::time::Instant::now(),
+            });
+            if let Ok(mut indexes) = cache.lock() {
+                indexes.retain(|_, index| index.built.elapsed() < FILE_INDEX_TTL);
+                indexes.insert(root.clone(), index.clone());
+            }
+            index
+        }
+    };
+    if cancelled() {
+        return Err(EngineError::Other("file search cancelled".into()));
+    }
+    Ok(rank_file_matches(
+        &index.entries,
+        &root,
+        query,
+        featured_paths,
+    ))
+}
+
+fn canonical_search_root(root: &Path) -> Result<PathBuf, EngineError> {
+    std::fs::canonicalize(root)
+        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))
+}
+
+fn walk_file_index<F: Fn() -> bool + Sync>(
+    root: &Path,
+    cancelled: &F,
+) -> Result<Vec<IndexedPath>, EngineError> {
+    if cancelled() {
+        return Err(EngineError::Other("file search cancelled".into()));
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(12))
+        .unwrap_or(4);
+    let collected: std::sync::Mutex<Vec<IndexedPath>> = std::sync::Mutex::new(Vec::new());
+    let was_cancelled = AtomicBool::new(false);
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .threads(threads)
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+        .build_parallel()
+        .run(|| {
+            const BATCH: usize = 512;
+            struct Batch<'a> {
+                items: Vec<IndexedPath>,
+                sink: &'a std::sync::Mutex<Vec<IndexedPath>>,
+            }
+            impl Drop for Batch<'_> {
+                fn drop(&mut self) {
+                    if self.items.is_empty() {
+                        return;
+                    }
+                    if let Ok(mut all) = self.sink.lock() {
+                        all.append(&mut self.items);
+                    }
+                }
+            }
+            let mut batch = Batch {
+                items: Vec::with_capacity(BATCH),
+                sink: &collected,
+            };
+            let was_cancelled = &was_cancelled;
+            Box::new(move |entry| {
+                if was_cancelled.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
+                }
+                if cancelled() {
+                    was_cancelled.store(true, Ordering::Relaxed);
+                    return ignore::WalkState::Quit;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        tracing::debug!(%err, "file mention index skipped entry");
+                        return ignore::WalkState::Continue;
+                    }
+                };
+                let path = entry.path();
+                if path == root {
+                    return ignore::WalkState::Continue;
+                }
+                let Ok(relative) = path.strip_prefix(root) else {
+                    return ignore::WalkState::Continue;
+                };
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if relative == ".git" || relative.starts_with(".git/") {
+                    return ignore::WalkState::Continue;
+                }
+                batch.items.push(IndexedPath {
+                    haystack: nucleo_matcher::Utf32String::from(relative.as_str()),
+                    path: relative,
+                    is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
+                });
+                if batch.items.len() >= BATCH
+                    && let Ok(mut all) = batch.sink.lock()
+                {
+                    all.append(&mut batch.items);
+                    if all.len() >= FILE_INDEX_MAX_ENTRIES {
+                        return ignore::WalkState::Quit;
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+    if was_cancelled.load(Ordering::Relaxed) || cancelled() {
+        return Err(EngineError::Other("file search cancelled".into()));
+    }
+    let mut entries = collected
+        .into_inner()
+        .map_err(|_| EngineError::Other("file index poisoned".into()))?;
+    entries.truncate(FILE_INDEX_MAX_ENTRIES);
+    Ok(entries)
+}
+
+fn rank_file_matches(
+    entries: &[IndexedPath],
+    root: &Path,
+    query: &str,
+    featured_paths: &[String],
+) -> Vec<FileSearchMatch> {
     let featured: HashMap<String, usize> = featured_paths
         .iter()
         .filter_map(|path| {
@@ -1019,7 +1351,7 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
                 root.join(path)
             };
             let canonical = std::fs::canonicalize(full).ok()?;
-            let relative = canonical.strip_prefix(&root).ok()?;
+            let relative = canonical.strip_prefix(root).ok()?;
             Some(relative.to_string_lossy().replace('\\', "/"))
         })
         .enumerate()
@@ -1027,60 +1359,38 @@ fn search_files_blocking_with_cancel<F: Fn() -> bool>(
             paths.entry(path).or_insert(rank);
             paths
         });
-    let mut matches = Vec::new();
-    let walker = ignore::WalkBuilder::new(&root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
-        .build();
-    for entry in walker {
-        if cancelled() {
-            return Err(EngineError::Other("file search cancelled".into()));
-        }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                tracing::debug!(%err, "file mention search walk skipped entry");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let Ok(relative) = path.strip_prefix(&root) else {
+    let mut matcher = nucleo_matcher::Matcher::new({
+        let mut config = nucleo_matcher::Config::DEFAULT;
+        config.set_match_paths();
+        config
+    });
+    let pattern = nucleo_matcher::pattern::Pattern::parse(
+        query,
+        nucleo_matcher::pattern::CaseMatching::Smart,
+        nucleo_matcher::pattern::Normalization::Smart,
+    );
+    let mut matches: Vec<RankedFileMatch> = Vec::new();
+    for entry in entries {
+        let Some(score) = pattern.score(entry.haystack.slice(..), &mut matcher) else {
             continue;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        if relative.starts_with(".git/") || relative == ".git" {
-            continue;
-        }
-        let Some(path_score) = fuzzy_score(query, &relative) else {
-            continue;
-        };
-        let score = relative
-            .rsplit('/')
-            .next()
-            .and_then(|name| fuzzy_score(query, name))
-            .unwrap_or_else(|| path_score.saturating_add(1_000));
         matches.push((
-            featured.get(&relative).copied(),
+            featured.get(&entry.path).copied(),
             score,
-            relative,
-            entry.file_type().is_some_and(|kind| kind.is_dir()),
+            entry.path.clone(),
+            entry.is_dir,
         ));
-        if matches.len() > FILE_SEARCH_MAX_RESULTS {
+        if matches.len() >= RANK_BUFFER {
             matches.sort_by(|a, b| compare_file_matches(query, a, b));
             matches.truncate(FILE_SEARCH_MAX_RESULTS);
         }
     }
     matches.sort_by(|a, b| compare_file_matches(query, a, b));
-    Ok(matches
+    matches.truncate(FILE_SEARCH_MAX_RESULTS);
+    matches
         .into_iter()
         .map(|(_, _, path, is_dir)| FileSearchMatch { path, is_dir })
-        .collect())
+        .collect()
 }
 
 /// Turn a generated chat title into the semantic portion of a Zeron branch
@@ -1219,11 +1529,112 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn score(query: &str, candidate: &str) -> Option<u32> {
+        let mut matcher = nucleo_matcher::Matcher::new({
+            let mut config = nucleo_matcher::Config::DEFAULT;
+            config.set_match_paths();
+            config
+        });
+        nucleo_matcher::pattern::Pattern::parse(
+            query,
+            nucleo_matcher::pattern::CaseMatching::Smart,
+            nucleo_matcher::pattern::Normalization::Smart,
+        )
+        .score(
+            nucleo_matcher::Utf32String::from(candidate).slice(..),
+            &mut matcher,
+        )
+    }
+
+    #[test]
+    fn linux_drives_take_media_and_mnt_mounts_system_first() {
+        let mounts = "\
+sysfs /sys sysfs rw 0 0
+/dev/nvme0n1p2 / ext4 rw 0 0
+tmpfs /run tmpfs rw 0 0
+/dev/sda1 /media/wing/T7\\040Shield exfat rw 0 0
+/dev/sdb1 /run/media/wing/Backup ext4 rw 0 0
+/dev/sdc1 /mnt/scratch ext4 rw 0 0
+/dev/nvme0n1p2 /var/lib/docker ext4 rw 0 0
+";
+        let drives = finish_drives(linux_drives(mounts));
+        let rows: Vec<(&str, &str)> = drives
+            .iter()
+            .map(|d| (d.name.as_str(), d.path.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("System", "/"),
+                ("Backup", "/run/media/wing/Backup"),
+                ("scratch", "/mnt/scratch"),
+                ("T7 Shield", "/media/wing/T7 Shield"),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_drives_take_custom_top_level_block_mounts_not_system_splits() {
+        let mounts = "\
+/dev/nvme0n1p2 / ext4 rw 0 0
+/dev/sdb1 /disk2 ext4 rw 0 0
+/dev/mapper/vault /tank btrfs rw 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw 0 0
+/dev/sdd1 /boot ext4 rw 0 0
+/dev/sde1 /home ext4 rw 0 0
+/dev/sdf1 /data/disks/a ext4 rw 0 0
+/dev/loop3 /snap/core22/1234 squashfs ro 0 0
+/dev/loop9 /disk3 ext4 rw 0 0
+";
+        let drives = finish_drives(linux_drives(mounts));
+        let rows: Vec<&str> = drives.iter().map(|d| d.path.as_str()).collect();
+        // /disk2 and /tank are user drive roots; a loop-mounted ext4 image at
+        // a custom root counts too (it's squashfs snaps that are noise). The
+        // system's own split partitions and deep mounts stay out.
+        assert_eq!(rows, vec!["/", "/disk2", "/disk3", "/tank"]);
+    }
+
+    #[test]
+    fn finish_drives_dedupes_by_mount_point_keeping_the_first_name() {
+        let drives = finish_drives(vec![
+            DriveEntry {
+                name: "Macintosh HD".into(),
+                path: "/".into(),
+            },
+            DriveEntry {
+                name: "System".into(),
+                path: "/".into(),
+            },
+        ]);
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].name, "Macintosh HD");
+    }
+
+    #[test]
+    fn mount_point_unescape_handles_octal_and_lone_backslash() {
+        assert_eq!(unescape_mount_point("/media/a\\040b"), "/media/a b");
+        assert_eq!(unescape_mount_point("/media/tab\\011x"), "/media/tab\tx");
+        assert_eq!(unescape_mount_point("/media/plain"), "/media/plain");
+        assert_eq!(unescape_mount_point("/media/tail\\"), "/media/tail\\");
+    }
+
+    #[tokio::test]
+    async fn list_drives_resolves_on_this_platform() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        // Content is machine-dependent; the call must succeed and dedupe.
+        let drives = repos.list_drives().await.unwrap();
+        let mut paths: Vec<&String> = drives.iter().map(|d| &d.path).collect();
+        paths.dedup();
+        assert_eq!(paths.len(), drives.len());
+    }
+
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {
-        assert!(fuzzy_score("cmp rs", "crates/ui/src/composer.rs").is_some());
-        assert!(fuzzy_score("composer crates", "crates/ui/src/composer.rs").is_some());
-        assert!(fuzzy_score("xyz", "crates/ui/src/composer.rs").is_none());
+        assert!(score("cmp rs", "crates/ui/src/composer.rs").is_some());
+        assert!(score("composer crates", "crates/ui/src/composer.rs").is_some());
+        assert!(score("xyzq", "crates/ui/src/composer.rs").is_none());
     }
 
     #[test]
@@ -1291,6 +1702,19 @@ mod tests {
             .position(|entry| entry.path == "composer/docs/readme.md")
             .unwrap();
         assert!(composer < path_only);
+    }
+
+    #[test]
+    fn cached_search_reuses_one_walk_within_the_ttl() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("alpha.rs"), "").unwrap();
+        let cache: FileIndexCache = std::sync::Mutex::new(HashMap::new());
+
+        let first = search_files_cached(&cache, root.path(), "alpha", &[], || false).unwrap();
+        assert_eq!(first.first().map(|m| m.path.as_str()), Some("alpha.rs"));
+        std::fs::write(root.path().join("beta.rs"), "").unwrap();
+        let second = search_files_cached(&cache, root.path(), "beta", &[], || false).unwrap();
+        assert!(second.is_empty(), "{second:?}");
     }
 
     #[test]

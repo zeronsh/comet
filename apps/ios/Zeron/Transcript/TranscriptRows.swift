@@ -53,7 +53,7 @@ enum TranscriptRowBuilder {
     /// "{entryId}#{partId}" so the streaming tail re-parses O(delta + tail);
     /// `completed` memoizes settled parts so they parse exactly once.
     static func rows(entries: [MessageEntry],
-                     pendingSends: [(messageId: String, text: String, at: Int64)],
+                     pendingSends: [PendingSend],
                      parsers: inout [String: IncrementalMarkdownParser],
                      completed: inout [String: CompletedParse]) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []
@@ -90,11 +90,20 @@ enum TranscriptRowBuilder {
     private static func gap(for row: TranscriptRow,
                             previous: TranscriptRow?,
                             isFirst: Bool) -> CGFloat {
-        if isFirst { return TranscriptView.gapTurn + 10 }
-        if row.turnStart { return TranscriptView.gapTurn }
+        if isFirst { return Theme.spaceLG + 10 }
+        if row.turnStart { return Theme.spaceLG }
         // Same part ⇒ these are sibling markdown blocks, not a new turn.
         if let key = row.partKey, key == previous?.partKey { return MD.blockGap }
-        return TranscriptView.gapBlock
+        // Tool stacks are visually denser than prose, so use one larger
+        // global spacing step on both boundaries, matching desktop.
+        if isToolGroup(row) || isToolGroup(previous) { return Theme.spaceMD }
+        return Theme.spaceSM
+    }
+
+    private static func isToolGroup(_ row: TranscriptRow?) -> Bool {
+        guard let row else { return false }
+        if case .toolGroup = row.kind { return true }
+        return false
     }
 
     private static func rowsForEntry(_ entry: MessageEntry,

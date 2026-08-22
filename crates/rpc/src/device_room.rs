@@ -49,19 +49,60 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Text `"ping"` keepalive — answered by the DO's hibernation-safe auto-response
 /// pair (`edge/src/device-room.ts`) without waking it.
 ///
-/// 15s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
+/// 10s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
 /// consumer NAT) can reap an idle flow well inside a minute, and a keepalive
 /// that races the reaper loses. The frame is 4 bytes and never wakes the DO, so
-/// the only cost of halving the interval is that the host stays reachable.
-const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// the only cost of shortening the interval is that the host stays reachable —
+/// and a tight interval is what lets the silence lease below stay short.
+const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// Silence lease: every ping elicits an auto-pong, so a healthy socket sees
 /// inbound traffic at least once per `PING_INTERVAL`. No inbound frame for a
 /// couple of intervals plus grace = dead socket (half-open TCP after NAT
 /// timeout or sleep/wake) — drop it and reconnect instead of waiting on a TCP
-/// write error. Must stay well under the relay's own host-liveness window
-/// (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces its dead
-/// socket before the relay gives up on the device.
-const SILENCE_LEASE: Duration = Duration::from_secs(40);
+/// write error. 25s tolerates one lost pong (pings at +10/+20) before ruling
+/// the socket dead; the old 40s left sends wedged for most of a minute after
+/// an unnoticed drop. Must stay well under the relay's own host-liveness
+/// window (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces
+/// its dead socket before the relay gives up on the device.
+const SILENCE_LEASE: Duration = Duration::from_secs(25);
+/// App-level end-to-end liveness for the CLIENT link. The transport lease
+/// above proves only the client↔edge leg — the DO's auto-pong answers from
+/// the edge, so a link whose edge↔host leg is dead still looks healthy and
+/// retries frames into the void indefinitely (2026-08-19 incident: a peer
+/// link sat dead for 6 minutes until an unrelated token refresh cycled the
+/// host session). The client rides an `echo` frame on every keepalive; the
+/// HOST echoes it back. Silence past this deadline on a link that HAS echoed
+/// before = zombie relay path → drop and redial. Feature-detected: a link
+/// that never echoed (old host) keeps the transport-lease-only behavior, and
+/// inbound RPC frames count as echoes (end-to-end proof either way).
+const ECHO_KIND: &str = "echo";
+const ECHO_DEADLINE: Duration = Duration::from_secs(20);
+
+// Test seam: the consts above stay the production truth; integration tests
+// compress the client-link clocks so the zombie-path regression runs in
+// milliseconds instead of tens of seconds. Process-wide, test-only.
+static CLIENT_PING_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CLIENT_ECHO_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn set_client_liveness_for_tests(ping: Duration, echo_deadline: Duration) {
+    CLIENT_PING_MS.store(ping.as_millis() as u64, Ordering::Relaxed);
+    CLIENT_ECHO_DEADLINE_MS.store(echo_deadline.as_millis() as u64, Ordering::Relaxed);
+}
+
+fn client_ping_interval() -> Duration {
+    match CLIENT_PING_MS.load(Ordering::Relaxed) {
+        0 => PING_INTERVAL,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+fn client_echo_deadline() -> Duration {
+    match CLIENT_ECHO_DEADLINE_MS.load(Ordering::Relaxed) {
+        0 => ECHO_DEADLINE,
+        ms => Duration::from_millis(ms),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Frame codec
@@ -488,6 +529,21 @@ async fn handle_host_frame(
         }
         return;
     }
+    if header.k == ECHO_KIND {
+        // App-level liveness: echo straight back to the sender — the
+        // client's proof the edge↔host leg is alive (auto-pongs only prove
+        // its client↔edge leg).
+        if let Some(from) = header.from {
+            let reply = DeviceFrameHeader::new(ECHO_KIND, ECHO_KIND).with_to(from);
+            match encode_device_frame(&reply, &payload) {
+                Ok(frame) => {
+                    let _ = out_tx.send(frame).await;
+                }
+                Err(err) => tracing::error!(error = %err, "device-room: echo encode failed"),
+            }
+        }
+        return;
+    }
     if header.k == NUDGE_KIND {
         // Durable command nudge (§7): open the chat doc so drain fires.
         #[derive(Deserialize)]
@@ -543,10 +599,23 @@ impl DeviceLink {
         let (closed_tx, closed_rx) = watch::channel::<Option<String>>(None);
 
         let pump = tokio::spawn(async move {
-            let mut ping = tokio::time::interval(PING_INTERVAL);
+            let mut ping = tokio::time::interval(client_ping_interval());
             ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ping.tick().await; // consume the immediate first tick
             let mut last_rx = tokio::time::Instant::now();
+            // End-to-end liveness (see ECHO_DEADLINE): armed only once the
+            // host has echoed at least once, so old hosts keep working.
+            let mut last_echo = tokio::time::Instant::now();
+            let mut echo_seen = false;
+            let echo_frame =
+                encode_device_frame(&DeviceFrameHeader::new(ECHO_KIND, ECHO_KIND), &[])
+                    .unwrap_or_default();
+            // First echo right away: fast feature detection + instant proof
+            // the host leg is alive (the dial's readiness probe proves it
+            // too; this seeds the ongoing cadence).
+            if !echo_frame.is_empty() {
+                let _ = sink.send(WsMessage::Binary(echo_frame.clone())).await;
+            }
             let reason = loop {
                 tokio::select! {
                     frame = out_rx.recv() => match frame {
@@ -580,10 +649,17 @@ impl DeviceLink {
                                     break code;
                                 }
                                 Ok((header, payload)) if header.k == RPC_KIND => {
+                                    // An RPC frame from the host proves the
+                                    // whole path just as well as an echo.
+                                    last_echo = tokio::time::Instant::now();
                                     let text = String::from_utf8_lossy(&payload).into_owned();
                                     if in_tx.send(text).await.is_err() {
                                         break "client dropped".to_string();
                                     }
+                                }
+                                Ok((header, _)) if header.k == ECHO_KIND => {
+                                    last_echo = tokio::time::Instant::now();
+                                    echo_seen = true;
                                 }
                                 Ok(_) => {}
                                 Err(err) => {
@@ -601,9 +677,18 @@ impl DeviceLink {
                         if sink.send(WsMessage::Text("ping".into())).await.is_err() {
                             break "connection lost".to_string();
                         }
+                        if !echo_frame.is_empty()
+                            && sink.send(WsMessage::Binary(echo_frame.clone())).await.is_err()
+                        {
+                            break "connection lost".to_string();
+                        }
                     }
                     _ = tokio::time::sleep_until(last_rx + SILENCE_LEASE) => {
                         break "silent past lease".to_string();
+                    }
+                    _ = tokio::time::sleep_until(last_echo + client_echo_deadline()), if echo_seen => {
+                        tracing::warn!("device-room: host echo silent past deadline; link suspect");
+                        break "host echo silent".to_string();
                     }
                 }
             };
@@ -642,6 +727,19 @@ impl Drop for DeviceLink {
 // Link cache
 // ---------------------------------------------------------------------------
 
+/// A dial-gate verdict on a peer device from the workspace layer (registry
+/// presence). Only a definitive `Dark` parks dials; every ambiguous state
+/// stays `Unknown` so a dead registry room (rows down, relay fine — the
+/// 2026-08-18 03:45 incident shape) never blocks the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerLiveness {
+    Live,
+    Dark,
+    Unknown,
+}
+
+pub type PeerLivenessProbe = Arc<dyn Fn(&str) -> PeerLiveness + Send + Sync>;
+
 pub struct LinkCacheConfig {
     pub edge_url: String,
     pub token: Arc<dyn TokenSource>,
@@ -652,6 +750,12 @@ pub struct LinkCacheConfig {
     /// Readiness probe budget: the relay accepts client joins even when the host is
     /// offline, so a `ListHarnesses` round-trip proves the path before caching.
     pub probe_timeout: Duration,
+    /// Optional dial gate: a `Dark` verdict fails the call fast with NO dial.
+    /// Without it, retrying callers hot-dialed devices that had been offline
+    /// for days in 3-dial bursts every ~60s for the life of the app. Un-park
+    /// is presence-driven: the workspace's peer-alive hook fires the moment
+    /// heartbeats return, and the next call passes the gate.
+    pub liveness: Option<PeerLivenessProbe>,
 }
 
 impl LinkCacheConfig {
@@ -668,6 +772,7 @@ impl LinkCacheConfig {
             cooldown_base: Duration::from_secs(5),
             cooldown_max: Duration::from_secs(60),
             probe_timeout: Duration::from_secs(10),
+            liveness: None,
         }
     }
 }
@@ -707,12 +812,16 @@ impl LinkCache {
         });
         // Wake = every cached link is half-open and every cooldown is moot
         // (the failures belonged to the pre-suspend network). Drop them so the
-        // next call redials immediately with fresh credentials. Skipped
-        // outside a runtime (sync unit tests).
+        // next call redials immediately with fresh credentials. An online
+        // event (network path back / sibling dial success) likewise voids the
+        // cooldowns — those failures belonged to the dead network — but keeps
+        // live links, which a mere network *recovery* has not invalidated.
+        // Skipped outside a runtime (sync unit tests).
         if tokio::runtime::Handle::try_current().is_ok() {
             let weak = Arc::downgrade(&cache);
             tokio::spawn(async move {
                 let mut wake = zeron_sync::wake::subscribe();
+                let mut online = zeron_sync::wake::subscribe_online();
                 let mut token_changes = weak
                     .upgrade()
                     .and_then(|cache| cache.config.token.subscribe());
@@ -724,6 +833,11 @@ impl LinkCache {
                             lock(&cache.links).clear();
                             lock(&cache.dial_state).clear();
                             tracing::info!("peer: links + cooldowns cleared after wake");
+                        }
+                        result = online.recv() => {
+                            if result.is_err() { return; }
+                            let Some(cache) = weak.upgrade() else { return };
+                            lock(&cache.dial_state).clear();
                         }
                         _ = token_changed(&mut token_changes) => {
                             let Some(cache) = weak.upgrade() else { return };
@@ -764,6 +878,17 @@ impl LinkCache {
         // Fast path outside any lock.
         if let Some(link) = self.cached(device_id) {
             return Ok(link.client());
+        }
+        // Registry-dark gate: a device with no recent presence is not worth a
+        // dial (let alone the 3-attempt sequence) — fail fast with zero
+        // network traffic. A live cached link above always wins over the
+        // verdict; ambiguity (registry down, unknown device) never parks.
+        if let Some(probe) = &self.config.liveness
+            && probe(device_id) == PeerLiveness::Dark
+        {
+            return Err(RpcError::Transport(format!(
+                "peer {device_id}: device is offline (no recent presence)"
+            )));
         }
         let dial_lock = {
             let mut locks = lock(&self.dial_locks);
@@ -898,7 +1023,14 @@ impl LinkCache {
             &token,
         );
         tracing::info!(device = %device_id, "peer: dialing via device room");
-        let link = Arc::new(DeviceLink::connect(&url).await?);
+        // Bounded connect: `DeviceLink::connect` was the one unbounded await
+        // under `forward()` — a wedged edge socket hung callers indefinitely
+        // and only the UI's own per-call timers saved them (silently).
+        const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+        let link = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, DeviceLink::connect(&url))
+            .await
+            .map_err(|_| RpcError::Transport(format!("peer {device_id}: connect timed out")))?;
+        let link = Arc::new(link?);
         // Readiness probe: prove the host answers before caching (an offline host bounces
         // host_offline, which closes the link and fails this call fast).
         let client = link.client();

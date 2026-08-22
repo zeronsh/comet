@@ -68,6 +68,7 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
     let mut stream = match harness.run(req, controls).await {
@@ -199,12 +200,10 @@ async fn real_all_harnesses_quiet_survey() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
     let agents: Vec<(&str, fn() -> AcpHarness)> = vec![
-        ("claude", AcpHarness::claude),
-        ("codex", AcpHarness::codex),
-        ("cursor", AcpHarness::cursor),
         ("grok", AcpHarness::grok),
         ("hermes", AcpHarness::hermes),
         ("pi", AcpHarness::pi),
+        ("opencode", AcpHarness::opencode),
     ];
     let mut failures: Vec<String> = Vec::new();
     for (name, ctor) in agents {

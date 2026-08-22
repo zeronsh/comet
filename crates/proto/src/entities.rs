@@ -291,6 +291,22 @@ pub struct FolderListing {
     pub truncated: bool,
 }
 
+/// A browse root beyond home: a mounted drive/volume (or the system root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveEntry {
+    /// Display name (volume label / mount folder name; "System" for `/`).
+    pub name: String,
+    /// Absolute mount point.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveListing {
+    pub drives: Vec<DriveEntry>,
+}
+
 /// A workspace-relative file or directory returned by `SearchFiles`.
 /// Contents deliberately never cross this boundary: mentioning a path leaves
 /// the harness to read it through its normal workspace tools when needed.
@@ -329,6 +345,43 @@ pub struct CheckoutDiff {
     /// True when the patch was truncated at the byte cap ("Partial snapshot").
     pub truncated: bool,
     pub checksum: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Provider-neutral lifecycle state for a code change request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
+/// Compact provider-neutral change request metadata for checkout surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRequestSummary {
+    pub provider: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: ChangeRequestState,
+    pub base_ref: String,
+    pub head_ref: String,
+}
+
+/// Latest successful change request resolution for one checkout and branch.
+///
+/// `change_request: None` is an authoritative successful lookup with no match;
+/// resolution failures must retain the previous successful snapshot instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutChangeRequestStatus {
+    pub checkout_id: String,
+    pub device_id: String,
+    pub cwd: String,
+    pub branch: String,
+    pub change_request: Option<ChangeRequestSummary>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -512,9 +565,111 @@ pub enum TerminalEvent {
     },
 }
 
+/// One in-flight queued-attachment transfer (the `WatchTransfers` stream):
+/// raw-byte progress of the engine-side relay leg pushing staged bytes to a
+/// remote host. An entry appears when a file's chunks start moving, updates
+/// per landed chunk, and disappears when the host commits it (or the attempt
+/// fails — the retry re-adds it). Keyed by the send-minted uploadId, so the
+/// sender's thumbnails can resolve their `pending://{uploadId}/…` refs to a
+/// real percent instead of an indeterminate spinner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub upload_id: String,
+    pub file_name: String,
+    /// Raw bytes the host has acknowledged so far.
+    pub done: u64,
+    /// Total raw bytes of the staged file.
+    pub total: u64,
+}
+
+/// Live edge-connectivity posture (the `WatchConnectivity` stream): the truth
+/// the connection pill, composer honesty, and queued-send badges render.
+/// Derived engine-side from the registry room's reconnect state, the OS
+/// network-path monitor, and each open chat room's stats.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Connectivity {
+    pub state: ConnectivityState,
+    /// Epoch ms of the next scheduled registry dial while reconnecting
+    /// (0 = none pending / dialing right now). The countdown renders
+    /// client-side from this.
+    #[serde(default)]
+    pub retry_at_ms: i64,
+    /// The failure that started the current outage — sticky through the next
+    /// attempt (no flicker back to a bare "connecting…"), cleared on rejoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    /// Per-OPEN-chat room state; a chat absent here is unknown (consumers
+    /// fall back to the global state).
+    #[serde(default)]
+    pub chats: Vec<ChatConnectivity>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectivityState {
+    /// No edge transports on this profile (local scope) — hide the pill.
+    #[default]
+    Disabled,
+    /// The OS reports no network path.
+    Offline,
+    /// Edge expected but the registry room is down (dialing/backing off).
+    Reconnecting,
+    Connected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatConnectivity {
+    pub chat_id: String,
+    pub connected: bool,
+    /// Local update batches not yet acked by the chat's edge room.
+    #[serde(default)]
+    pub pending_pushes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn checkout_change_request_status_round_trips_all_states_as_camel_case() {
+        for (state, encoded_state) in [
+            (ChangeRequestState::Open, "open"),
+            (ChangeRequestState::Closed, "closed"),
+            (ChangeRequestState::Merged, "merged"),
+        ] {
+            let status = CheckoutChangeRequestStatus {
+                checkout_id: "checkout-1".into(),
+                device_id: "device-1".into(),
+                cwd: "/repo".into(),
+                branch: "feature/change".into(),
+                change_request: Some(ChangeRequestSummary {
+                    provider: "github".into(),
+                    number: 90,
+                    title: "Model checkout change request status".into(),
+                    url: "https://github.com/acme/zeron/pull/90".into(),
+                    state,
+                    base_ref: "main".into(),
+                    head_ref: "feature/change".into(),
+                }),
+                updated_at: Utc.with_ymd_and_hms(2026, 8, 15, 12, 30, 0).unwrap(),
+            };
+
+            let value = serde_json::to_value(&status).unwrap();
+            assert_eq!(value["checkoutId"], "checkout-1");
+            assert_eq!(value["deviceId"], "device-1");
+            assert_eq!(value["changeRequest"]["state"], encoded_state);
+            assert_eq!(value["changeRequest"]["baseRef"], "main");
+            assert_eq!(value["changeRequest"]["headRef"], "feature/change");
+            assert_eq!(
+                serde_json::from_value::<CheckoutChangeRequestStatus>(value).unwrap(),
+                status
+            );
+        }
+    }
 
     #[test]
     fn checkout_file_diff_text_contract_is_camel_case() {

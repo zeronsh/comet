@@ -59,6 +59,8 @@ icon_assets![
     // Hand-drawn git-branch glyph in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
+    // Provider-neutral pull-request glyph, drawn in the same linear family.
+    (PULL_REQUEST, "pull-request"),
     // Compact history-ref glyphs, drawn in the same linear style.
     (CLOUD, "cloud"),
     (TAG, "tag"),
@@ -75,6 +77,9 @@ icon_assets![
     // arrow-up mirrored (like the sidebar flip) — the Solar Linear set here
     // has no plain arrow-down.
     (ARROW_DOWN, "arrow-down"),
+    // arrow-up rotated 45° — the "opens elsewhere" glyph on spawn chips;
+    // the set has no diagonal arrow.
+    (ARROW_UP_RIGHT, "arrow-up-right"),
     // Hand-drawn return/enter arrow in the Solar Linear style (like the
     // terminal/plus/close ports) — the set has no return glyph.
     (RETURN, "return"),
@@ -82,9 +87,14 @@ icon_assets![
     // Hand-drawn expand/maximize arrows in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no expand glyph.
     (EXPAND_ARROWS, "expand-arrows"),
+    // Inward-pointing companion used to restore an expanded pane.
+    (COLLAPSE_ARROWS, "collapse-arrows"),
     // Hand-drawn fold-all chevrons, drawn as a family with EXPAND_ARROWS
     // (same stroke, caps, 90° joints) — Solar has no unfold-less either.
     (FOLD_VERTICAL, "fold-vertical"),
+    // The changes pane's unified/split toggle: a rounded frame halved by a
+    // centre rule (Solar Linear weight).
+    (SPLIT_COLUMNS, "split-columns"),
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
     (SMARTPHONE, "smartphone"),
@@ -113,6 +123,9 @@ icon_assets![
     (INFO_CIRCLE, "info-circle"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
+    // Hand-drawn bot head (antenna + eyes + ears) in the Solar Linear style
+    // — the embedded set has no bot/robot glyph. Subagent tabs.
+    (BOT, "bot"),
     // Hand-drawn bell + speaker in the Solar Linear style (like the terminal/
     // plus/return ports) — the embedded set has neither.
     (BELL, "bell"),
@@ -122,6 +135,18 @@ icon_assets![
     (TERMINAL, "terminal"),
     (PLUS, "plus"),
     (CLOSE, "close"),
+    // Hand-drawn Linux caption glyphs (minimize dash, maximize square,
+    // restore stacked squares) in the same style as `close` — drawn for the
+    // client-side-decoration window controls; no system glyph font exists on
+    // Linux the way Segoe Fluent Icons does on Windows.
+    (WINDOW_MINIMIZE, "window-minimize"),
+    (WINDOW_MAXIMIZE, "window-maximize"),
+    (WINDOW_RESTORE, "window-restore"),
+    // Hand-drawn hard-drive + home glyphs in the Solar Linear style (like the
+    // terminal/plus/return ports) — drawn for the add-space palette's
+    // Locations rail; the set has neither.
+    (HARD_DRIVE, "hard-drive"),
+    (HOME, "home"),
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
@@ -138,6 +163,7 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    (OPENCODE_MARK, "opencode-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the

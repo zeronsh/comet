@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
+use zeron_proto::{AgentEvent, SUBAGENT_INPUT_KEEP, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -110,6 +110,15 @@ pub enum MessageStatus {
     Aborted,
 }
 
+/// Lifecycle of a spawned subagent, carried on its spawn chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -150,6 +159,22 @@ pub enum MessagePart {
         /// Per-file diff stats (additive replacement for inline `diff`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_stats: Option<Vec<ToolDiffStat>>,
+        /// The SUBAGENT doc id this spawn chip indexes (additive; stamped by
+        /// the engine like the sidecar refs — the fold is chat-agnostic).
+        /// The chip IS the index: the client learns the doc/blob id from it,
+        /// there is no listing endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_ref: Option<String>,
+        /// Subagent lifecycle, DISTINCT from `resolved`: under the eager-done
+        /// policy the spawn tool's own result lands while the subagent still
+        /// runs. `running` → the ref is a live doc (watch it); `done`/
+        /// `failed` → frozen (blob first, doc as fallback).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_status: Option<SubagentStatus>,
+        /// One-line live tail of the subagent's latest output, folded from
+        /// its tagged text deltas (capped; display-only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_tail: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -254,6 +279,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     output_bytes: None,
                     diff_ref: None,
                     diff_stats: None,
+                    subagent_ref: None,
+                    subagent_status: None,
+                    subagent_tail: None,
                 });
             }
         }
@@ -336,11 +364,65 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
+        // Subagent-attributed CONTENT belongs to the subagent's own doc (the
+        // engine routes it there); the parent doc keeps only the spawn chip —
+        // which these events refresh in place: LIFECYCLE ONLY. A live tail
+        // was tried and rejected: rewriting the chip per delta batch grew
+        // the parent doc's oplog for the whole subagent run and rendered as
+        // distracting mid-stream fragments (user call, 2026-08-18). The
+        // `subagent_tail` field stays in the schema for docs that carry it.
+        AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } => {
+            let status = match event.as_ref() {
+                AgentEvent::Done { status, .. } => Some(match status {
+                    zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
+                    _ => SubagentStatus::Done,
+                }),
+                // A steer RESURRECTS a settled chip — it announces more work
+                // (claude: a queued SendMessage relaunches the agent), so
+                // this is the one event allowed past the no-regress guard.
+                AgentEvent::UserMessage { .. } => Some(SubagentStatus::Running),
+                _ => None,
+            };
+            for p in out.iter_mut() {
+                if let MessagePart::Tool {
+                    id,
+                    call,
+                    subagent_status,
+                    ..
+                } = p
+                    && id == parent_tool_use_id
+                    // Genus gate: only a SPAWN call ever carries subagent
+                    // lifecycle. A driver keying bug (claude's background
+                    // shells settled through the subagent subtype,
+                    // 2026-08-20) must not decorate an ordinary chip.
+                    && call.is_subagent_spawn()
+                {
+                    match status {
+                        Some(s) => *subagent_status = Some(s),
+                        // Any tagged traffic proves the subagent is live;
+                        // never regress a terminal state.
+                        None if !matches!(
+                            subagent_status,
+                            Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
+                        ) =>
+                        {
+                            *subagent_status = Some(SubagentStatus::Running);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
         // AvailableCommands feeds the engine's per-harness command cache, not
-        // the transcript.
+        // the transcript. UserMessage becomes its own doc ENTRY (the engine's
+        // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::AvailableCommands { .. } => {}
+        | AgentEvent::AvailableCommands { .. }
+        | AgentEvent::UserMessage { .. } => {}
     }
 }
 
@@ -402,7 +484,9 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
+/// Keeps: command / path / pattern / url / query / todo items / server+tool names,
+/// and a subagent spawn's model/type (see [`spawn_badge`] — a couple of short
+/// identifiers the chip names the child by).
 /// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
@@ -423,14 +507,41 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
         ToolCall::Mcp { server, tool, .. } => ToolCall::Mcp {
             server: server.clone(),
             tool: tool.clone(),
-            input: None,
+            input: spawn_badge(call),
         },
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),
-            input: None,
+            input: spawn_badge(call),
         },
         other => other.clone(),
     }
+}
+
+/// The only slice of a tool input allowed into the doc: a subagent spawn's
+/// [`SUBAGENT_INPUT_KEEP`] keys, so the chip can say WHICH model the child
+/// runs on (`Agent · haiku`) without the reader opening the subagent tab.
+///
+/// Everything else — the prompt above all — stays in the host's run journal,
+/// so this stays a whitelist of short identifiers rather than a size cap.
+/// `None` for anything that is not a spawn, and for a spawn that named
+/// neither, which keeps it idempotent: re-sanitizing a sanitized call is a
+/// fixpoint (the kept keys are themselves kept).
+fn spawn_badge(call: &ToolCall) -> Option<serde_json::Value> {
+    if !call.is_subagent_spawn() {
+        return None;
+    }
+    let input = match call {
+        ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref()?,
+        _ => return None,
+    };
+    let kept: serde_json::Map<String, serde_json::Value> = SUBAGENT_INPUT_KEEP
+        .iter()
+        .filter_map(|key| {
+            let value = input.get(key)?.as_str()?.trim();
+            (!value.is_empty()).then(|| ((*key).to_owned(), serde_json::Value::from(value)))
+        })
+        .collect();
+    (!kept.is_empty()).then(|| serde_json::Value::Object(kept))
 }
 
 /// Deterministic continuation id: `"{root}#c{n}"`.
@@ -609,6 +720,70 @@ mod tests {
         assert_eq!(sanitize_tool_call(&clean), clean);
     }
 
+    /// A spawn keeps the two short identifiers its chip names the child by and
+    /// drops the prompt — the whole point of the whitelist. Still a fixpoint.
+    #[test]
+    fn sanitize_keeps_a_spawns_model_and_drops_its_prompt() {
+        let call = ToolCall::Unknown {
+            name: "Agent: Explore theme system".into(),
+            input: Some(serde_json::json!({
+                "description": "Explore theme system",
+                "subagent_type": "Explore",
+                "model": "haiku",
+                "prompt": "a very long private prompt",
+            })),
+        };
+        let clean = sanitize_tool_call(&call);
+        assert_eq!(
+            clean,
+            ToolCall::Unknown {
+                name: "Agent: Explore theme system".into(),
+                input: Some(serde_json::json!({
+                    "model": "haiku",
+                    "subagent_type": "Explore",
+                })),
+            }
+        );
+        assert_eq!(clean.subagent_model(), Some("haiku"));
+        assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    /// An ordinary tool's input still goes, even when it happens to carry a
+    /// `model` argument — the badge is gated on the spawn genus, not the key.
+    #[test]
+    fn sanitize_still_strips_a_non_spawn_carrying_a_model_argument() {
+        let call = ToolCall::Unknown {
+            name: "SomeTool".into(),
+            input: Some(serde_json::json!({ "model": "haiku", "prompt": "secret" })),
+        };
+        assert_eq!(
+            sanitize_tool_call(&call),
+            ToolCall::Unknown {
+                name: "SomeTool".into(),
+                input: None,
+            }
+        );
+    }
+
+    /// A spawn that named no model keeps no input at all — `None`, not an
+    /// empty object, so the doc gains nothing and the fixpoint is exact.
+    #[test]
+    fn sanitize_drops_a_spawn_input_that_names_nothing_worth_keeping() {
+        let call = ToolCall::Unknown {
+            name: "Agent".into(),
+            input: Some(serde_json::json!({ "prompt": "secret", "model": "  " })),
+        };
+        let clean = sanitize_tool_call(&call);
+        assert_eq!(
+            clean,
+            ToolCall::Unknown {
+                name: "Agent".into(),
+                input: None,
+            }
+        );
+        assert_eq!(clean.subagent_model(), None);
+    }
+
     #[test]
     fn split_and_join_round_trip() {
         let big = "x".repeat(MSG_INLINE_MAX * 2 + 100);
@@ -630,6 +805,9 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             },
         ];
         let chunks = split_parts(&parts);
@@ -812,6 +990,110 @@ mod tests {
                 assert_eq!(diff_ref.as_deref(), Some("chat-9/t1.diff"));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_events_refresh_the_spawn_chip_in_place() {
+        use zeron_proto::DoneStatus;
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "toolu_sub".into(),
+                call: ToolCall::Unknown {
+                    name: "Agent".into(),
+                    input: None,
+                },
+            },
+        );
+        // Tagged traffic marks the chip running — and ONLY that: the tail
+        // stays untouched (per-delta chip rewrites polluted the parent doc).
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "scanning\nfound 3 issues".into(),
+                }),
+            },
+        );
+        match &parts[0] {
+            MessagePart::Tool {
+                subagent_status,
+                subagent_tail,
+                ..
+            } => {
+                assert_eq!(*subagent_status, Some(SubagentStatus::Running));
+                assert_eq!(*subagent_tail, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A tagged Done is terminal; later traffic must not regress it.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::TextDelta {
+                    text: "late flush".into(),
+                }),
+            },
+        );
+        match &parts[0] {
+            MessagePart::Tool {
+                subagent_status, ..
+            } => assert_eq!(*subagent_status, Some(SubagentStatus::Done)),
+            other => panic!("{other:?}"),
+        }
+        // Content never leaked into the parent parts.
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn subagent_events_never_decorate_a_non_spawn_chip() {
+        // Mis-keyed tagged traffic (claude's background shells settled
+        // through the subagent subtype, 2026-08-20) must not stamp lifecycle
+        // onto an ordinary tool chip — the genus gate is the CALL.
+        use zeron_proto::DoneStatus;
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "toolu_bash".into(),
+                call: ToolCall::Exec {
+                    command: "git clone …".into(),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_bash".into(),
+                event: Box::new(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }),
+            },
+        );
+        match &parts[0] {
+            MessagePart::Tool {
+                subagent_status, ..
+            } => assert_eq!(*subagent_status, None),
+            other => panic!("{other:?}"),
         }
     }
 

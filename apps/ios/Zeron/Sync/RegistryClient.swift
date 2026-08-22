@@ -45,7 +45,10 @@ actor RegistryClient {
     static let probeQuietNs: UInt64 = 900_000_000_000  // 15min quiet-room probe
     static let livenessTickNs: UInt64 = 1_000_000_000
     static let backoffBaseMs = 250
-    static let backoffCapMs = 30_000
+    static let backoffCapMs = 16_000
+    /// Stability-gated backoff reset (registry.rs STABLE_RESET): only a
+    /// session that joined AND survived this long resets backoff to base.
+    static let stableResetNs: UInt64 = 30_000_000_000
 
     /// MainActor-isolated bridge to the store's RegistryDoc.
     struct Delegate: Sendable {
@@ -64,6 +67,8 @@ actor RegistryClient {
     private var presenceTask: Task<Void, Never>?
     private var livenessTask: Task<Void, Never>?
     private var joined = false
+    /// When the current session joined — feeds the stability-gated reset.
+    private var joinedAt: DispatchTime?
     private var closed = false
     private var generation = 0
     private var backoffMs = RegistryClient.backoffBaseMs
@@ -112,8 +117,20 @@ actor RegistryClient {
     func kick() async {
         guard !closed else { return }
         backoffMs = RegistryClient.backoffBaseMs
-        if socket == nil || !joined {
+        if socket == nil {
             connect()
+            return
+        }
+        if !joined {
+            // A dial/handshake is already in flight on this socket — its own
+            // hello deadline polices it. Redialing here killed the launch
+            // dial mid-TLS every cold open (foregrounded() fires on scene
+            // activation), rerunning the handshake on the busiest link and
+            // doubling the spinner (NLC Edge, 2026-08-17). Only a zombie
+            // socket with NO handshake pending is redialed.
+            if helloSentAt == nil {
+                connect()
+            }
             return
         }
         guard probeSentAt == nil, helloSentAt == nil else { return }  // already policed
@@ -142,7 +159,7 @@ actor RegistryClient {
                 // confusing silent failure: everything cached renders, nothing
                 // syncs. Say so and back off.
                 roomLog.error("registry: no socket URL (token unavailable); backing off")
-                await self.scheduleReconnect(gen: gen)
+                self.scheduleReconnect(gen: gen)
                 return
             }
             await self.openSocket(url: url, gen: gen)
@@ -220,11 +237,21 @@ actor RegistryClient {
         socket?.cancel(with: .abnormalClosure, reason: nil)
         socket = nil
         cancelTasks()
+        // Stability-gated reset: only a session that survived ≥30s earns a
+        // fresh 250ms; a connect-and-die session keeps growing the backoff.
+        if let joinedAt,
+           DispatchTime.now().uptimeNanoseconds - joinedAt.uptimeNanoseconds
+               >= RegistryClient.stableResetNs {
+            backoffMs = RegistryClient.backoffBaseMs
+        }
+        joinedAt = nil
         let delay = backoffMs
         backoffMs = min(backoffMs * 2, RegistryClient.backoffCapMs)
         Task {
-            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
-            await self.connect()
+            // Parked while the OS path is offline; cut short by any online
+            // event (a sibling dial success, path recovery, focus probe).
+            await OnlineBus.shared.waitBackoff(ms: delay)
+            self.connect()
         }
     }
 
@@ -301,11 +328,13 @@ actor RegistryClient {
             helloSentAt = nil
             let wasJoined = joined
             joined = true
-            backoffMs = RegistryClient.backoffBaseMs
+            joinedAt = .now()
             await delegate.event(.state(seq: seq, full: full, gcFloor: gcFloor,
                                         rows: rows, presence: presence))
             if !wasJoined {
                 roomLog.info("registry: joined (seq=\(seq), full=\(full), rows=\(rows.count))")
+                // One recovered socket un-parks the whole fleet's backoffs.
+                OnlineBus.shared.notifyOnline()
                 await delegate.event(.connected)
             }
             // Anything pending (offline writes, reseeds) pushes now, and our

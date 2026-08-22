@@ -20,6 +20,9 @@ final class AppModel {
     var phase: Phase = .signedOut
     var workspace: WorkspaceStore?
     var demo: DemoDataset?
+    /// Graced connectivity truth — one stream every consumer inherits calm
+    /// from (home pill, composer notice, Queued/Failed badges).
+    let connectivity = ConnectivityCenter()
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
@@ -254,14 +257,37 @@ final class AppModel {
         let store = WorkspaceStore(config: config)
         workspace = store
         store.start()
+        startConnectivity()
         phase = .ready
+    }
+
+    /// Wire the graced-connectivity recompute over the live stores (the
+    /// engine's 1s compute_connectivity, phone edition).
+    private func startConnectivity() {
+        connectivity.registryConnected = { [weak self] in
+            guard let self, self.demo == nil, let workspace = self.workspace else { return true }
+            return workspace.connected
+        }
+        connectivity.chatRooms = { [weak self] in
+            guard let self else { return [] }
+            return self.sessionStores.compactMap { id, store in
+                store.roomActive ? (id: id, connected: store.connected) : nil
+            }
+        }
+        connectivity.hasPendingSends = { [weak self] in
+            self?.sessionStores.values.contains { !$0.pendingSends.isEmpty } ?? false
+        }
+        connectivity.start()
     }
 
     // MARK: Unified data accessors (demo or live — one path for views)
 
     var spaces: [Space] { demo?.spaces ?? workspace?.spaces ?? [] }
 
-    var connected: Bool { demo != nil || workspace?.connected == true }
+    // "Connected" for the header spinner means "server state has reached this
+    // session" — over the socket OR the HTTPS pull (which lands in ~1 RTT and
+    // is the only transport airplane wifi permits).
+    var connected: Bool { demo != nil || workspace?.connected == true || workspace?.synced == true }
 
     var overviewChats: [Chat] {
         if let demo {
@@ -294,6 +320,11 @@ final class AppModel {
             return chatIndicator(chat: chat, live: effectiveStatus(demo.sessions[chat.id], now: nowMs()))
         }
         return workspace?.indicator(for: chat) ?? .idle
+    }
+
+    func changeRequest(for chat: Chat) -> ChangeRequestSummary? {
+        if let demo { return demo.changeRequests[chat.id] }
+        return workspace?.changeRequest(for: chat)
     }
 
     func spaceIndicator(_ spaceId: String) -> ChatIndicator? {
@@ -502,21 +533,61 @@ final class AppModel {
     /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after
     /// a suspension the workspace room in particular stayed dead while chat
     /// views reconnected on open, freezing sidebar rows and Working
-    /// indicators against perfectly live transcripts (2026-08-04).
+    /// indicators against perfectly live transcripts (2026-08-04). Also the
+    /// focus fast path (PR #168): probe {edge}/health (3s) and broadcast the
+    /// online event on success, so every PARKED backoff (not just the rooms
+    /// the kick reaches) lands a redial in ~1 RTT.
     func foregrounded() {
         kickAllRooms()
+        probeEdgeHealth()
+    }
+
+    private func probeEdgeHealth() {
+        guard let config, demo == nil else { return }
+        Task.detached {
+            var request = URLRequest(url: config.edgeURL.appending(path: "health"))
+            request.timeoutInterval = 3
+            guard let (_, response) = try? await URLSession.shared.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200 else { return }
+            OnlineBus.shared.notifyOnline()
+        }
     }
 
     private func kickAllRooms() {
         workspace?.kickRoom()
         // Deliver any roomGen flips that landed while the store had no open
-        // view, then kick every room.
+        // view, then kick every room — registry first and instantly, chat
+        // rooms trickled one per 200ms in attention order. Post-suspend and
+        // path-recovery kicks redial dead sockets; a simultaneous N-socket
+        // redial competed with the registry (the sidebar the user is
+        // actually looking at) on thin links.
         if let workspace {
             for chat in workspace.chats {
                 sessionStores[chat.id]?.updateRoomGen(chat.roomGen)
             }
         }
-        sessionStores.values.forEach { $0.kickRoom() }
+        var delay: UInt64 = 0
+        var kicked = Set<String>()
+        for chat in overviewChats {
+            // Dial-held stores stay held: a kick force-dials, and sweeping 46
+            // of them on every foreground/path flap is the stampede the warm
+            // cap exists to prevent. Held chats reconnect on open.
+            guard let store = sessionStores[chat.id], !store.isDialHeld else { continue }
+            kicked.insert(chat.id)
+            scheduleKick(store, afterNs: delay)
+            delay += 200_000_000
+        }
+        for (id, store) in sessionStores where !kicked.contains(id) && !store.isDialHeld {
+            scheduleKick(store, afterNs: delay)
+            delay += 200_000_000
+        }
+    }
+
+    private func scheduleKick(_ store: SessionStore, afterNs delay: UInt64) {
+        Task { @MainActor in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            store.kickRoom()
+        }
     }
 
     /// Kick rooms the moment the network path recovers or hops interfaces
@@ -530,6 +601,17 @@ final class AppModel {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
+            // net_path.rs semantics: only a definitive "unsatisfied" parks —
+            // requiresConnection/other stay optimistic (a confused monitor
+            // can only make us dial too much, never go silent). Every
+            // satisfied report also broadcasts online: satisfied→satisfied
+            // updates are interface handovers (wifi→cellular), and the old
+            // sockets are dead on the new path; redundant kicks are free
+            // because waiters drain stale events.
+            OnlineBus.shared.setPathOnline(path.status != .unsatisfied)
+            if path.status == .satisfied {
+                OnlineBus.shared.notifyOnline()
+            }
             // Interface set is part of the key: a satisfied→satisfied hop
             // (wifi→cellular) silently kills established sockets too.
             let key = path.status == .satisfied
@@ -537,6 +619,7 @@ final class AppModel {
                 : "down"
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.connectivity.setPathOffline(path.status == .unsatisfied)
                 let previous = self.lastPathKey
                 self.lastPathKey = key
                 // First callback reports the initial state — nothing to revive.
@@ -563,14 +646,63 @@ final class AppModel {
             // views re-derive `chat` from the registry on every change, so
             // this accessor is the flip's delivery path.
             existing.updateRoomGen(chat.roomGen)
+            // An open view wants live sync NOW — any preload dial-hold ends.
+            existing.releaseDial()
             return existing
         }
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
+        store.hostLiveness = { [weak self] deviceId in
+            self?.workspace?.peerLiveness(deviceId) ?? .unknown
+        }
         sessionStores[chat.id] = store
         store.start()
         store.updateRoomGen(chat.roomGen)
         return store
+    }
+
+    // MARK: Delivery truth (state.rs chat_delivery_degraded / send_* ports)
+
+    /// Queued-attachment version gate (composer.rs QUEUED_ATTACHMENTS_MIN):
+    /// the host must defer commands with pending:// refs, or the send would
+    /// dispatch with unresolvable paths.
+    static let queuedAttachmentsMin = (0, 2, 12)
+
+    func hostSupportsQueuedAttachments(_ chat: Chat) -> Bool {
+        hostSupportsQueuedAttachmentsOn(deviceId: chat.deviceId)
+    }
+
+    func hostSupportsQueuedAttachmentsOn(deviceId: String) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceVersionAtLeast(deviceId, Self.queuedAttachmentsMin) ?? false
+    }
+
+    /// Whether a send to this chat would queue rather than deliver promptly:
+    /// OS offline, the chat's room degraded (graced), or the host device
+    /// presence-dark. Every chat is remote-hosted on the phone — there is no
+    /// "locally hosted, never degraded" branch.
+    func chatDeliveryDegraded(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        if connectivity.state == .offline { return true }
+        if let store = sessionStores[chat.id], store.roomActive {
+            if connectivity.degradedChats.contains(chat.id) { return true }
+        } else if connectivity.state != .connected {
+            return true
+        }
+        if !deviceOnline(chat.deviceId) { return true }
+        return false
+    }
+
+    /// The user-visible truth of a chat's oldest unadopted send. `failed`
+    /// (unadopted past the 2-minute grace, with a retry affordance) wins over
+    /// `queued` (pending on a degraded path); a healthy in-flight send reads
+    /// `sending`. nil = nothing pending.
+    func sendState(for chat: Chat, now: Int64 = nowMs()) -> SendState? {
+        guard demo == nil, let store = sessionStores[chat.id],
+              let oldest = store.pendingSends.map(\.started).min() else { return nil }
+        if now - oldest > undeliveredGraceMs { return .failed }
+        if chatDeliveryDegraded(chat) { return .queued }
+        return .sending
     }
 
     func releaseSessionStore(chatId: String) {
@@ -578,11 +710,52 @@ final class AppModel {
     }
 
     /// Warm every non-archived session: stores hydrate from disk instantly
-    /// and keep their rooms syncing, so opening a session never shows a
-    /// loading state.
+    /// so opening a session never shows a loading state. The room DIALS are
+    /// held and released one per 300ms in attention order — N simultaneous
+    /// TLS handshakes at launch competed with the registry dial for a thin
+    /// uplink (and, pre-single-flight, raced N token refreshes), which was
+    /// the cold-open "connecting…" stall. Opening a session releases its
+    /// hold immediately (sessionStore(for:) above).
+    /// Sessions that keep a live socket without an open view. Everything else
+    /// hydrates from disk but dials on demand: 46 background joins (TLS +
+    /// hello + state each) drowned a 450kbps link for tens of seconds at
+    /// every cold open and network kick, for transcripts nobody was reading —
+    /// sidebar status (Working, presence, titles) rides the registry room, so
+    /// an undialed chat's row stays live regardless, and opening it releases
+    /// its dial instantly.
+    static let warmDialCap = 8
+
     func preloadSessions() {
-        for chat in overviewChats {
-            _ = sessionStore(for: chat)
+        guard demo == nil, let config else { return }
+        var stagger: UInt64 = 0
+        var released = 0
+        for chat in overviewChats where sessionStores[chat.id] == nil {
+            let store = SessionStore(chatId: chat.id, config: config)
+            store.hostDeviceId = chat.deviceId
+            store.hostLiveness = { [weak self] deviceId in
+                self?.workspace?.peerLiveness(deviceId) ?? .unknown
+            }
+            sessionStores[chat.id] = store
+            store.start(holdDial: true)
+            store.updateRoomGen(chat.roomGen)
+            guard released < Self.warmDialCap else { continue }
+            released += 1
+            let delay = stagger
+            Task { @MainActor in
+                // The registry (the sidebar the user is looking at) gets the
+                // pipe to itself first: on a 240kbps link, warm chat dials
+                // racing the registry's own handshake+state pushed the
+                // connect spinner from ~1.5s to ~7s (NLC Edge, 2026-08-17).
+                // An open view still dials instantly via releaseDial.
+                let start = DispatchTime.now()
+                while !(self.workspace?.connected ?? false),
+                      DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds < 10_000_000_000 {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+                if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                store.releaseDial()
+            }
+            stagger += 300_000_000
         }
     }
 }

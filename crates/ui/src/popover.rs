@@ -300,17 +300,21 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 /// [`crate::frost::MENU_BLUR`] blur from the mount helpers below, plus the
 /// same hairline + baked-in shadow. Opaque platforms keep the near-opaque
 /// tone the reference composites to on the dark panels (~#161616).
+/// Corner radius of every floating card. The frost wrapper masks its backdrop
+/// blur to the same value, so the two must agree.
+pub const CARD_RADIUS: f32 = 12.0;
+
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
         .border_color(hairline(0.10))
-        .rounded(px(12.0))
+        .rounded(px(CARD_RADIUS))
         .shadow_lg()
         .p(px(4.0))
         .overflow_hidden()
         .text_size(px(13.0))
         .text_color(theme.text);
-    if theme.is_glass() {
+    if theme.is_frost() {
         // Translucent tint — the backdrop blur beneath it comes from the
         // [`crate::frost::frosted`] wrapper at the mount helpers below.
         card.bg(theme.glass_overlay())
@@ -362,7 +366,7 @@ fn exit_progress(since: std::time::Instant) -> f32 {
 /// hold full strength through the fade and pop off at unmount.
 fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
     let blur = crate::frost::MENU_BLUR * (1.0 - exit.unwrap_or(0.0));
-    crate::frost::frosted(12.0, blur, content).into_any_element()
+    crate::frost::frosted(CARD_RADIUS, blur, content).into_any_element()
 }
 
 /// Entrance or exit motion for a popover layer. While exiting (the [`Popup`]
@@ -497,6 +501,29 @@ pub fn anchored_menu_above_at(
         .top(position.y)
         .size_0()
         .child(anchored_menu_above(id, content, closing))
+        .into_any_element()
+}
+
+pub fn full_width_menu_above(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = frosted_menu(exit, content);
+    div()
+        .absolute()
+        .bottom_full()
+        .left_0()
+        .right_0()
+        .child(
+            gpui::deferred(menu_motion(
+                id.into(),
+                exit,
+                div().occlude().pb(px(6.0)).child(content),
+            ))
+            .priority(1),
+        )
         .into_any_element()
 }
 

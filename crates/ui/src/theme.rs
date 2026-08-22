@@ -471,6 +471,10 @@ impl Theme {
     pub const SPACE_SM: f32 = 8.0;
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
+    /// Optical separation for a tightly coupled title/description stack.
+    /// This is intentionally outside the base spacing ladder: it corrects
+    /// line-box whitespace rather than separating layout regions.
+    pub const TEXT_STACK_GAP: f32 = 1.0;
 
     /// The frost tint painted over the blurred window background (macOS glass).
     /// Dark: darker than `surface`, matched to the reference vibrancy scrim
@@ -506,6 +510,17 @@ impl Theme {
     /// alpha (and with it whether glass is on at all) is per-appearance.
     pub fn is_glass(&self) -> bool {
         self.glass().a < 1.0
+    }
+
+    /// Whether FLOATING surfaces (popovers, the composer pill) paint their
+    /// backdrop blur and translucent tints. Unlike [`Self::is_glass`] this is
+    /// scene-level: the blur runs on in-app content inside the window, not on
+    /// the desktop behind it, so it needs no compositor vibrancy — macOS
+    /// rasterizes it in Metal and Linux in the vendored wgpu renderer (other
+    /// wgpu platforms keep opaque floats until tested). The window chrome
+    /// itself stays opaque off macOS either way.
+    pub fn is_frost(&self) -> bool {
+        cfg!(any(target_os = "macos", target_os = "linux"))
     }
 
     /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
@@ -550,7 +565,7 @@ impl Theme {
     /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
     /// is already glass-native.
     pub fn input_glass_bg(&self) -> Hsla {
-        if self.is_glass() && matches!(self.appearance, Appearance::Light) {
+        if self.is_frost() && matches!(self.appearance, Appearance::Light) {
             self.input_bg.opacity(0.30)
         } else {
             self.input_bg

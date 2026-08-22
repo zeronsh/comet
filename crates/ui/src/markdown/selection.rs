@@ -35,6 +35,10 @@ struct MdSelection {
     /// Byte offset of the anchor within its element.
     anchor_ix: usize,
     dragging: bool,
+    /// Document direction established while the anchor is still painted.
+    /// Once virtualization moves it out of the registry, this tells us which
+    /// side of the accumulated spans to preserve while extending the head.
+    forward: Option<bool>,
     /// Resolved spans, document order. Empty while a click hasn't moved.
     spans: Vec<Span>,
 }
@@ -75,6 +79,7 @@ pub fn begin(key: &str, ix: usize) {
         anchor_key: key.to_string(),
         anchor_ix: ix,
         dragging: true,
+        forward: None,
         spans: Vec::new(),
     });
 }
@@ -85,6 +90,7 @@ pub fn begin_with_span(key: &str, text: &str, range: Range<usize>) {
         anchor_key: key.to_string(),
         anchor_ix: range.start,
         dragging: true,
+        forward: None,
         spans: vec![Span {
             key: key.to_string(),
             range,
@@ -98,6 +104,90 @@ pub fn drag_anchor(key: &str) -> Option<usize> {
     let guard = state().lock().unwrap();
     let sel = guard.as_ref()?;
     (sel.dragging && sel.anchor_key == key).then_some(sel.anchor_ix)
+}
+
+/// Whether a markdown selection drag is currently in flight.
+pub fn is_dragging() -> bool {
+    state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|selection| selection.dragging)
+}
+
+/// Resolve a drag head against this frame's visible elements.
+///
+/// While the anchor is visible this is a normal replacement, which lets the
+/// user contract or reverse the selection. Once a virtualized list scrolls the
+/// anchor away, merge through an overlapping selected element instead. The
+/// overlap preserves text that is no longer painted while allowing newly
+/// visible elements at the drag edge to join the selection.
+pub fn update_drag(elements: &[(&str, &str)], head: (usize, usize)) -> bool {
+    let mut guard = state().lock().unwrap();
+    let Some(selection) = guard.as_mut().filter(|selection| selection.dragging) else {
+        return false;
+    };
+    let spans = if let Some(anchor_ei) = elements
+        .iter()
+        .position(|(key, _)| *key == selection.anchor_key)
+    {
+        let anchor = (anchor_ei, selection.anchor_ix);
+        selection.forward = Some(anchor <= head);
+        resolve_spans(elements, anchor, head)
+    } else {
+        let Some(forward) = selection.forward else {
+            return false;
+        };
+        let Some(spans) = extend_virtualized_drag(&selection.spans, elements, head, forward) else {
+            return false;
+        };
+        spans
+    };
+    if selection.spans == spans {
+        return false;
+    }
+    selection.spans = spans;
+    true
+}
+
+fn extend_virtualized_drag(
+    existing: &[Span],
+    elements: &[(&str, &str)],
+    head: (usize, usize),
+    forward: bool,
+) -> Option<Vec<Span>> {
+    if forward {
+        let (element_ix, span_ix) =
+            elements
+                .iter()
+                .enumerate()
+                .find_map(|(element_ix, (key, _))| {
+                    existing
+                        .iter()
+                        .position(|span| span.key == *key)
+                        .map(|span_ix| (element_ix, span_ix))
+                })?;
+        let start = existing[span_ix].range.start;
+        let mut merged = existing[..span_ix].to_vec();
+        merged.extend(resolve_spans(elements, (element_ix, start), head));
+        Some(merged)
+    } else {
+        let (element_ix, span_ix) =
+            elements
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(element_ix, (key, _))| {
+                    existing
+                        .iter()
+                        .position(|span| span.key == *key)
+                        .map(|span_ix| (element_ix, span_ix))
+                })?;
+        let end = existing[span_ix].range.end;
+        let mut merged = resolve_spans(elements, head, (element_ix, end));
+        merged.extend_from_slice(&existing[span_ix + 1..]);
+        Some(merged)
+    }
 }
 
 /// Replace the resolved spans (drag update). Returns true if they changed.
@@ -122,6 +212,22 @@ pub fn end_drag(key: &str) -> Option<String> {
     }
     sel.dragging = false;
     if sel.spans.iter().all(|s| s.range.is_empty()) {
+        *guard = None;
+        return None;
+    }
+    Some(join_spans(&sel.spans))
+}
+
+/// End whichever drag is active, even when virtualization has removed the
+/// anchor element (and therefore its frame-scoped mouse-up listener).
+pub fn end_active_drag() -> Option<String> {
+    let mut guard = state().lock().unwrap();
+    let sel = guard.as_mut()?;
+    if !sel.dragging {
+        return None;
+    }
+    sel.dragging = false;
+    if sel.spans.iter().all(|span| span.range.is_empty()) {
         *guard = None;
         return None;
     }
@@ -266,6 +372,36 @@ mod tests {
         assert!(!clear_if_owner("p2"));
         assert!(clear_if_owner("p1"));
         assert_eq!(selected_text(), None);
+    }
+
+    #[test]
+    fn drag_survives_forward_virtualization() {
+        let _state = state_lock();
+        begin("p1", 6);
+        assert!(update_drag(&elems(), (2, 5)));
+        let shifted = [("p2", "second"), ("p3", "third one"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (2, 4)));
+        assert_eq!(
+            selected_text().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(
+            end_active_drag().as_deref(),
+            Some("paragraph\nsecond\nthird one\nfour")
+        );
+        assert_eq!(drag_anchor("p1"), None);
+    }
+
+    #[test]
+    fn drag_survives_backward_virtualization() {
+        let _state = state_lock();
+        begin("p5", 4);
+        let first = [("p3", "third"), ("p4", "fourth"), ("p5", "fifth")];
+        assert!(update_drag(&first, (0, 2)));
+        let shifted = [("p2", "second"), ("p3", "third"), ("p4", "fourth")];
+        assert!(update_drag(&shifted, (0, 3)));
+        assert_eq!(selected_text().as_deref(), Some("ond\nthird\nfourth\nfift"));
+        assert_eq!(end_drag("p5").as_deref(), Some("ond\nthird\nfourth\nfift"));
     }
 
     #[test]

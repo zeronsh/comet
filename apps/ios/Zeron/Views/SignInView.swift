@@ -162,9 +162,14 @@ final class AuthSessionCoordinator: NSObject, ASWebAuthenticationPresentationCon
 
     nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         MainActor.assumeIsolated {
-            UIApplication.shared.connectedScenes
-                .compactMap { ($0 as? UIWindowScene)?.keyWindow }
-                .first ?? ASPresentationAnchor()
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            if let keyWindow = scenes.compactMap(\.keyWindow).first {
+                return keyWindow
+            }
+            guard let scene = scenes.first else {
+                preconditionFailure("Authentication requested without a connected window scene")
+            }
+            return ASPresentationAnchor(windowScene: scene)
         }
     }
 }

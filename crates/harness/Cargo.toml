@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 zeron-proto.workspace = true
 base64 = "0.22"
+reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true

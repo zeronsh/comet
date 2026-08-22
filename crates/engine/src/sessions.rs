@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    fold_event_into_parts, sanitize_tool_call,
+    SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
@@ -67,9 +67,45 @@ struct HarnessSessionRef {
     cwd: String,
 }
 
+/// Configuration baked into a live harness runtime. The steering mailbox only
+/// carries prompt text, so routing a request whose model/effort/sandbox changed
+/// would silently run it with the old process configuration. Such requests
+/// must replace the runtime and resume its harness-native session instead.
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeConfig {
+    harness_id: HarnessId,
+    model: Option<String>,
+    reasoning: Option<zeron_proto::ReasoningLevel>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+    cwd: String,
+    sandbox: zeron_proto::SandboxLevel,
+    auto_approve: bool,
+    worktree: Option<zeron_proto::WorktreeSpec>,
+}
+
+impl RuntimeConfig {
+    fn from_request(harness_id: HarnessId, request: &RunRequest) -> Self {
+        Self {
+            harness_id,
+            model: request.model.clone(),
+            reasoning: request.reasoning,
+            model_options: request.model_options.clone(),
+            cwd: request.cwd.clone(),
+            sandbox: request.sandbox,
+            auto_approve: request.auto_approve,
+            worktree: request.worktree.clone(),
+        }
+    }
+
+    fn can_route(&self, harness_id: HarnessId, request: &RunRequest) -> bool {
+        request.attachments.is_empty() && self == &Self::from_request(harness_id, request)
+    }
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
+    runtime_config: RuntimeConfig,
     steer_tx: mpsc::Sender<SteerMessage>,
     /// Harness-level cancellation (protocol interrupt + child teardown).
     interrupt_token: CancellationToken,
@@ -302,16 +338,17 @@ impl SessionsEngine {
             (
                 h.run_id.clone(),
                 h.steerable,
+                h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
             )
         });
-        if let Some((run_id, steerable, steer_tx, ledger)) = routed {
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
-            if steerable && steer_tx.try_send(message).is_ok() {
+            if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
                 // The run can vanish between the send and here (the idle
                 // reaper, a parked child death): the ledger entry below is
                 // the at-least-once guarantee — the run task's exit drain
@@ -350,8 +387,15 @@ impl SessionsEngine {
                 // below (write_user_message dedupes by id).
                 message_id = Some(user_id);
             }
+            if !same_runtime {
+                tracing::debug!(
+                    chat = %chat_id,
+                    "restarting live harness to apply changed run configuration"
+                );
+            }
             // Mailbox closed (runtime mid-teardown / non-steering harness) or
-            // the routed run died with the message reclaimed: replace it.
+            // the routed run died with the message reclaimed, or configuration
+            // changed beyond what the text-only mailbox can carry: replace it.
             self.interrupt(chat_id).await?;
         }
 
@@ -408,6 +452,7 @@ impl SessionsEngine {
             RunHandle {
                 run_id: run_id.clone(),
                 steerable: harness.supports_steering(),
+                runtime_config: RuntimeConfig::from_request(harness_id, &request),
                 steer_tx,
                 interrupt_token,
                 cancel: cancel_tx,
@@ -677,6 +722,7 @@ impl SessionsEngine {
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
+                            worktree: None,
                         })
                     });
                 let Some(mut request) = request else {
@@ -939,6 +985,160 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
+// ── subagent docs ───────────────────────────────────────────────────────────
+
+/// The per-subagent doc id: `{chatId}--sub--{suffix}`. Constrained by the
+/// edge's `ID_RE` (`^[A-Za-z0-9_-]{1,128}$` — the same id names the ChatRoom
+/// `chat2/{id}/ws` and the frozen blob `blob/{chatId}/{id}`): a clean, short
+/// tool-use id rides verbatim; anything unclean or over budget hashes.
+pub(crate) fn subagent_doc_id(chat_id: &str, tool_use_id: &str) -> String {
+    let clean = tool_use_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    let budget = 128usize.saturating_sub(chat_id.len() + "--sub--".len());
+    if clean && !tool_use_id.is_empty() && tool_use_id.len() <= budget {
+        return format!("{chat_id}--sub--{tool_use_id}");
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(tool_use_id.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for b in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("{chat_id}--sub--{hex}")
+}
+
+/// A live subagent transcript sink: its own doc (opened by id — the room
+/// `chat2/{docId}/ws` dials automatically, so viewers sync it like a chat),
+/// one streaming assistant entry folded from the tagged events. The held
+/// doc Arc pins the doc warm for the LRU while the subagent runs.
+struct SubagentSink {
+    doc_id: String,
+    doc: Arc<SessionDoc>,
+    entry_id: String,
+    started_at: i64,
+    entry_index: Option<usize>,
+    written: Vec<MessagePart>,
+    folded: Vec<MessagePart>,
+    dirty: bool,
+}
+
+impl SubagentSink {
+    fn flush(&mut self, device_id: &str) {
+        if !self.dirty || self.folded.is_empty() {
+            return;
+        }
+        let rendered = render_parts(&self.folded);
+        let result = match self.entry_index {
+            Some(ix) => {
+                let mut w = SegmentWriter::resume(&self.doc, ix, std::mem::take(&mut self.written));
+                let r = w.sync(&rendered);
+                let (ix, written) = w.into_state();
+                self.entry_index = Some(ix);
+                self.written = written;
+                r
+            }
+            None => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(mut w) => {
+                        let r = w.sync(&rendered);
+                        let (ix, written) = w.into_state();
+                        self.entry_index = Some(ix);
+                        self.written = written;
+                        r
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        if let Err(err) = result {
+            // Fail soft: a broken subagent doc degrades to chip-only, never
+            // errors the chat.
+            tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink flush failed");
+        }
+        self.dirty = false;
+    }
+
+    /// A parent→subagent steer ([`AgentEvent::UserMessage`], tagged): close
+    /// the open assistant segment (it reads Complete above the steer), write
+    /// the steer as its own USER entry, and reset so the next tagged delta
+    /// opens a fresh assistant entry below it — the subagent transcript then
+    /// reads like any steered chat.
+    fn push_user(&mut self, device_id: &str, text: &str) {
+        let rendered = render_parts(&self.folded);
+        let closed = match self.entry_index.take() {
+            Some(ix) => SegmentWriter::resume(&self.doc, ix, std::mem::take(&mut self.written))
+                .finish(&rendered, MessageStatus::Complete),
+            None if !self.folded.is_empty() => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(w) => w.finish(&rendered, MessageStatus::Complete),
+                    Err(e) => Err(e),
+                }
+            }
+            None => Ok(()),
+        };
+        if let Err(err) = closed {
+            tracing::warn!(doc = %self.doc_id, error = %err, "subagent segment close failed");
+        }
+        let entry = SessionMessageEntry {
+            id: new_id(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_owned(),
+            }],
+            created_at: now_ms(),
+            device_id: device_id.to_owned(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        };
+        if let Err(err) = self.doc.push_message(&entry) {
+            tracing::warn!(doc = %self.doc_id, error = %err, "subagent steer write failed");
+        }
+        self.entry_id = new_id();
+        self.started_at = now_ms();
+        self.written = Vec::new();
+        self.folded = Vec::new();
+        self.dirty = false;
+    }
+
+    /// Final flush + entry finalize; returns the transcript JSON for the
+    /// frozen blob (entries as the client renders them).
+    fn finish(mut self, device_id: &str, status: MessageStatus) -> Option<String> {
+        let rendered = render_parts(&self.folded);
+        let finished = match self.entry_index {
+            Some(ix) => SegmentWriter::resume(&self.doc, ix, std::mem::take(&mut self.written))
+                .finish(&rendered, status),
+            None if !self.folded.is_empty() => {
+                match SegmentWriter::begin(&self.doc, &self.entry_id, device_id, self.started_at) {
+                    Ok(w) => w.finish(&rendered, status),
+                    Err(e) => Err(e),
+                }
+            }
+            None => Ok(()),
+        };
+        if let Err(err) = finished {
+            tracing::warn!(doc = %self.doc_id, error = %err, "subagent sink finish failed");
+        }
+        let entries = zeron_doc::join_continuation_entries(self.doc.read_entries().ok()?);
+        serde_json::to_string(&entries).ok()
+    }
+}
+
+/// The parent-chip refresh a tagged event implies, for the in-place (parked)
+/// path — LIFECYCLE ONLY, mirroring the fold (live tails were rejected:
+/// per-delta chip rewrites grew the parent doc for the whole run).
+fn subagent_chip_update(event: &AgentEvent) -> Option<&'static str> {
+    match event {
+        AgentEvent::Done { status, .. } => Some(match status {
+            DoneStatus::Errored => "failed",
+            _ => "done",
+        }),
+        _ => Some("running"),
+    }
+}
+
 /// Apply the render-parts privacy policy: strip heavy/sensitive tool inputs before doc
 /// entry. Full inputs live only in the local run journal.
 fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
@@ -956,6 +1156,9 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 output_bytes,
                 diff_ref,
                 diff_stats,
+                subagent_ref,
+                subagent_status,
+                subagent_tail,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -971,6 +1174,9 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 output_bytes: *output_bytes,
                 diff_ref: diff_ref.clone(),
                 diff_stats: diff_stats.clone(),
+                subagent_ref: subagent_ref.clone(),
+                subagent_status: *subagent_status,
+                subagent_tail: subagent_tail.clone(),
             },
             other => other.clone(),
         })
@@ -1155,12 +1361,18 @@ async fn drive_run(
     // costs a status dip: the parked-resume path below re-arms Working the
     // moment output flows again, and nothing is lost. `ZERON_TURN_QUIESCE_MS`
     // overrides the window; 0 disables.
+    // RETIRED for native drivers: a harness whose every turn shape ends with
+    // a deterministic wire Done (claude/codex/cursor native) needs no
+    // quiesce backstop — arming one only risks false parks on long silent
+    // work. The env knob still forces a window on for diagnostics.
+    let deterministic_turn_end = harness.deterministic_turn_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
         Some(0) => None,
         Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None if deterministic_turn_end => None,
         None => Some(std::time::Duration::from_secs(120)),
     };
     let mut last_stream_activity = tokio::time::Instant::now();
@@ -1186,6 +1398,16 @@ async fn drive_run(
             None => Some(std::time::Duration::from_secs(20)),
         };
     let mut self_continued_turn = false;
+    // Spawn chips that have SETTLED (tagged Done seen). Content events for a
+    // settled chip with no live sink are dropped — a straggler frame after
+    // the freeze must not mint a new doc entry or wedge the transcript back
+    // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
+    // settled subagent: it announces more work is coming.
+    let mut settled_subagents: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Live subagent sinks, parent tool-use id → transcript doc state.
+    let mut subagents: std::collections::HashMap<String, SubagentSink> =
+        std::collections::HashMap::new();
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -1260,14 +1482,20 @@ async fn drive_run(
                     session_id: None,
                 },
             },
-            _ = tokio::time::sleep_until(flush_at), if dirty => {
-                // Coalesced STREAM_COMMIT_MS tick: one doc commit per window.
-                if let Err(err) = sync_segment(
-                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
-                ) {
-                    tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+            _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
+                // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
+                // (parent + any dirty subagent docs).
+                if dirty {
+                    if let Err(err) = sync_segment(
+                        doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                    ) {
+                        tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                    }
+                    dirty = false;
                 }
-                dirty = false;
+                for sink in subagents.values_mut() {
+                    sink.flush(&device_id);
+                }
                 continue;
             }
             // Turn-quiesce watchdog (see the knob above). Armed only when the
@@ -1327,6 +1555,161 @@ async fn drive_run(
                 continue;
             }
         };
+
+        // ── subagent routing ───────────────────────────────────────────
+        // Tagged events NEVER fold into the parent transcript: they stream
+        // into the subagent's own doc, and the parent keeps only the spawn
+        // chip (ref + status + one-line tail) — refreshed through the live
+        // fold while its segment still streams, else stamped in place (the
+        // eager-done norm: the chip's entry finished before the background
+        // subagent spoke). Handled BEFORE the parked gate so a parked
+        // session's background traffic still reaches the subagent doc
+        // without un-parking the chat.
+        if let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event: sub_event,
+        } = &event
+        {
+            inner.publish(&chat_id, &event);
+            let is_steer = matches!(sub_event.as_ref(), AgentEvent::UserMessage { .. });
+            if is_steer {
+                settled_subagents.remove(parent_tool_use_id);
+            } else if settled_subagents.contains(parent_tool_use_id)
+                && !subagents.contains_key(parent_tool_use_id)
+            {
+                // Straggler after the freeze: chip-only silence (the old
+                // pre-viz behavior), never a reopened doc.
+                continue;
+            }
+            let sub_id = subagent_doc_id(&chat_id, parent_tool_use_id);
+            let chip_streaming = folded
+                .iter()
+                .any(|p| matches!(p, MessagePart::Tool { id, .. } if id == parent_tool_use_id));
+            let sink_known = subagents.contains_key(parent_tool_use_id);
+            // A Done with NO sink (a subagent that never streamed — codex
+            // turn ends can beat registration) is chip-only: minting a doc
+            // just to freeze it empty helps no one, and stamping the ref
+            // would link the chip to that never-created doc (an empty tab
+            // on click).
+            let done_only = !sink_known && matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            if chip_streaming {
+                if !sink_known && !done_only {
+                    for p in folded.iter_mut() {
+                        if let MessagePart::Tool {
+                            id,
+                            call,
+                            subagent_ref,
+                            ..
+                        } = p
+                            && id == parent_tool_use_id
+                            // Genus gate: a subagent ref may only ever bind
+                            // to a SPAWN call — mis-keyed tagged traffic
+                            // must not turn an ordinary chip into a spawn
+                            // link (empty tab on click).
+                            && call.is_subagent_spawn()
+                        {
+                            *subagent_ref = Some(sub_id.clone());
+                        }
+                    }
+                }
+                zeron_doc::fold_event_into_parts(&mut folded, &event);
+                if !dirty {
+                    dirty = true;
+                    flush_at = tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(STREAM_COMMIT_MS);
+                }
+            }
+            // Open the sink lazily; an open failure degrades to chip-only.
+            if !sink_known && !done_only {
+                let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
+                    Ok(handle) => Some(handle.doc_arc()),
+                    Err(err) => {
+                        tracing::warn!(doc = %sub_id, error = %err, "subagent doc open failed (chip-only)");
+                        None
+                    }
+                });
+                if let Some(sub_doc) = opened {
+                    subagents.insert(
+                        parent_tool_use_id.clone(),
+                        SubagentSink {
+                            doc_id: sub_id.clone(),
+                            doc: sub_doc,
+                            entry_id: new_id(),
+                            started_at: now_ms(),
+                            entry_index: None,
+                            written: Vec::new(),
+                            folded: Vec::new(),
+                            dirty: false,
+                        },
+                    );
+                    if !chip_streaming {
+                        let _ = doc_ref.update_subagent_chip(
+                            parent_tool_use_id,
+                            Some(&sub_id),
+                            Some("running"),
+                            None,
+                        );
+                    }
+                }
+            }
+            let done = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
+            if done {
+                settled_subagents.insert(parent_tool_use_id.clone());
+            }
+            if let Some(sink) = subagents.get_mut(parent_tool_use_id) {
+                if let AgentEvent::UserMessage { text } = sub_event.as_ref() {
+                    // A steer splits ENTRIES, not parts — handled at the
+                    // sink level (the fold ignores UserMessage).
+                    sink.push_user(&device_id, text);
+                    continue;
+                }
+                zeron_doc::fold_event_into_parts(&mut sink.folded, sub_event);
+                sink.dirty = true;
+                if !chip_streaming && done {
+                    // In-place chip refresh on lifecycle transitions only —
+                    // content never rewrites the parent doc.
+                    let _ = doc_ref.update_subagent_chip(
+                        parent_tool_use_id,
+                        None,
+                        subagent_chip_update(sub_event),
+                        None,
+                    );
+                }
+                if done {
+                    let status = match sub_event.as_ref() {
+                        AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            ..
+                        } => MessageStatus::Complete,
+                        AgentEvent::Done {
+                            status: DoneStatus::Interrupted,
+                            ..
+                        } => MessageStatus::Aborted,
+                        _ => MessageStatus::Complete,
+                    };
+                    let sink = subagents.remove(parent_tool_use_id).expect("checked");
+                    let doc_id = sink.doc_id.clone();
+                    // FREEZE: the finished transcript uploads as a static R2
+                    // blob (`blob/{chatId}/{subDocId}`) so viewers of
+                    // finished subagents never wake the doc's room; dropping
+                    // the sink unpins the doc for the LRU and the room
+                    // idles. The live doc remains the fallback.
+                    if let Some(json) = sink.finish(&device_id, status)
+                        && let Some(host) = inner.doc_host()
+                    {
+                        host.upload_tool_sidecar(
+                            &chat_id,
+                            zeron_doc::SidecarPayload {
+                                part_id: doc_id,
+                                output: Some(json),
+                                diff: None,
+                            },
+                        );
+                    }
+                }
+            }
+            continue;
+        }
 
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled), and
@@ -1697,6 +2080,25 @@ async fn drive_run(
         }
     };
 
+    // Any subagent still streaming when the run ends freezes as-is: the
+    // parent process is gone, so nothing more can arrive on this stream.
+    for (parent_id, sink) in subagents.drain() {
+        let doc_id = sink.doc_id.clone();
+        let _ = doc_ref.update_subagent_chip(&parent_id, None, Some("failed"), None);
+        if let Some(json) = sink.finish(&device_id, MessageStatus::Aborted)
+            && let Some(host) = inner.doc_host()
+        {
+            host.upload_tool_sidecar(
+                &chat_id,
+                zeron_doc::SidecarPayload {
+                    part_id: doc_id,
+                    output: Some(json),
+                    diff: None,
+                },
+            );
+        }
+    }
+
     // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
     // a routed send that raced this exit either finds its entry gone (we own
     // it — re-dispatched below) or reclaims it and starts a fresh run itself.
@@ -1740,5 +2142,80 @@ async fn drive_run(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeConfig, subagent_doc_id};
+    use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    fn request() -> RunRequest {
+        RunRequest {
+            prompt: "first".into(),
+            harness: None,
+            model: Some("grok-4.6".into()),
+            reasoning: Some(zeron_proto::ReasoningLevel::High),
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn live_routing_requires_the_same_runtime_configuration() {
+        let initial = request();
+        let config = RuntimeConfig::from_request(HarnessId::Grok, &initial);
+
+        let mut follow_up = initial.clone();
+        follow_up.prompt = "second".into();
+        follow_up.resume = Some("session-1".into());
+        assert!(config.can_route(HarnessId::Grok, &follow_up));
+
+        follow_up.model = Some("grok-4.5".into());
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        follow_up.model = initial.model.clone();
+
+        follow_up.reasoning = Some(zeron_proto::ReasoningLevel::Medium);
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+        follow_up.reasoning = initial.reasoning;
+
+        follow_up.attachments.push("/tmp/image.png".into());
+        assert!(!config.can_route(HarnessId::Grok, &follow_up));
+    }
+
+    #[test]
+    fn clean_tool_ids_ride_verbatim_and_fit_id_re() {
+        let id = subagent_doc_id("chat-abc123", "toolu_01EjFLnNhCiMR2PBNKcVvkT");
+        assert_eq!(id, "chat-abc123--sub--toolu_01EjFLnNhCiMR2PBNKcVvkT");
+        assert!(id.len() <= 128);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
+    }
+
+    #[test]
+    fn unclean_or_oversized_ids_hash_deterministically() {
+        let dirty = subagent_doc_id("chat", "call/with:odd chars");
+        assert!(
+            dirty
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "{dirty}"
+        );
+        assert_eq!(dirty, subagent_doc_id("chat", "call/with:odd chars"));
+        let long_chat = "c".repeat(100);
+        let long = subagent_doc_id(&long_chat, &"t".repeat(64));
+        assert!(long.len() <= 128, "{}", long.len());
+        // Distinct inputs stay distinct.
+        assert_ne!(
+            subagent_doc_id("chat", "a:b"),
+            subagent_doc_id("chat", "a:c")
+        );
     }
 }

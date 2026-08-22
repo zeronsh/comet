@@ -40,6 +40,12 @@ use super::view::{
 /// Fixed tab width — drag-reorder math stays analytic.
 pub const TAB_WIDTH: f32 = 118.0;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
+const SELECTION_SCROLL_TICK_MS: u64 = 24;
+const SCROLLBAR_TRACK_INSET: f32 = 4.0;
+const SCROLLBAR_HIT_WIDTH: f32 = 10.0;
+const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
+const SCROLLBAR_HOVER_THUMB_WIDTH: f32 = 4.5;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 actions!(terminal, [ToggleTerminal]);
 
@@ -184,6 +190,8 @@ pub struct GridSnapshot {
 /// after a resize.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridGeometry {
+    /// Full terminal body bounds, used by edge scrolling and the scrollbar.
+    pub bounds: gpui::Bounds<Pixels>,
     /// Top-left of the first glyph (bounds origin plus padding).
     pub origin: gpui::Point<Pixels>,
     pub cell_w: f32,
@@ -204,7 +212,86 @@ struct SelectionDrag {
     /// selection's anchor, so the selection starts where the press landed
     /// rather than where the threshold happened to trip.
     origin: gpui::Point<Pixels>,
+    /// Latest pointer sample. Edge scrolling keeps using it while the pointer
+    /// is stationary, updating the selection after every scrollback step.
+    position: gpui::Point<Pixels>,
     armed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDrag {
+    grab_offset: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollbarMetrics {
+    track_top: f32,
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    history_lines: usize,
+}
+
+impl ScrollbarMetrics {
+    fn travel(self) -> f32 {
+        (self.track_height - self.thumb_height).max(0.0)
+    }
+}
+
+fn scrollbar_metrics(
+    bounds: gpui::Bounds<Pixels>,
+    rows: usize,
+    history_lines: usize,
+    display_offset: usize,
+) -> Option<ScrollbarMetrics> {
+    if history_lines == 0 {
+        return None;
+    }
+    let track_height = (f32::from(bounds.size.height) - SCROLLBAR_TRACK_INSET * 2.0).max(0.0);
+    if track_height <= 0.0 {
+        return None;
+    }
+    let total_lines = history_lines.saturating_add(rows).max(1);
+    let thumb_height = (track_height * rows as f32 / total_lines as f32)
+        .max(SCROLLBAR_MIN_THUMB)
+        .min(track_height);
+    let travel = (track_height - thumb_height).max(0.0);
+    let offset = display_offset.min(history_lines);
+    let progress_from_top = 1.0 - offset as f32 / history_lines as f32;
+    Some(ScrollbarMetrics {
+        track_top: f32::from(bounds.top()) + SCROLLBAR_TRACK_INSET,
+        track_height,
+        thumb_top: travel * progress_from_top,
+        thumb_height,
+        history_lines,
+    })
+}
+
+/// Terminal scroll direction for a selection near the grid edge.
+///
+/// Alacritty uses positive deltas for history (up) and negative deltas for the
+/// live bottom. Speed is line-based because the terminal cannot expose partial
+/// rows without breaking its fixed grid.
+fn selection_scroll_lines(geometry: GridGeometry, position: gpui::Point<Pixels>) -> i32 {
+    let grid_height = geometry.line_h * geometry.rows as f32;
+    if grid_height <= 0.0 {
+        return 0;
+    }
+    let edge = geometry.line_h.min(grid_height / 3.0);
+    let y = f32::from(position.y);
+    let top = f32::from(geometry.origin.y);
+    let bottom = top + grid_height;
+    let speed = |penetration: f32| {
+        let t = (penetration / edge).clamp(0.0, 1.0);
+        (1.0 + 2.0 * t * t).round() as i32
+    };
+    if y < top + edge {
+        speed(top + edge - y)
+    } else if y > bottom - edge {
+        -speed(y - (bottom - edge))
+    } else {
+        0
+    }
 }
 
 struct TerminalTab {
@@ -277,6 +364,10 @@ pub struct TerminalPanel {
     /// explicitly (no ensure-on-open/chat-switch), and closing the last tab
     /// must not dispatch the bottom drawer's [`ToggleTerminal`].
     embedded: bool,
+    /// The right pane is in its width tween. Keep painting the retained grid
+    /// through the changing clip, but do not feed transient widths into the
+    /// emulator: alternate-screen rows truncate rather than reflow.
+    resize_suspended: bool,
     tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
@@ -284,6 +375,15 @@ pub struct TerminalPanel {
     geometry: Option<GridGeometry>,
     /// Left-button gesture in flight, if any.
     selection_drag: Option<SelectionDrag>,
+    /// One-shot timer rescheduled only while a live selection remains in an
+    /// edge zone.
+    selection_scroll_task: Option<Task<()>>,
+    /// Active scrollbar thumb/track drag.
+    scrollbar_drag: Option<ScrollbarDrag>,
+    /// The terminal owns the cursor. The scrollbar is an on-demand affordance
+    /// rather than a permanently painted rail beside the panel.
+    terminal_hovered: bool,
+    scrollbar_hovered: bool,
     _observe: Subscription,
 }
 
@@ -296,11 +396,16 @@ impl TerminalPanel {
             chats: HashMap::new(),
             open: false,
             embedded: false,
+            resize_suspended: false,
             tab_seq: 0,
             drag: None,
             last_selected: None,
             geometry: None,
             selection_drag: None,
+            selection_scroll_task: None,
+            scrollbar_drag: None,
+            terminal_hovered: false,
+            scrollbar_hovered: false,
             _observe: observe,
         }
     }
@@ -314,6 +419,10 @@ impl TerminalPanel {
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    pub fn set_resize_suspended(&mut self, suspended: bool) {
+        self.resize_suspended = suspended;
     }
 
     /// Shell toggle hook. Opening lazily creates the first tab for the
@@ -790,6 +899,9 @@ impl TerminalPanel {
         // mapping needs the placement even on frames where nothing resized,
         // which is almost all of them.
         self.geometry = Some(geometry);
+        if self.resize_suspended {
+            return;
+        }
         let (cols, rows) = (geometry.cols, geometry.rows);
         let Some(chat) = self.selected_chat(cx) else {
             return;
@@ -922,6 +1034,7 @@ impl TerminalPanel {
             if extended {
                 self.selection_drag = Some(SelectionDrag {
                     origin: event.position,
+                    position: event.position,
                     armed: true,
                 });
                 cx.notify();
@@ -932,6 +1045,7 @@ impl TerminalPanel {
             self.with_active_emulator(cx, |emu| emu.clear_selection());
             self.selection_drag = Some(SelectionDrag {
                 origin: event.position,
+                position: event.position,
                 armed: false,
             });
         } else {
@@ -941,6 +1055,7 @@ impl TerminalPanel {
             self.with_active_emulator(cx, |emu| emu.start_selection(ty, point, side));
             self.selection_drag = Some(SelectionDrag {
                 origin: event.position,
+                position: event.position,
                 armed: true,
             });
         }
@@ -953,12 +1068,22 @@ impl TerminalPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = self.scrollbar_drag {
+            if event.dragging() {
+                self.scrollbar_to_pointer(event.position.y, drag.grab_offset, cx);
+            } else {
+                self.scrollbar_drag = None;
+            }
+            return;
+        }
         if !event.dragging() {
             return;
         }
-        let Some(drag) = self.selection_drag else {
+        let Some(mut drag) = self.selection_drag else {
             return;
         };
+        drag.position = event.position;
+        self.selection_drag = Some(drag);
         if !drag.armed {
             let dx = f32::from(event.position.x - drag.origin.x);
             let dy = f32::from(event.position.y - drag.origin.y);
@@ -983,6 +1108,7 @@ impl TerminalPanel {
         };
         self.with_active_emulator(cx, |emu| emu.update_selection(point, side));
         cx.notify();
+        self.schedule_selection_scroll(cx);
     }
 
     fn on_mouse_up(
@@ -992,6 +1118,8 @@ impl TerminalPanel {
         _cx: &mut Context<Self>,
     ) {
         self.selection_drag = None;
+        self.selection_scroll_task = None;
+        self.scrollbar_drag = None;
     }
 
     /// Copy the selection. Returns whether anything was copied, so the caller
@@ -1024,11 +1152,166 @@ impl TerminalPanel {
         }
     }
 
+    fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_task.is_some() {
+            return;
+        }
+        let (Some(drag), Some(geometry)) = (self.selection_drag, self.geometry) else {
+            return;
+        };
+        if !drag.armed || selection_scroll_lines(geometry, drag.position) == 0 {
+            return;
+        }
+        self.selection_scroll_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SELECTION_SCROLL_TICK_MS))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.selection_scroll_task = None;
+                panel.step_selection_scroll(cx);
+            });
+        }));
+    }
+
+    fn step_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        let (Some(drag), Some(geometry)) = (self.selection_drag, self.geometry) else {
+            return;
+        };
+        if !drag.armed {
+            return;
+        }
+        let lines = selection_scroll_lines(geometry, drag.position);
+        if lines == 0 {
+            return;
+        }
+        self.scroll_active(lines, cx);
+        if let Some((point, side)) = self.grid_point_at(drag.position, cx) {
+            self.with_active_emulator(cx, |emu| emu.update_selection(point, side));
+        }
+        self.schedule_selection_scroll(cx);
+    }
+
+    fn active_scrollbar_metrics(&self, cx: &App) -> Option<ScrollbarMetrics> {
+        let geometry = self.geometry?;
+        let tab = self.active_tab(cx)?;
+        scrollbar_metrics(
+            geometry.bounds,
+            tab.emulator.rows(),
+            tab.emulator.history_lines(),
+            tab.emulator.display_offset(),
+        )
+    }
+
+    fn scrollbar_to_pointer(
+        &mut self,
+        pointer_y: Pixels,
+        grab_offset: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.active_scrollbar_metrics(cx) else {
+            return;
+        };
+        let thumb_top =
+            (f32::from(pointer_y) - metrics.track_top - grab_offset).clamp(0.0, metrics.travel());
+        let offset = if metrics.travel() <= 0.0 {
+            0
+        } else {
+            ((1.0 - thumb_top / metrics.travel()) * metrics.history_lines as f32).round() as usize
+        };
+        self.with_active_emulator(cx, |emu| emu.scroll_to_offset(offset));
+        cx.notify();
+    }
+
+    fn on_scrollbar_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.active_scrollbar_metrics(cx) else {
+            return;
+        };
+        window.focus(&self.focus_handle, cx);
+        let pointer_on_track = f32::from(event.position.y) - metrics.track_top;
+        let grab_offset = if (metrics.thumb_top..=metrics.thumb_top + metrics.thumb_height)
+            .contains(&pointer_on_track)
+        {
+            pointer_on_track - metrics.thumb_top
+        } else {
+            metrics.thumb_height / 2.0
+        };
+        self.scrollbar_drag = Some(ScrollbarDrag { grab_offset });
+        self.scrollbar_to_pointer(event.position.y, grab_offset, cx);
+        cx.stop_propagation();
+    }
+
+    fn on_terminal_hover(
+        &mut self,
+        hovered: &bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal_hovered != *hovered {
+            self.terminal_hovered = *hovered;
+            if !*hovered {
+                self.scrollbar_hovered = false;
+            }
+            cx.notify();
+        }
+    }
+
+    fn render_scrollbar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.terminal_hovered {
+            return None;
+        }
+        let metrics = self.active_scrollbar_metrics(cx)?;
+        let thumb_width = if self.scrollbar_hovered {
+            SCROLLBAR_HOVER_THUMB_WIDTH
+        } else {
+            SCROLLBAR_THUMB_WIDTH
+        };
+        Some(
+            div()
+                .id("terminal-scrollbar")
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(SCROLLBAR_HIT_WIDTH))
+                .cursor_pointer()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if this.scrollbar_hovered != *hovered {
+                        this.scrollbar_hovered = *hovered;
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(Self::on_scrollbar_mouse_down),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(SCROLLBAR_TRACK_INSET + metrics.thumb_top))
+                        .right(px(2.0))
+                        // This is an absolute child inside a fixed-width hit
+                        // rail, so the hover expansion changes only paint
+                        // geometry and never reflows the terminal.
+                        .w(px(thumb_width))
+                        .h(px(metrics.thumb_height))
+                        .rounded(px(thumb_width / 2.0))
+                        .bg(theme.text_faint.opacity(0.52)),
+                )
+                .into_any_element(),
+        )
+    }
+
     // ---- tab management ----
 
     fn select_tab(&mut self, chat: &str, ix: usize, cx: &mut Context<Self>) {
         if let Some(tabs) = self.chats.get_mut(chat)
             && ix < tabs.tabs.len()
+            && tabs.active != ix
         {
             tabs.active = ix;
             cx.notify();
@@ -1378,6 +1661,7 @@ impl Render for TerminalPanel {
                 .into_any_element();
         };
         let focused = self.focus_handle.is_focused(window);
+        let scrollbar = self.render_scrollbar(&theme, cx);
 
         // Embedded (right-pane surface host): the shell's surface tabs
         // replace the internal bar.
@@ -1392,10 +1676,12 @@ impl Render for TerminalPanel {
             .child(
                 div()
                     .id("terminal-body")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .key_context("Terminal")
                     .track_focus(&self.focus_handle)
+                    .on_hover(cx.listener(Self::on_terminal_hover))
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1415,7 +1701,8 @@ impl Render for TerminalPanel {
                         let step = lines.round() as i32;
                         this.scroll_active(step, cx);
                     }))
-                    .child(TerminalElement::new(cx.entity(), focused)),
+                    .child(TerminalElement::new(cx.entity(), focused))
+                    .children(scrollbar),
             )
             .into_any_element()
     }
@@ -1444,6 +1731,44 @@ mod tests {
         assert_eq!(backoff_ms(4), 8000);
         assert_eq!(backoff_ms(10), 8000);
         assert_eq!(backoff_ms(u32::MAX), 8000);
+    }
+
+    fn test_geometry() -> GridGeometry {
+        GridGeometry {
+            bounds: gpui::Bounds::new(
+                gpui::point(px(10.0), px(20.0)),
+                gpui::size(px(300.0), px(200.0)),
+            ),
+            origin: gpui::point(px(18.0), px(28.0)),
+            cell_w: 8.0,
+            line_h: 20.0,
+            cols: 35,
+            rows: 9,
+        }
+    }
+
+    #[test]
+    fn selection_edge_scroll_uses_terminal_direction() {
+        let geometry = test_geometry();
+        assert!(selection_scroll_lines(geometry, gpui::point(px(20.0), px(28.0))) > 0);
+        assert_eq!(
+            selection_scroll_lines(geometry, gpui::point(px(20.0), px(100.0))),
+            0
+        );
+        assert!(selection_scroll_lines(geometry, gpui::point(px(20.0), px(208.0))) < 0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_maps_history_top_and_bottom() {
+        let bounds = test_geometry().bounds;
+        assert!(scrollbar_metrics(bounds, 20, 0, 0).is_none());
+
+        let bottom = scrollbar_metrics(bounds, 20, 80, 0).unwrap();
+        let top = scrollbar_metrics(bounds, 20, 80, 80).unwrap();
+        assert!((bottom.thumb_height - 38.4).abs() < 0.01);
+        assert!((bottom.thumb_top - bottom.travel()).abs() < 0.01);
+        assert_eq!(top.thumb_top, 0.0);
+        assert_eq!(top.thumb_height, bottom.thumb_height);
     }
 
     #[test]

@@ -20,11 +20,13 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>sh.zeron.Zeron.auth</string>
+			<string>sh.zeron.ios.auth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>zeron</string>
