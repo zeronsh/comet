@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::UiSettings;
 use crate::theme::{Appearance, Theme};
+use crate::themes;
 
 /// The user's appearance preference. Persisted in `ui-settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -59,6 +60,13 @@ impl AppearanceMode {
 pub struct AppearanceState {
     pub mode: AppearanceMode,
     pub system: Appearance,
+    /// Which theme to paint for each appearance. `None`/unknown ids resolve to
+    /// the stock palette (see [`themes::resolve`]).
+    pub dark_theme: Option<String>,
+    pub light_theme: Option<String>,
+    /// Global frost (glass) opacity, 0.0–1.0. Mirrors `ui-settings.json`;
+    /// `1.0` disables the frosted chrome.
+    pub frost_alpha: f32,
     /// Where `ui-settings.json` lives, so a menu action can persist the choice
     /// without routing through the shell entity that normally owns settings.
     pub data_dir: PathBuf,
@@ -78,16 +86,51 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
 /// Install the appearance globals and the matching theme. Call once at boot,
 /// before any window opens, so the first frame is already the right palette
 /// (installing later produces a visible dark-to-light flash).
-pub fn init(mode: AppearanceMode, data_dir: impl Into<PathBuf>, cx: &mut App) {
+pub fn init(settings: &UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
+    let mode = settings.appearance;
     let system = Appearance::from_window(cx.window_appearance());
     tracing::debug!(?mode, ?system, "appearance: initial");
     cx.set_global(AppearanceState {
         mode,
         system,
+        dark_theme: settings.dark_theme.clone(),
+        light_theme: settings.light_theme.clone(),
+        frost_alpha: settings.frost_alpha,
         data_dir: data_dir.into(),
     });
     sync_ns_appearance(mode);
-    Theme::install(resolve(mode, system), cx);
+    // Install unconditionally — there is no previous palette to compare with,
+    // and boot must not flash the stock theme before the user's choice lands.
+    let wanted = resolve(mode, system);
+    let entry = themes::resolve(theme_pref(wanted, cx).as_deref(), wanted);
+    Theme::install_theme(build_theme(entry, wanted, cx), cx);
+}
+
+/// Effective frost opacity: the user's setting on macOS, forced opaque (glass
+/// off) on platforms without vibrancy.
+fn effective_frost(cx: &App) -> f32 {
+    if !cfg!(target_os = "macos") {
+        return 1.0;
+    }
+    cx.try_global::<AppearanceState>()
+        .map(|s| s.frost_alpha)
+        .unwrap_or_else(crate::settings::default_frost_alpha)
+}
+
+/// Build the runtime theme for an entry, applying the global frost strength.
+fn build_theme(entry: &themes::ThemeEntry, appearance: Appearance, cx: &App) -> Theme {
+    let mut theme = Theme::from_colors(entry.colors.clone(), entry.id, entry.name, appearance);
+    theme.glass_alpha = effective_frost(cx);
+    theme
+}
+
+/// The persisted theme preference for `appearance`, if the globals exist.
+fn theme_pref(appearance: Appearance, cx: &App) -> Option<String> {
+    let state = cx.try_global::<AppearanceState>()?;
+    match appearance {
+        Appearance::Dark => state.dark_theme.clone(),
+        Appearance::Light => state.light_theme.clone(),
+    }
 }
 
 /// The mode currently in effect (defaults to `System` before [`init`]).
@@ -110,18 +153,61 @@ pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
     state.mode = mode;
     let data_dir = state.data_dir.clone();
     apply(cx);
-    persist(mode, &data_dir);
+    persist_theme_and_mode(cx, &data_dir);
 }
 
-/// Read-modify-write `ui-settings.json` for just the appearance key.
+/// Select which theme paints for `appearance` (e.g. a dark variant while in
+/// System mode). Repaints if the active palette actually moved, persists, and
+/// keeps the other appearance's choice untouched so switching mode later
+/// restores it.
+pub fn set_theme(id: &str, appearance: Appearance, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    // Unknown ids resolve to stock at paint time; storing them verbatim would
+    // make the settings file disagree with what is on screen. Normalize here.
+    let id = themes::resolve(Some(id), appearance).id.to_owned();
+    let state = cx.global_mut::<AppearanceState>();
+    match appearance {
+        Appearance::Dark => state.dark_theme = Some(id.clone()),
+        Appearance::Light => state.light_theme = Some(id.clone()),
+    }
+    let data_dir = state.data_dir.clone();
+    apply(cx);
+    persist_theme_and_mode(cx, &data_dir);
+}
+
+/// Change the global frost (glass) opacity and repaint. `1.0` = opaque chrome.
+pub fn set_frost(alpha: f32, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let alpha = alpha.clamp(0.0, 1.0);
+    let state = cx.global_mut::<AppearanceState>();
+    if (state.frost_alpha - alpha).abs() < f32::EPSILON {
+        return;
+    }
+    state.frost_alpha = alpha;
+    let data_dir = state.data_dir.clone();
+    apply(cx);
+    persist_theme_and_mode(cx, &data_dir);
+}
+
+/// Read-modify-write `ui-settings.json` for just the appearance keys.
 ///
 /// Deliberately a fresh load rather than a write of some cached struct: the
 /// shell holds its own `UiSettings` and saves it debounced, so writing a stale
 /// snapshot from here would silently roll back a pane resize the user made
-/// seconds earlier. Reloading keeps this to the one field we own.
-fn persist(mode: AppearanceMode, data_dir: &Path) {
+/// seconds earlier. Reloading keeps this to the keys we own.
+fn persist_theme_and_mode(cx: &App, data_dir: &Path) {
+    let Some(state) = cx.try_global::<AppearanceState>() else {
+        return;
+    };
     let mut settings = UiSettings::load(data_dir);
-    settings.appearance = mode;
+    settings.appearance = state.mode;
+    settings.dark_theme = state.dark_theme.clone();
+    settings.light_theme = state.light_theme.clone();
+    settings.frost_alpha = state.frost_alpha;
     if let Err(err) = settings.save(data_dir) {
         tracing::warn!(error = %err, "could not persist appearance");
     }
@@ -172,12 +258,19 @@ pub fn apply(cx: &mut App) {
     };
     sync_ns_appearance(state.mode);
     let wanted = resolve(state.mode, state.system);
-    let changed = !cx
-        .try_global::<Theme>()
-        .is_some_and(|t| t.appearance == wanted);
+    let entry = themes::resolve(theme_pref(wanted, cx).as_deref(), wanted);
+    let frost = effective_frost(cx);
+    let changed = !cx.try_global::<Theme>().is_some_and(|t| {
+        t.id == entry.id && t.appearance == wanted && (t.glass_alpha - frost).abs() < f32::EPSILON
+    });
     if changed {
-        tracing::debug!(?wanted, "appearance: installing palette");
-        Theme::install(wanted, cx);
+        tracing::debug!(
+            ?wanted,
+            theme = entry.id,
+            frost,
+            "appearance: installing palette"
+        );
+        Theme::install_theme(build_theme(entry, wanted, cx), cx);
         cx.refresh_windows();
     }
     // Unconditional, even when the palette did not move: this is the only thing
