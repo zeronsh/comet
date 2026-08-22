@@ -939,6 +939,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::LIST_SOURCE_CONTROL_CONNECTIONS
             | methods::LIST_PULL_REQUESTS
+            | methods::GET_PULL_REQUEST_COMMENTS
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
@@ -1418,6 +1419,23 @@ impl RpcService for EngineRpc {
                 )
                 .await;
                 RpcReply::value(&pull_requests)
+            }
+            methods::GET_PULL_REQUEST_COMMENTS => {
+                #[derive(Debug, Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    provider: String,
+                    repository: String,
+                    number: u64,
+                }
+                let p: Params = parse_params(params)?;
+                let comments = crate::source_control::pull_request_comments(
+                    &p.provider,
+                    &p.repository,
+                    p.number,
+                )
+                .await;
+                RpcReply::value(&comments)
             }
             // One-shot scoped capture for the Changes pane: `branch` diffs the
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the

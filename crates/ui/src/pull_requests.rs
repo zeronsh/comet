@@ -6,8 +6,8 @@ use gpui::{
 };
 
 use zeron_proto::{
-    ChangeRequestState, PullRequestChecksState, PullRequestListItem, PullRequestReviewState,
-    SourceControlConnection,
+    ChangeRequestState, PullRequestChecksState, PullRequestComment, PullRequestListItem,
+    PullRequestReviewState, SourceControlConnection,
 };
 use zeron_rpc::methods;
 
@@ -105,6 +105,8 @@ pub struct PullRequestsPage {
     authored_accounts: Vec<(String, String)>,
     accounts_loaded: bool,
     selected: Option<PullRequestListItem>,
+    comments: Loadable<Vec<PullRequestComment>>,
+    comments_task: Option<Task<()>>,
     filters: PullRequestFilters,
     filter_menu: Popup<()>,
     load_task: Option<Task<()>>,
@@ -114,6 +116,9 @@ pub struct PullRequestsPage {
 #[derive(Clone)]
 pub(crate) enum PullRequestsEvent {
     SelectionChanged(Option<PullRequestListItem>),
+    /// The selected pull request's comments finished loading; the shell renders
+    /// the detail surface inline, so it must repaint to pick up the result.
+    CommentsLoaded,
 }
 
 impl gpui::EventEmitter<PullRequestsEvent> for PullRequestsPage {}
@@ -134,6 +139,8 @@ impl PullRequestsPage {
             authored_accounts: Vec::new(),
             accounts_loaded: false,
             selected: None,
+            comments: Loadable::Idle,
+            comments_task: None,
             filters: PullRequestFilters::default(),
             filter_menu: Popup::default(),
             load_task: None,
@@ -462,7 +469,15 @@ impl PullRequestsPage {
             })
             .hover(|s| s.bg(theme.glass_hover()))
             .on_click(cx.listener(move |page, _, _, cx| {
+                let changed = page.selected.as_ref().is_none_or(|current| {
+                    current.number != selected_item.number
+                        || current.repository != selected_item.repository
+                        || current.provider != selected_item.provider
+                });
                 page.selected = Some(selected_item.clone());
+                if changed {
+                    page.load_comments(&selected_item, cx);
+                }
                 cx.emit(PullRequestsEvent::SelectionChanged(page.selected.clone()));
                 cx.notify();
             }))
@@ -526,12 +541,59 @@ impl PullRequestsPage {
         )
     }
 
+    /// Fetch the conversation for the given pull request and swap it into the
+    /// detail view once loaded.
+    fn load_comments(&mut self, item: &PullRequestListItem, cx: &mut Context<Self>) {
+        self.comments = Loadable::Loading;
+        cx.notify();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.comments = Loadable::Error("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let params = serde_json::json!({
+            "provider": item.provider,
+            "repository": item.repository,
+            "number": item.number,
+        });
+        self.comments_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::GET_PULL_REQUEST_COMMENTS, params)
+                .await;
+            this.update(cx, |page, cx| {
+                page.comments = match result {
+                    Ok(value) => serde_json::from_value(value)
+                        .map(Loadable::Ready)
+                        .unwrap_or_else(|err| Loadable::Error(err.to_string())),
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                page.comments_task = None;
+                cx.emit(PullRequestsEvent::CommentsLoaded);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     pub(crate) fn set_selection_silently(
         &mut self,
         item: Option<PullRequestListItem>,
         cx: &mut Context<Self>,
     ) {
-        self.selected = item;
+        let changed = match (&self.selected, &item) {
+            (Some(current), Some(next)) => {
+                current.provider != next.provider
+                    || current.repository != next.repository
+                    || current.number != next.number
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        self.selected = item.clone();
+        if changed && let Some(item) = item {
+            self.load_comments(&item, cx);
+        }
         cx.notify();
     }
 
@@ -542,10 +604,16 @@ impl PullRequestsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        Self::detail(item, &theme, window)
+        let comments = self.comments.clone();
+        Self::detail(item, &theme, window, comments)
     }
 
-    fn detail(item: &PullRequestListItem, theme: &Theme, window: &Window) -> AnyElement {
+    fn detail(
+        item: &PullRequestListItem,
+        theme: &Theme,
+        window: &Window,
+        comments: Loadable<Vec<PullRequestComment>>,
+    ) -> AnyElement {
         let url = item.url.clone();
         let state = match item.state {
             ChangeRequestState::Open => ("Open", theme.success),
@@ -718,7 +786,10 @@ impl PullRequestsPage {
                             .text_color(theme.text_muted)
                             .child(SharedString::from("Reviewers"))
                             .child(SharedString::from("No reviewers loaded"))
-                            .child(SharedString::from("Comments  0")),
+                            .child(SharedString::from(match &comments {
+                                Loadable::Ready(list) => format!("Comments  {}", list.len()),
+                                _ => "Comments  …".to_string(),
+                            })),
                     )
                     .child(
                         div()
@@ -742,7 +813,8 @@ impl PullRequestsPage {
                                 window,
                                 &|_| None,
                             )),
-                    ),
+                    )
+                    .child(Self::comments_section(&comments, theme, window)),
             )
             .into_any_element()
     }
@@ -764,6 +836,107 @@ impl PullRequestsPage {
 
     fn detail_stat(value: String, color: gpui::Hsla) -> gpui::Div {
         div().text_color(color).child(SharedString::from(value))
+    }
+
+    fn comments_section(
+        comments: &Loadable<Vec<PullRequestComment>>,
+        theme: &Theme,
+        window: &Window,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .pt(px(8.0))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from("Comments")),
+            )
+            .child(match comments {
+                Loadable::Idle | Loadable::Loading => div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("Loading comments…")),
+                Loadable::Error(message) => div()
+                    .text_size(px(12.0))
+                    .text_color(theme.danger_muted)
+                    .child(SharedString::from(format!(
+                        "Could not load comments: {message}"
+                    ))),
+                Loadable::Ready(list) if list.is_empty() => div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from("No comments yet.")),
+                Loadable::Ready(list) => div().flex().flex_col().gap(px(10.0)).children(
+                    list.iter()
+                        .enumerate()
+                        .map(|(index, comment)| Self::comment_card(index, comment, theme, window)),
+                ),
+            })
+            .into_any_element()
+    }
+
+    fn comment_card(
+        index: usize,
+        comment: &PullRequestComment,
+        theme: &Theme,
+        window: &Window,
+    ) -> AnyElement {
+        let body_tree = parse_full(&comment.body);
+        let body_options =
+            markdown_render::RenderOptions::settled(format!("pull-request-comment-{index}").into());
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .px(px(12.0))
+            .py(px(10.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.border.opacity(0.45))
+            .bg(theme.glass_hover())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        comment.author.clone().unwrap_or_else(|| "Unknown".into()),
+                    ))
+                    .child(SharedString::from(Self::comment_date(comment))),
+            )
+            .child(markdown_render::render_tree(
+                &body_tree,
+                &body_options,
+                theme,
+                window,
+                &|_| None,
+            ))
+            .into_any_element()
+    }
+
+    /// Show just the calendar date from an ISO timestamp; fall back to the raw
+    /// string when the provider returns something unexpected.
+    fn comment_date(comment: &PullRequestComment) -> String {
+        comment
+            .created_at
+            .as_deref()
+            .map(|created| {
+                created
+                    .split(['T', ' '])
+                    .next()
+                    .unwrap_or(created)
+                    .to_owned()
+            })
+            .unwrap_or_default()
     }
 
     fn filter_heading(theme: &Theme, label: &str) -> gpui::Div {
