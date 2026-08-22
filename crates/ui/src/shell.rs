@@ -5601,6 +5601,9 @@ impl Shell {
                         PullRequestsEvent::SelectionChanged(None) => {
                             shell.close_active_pull_request_surface(cx);
                         }
+                        // Comments load async; the detail surface is rendered
+                        // inline by the shell, so it must repaint here.
+                        PullRequestsEvent::CommentsLoaded => cx.notify(),
                     },
                 ));
                 self.pull_requests_page = Some(page);

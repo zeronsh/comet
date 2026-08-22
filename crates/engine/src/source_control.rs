@@ -18,8 +18,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::Mutex;
 
 use zeron_proto::{
-    ChangeRequestState, ChangeRequestSummary, PullRequestChecksState, PullRequestListItem,
-    PullRequestReviewState, SourceControlConnection, Space,
+    ChangeRequestState, ChangeRequestSummary, PullRequestChecksState, PullRequestComment,
+    PullRequestListItem, PullRequestReviewState, SourceControlConnection, Space,
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -181,6 +181,41 @@ pub async fn list_connections() -> Vec<SourceControlConnection> {
         .await,
         probe_bitbucket_connection().await,
     ]
+}
+
+/// Fetch conversation comments for a single pull request. GitHub resolves
+/// through the provider CLI; Bitbucket calls the REST API directly. Failures
+/// degrade to an empty list so the detail view still renders.
+pub async fn pull_request_comments(
+    provider: &str,
+    repository: &str,
+    number: u64,
+) -> Vec<PullRequestComment> {
+    match provider {
+        "github" => GitHubCli::new()
+            .pull_request_comments(repository, number)
+            .await
+            .unwrap_or_default(),
+        "bitbucket" => {
+            // bitbucket_credentials yields (token, email); keep the order straight.
+            let Some((token, email)) = bitbucket_credentials() else {
+                return Vec::new();
+            };
+            let Ok(client) = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+            else {
+                return Vec::new();
+            };
+            let Some((workspace, name)) = repository.split_once('/') else {
+                return Vec::new();
+            };
+            bitbucket_pull_request_comments(&client, workspace, name, &email, &token, number)
+                .await
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// List pull requests for Git workspaces hosted on this device.
@@ -828,6 +863,50 @@ impl GitHubCli {
         serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)
     }
 
+    /// Conversation comments for one pull request, resolved through `gh` with
+    /// its own credentials against the already-sanitized repository identity.
+    async fn pull_request_comments(
+        &self,
+        repository: &str,
+        number: u64,
+    ) -> Result<Vec<PullRequestComment>, ChangeRequestError> {
+        let request = ProcessRequest {
+            program: "gh".into(),
+            args: vec![
+                "pr".into(),
+                "view".into(),
+                number.to_string().into(),
+                "--repo".into(),
+                repository.into(),
+                "--json".into(),
+                "comments".into(),
+            ],
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
+            timeout: GITHUB_TIMEOUT,
+            output_limit: GITHUB_OUTPUT_LIMIT,
+        };
+        let output = self.runner.run(request).await.map_err(classify_run_error)?;
+        if !output.success {
+            return Err(classify_github_failure(&output.stderr));
+        }
+        if output.stdout_truncated {
+            return Err(ChangeRequestError::Decode);
+        }
+        let view: GhPullRequestComments =
+            serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)?;
+        Ok(view
+            .comments
+            .into_iter()
+            .filter(|comment| !comment.body.trim().is_empty())
+            .map(|comment| PullRequestComment {
+                author: comment.author.map(|author| author.login),
+                body: comment.body,
+                created_at: comment.created_at,
+            })
+            .collect())
+    }
+
     /// Resolve the remote's default branch through the provider API.
     ///
     /// This deliberately never uses Git remote transport (`git ls-remote`)
@@ -1277,6 +1356,23 @@ struct GhPullRequestAuthor {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequestComments {
+    #[serde(default)]
+    comments: Vec<GhComment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhComment {
+    #[serde(default)]
+    author: Option<GhPullRequestAuthor>,
+    body: String,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BitbucketPullRequestsResponse {
     values: Vec<BitbucketPullRequest>,
 }
@@ -1327,6 +1423,71 @@ struct BitbucketBranchContainer {
 #[derive(Debug, Deserialize)]
 struct BitbucketBranch {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketCommentsResponse {
+    values: Vec<BitbucketComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketComment {
+    #[serde(default)]
+    user: Option<BitbucketUser>,
+    #[serde(default)]
+    content: Option<BitbucketCommentContent>,
+    #[serde(default)]
+    created_on: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitbucketCommentContent {
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+async fn bitbucket_pull_request_comments(
+    client: &reqwest::Client,
+    workspace: &str,
+    repository: &str,
+    email: &str,
+    token: &str,
+    number: u64,
+) -> Option<Vec<PullRequestComment>> {
+    let url = format!(
+        "https://api.bitbucket.org/2.0/repositories/{workspace}/{repository}/pullrequests/{number}/comments"
+    );
+    let response = client
+        .get(url)
+        .query(&[("pagelen", "50")])
+        .basic_auth(email, Some(token))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<BitbucketCommentsResponse>()
+        .await
+        .ok()?;
+    Some(
+        response
+            .values
+            .into_iter()
+            .filter_map(|comment| {
+                let body = comment.content?.raw?;
+                if body.trim().is_empty() {
+                    return None;
+                }
+                Some(PullRequestComment {
+                    author: comment
+                        .user
+                        .and_then(|user| user.display_name.or(user.nickname).or(user.username)),
+                    body,
+                    created_at: comment.created_on,
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn list_bitbucket_pull_requests(
@@ -1708,6 +1869,28 @@ mod tests {
 
     use super::*;
 
+    /// Live probe against Bitbucket; run with:
+    /// cargo test -p zeron-engine --lib -- --ignored bitbucket_live
+    #[tokio::test]
+    #[ignore]
+    async fn bitbucket_live_pull_request_comments() {
+        if std::env::var("BITBUCKET_API_TOKEN").is_err() {
+            eprintln!("BITBUCKET_API_TOKEN not set; skipping");
+            return;
+        }
+        let comments =
+            pull_request_comments("bitbucket", "tdisolutions/reception-assistant", 9).await;
+        println!("fetched {} comments", comments.len());
+        for comment in &comments {
+            println!(
+                "- {:?}: {}…",
+                comment.author,
+                &comment.body[..comment.body.len().min(60)]
+            );
+        }
+        assert!(!comments.is_empty(), "expected at least one comment");
+    }
+
     #[derive(Default)]
     struct FakeProcessRunner {
         requests: Mutex<Vec<ProcessRequest>>,
@@ -1797,6 +1980,52 @@ mod tests {
             ),
             default_branch: default_branch.map(str::to_owned),
         }
+    }
+
+    #[tokio::test]
+    async fn github_pull_request_comments_decode_author_body_and_date() {
+        let json = serde_json::json!({
+            "comments": [
+                {
+                    "author": {"login": "octocat"},
+                    "body": "Please rebase.",
+                    "createdAt": "2026-02-01T10:00:00Z"
+                },
+                {"author": null, "body": "   ", "createdAt": null}
+            ]
+        });
+        let runner = FakeProcessRunner::with_responses([command_success(
+            serde_json::to_vec(&json).unwrap(),
+        )]);
+        let github = GitHubCli::with_runner(runner.clone());
+
+        let comments = github
+            .pull_request_comments("acme/zeron", 12)
+            .await
+            .unwrap();
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author.as_deref(), Some("octocat"));
+        assert_eq!(comments[0].body, "Please rebase.");
+        assert_eq!(
+            comments[0].created_at.as_deref(),
+            Some("2026-02-01T10:00:00Z")
+        );
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, "gh");
+        assert_eq!(
+            requests[0].args,
+            [
+                "pr",
+                "view",
+                "12",
+                "--repo",
+                "acme/zeron",
+                "--json",
+                "comments"
+            ]
+        );
     }
 
     #[test]

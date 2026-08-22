@@ -406,6 +406,17 @@ pub struct PullRequestListItem {
     pub changed_files: u64,
 }
 
+/// One conversation comment on a pull request, normalized across providers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestComment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
 /// Review status normalized across source-control providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

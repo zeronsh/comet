@@ -136,6 +136,8 @@ pub mod methods {
     pub const LIST_SOURCE_CONTROL_CONNECTIONS: &str = "ListSourceControlConnections";
     /// Repository-wide pull requests from the configured source-control providers.
     pub const LIST_PULL_REQUESTS: &str = "ListPullRequests";
+    /// Conversation comments for one pull request, fetched live from the provider.
+    pub const GET_PULL_REQUEST_COMMENTS: &str = "GetPullRequestComments";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
