@@ -178,6 +178,38 @@ fn input_scroll_offset_for_cursor(
     next.clamp(0.0, input_max_scroll(content_height, viewport_height))
 }
 
+/// What a mouse press in a text field asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressIntent {
+    /// Take the whole field.
+    SelectAll,
+    /// Grow the current selection to the pressed position.
+    ExtendSelection,
+    /// Put the caret at the pressed position.
+    PlaceCaret,
+}
+
+impl PressIntent {
+    /// Whether the press starts a drag selection. A select-all must not, or
+    /// the next mouse move shrinks it back to a drag from the press position.
+    fn arms_drag(self) -> bool {
+        !matches!(self, Self::SelectAll)
+    }
+}
+
+/// Read the intent from the press. Two clicks or more take the whole field,
+/// and every further click keeps it, so holding the button through a third
+/// click does not change what is selected.
+fn press_intent(click_count: usize, shift: bool) -> PressIntent {
+    if click_count >= 2 {
+        PressIntent::SelectAll
+    } else if shift {
+        PressIntent::ExtendSelection
+    } else {
+        PressIntent::PlaceCaret
+    }
+}
+
 /// Per-frame drag-selection scroll. Distance increases speed, capped at one
 /// text row per frame so crossing the input boundary never causes a jump.
 fn input_drag_scroll_delta(
@@ -2297,15 +2329,24 @@ impl ComposerInput {
     ) {
         self.invalidate_mention_tooltip();
         window.focus(&self.focus_handle, cx);
-        self.is_selecting = true;
-        self.drag_position = Some(event.position);
+        let intent = press_intent(event.click_count, event.modifiers.shift);
+        self.is_selecting = intent.arms_drag();
+        self.drag_position = intent.arms_drag().then_some(event.position);
         self.drag_generation = self.drag_generation.wrapping_add(1);
         self.drag_autoscroll_active = false;
-        let index = self.index_for_mouse_position(event.position);
-        if event.modifiers.shift {
-            self.select_to(index, cx);
-        } else {
-            self.move_to(index, cx);
+        match intent {
+            PressIntent::SelectAll => {
+                self.move_to(0, cx);
+                self.select_to(self.content.len(), cx);
+            }
+            PressIntent::ExtendSelection => {
+                let index = self.index_for_mouse_position(event.position);
+                self.select_to(index, cx);
+            }
+            PressIntent::PlaceCaret => {
+                let index = self.index_for_mouse_position(event.position);
+                self.move_to(index, cx);
+            }
         }
     }
 
@@ -6095,6 +6136,27 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The press intent is judged by eye everywhere except here: that a
+    /// multi-click leaves the drag disarmed is invisible until a selection
+    /// collapses under the pointer.
+    #[test]
+    fn a_press_of_two_or_more_clicks_takes_the_whole_field_and_leaves_the_drag_disarmed() {
+        assert_eq!(press_intent(1, false), PressIntent::PlaceCaret);
+        assert_eq!(press_intent(1, true), PressIntent::ExtendSelection);
+        assert_eq!(press_intent(2, false), PressIntent::SelectAll);
+        // A triple click keeps the whole field, so holding the button down
+        // through a third click does not change what is selected.
+        assert_eq!(press_intent(3, false), PressIntent::SelectAll);
+        // The whole field wins over the shift modifier: shift has nothing
+        // left to extend once everything is selected.
+        assert_eq!(press_intent(2, true), PressIntent::SelectAll);
+        // Only a caret press arms the drag. A select-all that armed it would
+        // collapse to a drag selection on the next mouse move.
+        assert!(press_intent(1, false).arms_drag());
+        assert!(press_intent(1, true).arms_drag());
+        assert!(!press_intent(2, false).arms_drag());
+    }
 
     #[test]
     fn stable_outer_width_only_schedules_reflow_on_real_changes() {
