@@ -85,14 +85,6 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
 }
 
-fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
-    if is_chat_route && has_selected_chat {
-        1.0
-    } else {
-        0.0
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -3354,12 +3346,6 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
-        // The titlebar is the single owner of the new-session action in both
-        // sidebar states. Hide it on the new-session canvas: opening another
-        // blank canvas from an already blank canvas has no effect and used to
-        // leave two competing + placements across the responsive variants.
-        let plus_alpha = self.titlebar_plus_alpha(cx);
-        let show_plus = plus_alpha > 0.01;
         div()
             .absolute()
             .top_0()
@@ -3408,28 +3394,7 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
                     )),
             )
-            .children(show_plus.then(|| {
-                div()
-                    .flex_none()
-                    .ml(px(TITLEBAR_GROUP_GAP))
-                    .opacity(plus_alpha)
-                    .child(window_control_button(
-                        "titlebar-new-session",
-                        icons::PLUS,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.open_new_session(cx)),
-                    ))
-            }))
             .into_any_element()
-    }
-
-    /// The titlebar owns new-session creation regardless of sidebar state. It
-    /// is useful only while an existing session is selected.
-    pub(super) fn titlebar_plus_alpha(&self, cx: &App) -> f32 {
-        titlebar_new_session_alpha(
-            matches!(self.route, Route::Chat),
-            self.state.read(cx).selected_chat.is_some(),
-        )
     }
 
     /// Native Windows caption controls integrated into Zeron's unified
@@ -4370,36 +4335,6 @@ impl Shell {
             _ => search_row,
         };
 
-        let pull_requests_row = div()
-            .id("pull-requests-nav")
-            .mx(px(Theme::SPACE_SM))
-            .mb(px(Theme::SPACE_XS))
-            .px(px(10.0))
-            .py(px(7.0))
-            .rounded(px(8.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .text_size(px(12.5))
-            .text_color(if matches!(self.route, Route::PullRequests) {
-                theme.text
-            } else {
-                theme.text_muted
-            })
-            .when(matches!(self.route, Route::PullRequests), |el| {
-                el.bg(crate::theme::glass_selected_bg())
-            })
-            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.open_pull_requests(cx)))
-            .child(
-                icon(icons::PULL_REQUEST)
-                    .size(px(15.0))
-                    .text_color(theme.text_muted),
-            )
-            .child(SharedString::from("Pull Requests"));
-
         // "Pinned" section header — same hairline style as Active. Only when
         // a real boundary exists (some pinned, some not).
         let pinned_header = if has_split {
@@ -4482,7 +4417,6 @@ impl Shell {
             // Search and project navigation are separate controls in the
             // sidebar: search gets its own breathing room, while the project
             // selector stays visually aligned with the session list below.
-            .child(pull_requests_row)
             .child(search_row)
             .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
@@ -4730,6 +4664,34 @@ impl Shell {
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise
     /// their storage boundary and offer sync; synced runtimes offer sign-out.
+    /// Small icon button for the sidebar footer's quick-action cluster.
+    fn footer_action_button(
+        &self,
+        id: &'static str,
+        path: &'static str,
+        theme: &Theme,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .size(px(26.0))
+            .rounded(px(7.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_hover(motion::hover_listener(id))
+            .bg(motion::hover_blend(
+                id,
+                theme.glass_hover().opacity(0.0),
+                theme.glass_hover().opacity(0.8),
+            ))
+            .child(icon(path).size(px(14.0)).text_color(motion::hover_blend(
+                id,
+                theme.text_muted,
+                theme.text,
+            )))
+    }
+
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
@@ -4826,6 +4788,58 @@ impl Shell {
                                 .child(subline),
                         )
                     }),
+            )
+            .child(
+                // Quick actions live on the row itself: Pull Requests, Enable
+                // sync (local scope only), and Settings. Each stops
+                // propagation so tapping one never toggles the identity
+                // popup above.
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(
+                        self.footer_action_button(
+                            "user-row-pull-requests",
+                            icons::PULL_REQUEST,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_pull_requests(cx);
+                        })),
+                    )
+                    .when(
+                        matches!(action, Some(AccountMenuAction::EnableSync)),
+                        |row| {
+                            row.child(
+                                self.footer_action_button(
+                                    "user-row-enable-sync",
+                                    icons::GLOBAL,
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.start_sign_in(cx);
+                                    },
+                                )),
+                            )
+                        },
+                    )
+                    .child(
+                        self.footer_action_button(
+                            "user-row-settings",
+                            icons::SETTINGS_MINIMALISTIC,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_settings(SettingsSection::Devices, cx);
+                        })),
+                    ),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
@@ -8062,14 +8076,6 @@ mod tests {
     #[test]
     fn pane_resize_hitboxes_yield_the_titlebar_chrome() {
         assert_eq!(PANE_RESIZE_HITBOX_TOP, Theme::TITLEBAR_HEIGHT);
-    }
-
-    #[test]
-    fn new_session_action_lives_in_the_titlebar_only_when_useful() {
-        assert_eq!(titlebar_new_session_alpha(true, true), 1.0);
-        assert_eq!(titlebar_new_session_alpha(true, false), 0.0);
-        assert_eq!(titlebar_new_session_alpha(false, true), 0.0);
-        assert_eq!(titlebar_new_session_alpha(false, false), 0.0);
     }
 
     #[test]

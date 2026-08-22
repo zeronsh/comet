@@ -315,17 +315,11 @@ impl Shell {
             }
         };
 
-        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
-        // session is selected (`render_titlebar_cluster`) — this row budgets
-        // one button slot so the title never sits under it.
-        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
-
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
         // cluster as it collapses.
-        let content_left =
-            (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let content_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
 
         // Trailing titlebar section. With the changes pane open this is the
         // PANE'S HEADER — a strip exactly as wide as the pane carrying its
@@ -355,8 +349,7 @@ impl Shell {
             // own 8px pad lands the first chip on the pane gutter. The
             // window-control cluster still wins while the sidebar is
             // collapsed (the chips clear it instead of underlapping).
-            let cluster_end =
-                self.title_bar_content_start() - TITLEBAR_IDENTITY_GAP + plus_inset - 14.0;
+            let cluster_end = self.title_bar_content_start() - TITLEBAR_IDENTITY_GAP - 14.0;
             (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
