@@ -4259,14 +4259,45 @@ impl Shell {
         let filter_row = self.render_spaces_filter(theme, cx);
 
         // Inline thread-search (t3code SidebarV2): ComposerInput row.
+        // New Thread (t3code SidebarV2): the compose glyph summons the same
+        // searchable project selector, anchored beneath this row; picking a
+        // project opens a fresh session targeting it. Sits OUTSIDE the
+        // search pill, mirroring the New Project button's placement.
+        let new_thread_button = div()
+            .id("new-thread-button")
+            .flex_none()
+            .h(px(29.0))
+            .w(px(29.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_hover(motion::hover_listener("new-thread-btn"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_spaces_menu(
+                    spaces::SpacesMenuPurpose::NewThread,
+                    window,
+                    cx,
+                );
+            }))
+            .child(
+                crate::icons::icon(crate::icons::PEN_NEW_SQUARE)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(motion::hover_blend(
+                        "new-thread-btn",
+                        theme.text_muted.opacity(0.8),
+                        theme.text,
+                    )),
+            );
+
         let search_query = self.sidebar_search.read(cx).text().to_string();
         let searching = !search_query.is_empty();
-        let search_row = div()
-            .flex_none()
+        let search_pill = div()
+            .flex_1()
+            .min_w_0()
             .h(px(34.0))
-            .mx(px(Theme::SPACE_SM))
-            .mt(px(Theme::SPACE_SM))
-            .mb(px(Theme::SPACE_XS))
             .px(px(10.0))
             .flex()
             .flex_row()
@@ -4309,6 +4340,35 @@ impl Shell {
                         .child(SharedString::from("✕")),
                 )
             });
+
+        // The pill holds the search field; the New Thread compose button
+        // sits BESIDE it, outside the box.
+        let search_row = div()
+            .flex_none()
+            .mx(px(Theme::SPACE_SM))
+            .mt(px(Theme::SPACE_SM))
+            .mb(px(Theme::SPACE_XS))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(search_pill)
+            .child(new_thread_button);
+
+        // A NewThread picker anchors beneath the row that summoned it (the
+        // compose button), not under the filter trigger.
+        let search_row = match self.spaces_menu.get().map(|menu| menu.purpose) {
+            Some(spaces::SpacesMenuPurpose::NewThread) => {
+                let closing = self.spaces_menu.closing_since();
+                let menu = self.render_spaces_menu(theme, cx);
+                search_row.relative().child(popover::anchored_menu_below(
+                    "new-thread-menu",
+                    menu,
+                    closing,
+                ))
+            }
+            _ => search_row,
+        };
 
         let pull_requests_row = div()
             .id("pull-requests-nav")

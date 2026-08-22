@@ -55,6 +55,7 @@ icon_assets![
     (SORT_VERTICAL, "sort-vertical"),
     (LIST, "list"),
     (FOLDER_WITH_FILES, "folder-with-files"),
+    (FOLDER_PLUS, "folder-plus"),
     (FOLDER, "folder"),
     // Hand-drawn git-branch glyph in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no branch icon.
