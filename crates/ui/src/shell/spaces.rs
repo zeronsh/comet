@@ -26,6 +26,8 @@ struct ActiveChatRow {
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
 /// rows, keyboard highlight.
 pub(super) struct SpacesMenu {
+    /// What activating a project row does (filter vs new thread).
+    pub(super) purpose: SpacesMenuPurpose,
     search: Entity<ComposerInput>,
     /// Keyboard highlight within [`Shell::spaces_menu_rows`].
     active: usize,
@@ -41,7 +43,14 @@ pub(super) struct SpacesMenu {
 pub(super) enum SpacesMenuRow {
     All,
     Space(String),
-    AddSpace,
+}
+
+/// What the open dropdown is for: retargeting the sidebar filter (default)
+/// or picking a project for a brand-new thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpacesMenuPurpose {
+    Filter,
+    NewThread,
 }
 
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
@@ -176,15 +185,17 @@ impl Shell {
 
     // ---- sidebar sections ----
 
-    /// The filter's display rows: "All projects", then spaces matching the
-    /// search (ranked — `popover::filter_indices`), then "New project…".
-    /// "All" only shows on an empty query (searching means hunting a space).
+    /// The dropdown's display rows. Filter mode: "All projects", then
+    /// spaces matching the search (ranked — `popover::filter_indices`);
+    /// "All" only shows on an empty query (searching means hunting a
+    /// space). NewThread mode: just the space rows — you're picking a
+    /// project, not retargeting the filter.
     fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
-        let query = self
-            .spaces_menu
-            .get()
-            .map(|menu| menu.search.read(cx).text().to_string())
-            .unwrap_or_default();
+        let Some(menu) = self.spaces_menu.get() else {
+            return Vec::new();
+        };
+        let purpose = menu.purpose;
+        let query = menu.search.read(cx).text().to_string();
         let state = self.state.read(cx);
         let spaces = state.spaces_sorted();
         let names: Vec<String> = spaces
@@ -192,7 +203,7 @@ impl Shell {
             .map(|s| s.display_name().to_string())
             .collect();
         let mut rows: Vec<SpacesMenuRow> = Vec::new();
-        if query.trim().is_empty() {
+        if purpose == SpacesMenuPurpose::Filter && query.trim().is_empty() {
             rows.push(SpacesMenuRow::All);
         }
         rows.extend(
@@ -200,11 +211,15 @@ impl Shell {
                 .into_iter()
                 .map(|ix| SpacesMenuRow::Space(spaces[ix].id.clone())),
         );
-        rows.push(SpacesMenuRow::AddSpace);
         rows
     }
 
-    fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_spaces_menu(
+        &mut self,
+        purpose: SpacesMenuPurpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
         let search =
@@ -221,6 +236,7 @@ impl Shell {
         let current = self.settings.space_filter.clone();
         let handle = search.read(cx).focus_handle(cx);
         self.spaces_menu.open(SpacesMenu {
+            purpose,
             search,
             active: 0,
             focus: cx.focus_handle(),
@@ -246,12 +262,35 @@ impl Shell {
     fn activate_spaces_menu_row(&mut self, row: SpacesMenuRow, cx: &mut Context<Self>) {
         match row {
             SpacesMenuRow::All => self.set_space_filter(None, cx),
-            SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
-            SpacesMenuRow::AddSpace => {
-                self.close_spaces_menu(cx);
-                self.open_add_space(cx);
+            SpacesMenuRow::Space(id) => {
+                // NewThread mode: picking a project mints a thread there
+                // (the sidebar filter follows so the canvas targets it).
+                let for_thread = self.spaces_menu.get().is_some_and(|menu| {
+                    menu.purpose == SpacesMenuPurpose::NewThread
+                });
+                if for_thread {
+                    self.close_spaces_menu(cx);
+                    self.new_thread_in_space(id, cx);
+                } else {
+                    self.set_space_filter(Some(id), cx);
+                }
             }
         }
+    }
+
+    /// Start a fresh session targeted at `space_id`: filter the sidebar to
+    /// it (the canvas' space context follows the filter) and open the
+    /// new-session canvas — [`Shell::land_in_space`] minus the just-added
+    /// bookkeeping.
+    fn new_thread_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.settings.space_filter = Some(space_id.clone());
+        self.state.update(cx, |s, cx| {
+            s.select_space(Some(space_id), cx);
+            s.select_chat(None, cx);
+        });
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     /// Dropdown keys (bubbling from the focused search input): ↑↓ navigate,
@@ -358,7 +397,7 @@ impl Shell {
                 if this.spaces_menu.take_press_was_open() {
                     this.close_spaces_menu(cx);
                 } else {
-                    this.open_spaces_menu(window, cx);
+                    this.open_spaces_menu(SpacesMenuPurpose::Filter, window, cx);
                 }
             }))
             .child(
@@ -405,7 +444,14 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
             );
-        let trigger = if self.spaces_menu.get().is_some() {
+        // The dropdown anchors under the filter row only in Filter mode —
+        // a NewThread picker was summoned from the search row and anchors
+        // there instead (render_sidebar).
+        let menu_here = self
+            .spaces_menu
+            .get()
+            .is_some_and(|menu| menu.purpose == SpacesMenuPurpose::Filter);
+        let trigger = if menu_here {
             let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
             trigger.relative().child(popover::anchored_menu_below(
@@ -427,12 +473,38 @@ impl Shell {
             // shares one clean left edge with the rest of the sidebar.
             .px(px(Theme::SPACE_SM))
             .child(trigger)
+            .child(
+                div()
+                    .id("new-project-button")
+                    .flex_none()
+                    .h(px(29.0))
+                    .w(px(29.0))
+                    .rounded(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .on_hover(motion::hover_listener("new-project-btn"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_spaces_menu(cx);
+                        this.open_add_space(cx);
+                    }))
+                    .child(
+                        icon(icons::FOLDER_PLUS)
+                            .size(px(15.0))
+                            .text_color(motion::hover_blend(
+                                "new-project-btn",
+                                theme.text_muted.opacity(0.8),
+                                theme.text,
+                            )),
+                    ),
+            )
             .into_any_element()
     }
 
-    /// The dropdown card: search on top, "All projects" + space rows (check on
-    /// the active filter; right-click for rename/remove) + "New project…".
-    fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The dropdown card: search on top, "All projects" + space rows (check
+    /// on the active filter; right-click for rename/remove).
+    pub(super) fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (search, active, focus, list_scroll) = {
             let Some(menu) = self.spaces_menu.get() else {
                 return div().into_any_element();
@@ -468,9 +540,6 @@ impl Shell {
                         }
                         None => (row.clone(), SharedString::from("?"), None, false),
                     },
-                    SpacesMenuRow::AddSpace => {
-                        (row.clone(), SharedString::from("New project…"), None, false)
-                    }
                 })
                 .collect()
         };
@@ -489,12 +558,8 @@ impl Shell {
                         let is_selected = match &row {
                             SpacesMenuRow::All => filter.is_none(),
                             SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
-                            SpacesMenuRow::AddSpace => false,
                         };
-                        let leading = match &row {
-                            SpacesMenuRow::AddSpace => icons::PLUS,
-                            _ => icons::FOLDER,
-                        };
+                        let leading = icons::FOLDER;
                         let menu_space = match &row {
                             SpacesMenuRow::Space(id) => Some(id.clone()),
                             _ => None,
