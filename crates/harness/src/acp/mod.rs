@@ -579,8 +579,6 @@ pub struct AcpHarness {
     /// picker. OpenCode shares this with its real startup budget because both
     /// paths wait for the same plugin-heavy boot.
     model_discovery_timeout: Duration,
-    /// Discovery result cache: the advertised commands survive across calls.
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
@@ -602,7 +600,6 @@ impl AcpHarness {
             // wedged agent, not a slow one.
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
-            commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
             models_probe: tokio::sync::Mutex::new(()),
         }
@@ -810,12 +807,19 @@ impl AcpHarness {
         Ok((child, stderr_tail))
     }
 
-    /// Short-lived discovery run for [`Harness::commands`]: initialize, scan
-    /// the response, then try one unauthenticated `session/new` and wait
-    /// briefly for `available_commands_update`. Best-effort — an agent that
-    /// refuses sessions before login still surfaces whatever the handshake
-    /// advertised.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Short-lived discovery run: initialize, scan the response, then open one
+    /// session in `cwd` and wait briefly for `available_commands_update`.
+    /// Best-effort — an agent that refuses sessions before login still
+    /// surfaces whatever the handshake advertised.
+    ///
+    /// The cwd rides `session/new` only. Setting it as the CHILD's working
+    /// directory would turn a deleted worktree into a spawn `NotFound`, which
+    /// this module reports as `NotInstalled` ("adapter missing") — a lie the
+    /// user cannot act on.
+    async fn discover_commands(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -829,11 +833,22 @@ impl AcpHarness {
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
             let mut commands = scan_available_commands(&init);
-            if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-                let session = client
-                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            let home = || std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            // With a workspace asked for, ALWAYS open a session: the initialize
+            // list is not cwd-scoped, so trusting it would make the workspace
+            // moot for every agent that answers initialize.
+            if cwd.is_some() || commands.is_empty() {
+                let requested = cwd.map(str::to_string).unwrap_or_else(home);
+                let mut session = client
+                    .request("session/new", json!({ "cwd": requested, "mcpServers": [] }))
                     .await;
+                if session.is_err() && cwd.is_some() {
+                    // A path that no longer exists (deleted worktree): one retry
+                    // from home, so the popup still shows the built-ins.
+                    session = client
+                        .request("session/new", json!({ "cwd": home(), "mcpServers": [] }))
+                        .await;
+                }
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
                     // session response; 2s bounds a quiet agent.
@@ -849,7 +864,14 @@ impl AcpHarness {
                                     if update.get("sessionUpdate").and_then(Value::as_str)
                                         == Some("available_commands_update")
                                     {
-                                        commands = parse_commands(update.get("availableCommands"));
+                                        // Mirrors `capture_available_commands` on the run
+                                        // path: an empty update (skill-less project) must
+                                        // not erase the built-ins the initialize list
+                                        // already gave us.
+                                        let parsed = parse_commands(update.get("availableCommands"));
+                                        if !parsed.is_empty() {
+                                            commands = parsed;
+                                        }
                                         break;
                                     }
                                 }
@@ -1232,11 +1254,8 @@ impl Harness for AcpHarness {
         }
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
-            .await
-            .cloned()
+    async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.discover_commands(cwd).await
     }
 
     async fn run(
@@ -1863,12 +1882,14 @@ fn handle_server_request_live(
 /// Await a setup request while draining incoming messages, so a `session/load`
 /// whose replay outruns the incoming channel's capacity can't deadlock the
 /// reader. Replayed `session/update`s are dropped (the doc already holds the
-/// history); server requests are answered.
+/// history) except `available_commands_update`, which is captured (see
+/// [`capture_available_commands`]); server requests are answered.
 async fn request_draining(
     client: &RpcClient,
     incoming: &mut mpsc::Receiver<Incoming>,
     method: &'static str,
     params: Value,
+    captured: &mut Option<Vec<SlashCommand>>,
 ) -> Result<Value, HarnessError> {
     let mut fut = prompt_like_request(client.clone(), method, params);
     let res = loop {
@@ -1877,6 +1898,9 @@ async fn request_draining(
             inc = incoming.recv() => match inc {
                 Some(Incoming::Request { id, method, params }) => {
                     handle_server_request(client, id, &method, &params);
+                }
+                Some(Incoming::Notification { method, params }) => {
+                    capture_available_commands(&method, &params, captured);
                 }
                 Some(_) => {}
                 None => {
@@ -1891,11 +1915,37 @@ async fn request_draining(
     // replay updates the reader forwarded BEFORE the response line may still
     // sit in the buffer — flush them now or they'd leak into the live turn.
     while let Ok(inc) = incoming.try_recv() {
-        if let Incoming::Request { id, method, params } = inc {
-            handle_server_request(client, id, &method, &params);
+        match inc {
+            Incoming::Request { id, method, params } => {
+                handle_server_request(client, id, &method, &params);
+            }
+            Incoming::Notification { method, params } => {
+                capture_available_commands(&method, &params, captured);
+            }
+            _ => {}
         }
     }
     res
+}
+
+/// The one notification the setup window must not drop: agents that advertise
+/// their commands only after `session/new` (claude-agent-acp) send it here, and
+/// the list is cwd-scoped, which is the whole point of per-workspace discovery.
+/// Every other replayed update stays dropped — the doc already holds that history.
+fn capture_available_commands(method: &str, params: &Value, out: &mut Option<Vec<SlashCommand>>) {
+    if method != "session/update" {
+        return;
+    }
+    let Some(update) = params.get("update") else {
+        return;
+    };
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("available_commands_update") {
+        return;
+    }
+    let commands = parse_commands(update.get("availableCommands"));
+    if !commands.is_empty() {
+        *out = Some(commands);
+    }
 }
 
 fn prompt_like_request(
@@ -1981,12 +2031,24 @@ async fn run_session(session: Session) {
             .await?;
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
+        // The session's own advertisement is cwd-scoped, unlike the
+        // initialize list; captured here so claude-agent-acp's post-session/new
+        // `available_commands_update` (never seen at initialize) is not lost.
+        let mut session_commands: Option<Vec<SlashCommand>> = None;
 
         let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
-            match request_draining(&client, &mut incoming, "session/load", load).await {
+            match request_draining(
+                &client,
+                &mut incoming,
+                "session/load",
+                load,
+                &mut session_commands,
+            )
+            .await
+            {
                 Ok(resp) => (resume.clone(), resp),
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
@@ -1999,6 +2061,7 @@ async fn run_session(session: Session) {
                         &mut incoming,
                         "session/new",
                         session_params.clone(),
+                        &mut session_commands,
                     )
                     .await?;
                     (
@@ -2011,8 +2074,14 @@ async fn run_session(session: Session) {
                 }
             }
         } else {
-            let new =
-                request_draining(&client, &mut incoming, "session/new", session_params).await?;
+            let new = request_draining(
+                &client,
+                &mut incoming,
+                "session/new",
+                session_params,
+                &mut session_commands,
+            )
+            .await?;
             (
                 new.get("sessionId")
                     .and_then(Value::as_str)
@@ -2042,6 +2111,7 @@ async fn run_session(session: Session) {
                     "sessionId": session_id,
                     "modelId": model,
                 }),
+                &mut session_commands,
             )
             .await
             .map_err(|error| {
@@ -2074,6 +2144,7 @@ async fn run_session(session: Session) {
                 &mut incoming,
                 "session/set_config_option",
                 Value::Object(params),
+                &mut session_commands,
             )
             .await
             {
@@ -2083,13 +2154,14 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
+        Ok::<(String, bool, Vec<SlashCommand>, Option<Vec<SlashCommand>>), HarnessError>((
             session_id,
             steer_ext,
             init_commands,
+            session_commands,
         ))
     };
-    let (session_id, steer_ext, init_commands) = tokio::select! {
+    let (session_id, steer_ext, init_commands, session_commands) = tokio::select! {
         res = tokio::time::timeout(handshake_timeout, setup) => {
             let res = res.unwrap_or_else(|_| {
                 // A hung handshake (agent waiting on a login it can never
@@ -2172,11 +2244,13 @@ async fn run_session(session: Session) {
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
-    if !init_commands.is_empty()
+    // The session's own list wins: it is cwd-scoped, the initialize list is not.
+    let advertised = session_commands.unwrap_or(init_commands);
+    if !advertised.is_empty()
         && !send(
             &event_tx,
             AgentEvent::AvailableCommands {
-                commands: init_commands,
+                commands: advertised,
             },
         )
         .await

@@ -486,6 +486,87 @@ async fn resume_loads_the_session_and_drops_replayed_history() {
     }));
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
+
+#[tokio::test]
+async fn commands_discovery_scans_the_initialize_response() {
+    let harness = harness();
+    let commands = harness.commands(None).await.expect("discovery");
+    assert_eq!(commands.len(), 2, "{commands:?}");
+    assert_eq!(commands[0].name, "compact");
+    assert_eq!(commands[1].name, "goal");
+    assert_eq!(commands[1].input_hint.as_deref(), Some("the goal"));
+}
+
+#[tokio::test]
+async fn commands_discovery_opens_a_session_in_the_requested_cwd() {
+    let harness = harness();
+    let commands = harness
+        .commands(Some("/tmp/live-commands"))
+        .await
+        .expect("discovery");
+    // The session's list replaces the initialize list, even though initialize
+    // advertised two commands: only the session knows the workspace.
+    assert_eq!(
+        commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["live"],
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_cwd_retries_once_from_home() {
+    let harness = harness();
+    let commands = harness
+        .commands(Some("/tmp/reject-cwd"))
+        .await
+        .expect("discovery falls back instead of failing");
+    // Only the retry's own session/new response makes the fixture send this
+    // update; the pre-retry error carries no commands. Pinning the exact
+    // list (not just its length) fails if the retry is ever deleted.
+    assert_eq!(
+        commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["home-retry"],
+        "{commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn available_commands_update_in_the_handshake_reaches_the_run_stream() {
+    let harness = harness();
+    // An inert scenario: `scenario:happy` also advertises `deep-research`
+    // mid-turn, which would always postdate (and shadow) the handshake
+    // capture, defeating the last-write-wins assertion below.
+    let mut req = request("scenario:resumed");
+    req.cwd = "/tmp/live-commands".into();
+    // spawn_agent sets this cwd as the child process's real working
+    // directory (not just a session/new field), so the marker path must
+    // exist on disk for the spawn to succeed.
+    std::fs::create_dir_all(&req.cwd).expect("create marker cwd");
+    let (controls, _steer, _cancel) = controls();
+    let stream = harness.run(req, controls).await.expect("run starts");
+    let events: Vec<AgentEvent> = stream.filter_map(|e| async { e.ok() }).collect().await;
+    // Assert on the LAST such event, not on the flattened set. This fixture
+    // also advertises `compact`/`goal` at initialize, and whether the update is
+    // caught by the handshake capture or by the main loop depends on a read
+    // race, so the stream may legitimately carry two events. Last write wins
+    // in production too: `note_live` overwrites the cache entry.
+    let advertised = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AvailableCommands { commands } => Some(commands.clone()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or_default();
+    assert_eq!(
+        advertised
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["live"],
+        "{events:?}"
+    );
+}
 #[test]
 fn descriptor_surface_matches_registry_expectations() {
     let harness = AcpHarness::grok();

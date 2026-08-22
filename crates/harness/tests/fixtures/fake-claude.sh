@@ -106,7 +106,16 @@ case "$first" in
   # stdin line (no user message ever follows). Shape mirrors 2.1.228's
   # control_response: commands under response.response.
   rid=$(printf '%s\n' "$first" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
-  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
+  # The real CLI resolves <cwd>/.claude/skills relative to where it RUNS, so
+  # the working directory is the only signal that a workspace was requested.
+  # A project-marker directory adds one command no other cwd can produce.
+  project=""
+  case "$(basename "$PWD")" in
+  zeron-marker-project)
+    project=',{"name":"project-skill","description":"Only in the marker project","argumentHint":""}'
+    ;;
+  esac
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}$project],\"output_style\":\"default\"}}}"
   # Stay alive until the driver tears us down, like the real CLI would.
   exec sleep 30
   ;;

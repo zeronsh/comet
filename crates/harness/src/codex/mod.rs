@@ -307,7 +307,17 @@ impl Harness for CodexHarness {
 
     /// Skills from a short-lived `skills/list` probe (see
     /// [`Self::discover_commands`]); cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    ///
+    /// The `cwd` is accepted and ignored here, unlike the ACP and claude
+    /// probes. Scoping codex needs a different change, not the same one:
+    /// `skills/list` already answers with per-cwd GROUPS under `data`, which
+    /// [`parse_skill_commands`] flattens and dedupes, so the fix is to filter
+    /// those groups by the requested workspace rather than to set
+    /// `current_dir`. The group's own cwd field could not be confirmed without
+    /// the real binary, so this stays per-harness for now. The engine's
+    /// `(harness, cwd)` cache keys the answer per workspace regardless.
+    async fn commands(&self, cwd: Option<&str>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let _ = cwd;
         self.commands
             .get_or_try_init(|| self.discover_commands())
             .await

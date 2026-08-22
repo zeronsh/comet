@@ -19,6 +19,7 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
+pub mod commands;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
