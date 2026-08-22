@@ -84,6 +84,10 @@ icon_assets![
     // terminal/plus/close ports) — the set has no return glyph.
     (RETURN, "return"),
     (ALT_ARROW_DOWN, "alt-arrow-down"),
+    // alt-arrow-down mirrored (drawn as its twin: same stroke, caps, joints) —
+    // the embedded Solar Linear set ships no up chevron. The collapse half of
+    // the long-user-message expander.
+    (ALT_ARROW_UP, "alt-arrow-up"),
     // Hand-drawn expand/maximize arrows in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no expand glyph.
     (EXPAND_ARROWS, "expand-arrows"),

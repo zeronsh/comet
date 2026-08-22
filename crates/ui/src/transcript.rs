@@ -25,7 +25,7 @@
 //! While that anchor holds, wheel/touch is clamped rather than obeyed — the
 //! whole turn is already visible, so there is nothing to scroll to.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -117,6 +117,20 @@ const CHIPS_TOP_PAD: f32 = 2.0;
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
 const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+/// A user prompt renders at most this many wrapped lines until expanded. A
+/// pasted log or file drops into the transcript as one endless slab otherwise
+/// (user report) — past the cap the bubble clips and grows a chevron.
+pub const USER_COLLAPSED_LINES: usize = 5;
+/// The user bubble's line box.
+pub const USER_LINE_HEIGHT: f32 = 22.0;
+/// Conservative first-frame soft-wrap proxy for the fixed-width long-prompt
+/// bubble. The final decision uses the wrapped `StyledText` layout, but this
+/// fallback lets clearly long prompts render their affordance immediately
+/// before that first layout has completed.
+pub const USER_COLLAPSE_CHARS: usize = 400;
+/// The expander strip under a clipped prompt: a right-aligned chevron button
+/// inside the bubble, on its own row so it never paints over the last line.
+const USER_TOGGLE_SIZE: f32 = 18.0;
 /// User-bubble attachment thumbnails (user-attachments.tsx): 112×80 thumbs in
 /// a FIXED-height strip (load-state flips never shift the virtualizer).
 pub const ATT_THUMB_W: f32 = 112.0;
@@ -756,6 +770,34 @@ fn assistant_copy_text(entry: &SessionMessageEntry) -> Option<SharedString> {
         .collect::<Vec<_>>()
         .join("\n\n");
     (!text.is_empty()).then(|| text.into())
+}
+
+/// Conservative first-frame fallback for whether a prompt may need a fold
+/// affordance. Once the text element has measured, `render_user_body` replaces
+/// this proxy with the exact wrapped-line count, so glyph width and script no
+/// longer affect eligibility heuristically.
+pub fn user_message_needs_collapse(text: &str) -> bool {
+    text.lines().count() > USER_COLLAPSED_LINES || text.chars().count() > USER_COLLAPSE_CHARS
+}
+
+/// Layout transitions need more time when they travel farther, otherwise a
+/// 1,000px pasted log crosses the screen in the same 200ms as a six-line note
+/// and reads as a snap. Keep ordinary messages close to the catalog RESIZE
+/// timing, then scale to an 850ms ceiling for genuinely large pasted content.
+pub fn user_resize_duration_ms(height_delta: f32) -> u64 {
+    (220.0 + height_delta.max(0.0) * 0.32).min(850.0).round() as u64
+}
+
+/// Short folds keep the app's familiar decisive ease-out. Large folds use
+/// ease-in-out so thousands of pixels do not disappear in the first few frames
+/// of an aggressively front-loaded curve.
+pub fn user_resize_spec(height_delta: f32) -> motion::MotionSpec {
+    let curve = if height_delta > 500.0 {
+        motion::EASE_IN_OUT
+    } else {
+        motion::EASE_OUT
+    };
+    motion::MotionSpec::new(user_resize_duration_ms(height_delta), curve)
 }
 
 /// Build the block rows of one (already continuation-joined) entry.
@@ -1493,6 +1535,21 @@ struct FoldState {
     /// tween made every once-collapsed group flash open→closed on each
     /// reappearance (user report).
     toggled_at: Option<Instant>,
+    /// Per-toggle duration. User bubbles scale this with travel distance;
+    /// existing tool folds leave it at zero and keep their catalog constants.
+    duration_ms: u64,
+}
+
+/// Viewport compensation paired with a long user-message collapse. While the
+/// row loses height, this scrolls upward by the same eased distance so a
+/// bottom-pinned viewport keeps the collapsing bubble in view.
+struct UserCollapseScroll {
+    started_at: Instant,
+    duration_ms: u64,
+    height_delta: f32,
+    row_ix: usize,
+    initial_top: f32,
+    target_top: f32,
 }
 
 /// Layout state for the most recent locally-sent turn (notes-app parity):
@@ -1784,6 +1841,22 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
+    /// Expand/collapse state for user bubbles past [`USER_COLLAPSED_LINES`],
+    /// keyed by row id. Render-local like `folds` — never part of the row
+    /// fingerprint, so toggling one costs a repaint, not a rebuild.
+    user_folds: HashMap<SharedString, FoldState>,
+    /// Full laid-out text heights for long user bubbles. The text's paint
+    /// canvas writes these cells without notifying or mutating the transcript;
+    /// click handlers read them as exact endpoints for the RESIZE tween. This
+    /// preserves smooth layout motion without a paint → notify feedback loop.
+    user_heights: HashMap<SharedString, Rc<Cell<f32>>>,
+    /// Pending long-press toggle. A single task is enough because only one
+    /// pointer can own a hold gesture at a time; a token invalidates stale
+    /// timers when the pointer is released or moves into a text selection.
+    user_hold_task: Option<Task<()>>,
+    user_hold_token: u64,
+    user_collapse_scroll: Option<UserCollapseScroll>,
+    user_collapse_scroll_scheduled: bool,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1991,6 +2064,12 @@ impl Transcript {
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
             tool_details: HashMap::new(),
+            user_folds: HashMap::new(),
+            user_heights: HashMap::new(),
+            user_hold_task: None,
+            user_hold_token: 0,
+            user_collapse_scroll: None,
+            user_collapse_scroll_scheduled: false,
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -2972,6 +3051,12 @@ impl Transcript {
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            self.user_folds.clear();
+            self.user_heights.clear();
+            self.user_hold_token = self.user_hold_token.wrapping_add(1);
+            self.user_hold_task = None;
+            self.user_collapse_scroll = None;
+            self.user_collapse_scroll_scheduled = false;
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -3250,6 +3335,164 @@ impl Transcript {
         self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
     }
 
+    /// Expand/collapse one long user bubble. Heights come from the text's
+    /// passive paint cache, never from transcript state, so this changes
+    /// render-local fold state only and does not rebuild or splice rows.
+    fn toggle_user_fold(
+        &mut self,
+        row_id: SharedString,
+        row_ix: usize,
+        collapsed_h: f32,
+        full_h: f32,
+        reduced_motion: bool,
+    ) {
+        let duration_ms = user_resize_duration_ms(full_h - collapsed_h);
+        self.user_collapse_scroll = None;
+        self.user_collapse_scroll_scheduled = false;
+        let entry = self.user_folds.entry(row_id).or_default();
+        let currently_open = entry.open.unwrap_or(false);
+        entry.from = if currently_open { full_h } else { collapsed_h };
+        entry.open = Some(!currently_open);
+        entry.epoch += 1;
+        entry.toggled_at = Some(Instant::now());
+        entry.duration_ms = duration_ms;
+
+        // An expansion must release the bottom pin too. Otherwise the spring
+        // keeps the transcript's tail fixed while the bubble grows, lifting
+        // the newly revealed first lines behind the top fade.
+        if !currently_open {
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+            self.spring_settled_at = None;
+            self.spring_kick = false;
+        }
+
+        // Capture a screen-space anchor for the clicked row. We do not subtract
+        // the removed height: that is only correct when the row's top is
+        // exactly at the viewport bottom. At the top or middle of a long
+        // message it overscrolls past the collapsed bubble. The same anchor is
+        // used for expansion, with the full target height, so a bottom-pinned
+        // prompt reveals its beginning below the top fade instead of above it.
+        let Some(item_bounds) = self.list.bounds_for_item(row_ix) else {
+            return;
+        };
+        let viewport = self.list.viewport_bounds();
+        let initial_top = f32::from(item_bounds.top());
+        // Keep a newly revealed bubble below the transcript's top fade band. A
+        // 12px inset alone still leaves the first lines washed into the edge
+        // fade when the expanded row started above view.
+        let viewport_top = f32::from(viewport.top()) + Theme::TRANSCRIPT_FADE_BAND + 28.0;
+        let target_height = if currently_open { collapsed_h } else { full_h };
+        let viewport_bottom = f32::from(viewport.bottom()) - target_height - 12.0;
+        let target_top = if viewport_bottom >= viewport_top {
+            initial_top.clamp(viewport_top, viewport_bottom)
+        } else {
+            viewport_top
+        };
+        let needs_scroll = (target_top - initial_top).abs() > 0.5;
+
+        if needs_scroll {
+            self.pinned = false;
+            self.spring.reset();
+            self.spring_last_tick = None;
+            self.spring_settled_at = None;
+            self.spring_kick = false;
+            if reduced_motion {
+                if let Some(current) = self.list.bounds_for_item(row_ix) {
+                    self.list
+                        .scroll_by(px(f32::from(current.top()) - target_top));
+                }
+            } else {
+                self.user_collapse_scroll = Some(UserCollapseScroll {
+                    started_at: Instant::now(),
+                    duration_ms,
+                    height_delta: (full_h - collapsed_h).max(0.0),
+                    row_ix,
+                    initial_top,
+                    target_top,
+                });
+            }
+        }
+    }
+
+    fn cancel_user_hold(&mut self) {
+        self.user_hold_token = self.user_hold_token.wrapping_add(1);
+        self.user_hold_task = None;
+    }
+
+    /// Arm a long-press toggle instead of using double-click. Releasing before
+    /// the threshold preserves an ordinary click/selection gesture; moving
+    /// cancels the timer so drag selection never unexpectedly toggles the
+    /// message.
+    fn arm_user_hold(
+        &mut self,
+        row_id: SharedString,
+        row_ix: usize,
+        collapsed_h: f32,
+        measured_h: Rc<Cell<f32>>,
+        selection_key: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        const USER_HOLD_DELAY: Duration = Duration::from_millis(360);
+        self.cancel_user_hold();
+        self.user_hold_token = self.user_hold_token.wrapping_add(1);
+        let token = self.user_hold_token;
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(USER_HOLD_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.user_hold_token != token {
+                    return;
+                }
+                this.user_hold_task = None;
+                crate::markdown::selection::clear_if_owner(&selection_key);
+                this.toggle_user_fold(
+                    row_id,
+                    row_ix,
+                    collapsed_h,
+                    measured_h.get().max(collapsed_h),
+                    motion::reduced_motion(cx),
+                );
+                cx.notify();
+            })
+            .ok();
+        });
+        self.user_hold_task = Some(task);
+    }
+
+    fn step_user_collapse_scroll(&mut self, cx: &mut Context<Self>) {
+        let Some(scroll) = self.user_collapse_scroll.as_ref() else {
+            return;
+        };
+        let started_at = scroll.started_at;
+        let duration_ms = scroll.duration_ms;
+        let height_delta = scroll.height_delta;
+        let row_ix = scroll.row_ix;
+        let initial_top = scroll.initial_top;
+        let target_top = scroll.target_top;
+        let raw = (started_at.elapsed().as_secs_f32()
+            / (duration_ms as f32 / 1000.0))
+            .clamp(0.0, 1.0);
+        let spec = user_resize_spec(height_delta);
+        let progress = spec.progress(raw);
+        let desired_top = motion::lerp(initial_top, target_top, progress);
+        if let Some(current) = self.list.bounds_for_item(row_ix) {
+            // `scroll_by(+x)` moves content down, so correcting current minus
+            // desired keeps the row on the interpolated screen-space path.
+            let correction = f32::from(current.top()) - desired_top;
+            if correction.abs() > 0.1 {
+                self.list.scroll_by(px(correction));
+            }
+        }
+        if raw >= 1.0 {
+            self.user_collapse_scroll = None;
+            self.last_scroll_distance = self.distance_from_bottom();
+            self.show_jump_button =
+                self.last_scroll_distance > SCROLL_BUTTON_THRESHOLD_PX;
+        }
+        cx.notify();
+    }
+
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
@@ -3406,6 +3649,195 @@ impl Transcript {
             .ok();
         });
         self.attachment_retries.insert(key, task);
+    }
+
+    /// The inside of a user bubble: the prompt text, clipped to
+    /// [`USER_COLLAPSED_LINES`] until expanded, plus the expander chevron for
+    /// prompts past the cap. Returns the bubble's children in order.
+    ///
+    /// The collapsed form clips a normally-laid-out text element at exactly
+    /// five line boxes. Do not use gpui's `line_clamp` here: on an auto-width
+    /// flex item it answers intrinsic-width probes with the truncated layout,
+    /// collapsing the bubble to min-content width (one character per line).
+    /// A plain height clip preserves the original bubble width calculation and
+    /// never feeds measured layout back into the virtualized list.
+    fn render_user_body(
+        &mut self,
+        row_id: &SharedString,
+        row_ix: usize,
+        text: SharedString,
+        mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fold = self.user_folds.get(row_id).copied().unwrap_or_default();
+        let expanded = fold.open.unwrap_or(false);
+        let collapsed_h = USER_COLLAPSED_LINES as f32 * USER_LINE_HEIGHT;
+        let measured_h = self
+            .user_heights
+            .entry(row_id.clone())
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone();
+        let measured = measured_h.get();
+        let collapsible = text.lines().count() > USER_COLLAPSED_LINES
+            || (measured > 0.0 && measured > collapsed_h + 0.5)
+            || (measured == 0.0 && user_message_needs_collapse(&text));
+        let full_h = measured_h.get().max(collapsed_h);
+
+        let hold_key = row_id.clone();
+        let hold_height = measured_h.clone();
+        let hold_selection: Arc<str> = format!("{row_id}:u").into();
+        let body = div()
+            .id(SharedString::from(format!("{row_id}-body")))
+            // A long press toggles instead of double-click. A normal release
+            // remains available for text selection, and pointer movement
+            // cancels the pending toggle before a drag can select text.
+            .when(collapsible, |el| {
+                let down_key = hold_key.clone();
+                let down_height = hold_height.clone();
+                let down_selection = hold_selection.clone();
+                el.on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.arm_user_hold(
+                            down_key.clone(),
+                            row_ix,
+                            collapsed_h,
+                            down_height.clone(),
+                            down_selection.clone(),
+                            cx,
+                        );
+                    }),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.cancel_user_hold();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.cancel_user_hold();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, _, _, _| {
+                    this.cancel_user_hold();
+                }))
+            })
+            .child(user_bubble_text(
+                row_id,
+                text,
+                mentions,
+                theme,
+                measured_h.clone(),
+                cx.entity_id(),
+            ));
+        // Height motion uses the same ease-out curve as sidebars, tool folds,
+        // and pane transitions, with duration scaled to travel distance. The
+        // full text remains laid out behind the clip; only the viewport over it
+        // changes, so glyph wrapping never shifts.
+        let duration_ms = fold
+            .duration_ms
+            .max(user_resize_duration_ms(full_h - collapsed_h));
+        let animating = collapsible
+            && fold.epoch > 0
+            && fold
+                .toggled_at
+                .is_some_and(|at| {
+                    at.elapsed() < Duration::from_millis(duration_ms + 200)
+                })
+            && !motion::reduced_motion(cx);
+        let body: AnyElement = if animating {
+            let from = fold.from;
+            let to = if expanded { full_h } else { collapsed_h };
+            let resize = user_resize_spec(full_h - collapsed_h);
+            div()
+                .overflow_hidden()
+                .child(body)
+                .with_animation(
+                    SharedString::from(format!("{row_id}-user-resize-{}", fold.epoch)),
+                    resize.animation(),
+                    move |el, t| el.h(px(motion::lerp(from, to, t))),
+                )
+                .into_any_element()
+        } else if collapsible && !expanded {
+            div()
+                .h(px(collapsed_h))
+                .overflow_hidden()
+                .child(body)
+                .into_any_element()
+        } else {
+            body.into_any_element()
+        };
+        div()
+            .relative()
+            .child(body)
+            .when(collapsible, |el| {
+                el.child(self.render_user_expander(
+                    row_id,
+                    row_ix,
+                    expanded,
+                    collapsed_h,
+                    measured_h,
+                    theme,
+                    cx,
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// The expand/collapse chevron for a clipped prompt: bottom-right INSIDE
+    /// the bubble, on its own strip so it never paints over the last visible
+    /// line.
+    fn render_user_expander(
+        &mut self,
+        row_id: &SharedString,
+        row_ix: usize,
+        expanded: bool,
+        collapsed_h: f32,
+        measured_h: Rc<Cell<f32>>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let toggle_key = row_id.clone();
+        let glyph = if expanded {
+            crate::icons::ALT_ARROW_UP
+        } else {
+            crate::icons::ALT_ARROW_DOWN
+        };
+        div()
+            .id(SharedString::from(format!("{row_id}-expander")))
+            .absolute()
+            // The bubble supplies 16px/10px padding around the relative body.
+            // Bleed into that padding so the control sits near the actual
+            // bubble edge without reserving text width or covering the last
+            // line's content.
+            .right(px(-12.0))
+            .bottom(px(-6.0))
+            .size(px(USER_TOGGLE_SIZE))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(crate::theme::ink(0.08)))
+            .child(
+                crate::icons::icon(glyph)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted.opacity(0.75)),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_user_fold(
+                    toggle_key.clone(),
+                    row_ix,
+                    collapsed_h,
+                    measured_h.get().max(collapsed_h),
+                    motion::reduced_motion(cx),
+                );
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// The right-aligned thumbnail strip above a user bubble.
@@ -3810,10 +4242,12 @@ impl Transcript {
                                 .px(px(16.0))
                                 .py(px(10.0))
                                 .text_size(px(14.0))
-                                .line_height(px(22.0))
+                                .line_height(px(USER_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(user_bubble_text(&row.id, text, mentions, &theme)),
+                                .child(self.render_user_body(
+                                    &row.id, ix, text, mentions, &theme, cx,
+                                )),
                         ),
                     );
                 }
@@ -4623,6 +5057,8 @@ fn user_bubble_text(
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     theme: &Theme,
+    measured_h: Rc<Cell<f32>>,
+    entity_id: gpui::EntityId,
 ) -> AnyElement {
     // Split runs at chip boundaries (spans are in order): body text keeps the
     // sans font, chips read as inline code. Size/line-height flow from the
@@ -4662,7 +5098,7 @@ fn user_bubble_text(
     let sel_theme = theme.clone();
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |_, _, window, cx| {
             for span in mentions.iter() {
                 for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
                     window.paint_quad(quad(
@@ -4676,6 +5112,25 @@ fn user_bubble_text(
                 }
             }
             render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
+            // Passive geometry cache only: no entity update and no notify.
+            // `bounds().height` can be the collapsed clip height, so derive
+            // the full text height from the wrapped line layouts instead. The
+            // click handler reads this exact value as the RESIZE endpoint,
+            // while idle layout never feeds back into the transcript.
+            let line_count: usize = layout
+                .line_layouts()
+                .iter()
+                .map(|line| line.wrap_boundaries.len() + 1)
+                .sum();
+            let next_h = (line_count.max(1) as f32) * f32::from(layout.line_height());
+            if (measured_h.get() - next_h).abs() > 0.5 {
+                measured_h.set(next_h);
+                // The first layout is the source of truth for soft wrapping.
+                // Invalidate the transcript once so the expander and clip are
+                // present even when glyph widths make a short-looking string
+                // exceed five visual lines.
+                cx.notify(entity_id);
+            }
         },
     )
     .absolute()
@@ -5371,6 +5826,22 @@ impl Render for Transcript {
                             this.viewport_finalize_pending = false;
                         }
                         cx.notify();
+                    })
+                    .ok();
+            });
+        }
+        // A long-message collapse near the bottom owns the viewport for the
+        // duration of its height tween. Advance the matching upward scroll once
+        // per frame so the bubble stays visible instead of shrinking above the
+        // fixed viewport while the bottom content remains on screen.
+        if self.user_collapse_scroll.is_some() && !self.user_collapse_scroll_scheduled {
+            self.user_collapse_scroll_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.user_collapse_scroll_scheduled = false;
+                        this.step_user_collapse_scroll(cx);
                     })
                     .ok();
             });
@@ -6292,6 +6763,61 @@ mod tests {
             &echoed[0].kind,
             RowKind::User { pending: true, .. }
         ));
+    }
+
+    /// Explicit multiline and long soft-wrapped prompts get a fold affordance;
+    /// short messages stay untouched.
+    #[test]
+    fn long_prompts_collapse_and_short_ones_do_not() {
+        assert!(!user_message_needs_collapse("short message"));
+        assert!(!user_message_needs_collapse("1\n2\n3\n4\n5"));
+        assert!(user_message_needs_collapse("1\n2\n3\n4\n5\n6"));
+        assert!(
+            !user_message_needs_collapse(&"x".repeat(240)),
+            "ordinary two- or three-line prose must not grow a toggle"
+        );
+        assert!(!user_message_needs_collapse(
+            &"x".repeat(USER_COLLAPSE_CHARS)
+        ));
+        assert!(user_message_needs_collapse(
+            &"x".repeat(USER_COLLAPSE_CHARS + 1)
+        ));
+    }
+
+    #[test]
+    fn user_resize_duration_scales_with_distance_and_stays_bounded() {
+        let short = user_resize_duration_ms(100.0);
+        let medium = user_resize_duration_ms(600.0);
+        let long = user_resize_duration_ms(2_000.0);
+        assert!((220..=260).contains(&short));
+        assert!(medium > short);
+        assert_eq!(long, 850);
+        assert_eq!(
+            user_resize_spec(100.0).curve,
+            motion::EASE_OUT,
+            "short folds keep the decisive sidebar-like ease-out"
+        );
+        assert_eq!(
+            user_resize_spec(2_000.0).curve,
+            motion::EASE_IN_OUT,
+            "large folds avoid front-loading the whole travel"
+        );
+    }
+
+    /// The toggle is render-local: expanding a prompt must not change the
+    /// row's identity or version, or the list would splice (and the
+    /// virtualizer would drop the scroll anchor) on every click.
+    #[test]
+    fn expanding_a_prompt_is_not_a_row_change() {
+        let mut entry = assistant("u3", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", &"a line\n".repeat(40))];
+        let before = rows_for_entry(&entry, false, &mut parse);
+        let after = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].id, after[0].id);
+        assert_eq!(before[0].version, after[0].version);
     }
 
     #[test]
