@@ -8,7 +8,7 @@
 //! pinned rev (f14fea9bf3c9).
 //!
 //! Wiring: [`init`] registers the global action handlers (run once at boot),
-//! [`bind_keys`] installs the fixed macOS shortcuts (re-run by
+//! [`bind_keys`] installs the fixed application shortcuts (re-run by
 //! `shell::apply_keymap`, which clears every binding first), and
 //! [`app_menus`] builds the menu bar handed to `cx.set_menus` in `run_app`.
 
@@ -16,6 +16,7 @@ use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, ac
 
 use crate::appearance::{self, AppearanceMode};
 use crate::composer;
+use crate::shell;
 
 actions!(
     zeron,
@@ -74,25 +75,31 @@ fn quit(_: &Quit, cx: &mut App) {
 
 /// Fixed app-level shortcuts backing the menu key equivalents. These live
 /// outside the customizable keymap; `shell::apply_keymap` calls this after its
-/// `clear_key_bindings` so they survive keymap re-application. macOS only —
-/// on Linux/Windows we keep ctrl-w/ctrl-q free for future in-app use.
+/// `clear_key_bindings` so they survive keymap re-application. Settings follows
+/// the platform convention everywhere (Cmd+, on macOS, Ctrl+, elsewhere);
+/// window/application lifecycle shortcuts remain macOS-only.
 pub fn bind_keys(cx: &mut App) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    cx.bind_keys(macos_key_bindings());
+    cx.bind_keys(app_key_bindings(cfg!(target_os = "macos")));
 }
 
 /// The binding table behind [`bind_keys`] — `KeyBinding` construction is pure
 /// (no `App`), so unit tests can inspect it directly.
-fn macos_key_bindings() -> Vec<KeyBinding> {
-    vec![
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
-    ]
+fn app_key_bindings(macos: bool) -> Vec<KeyBinding> {
+    let mut bindings = vec![KeyBinding::new(
+        if macos { "cmd-," } else { "ctrl-," },
+        shell::OpenSettings,
+        None,
+    )];
+    if macos {
+        bindings.extend([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-h", Hide, None),
+            KeyBinding::new("alt-cmd-h", HideOthers, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            KeyBinding::new("cmd-w", CloseWindow, None),
+        ]);
+    }
+    bindings
 }
 
 /// The zeron menu bar. macOS renders this natively; mac-only entries are gated
@@ -105,6 +112,8 @@ pub fn app_menus() -> Vec<Menu> {
     let mut app_items = vec![
         // Placeholder until a real about dialog exists (explicitly disabled).
         MenuItem::action("About Zeron", About).disabled(true),
+        MenuItem::separator(),
+        MenuItem::action("Settings", shell::OpenSettings),
         MenuItem::separator(),
     ];
     if macos {
@@ -185,6 +194,19 @@ mod tests {
     }
 
     #[test]
+    fn app_menu_offers_settings() {
+        let menus = app_menus();
+        assert!(
+            menus[0].items.iter().any(|item| matches!(
+                item,
+                MenuItem::Action { name, action, .. }
+                    if name.as_ref() == "Settings" && action.name() == shell::OpenSettings.name()
+            )),
+            "the application menu should expose Settings"
+        );
+    }
+
+    #[test]
     fn about_is_disabled_placeholder() {
         let menus = app_menus();
         let first = &menus[0].items[0];
@@ -246,11 +268,10 @@ mod tests {
     }
 
     #[test]
-    fn macos_bindings_cover_quit_close_minimize() {
+    fn app_bindings_use_platform_settings_convention() {
         // `KeyBinding::new` panics on unparseable combos, so constructing the
         // table is itself the parse check.
-        let bindings = macos_key_bindings();
-        let find = |name: &str| {
+        let find = |bindings: &[KeyBinding], name: &str| {
             bindings
                 .iter()
                 .find(|binding| binding.action().name() == name)
@@ -263,8 +284,20 @@ mod tests {
                 })
         };
         let combo = |source: &str| vec![Keystroke::parse(source).unwrap()];
-        assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
-        assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
-        assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
+        let macos = app_key_bindings(true);
+        assert_eq!(
+            find(&macos, shell::OpenSettings.name()),
+            Some(combo("cmd-,"))
+        );
+        assert_eq!(find(&macos, Quit.name()), Some(combo("cmd-q")));
+        assert_eq!(find(&macos, CloseWindow.name()), Some(combo("cmd-w")));
+        assert_eq!(find(&macos, Minimize.name()), Some(combo("cmd-m")));
+
+        let other = app_key_bindings(false);
+        assert_eq!(
+            find(&other, shell::OpenSettings.name()),
+            Some(combo("ctrl-,"))
+        );
+        assert_eq!(find(&other, Quit.name()), None);
     }
 }

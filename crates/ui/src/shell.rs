@@ -59,7 +59,13 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        NewSession,
+        OpenSettings
+    ]
 );
 
 /// Vertical pane resize hitboxes yield the global titlebar. Keeping this in
@@ -186,9 +192,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     }
     cx.clear_key_bindings();
     crate::composer::init(cx);
-    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
-    // these back the native menu key equivalents and must survive keymap
-    // re-application.
+    // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
+    // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
+    // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new(
@@ -7020,6 +7026,11 @@ impl Render for Shell {
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
+            // Native Settings menu item and the platform convention (Cmd+, on
+            // macOS, Ctrl+, elsewhere) always land on the default section.
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                this.open_settings(SettingsSection::Devices, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
