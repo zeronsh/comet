@@ -650,6 +650,24 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             zeron_proto::ReasoningLevel::Max,
         ]
     );
+
+    let omp = AcpHarness::oh_my_pi();
+    assert_eq!(omp.id(), HarnessId::OhMyPi);
+    assert_eq!(omp.display_name(), "Oh My Pi");
+    assert!(omp.supports_steering());
+    assert_eq!(omp.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        omp.reasoning_levels(),
+        &[
+            zeron_proto::ReasoningLevel::Minimal,
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::Medium,
+            zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::XHigh,
+            zeron_proto::ReasoningLevel::Max,
+        ]
+    );
+
 }
 
 #[tokio::test]

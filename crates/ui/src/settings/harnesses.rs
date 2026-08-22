@@ -44,8 +44,10 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Grok => "xAI's Grok Build agent (grok CLI).",
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
+        HarnessId::OhMyPi => "Oh My Pi, driven through native omp acp.",
         HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
         HarnessId::Mock => "Scripted test harness.",
+
     }
 }
 
@@ -58,8 +60,10 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
+        HarnessId::OhMyPi => "omp",
         HarnessId::Opencode => "opencode",
         HarnessId::Mock => "mock",
+
     }
 }
 

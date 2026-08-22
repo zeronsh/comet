@@ -16,6 +16,9 @@ pub enum HarnessId {
     Pi,
     /// SST's opencode agent, driven over ACP (`opencode acp`).
     Opencode,
+    /// Oh My Pi (`omp`), a separate product, driven over ACP (`omp acp`).
+    OhMyPi,
+
     /// Test harness; never shown in production pickers.
     Mock,
 }

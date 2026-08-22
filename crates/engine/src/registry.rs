@@ -520,6 +520,29 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
     );
+    // Oh My Pi over ACP (`omp acp`). Separate product from Pi — do not
+    // share a slot. Same lazy pattern as Hermes.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::OhMyPi,
+            name: "Oh My Pi".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::AcpHarness::oh_my_pi().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::oh_my_pi()) as Arc<dyn Harness>)),
+    );
+
     registry
 }
 
@@ -577,7 +600,9 @@ mod tests {
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi,
-                HarnessId::Opencode
+                HarnessId::Opencode,
+                HarnessId::OhMyPi
+
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -600,7 +625,8 @@ mod tests {
                 ReasoningLevel::High
             ]
         );
-        // Cursor, Hermes and Pi mirror their specs the same way.
+        // Cursor, Hermes, Pi, OpenCode and Oh My Pi mirror their specs the same way.
+
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
@@ -640,6 +666,22 @@ mod tests {
                 ReasoningLevel::Max
             ]
         );
+        let omp = registry.resolve(HarnessId::OhMyPi).unwrap();
+        assert_eq!(omp.id(), HarnessId::OhMyPi);
+        assert_eq!(omp.display_name(), "Oh My Pi");
+        assert_eq!(omp.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            omp.reasoning_levels(),
+            &[
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`
