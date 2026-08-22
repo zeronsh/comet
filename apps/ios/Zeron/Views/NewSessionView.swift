@@ -18,7 +18,9 @@ struct NewSessionView: View {
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
 
-    @State private var draft = ""
+    @State private var draft = ComposerText()
+    @State private var selection = AttributedTextSelection()
+    @State private var suggestions = ComposerSuggestions()
     @State private var showPicker = false
     @State private var showTraitPicker = false
     @State private var showRefPicker = false
@@ -36,7 +38,13 @@ struct NewSessionView: View {
     @State private var selectedRef: String?
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
-    @FocusState private var focused: Bool
+    /// Mirrors ComposerShell's own focus, reported out through
+    /// `onFocusChange`. Gates the popover for the same reason it does in a live
+    /// chat (ComposerView.swift): a tap on the canvas resigns focus without
+    /// changing the draft, so the trigger alone would hold the popover open
+    /// over a dismissed keyboard.
+    @State private var composerFocused = false
+    @State private var refreshTask: Task<Void, Never>?
     /// Basis for the leading header's fixed width (SessionView's pattern —
     /// iOS 26 proposes leading toolbar items almost nothing).
     @State private var viewWidth: CGFloat = 0
@@ -66,19 +74,34 @@ struct NewSessionView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Canvas — tap dismisses the keyboard, like the old app.
+            //
+            // The mark and the line under it are decoration, and they hold a
+            // ~126pt floor under this row. The suggestion popover is the one
+            // thing on this page tall enough to need that floor back, so it
+            // takes it: with the keyboard up there is not enough room for both
+            // on a small device, and the loser of that fight was the whole
+            // column (the canvas overflowed over the navigation bar and the
+            // pill's chip row went under the keyboard). Empty, the row is a
+            // plain colour and compresses to nothing.
             ZStack {
                 Theme.bg
-                VStack(spacing: 24) {
-                    ZeronMark()
-                        .frame(width: 84, height: 84)
-                        .opacity(0.22)
-                    Text("What are we building?")
-                        .font(Theme.sans(15))
-                        .foregroundStyle(Theme.textFaint)
+                if !suggestionsOpen {
+                    VStack(spacing: 24) {
+                        ZeronMark()
+                            .frame(width: 84, height: 84)
+                            .opacity(0.22)
+                        Text("What are we building?")
+                            .font(Theme.sans(15))
+                            .foregroundStyle(Theme.textFaint)
+                    }
                 }
             }
+            // Belt and braces for the frame the decoration is mid-fade on: a
+            // ZStack centres its content and lets it spill both ways, and this
+            // row's neighbour is the navigation bar.
+            .clipped()
             .contentShape(Rectangle())
-            .onTapGesture { focused = false }
+            .onTapGesture { dismissKeyboard() }
 
             if let space, !model.deviceOnline(space.deviceId), model.demo == nil {
                 offlineNotice(space: space)
@@ -90,11 +113,11 @@ struct NewSessionView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         chip(icon: checkoutIcon, label: checkoutLabel) {
-                            focused = false
+                            dismissKeyboard()
                             showCheckoutPicker = true
                         }
                         chip(icon: .gitBranch, label: refLabel) {
-                            focused = false
+                            dismissKeyboard()
                             showRefPicker = true
                         }
                     }
@@ -105,6 +128,17 @@ struct NewSessionView: View {
 
             composer
                 .padding(.bottom, 8)
+                // The composer is served its ideal height BEFORE the canvas
+                // above it. Both rows are flexible — the canvas is a bare
+                // colour, and the popover's list is a scroll view that will
+                // take any height up to its cap — and a VStack splits the free
+                // space between flexible children rather than filling one
+                // first. With the keyboard up that split starved the popover
+                // to a single clipped row while the canvas above it sat empty
+                // (user report). Priority reverses the order: the popover
+                // takes what it wants, the canvas keeps the rest, and the
+                // popover only compresses once the canvas has nothing left.
+                .layoutPriority(1)
         }
         .background(Theme.bg.ignoresSafeArea())
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
@@ -193,11 +227,30 @@ struct NewSessionView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
+        .task {
+            // Wire the fetchers FIRST, before any await. The default no-op
+            // fetcher returns [], and ComposerSuggestions caches that empty
+            // list under the real key for the life of the view — every later
+            // `/` would then silently show nothing (ComposerView.swift).
+            //
+            suggestions.fetchCommands = { [weak model] harness, device, cwd in
+                guard let model else { return [] }
+                return try await model.listCommands(deviceId: device, harness: harness, cwd: cwd)
+            }
+            suggestions.fetchPaths = { [weak model] context, query in
+                guard let model else { return [] }
+                return try await model.searchFiles(deviceId: context.deviceId,
+                                                   chatId: context.chatId,
+                                                   spaceId: context.spaceId,
+                                                   query: query)
+            }
+        }
+        .onChange(of: draft) { _, _ in scheduleRefresh() }
+        .onChange(of: selection) { _, _ in scheduleRefresh() }
         .onAppear {
-            focused = true
             if model.launchAutosend {
                 model.launchAutosend = false
-                draft = "Sketch the plan for porting the diff pane."
+                draft = ComposerText("Sketch the plan for porting the diff pane.")
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     send()
@@ -218,8 +271,22 @@ struct NewSessionView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // A SIBLING above the pill, not a ZStack over it, and gated on
+            // trigger-plus-focus only — same shape and same reasons as the live
+            // chat's popover (ComposerView.swift).
+            if let trigger = draft.trigger(at: selection), suggestionsOpen {
+                ComposerPopover(items: suggestions.items,
+                                kind: trigger.kind,
+                                isLoading: suggestions.isLoading,
+                                errorText: suggestions.errorText) { item in
+                    pick(item, over: trigger.range)
+                }
+                .padding(.horizontal, 10)
+                .transition(.opacity)
+            }
             ComposerShell(
                 draft: $draft,
+                selection: $selection,
                 placeholder: "Do anything…",
                 sendEnabled: space != nil,
                 showStop: false,
@@ -228,21 +295,98 @@ struct NewSessionView: View {
                 onSend: send,
                 attachments: attachments,
                 onAttach: { showPhotoPicker = true },
-                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
+                onFocusChange: { composerFocused = $0 }
             ) {
                 // Model + trait chips, split like the desktop's footer pickers
                 // (they ride right of the shell's attach button).
                 ComposerChip(label: selectedModel.label, badgeHarness: harness) {
-                    focused = false
+                    dismissKeyboard()
                     showPicker = true
                 }
                 if let reasoning {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(reasoning)) {
-                        focused = false
+                        dismissKeyboard()
                         showTraitPicker = true
                     }
                 }
             }
+        }
+    }
+
+    /// Resign the editor's first responder from outside it. ComposerShell owns
+    /// its own `@FocusState` and exposes no binding for it, so a local
+    /// `@FocusState` here was never attached to anything: the canvas tap and
+    /// the picker chips both set it and neither ever put the keyboard down.
+    /// Going through the responder chain does, and ComposerShell reports the
+    /// resulting blur back through `onFocusChange`, which also closes the
+    /// suggestion popover — the same gesture the desktop closes it on.
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                        to: nil, from: nil, for: nil)
+    }
+
+    // MARK: Suggestions
+
+    /// Popover visibility: an open trigger AND focus, the live chat's gate. Two
+    /// rows read it — the popover itself, and the canvas that gives up its
+    /// space for it — so they can never disagree about whether it is up.
+    private var suggestionsOpen: Bool {
+        draft.trigger(at: selection) != nil && composerFocused
+    }
+
+    /// Everything the fetchers need, for a draft that has no chat yet. The
+    /// space fixes both the device and the folder, and the file search goes out
+    /// as a `spaceId` search: the engine needs exactly one of `chatId` or
+    /// `spaceId` (crates/engine/src/rpc.rs), and there is no chat to name.
+    ///
+    /// `harness` is read here, not captured, so flipping the agent chip
+    /// mid-draft re-keys the command cache and fetches the new agent's list.
+    private var suggestionContext: SuggestionContext {
+        SuggestionContext(harness: harness,
+                          deviceId: space?.deviceId ?? "",
+                          cwd: slashCwd(chatCwd: nil, spacePath: space?.path),
+                          chatId: nil,
+                          spaceId: space?.id)
+    }
+
+    private func pick(_ item: SuggestionItem, over range: Range<Int>) {
+        switch item.payload {
+        case .command(let name):
+            draft.apply(command: name, over: range, selection: &selection)
+        case .path(let path, let isDir):
+            draft.apply(path: path, isDir: isDir, over: range, selection: &selection)
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func refreshSuggestions() async {
+        // No space means no device and no folder to ask. Reset rather than
+        // return: `scheduleRefresh` has already marked the fetch pending, and
+        // nothing else would ever clear that spinner.
+        guard space != nil, let trigger = draft.trigger(at: selection) else {
+            suggestions.reset()
+            return
+        }
+        await suggestions.update(trigger: trigger, context: suggestionContext)
+    }
+
+    /// Debounce and cancel — ComposerView.scheduleRefresh's twin, and for the
+    /// same reasons: one keystroke changes BOTH `draft` and `selection`, and
+    /// the trigger check has to run synchronously on this keystroke so a closed
+    /// trigger drops its stale rows and an open one shows its pending state
+    /// through the debounce window.
+    private func scheduleRefresh() {
+        refreshTask?.cancel()
+        guard draft.trigger(at: selection) != nil else {
+            suggestions.reset()
+            return
+        }
+        suggestions.beginPending()
+        refreshTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+            await refreshSuggestions()
         }
     }
 
@@ -344,7 +488,7 @@ struct NewSessionView: View {
 
     private var canSend: Bool {
         guard !busy, space != nil else { return false }
-        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !draft.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !attachments.isEmpty
     }
 
@@ -370,7 +514,7 @@ struct NewSessionView: View {
     /// forever on a zombie link (the 2026-08-18 "Sending…" incident).
     private func send() {
         guard let space, canSend else { return }
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = draft.markdown().trimmingCharacters(in: .whitespacesAndNewlines)
         busy = true
         let config = ChatConfig(harness: harness, model: selectedModel.id,
                                 reasoning: reasoning, sandbox: "workspace-write")
@@ -450,7 +594,7 @@ struct NewSessionView: View {
                               chat: chat, attachments: legacyPaths, worktree: worktree)
             }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
+            draft.clear(selection: &selection)
             attachments = []
             busy = false
             // Replace the canvas with the live session (in-place swap, no
