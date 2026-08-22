@@ -11,7 +11,7 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -101,6 +101,22 @@ fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f
 /// fullscreen hides them and the cluster reclaims the inset.
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
     if fullscreen { 12.0 } else { 88.0 }
+}
+
+fn checkout_relative_path(cwd: &str, target: &str) -> Option<String> {
+    let relative = Path::new(target).strip_prefix(cwd).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let path = relative.to_str()?.replace('\\', "/");
+    (!path.is_empty()).then_some(path)
 }
 
 /// Width of the spacer ahead of the control cluster for a strip that already
@@ -1624,6 +1640,56 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_transcript_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        if url.starts_with("https://") || url.starts_with("http://") {
+            cx.open_url(url);
+            return;
+        }
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone());
+        let Some(cwd) = cwd else {
+            return;
+        };
+        let Some(path) = checkout_relative_path(&cwd, url) else {
+            return;
+        };
+        self.reveal_change_file(path, cx);
+    }
+
+    fn reveal_change_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        let existing = self.right_tabs.get(&key).and_then(|tabs| {
+            tabs.iter().find_map(|surface| match surface {
+                RightSurface::Diff(id)
+                    if self
+                        .diffs
+                        .get(id)
+                        .is_some_and(|changes| changes.read(cx).is_working_tree()) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+        });
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                self.add_diff_surface(cx);
+                self.diff_seq
+            }
+        };
+        self.set_right_active(RightSurface::Diff(id), cx);
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        if let Some(changes) = self.diffs.get(&id).cloned() {
+            changes.update(cx, |changes, cx| changes.reveal_file(path, cx));
+        }
+    }
+
     fn right_terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
         if let Some(terminal) = &self.right_terminal {
             return terminal.clone();
@@ -1811,6 +1877,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match event {
+            TranscriptEvent::OpenLink(url) => self.open_transcript_link(url, cx),
             TranscriptEvent::OpenSubagent {
                 chat_id,
                 doc_id,
@@ -7843,6 +7910,22 @@ mod tests {
         // The right pane round-trips back closed.
         assert!(!panels.toggle_changes("a"));
         assert!(!panels.get("a").changes_open);
+    }
+
+    #[test]
+    fn checkout_relative_path_rejects_escape_and_keeps_project_paths() {
+        assert_eq!(
+            checkout_relative_path("/workspace/comet", "/workspace/comet/docs/plan.md"),
+            Some("docs/plan.md".into())
+        );
+        assert_eq!(
+            checkout_relative_path("/workspace/comet", "/workspace/other/a.md"),
+            None
+        );
+        assert_eq!(
+            checkout_relative_path("/workspace/comet", "/workspace/comet/../secret.md"),
+            None
+        );
     }
 
     #[test]

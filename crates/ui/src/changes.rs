@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, ListAlignment, ListState,
-    SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, ListAlignment, ListOffset,
+    ListState, SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
 use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
@@ -1354,6 +1354,11 @@ pub struct Changes {
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
     /// the fetch and the surface-tab title).
     commit: Option<GitHistoryCommit>,
+    /// A project link can arrive before the async diff parser. Keep it until
+    /// rows exist, then expand and scroll to the requested file.
+    reveal_path: Option<String>,
+    preview: Option<(SharedString, SharedString)>,
+    preview_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -1413,6 +1418,9 @@ impl Changes {
             history_fetch_button: None,
             history_events: None,
             commit: None,
+            reveal_path: None,
+            preview: None,
+            preview_task: None,
             _observe: observe,
         }
     }
@@ -1441,6 +1449,92 @@ impl Changes {
             return commit.sha.chars().take(7).collect::<String>().into();
         }
         gpui::SharedString::from(self.scope.label())
+    }
+
+    pub fn is_working_tree(&self) -> bool {
+        self.scope == DiffScope::WorkingTree
+    }
+
+    pub fn reveal_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.reveal_path = Some(path);
+        self.preview = None;
+        self.error = None;
+        self.ensure_content(cx);
+        self.apply_reveal(cx);
+    }
+
+    fn apply_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.reveal_path.clone() else {
+            return;
+        };
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let Some(file_ix) = parsed.files.iter().position(|file| file.path == path) else {
+            self.reveal_path = None;
+            self.load_preview(path, cx);
+            cx.notify();
+            return;
+        };
+        if self.folds.get(&path).is_some_and(|fold| fold.collapsed) {
+            self.toggle_fold(file_ix, cx);
+        }
+        if let Some(range) = self.row_ranges.get(file_ix) {
+            self.list.scroll_to(ListOffset {
+                item_ix: range.start,
+                offset_in_item: px(0.0),
+            });
+        }
+        self.reveal_path = None;
+        cx.notify();
+    }
+
+    fn load_preview(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("File preview is unavailable".into());
+            return;
+        };
+        let chat_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.id.clone());
+        let Some(chat_id) = chat_id else {
+            self.error = Some("File preview has no workspace".into());
+            return;
+        };
+        let target = self.desired_target(cx);
+        self.preview_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "chatId": chat_id, "path": path });
+            if let Some(target) = target
+                && let Some(object) = params.as_object_mut()
+            {
+                object.insert("targetDeviceId".into(), target.into());
+            }
+            let text = engine
+                .client()
+                .call(methods::READ_WORKSPACE_FILE, params)
+                .await
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .map(str::to_string)
+                });
+            this.update(cx, |changes, cx| {
+                changes.preview_task = None;
+                match text {
+                    Some(text) => changes.preview = Some((path.into(), text.into())),
+                    None => {
+                        changes.error =
+                            Some("File is unavailable, binary, or larger than 1 MiB".into())
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// The selected chat's host device when it differs from the connected
@@ -1927,6 +2021,7 @@ impl Changes {
                     file_count,
                     files: Arc::new(files),
                 });
+                changes.apply_reveal(cx);
                 cx.notify();
             })
             .ok();
@@ -3396,7 +3491,6 @@ impl Changes {
                 .flex_col()
                 .gap(px(2.0))
                 .max_h(px(240.0))
-                .overflow_y_scroll()
                 .track_scroll(&list_scroll)
                 .children(rows.into_iter().enumerate().map(|(row_ix, branch_ix)| {
                     let name = branches[branch_ix].clone();
@@ -4287,6 +4381,25 @@ impl Render for Changes {
                     theme.text_faint
                 })
                 .child(message)
+                .into_any_element()
+        } else if let Some((path, text)) = self.preview.clone() {
+            div()
+                .id(format!("changes-preview-{path}"))
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(px(Theme::SPACE_MD))
+                .py(px(Theme::SPACE_MD))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(12.0))
+                .text_color(theme.text)
+                .child(
+                    div()
+                        .mb(px(Theme::SPACE_SM))
+                        .text_color(theme.text_muted)
+                        .child(path),
+                )
+                .child(text)
                 .into_any_element()
         } else {
             match phase {

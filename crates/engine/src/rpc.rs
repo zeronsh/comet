@@ -288,6 +288,13 @@ struct ReadAttachmentChunkParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ReadWorkspaceFileParams {
+    chat_id: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FetchToolBlobParams {
     /// Doc-resident sidecar ref (`{chatId}/{partId}` or `…​.diff`).
     blob_ref: String,
@@ -917,6 +924,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
+            | methods::READ_WORKSPACE_FILE
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
@@ -1880,6 +1888,44 @@ impl RpcService for EngineRpc {
                     .read_chunk(&p.path, p.offset, &roots)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
+            }
+            methods::READ_WORKSPACE_FILE => {
+                let p: ReadWorkspaceFileParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                let cwd = chat
+                    .cwd
+                    .ok_or_else(|| RpcError::Failed("chat has no workspace".into()))?;
+                let relative = std::path::Path::new(&p.path);
+                if relative.is_absolute()
+                    || relative.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(RpcError::Failed("invalid workspace path".into()));
+                }
+                let root =
+                    std::fs::canonicalize(&cwd).map_err(|e| RpcError::Failed(e.to_string()))?;
+                let file = root.join(relative);
+                let metadata = std::fs::symlink_metadata(&file)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.len() > 1024 * 1024
+                {
+                    return Err(RpcError::Failed("workspace file is not previewable".into()));
+                }
+                let text = std::fs::read_to_string(&file)
+                    .map_err(|_| RpcError::Failed("workspace file is not UTF-8".into()))?;
+                RpcReply::value(&serde_json::json!({ "text": text }))
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
