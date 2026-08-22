@@ -858,6 +858,11 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
+    /// The CLI logins this device has, for the titlebar's account label.
+    /// Listed once, without `forceUsage`, which the engine serves off disk —
+    /// this never reaches the network.
+    pub(super) agent_accounts: Vec<zeron_proto::AgentAccount>,
+    agent_accounts_task: Option<gpui::Task<()>>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -1140,6 +1145,8 @@ impl Shell {
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
+            agent_accounts: Vec::new(),
+            agent_accounts_task: None,
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
@@ -1233,7 +1240,41 @@ impl Shell {
 
     // ---- splash ----
 
+    /// List the device's CLI logins for the titlebar label, once.
+    ///
+    /// `forceUsage` is deliberately absent: a non-forced list is served from
+    /// the credential stores on disk, so this makes no request to any provider.
+    fn load_agent_accounts(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.agent_accounts_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
+                .await;
+            // A failed list leaves the titlebar unlabelled rather than
+            // erroring: the label is ambient, and its absence is already a
+            // legitimate state (no login, or a chat on another device).
+            if let Ok(value) = result
+                && let Ok(snapshot) =
+                    serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(value)
+            {
+                this.update(cx, |shell, cx| {
+                    shell.agent_accounts = snapshot.accounts;
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        // `load` only sets the task once it has an engine, so this retries
+        // across state changes until one is attached, then never again.
+        if self.agent_accounts_task.is_none() {
+            self.load_agent_accounts(cx);
+        }
         let next_sync_flow = {
             let state = state.read(cx);
             sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
