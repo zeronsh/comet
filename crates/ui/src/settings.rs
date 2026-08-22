@@ -95,6 +95,9 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Whether bare Escape stops the active agent after contextual consumers
+    /// decline it. Device-local and opt-in.
+    pub escape_stops_active_agent: bool,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Changes pane: side-by-side diffs instead of the unified stack.
@@ -120,6 +123,7 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            escape_stops_active_agent: false,
             appearance: crate::appearance::AppearanceMode::default(),
             diff_split: false,
         }
@@ -397,6 +401,7 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            escape_stops_active_agent: true,
             appearance: crate::appearance::AppearanceMode::Light,
             diff_split: true,
         };
@@ -426,6 +431,10 @@ mod tests {
         assert!(
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
+        );
+        assert!(
+            !loaded.escape_stops_active_agent,
+            "preference files default Escape stopping off"
         );
     }
 
@@ -477,6 +486,7 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert!(!d.escape_stops_active_agent);
     }
 
     #[test]
@@ -565,6 +575,22 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+        assert!(!loaded.escape_stops_active_agent);
+    }
+
+    #[test]
+    fn escape_stopping_is_opt_in_for_old_and_partial_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert!(!loaded.escape_stops_active_agent);
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
     }
 
     #[test]
