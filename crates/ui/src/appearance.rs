@@ -99,12 +99,10 @@ pub fn init(settings: &UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     // and boot must not flash the stock theme before the user's choice lands.
     let wanted = resolve(mode, system);
     let entry = themes::resolve(theme_pref(wanted, cx).as_deref(), wanted);
-    Theme::install_theme(Theme::from_colors(
-        entry.colors.clone(),
-        entry.id,
-        entry.name,
-        wanted,
-    ), cx);
+    Theme::install_theme(
+        Theme::from_colors(entry.colors.clone(), entry.id, entry.name, wanted),
+        cx,
+    );
 }
 
 /// The persisted theme preference for `appearance`, if the globals exist.
@@ -225,7 +223,9 @@ pub fn apply(cx: &mut App) {
     sync_ns_appearance(state.mode);
     let wanted = resolve(state.mode, state.system);
     let entry = themes::resolve(theme_pref(wanted, cx).as_deref(), wanted);
-    let changed = !cx.try_global::<Theme>().is_some_and(|t| t.id == entry.id && t.appearance == wanted);
+    let changed = !cx
+        .try_global::<Theme>()
+        .is_some_and(|t| t.id == entry.id && t.appearance == wanted);
     if changed {
         tracing::debug!(?wanted, theme = entry.id, "appearance: installing palette");
         Theme::install_theme(

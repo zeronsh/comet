@@ -144,6 +144,35 @@ fn preview(mode: AppearanceMode) -> AnyElement {
     }
 }
 
+/// The selectable themes for one appearance, as preview cards. Clicking installs
+/// that theme for the appearance (and repaints via [`appearance::set_theme`]).
+fn theme_cards(
+    appearance: Appearance,
+    selected_id: &str,
+    page_theme: &Theme,
+    cx: &mut Context<AppearancePage>,
+) -> Vec<gpui::Stateful<gpui::Div>> {
+    crate::themes::built_ins_for(appearance)
+        .into_iter()
+        .map(|entry| {
+            let id = entry.id;
+            let preview_theme =
+                Theme::from_colors(entry.colors.clone(), entry.id, entry.name, entry.appearance);
+            widgets::option_card(
+                page_theme,
+                entry.name,
+                entry.id == selected_id,
+                miniature(&preview_theme, Corners::All),
+            )
+            .id(SharedString::from(format!("theme-{id}")))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                appearance::set_theme(id, appearance, cx);
+                cx.notify();
+            }))
+        })
+        .collect()
+}
+
 /// Helper copy under the picker.
 fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
     match mode {
@@ -166,10 +195,12 @@ impl Render for AppearancePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let current = appearance::mode(cx);
-        let system = cx
-            .try_global::<appearance::AppearanceState>()
-            .map(|state| state.system)
-            .unwrap_or_default();
+        let state = cx.try_global::<appearance::AppearanceState>();
+        let system = state.map(|state| state.system).unwrap_or_default();
+        let dark_theme = state.and_then(|state| state.dark_theme.clone());
+        let light_theme = state.and_then(|state| state.light_theme.clone());
+        let dark_selected = crate::themes::resolve(dark_theme.as_deref(), Appearance::Dark).id;
+        let light_selected = crate::themes::resolve(light_theme.as_deref(), Appearance::Light).id;
 
         let cards = AppearanceMode::ALL.into_iter().map(|mode| {
             widgets::option_card(&theme, mode.label(), mode == current, preview(mode))
@@ -212,6 +243,34 @@ impl Render for AppearancePage {
                             .text_color(theme.text_muted)
                             .line_height(px(18.0))
                             .child(helper(current, system)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(widgets::field_label(&theme, "Dark theme"))
+                            .child(widgets::option_card_row().children(theme_cards(
+                                Appearance::Dark,
+                                dark_selected,
+                                &theme,
+                                cx,
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .mt(px(32.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.0))
+                            .child(widgets::field_label(&theme, "Light theme"))
+                            .child(widgets::option_card_row().children(theme_cards(
+                                Appearance::Light,
+                                light_selected,
+                                &theme,
+                                cx,
+                            ))),
                     ),
             )
     }

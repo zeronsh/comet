@@ -35,7 +35,7 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use gpui::{App, Global, Hsla, SharedString, hsla};
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeron_syntax::HighlightKind;
 
 /// Which appearance the app is painting.
@@ -231,46 +231,45 @@ impl SyntaxPalette {
     }
 
     fn dark(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
-        // Same sources and 72% saturation treatment as history::graph_color.
-        let indigo = git_graph_tone(oklch(0.673, 0.182, 276.935));
-        let pink = git_graph_tone(oklch(0.718, 0.202, 349.761));
-        let emerald = git_graph_tone(oklch(0.765, 0.177, 163.223));
-        let amber = git_graph_tone(oklch(0.828, 0.189, 84.429));
-        let red = git_graph_tone(danger);
-        Self {
+        Self::from_roles(
+            text,
             comment,
-            keyword: indigo,
-            string: emerald,
-            string_special: pink,
-            escape: pink,
-            number: amber,
-            boolean: amber,
-            type_name: amber,
-            type_builtin: emerald,
-            constructor: amber,
-            function: indigo,
-            function_builtin: pink,
-            macro_name: pink,
-            property: amber,
-            constant: emerald,
-            variable: text,
-            variable_special: pink,
-            parameter: text,
-            operator: text,
-            punctuation: text,
-            tag: pink,
-            attribute: amber,
-            label: amber,
-            invalid: red,
-        }
+            danger,
+            // Same sources as history::graph_color.
+            oklch(0.673, 0.182, 276.935), // indigo — keywords, functions
+            oklch(0.718, 0.202, 349.761), // pink — specials, tags
+            oklch(0.765, 0.177, 163.223), // emerald — strings, constants
+            oklch(0.828, 0.189, 84.429),  // amber — numbers, types
+        )
     }
 
     fn light(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
-        // Match the light graph's hue families at text-safe lightness.
-        let indigo = git_graph_tone(oklch(0.47, 0.20, 276.966));
-        let pink = git_graph_tone(oklch(0.47, 0.17, 0.584));
-        let emerald = git_graph_tone(oklch(0.46, 0.11, 163.225));
-        let amber = git_graph_tone(oklch(0.47, 0.12, 48.998));
+        Self::from_roles(
+            text,
+            comment,
+            danger,
+            oklch(0.47, 0.20, 276.966), // indigo
+            oklch(0.47, 0.17, 0.584),   // pink
+            oklch(0.46, 0.11, 163.225), // emerald
+            oklch(0.47, 0.12, 48.998),  // amber
+        )
+    }
+
+    /// Role-color constructor for theme families: pass the palette's own
+    /// accents (keyword/special/string/number hues) and every input gets the
+    /// [`git_graph_tone`] saturation treatment so code stays quieter than
+    /// content.
+    pub fn from_roles(
+        text: Hsla,
+        comment: Hsla,
+        danger: Hsla,
+        indigo: Hsla,
+        pink: Hsla,
+        emerald: Hsla,
+        amber: Hsla,
+    ) -> Self {
+        let (indigo, pink) = (git_graph_tone(indigo), git_graph_tone(pink));
+        let (emerald, amber) = (git_graph_tone(emerald), git_graph_tone(amber));
         let red = git_graph_tone(danger);
         Self {
             comment,
@@ -442,7 +441,10 @@ pub struct ThemeColors {
     pub code_text: Hsla,
     #[serde(with = "hex_color")]
     pub code_wash: Hsla,
-    #[serde(serialize_with = "syntax_serialize", deserialize_with = "syntax_deserialize")]
+    #[serde(
+        serialize_with = "syntax_serialize",
+        deserialize_with = "syntax_deserialize"
+    )]
     pub syntax: SyntaxPalette,
     #[serde(with = "hex_color")]
     pub diff_add: Hsla,
@@ -472,7 +474,10 @@ pub struct ThemeColors {
     pub glass_overlay_tint: Option<Hsla>,
 }
 
-fn syntax_serialize<S: Serializer>(syntax: &SyntaxPalette, serializer: S) -> Result<S::Ok, S::Error> {
+fn syntax_serialize<S: Serializer>(
+    syntax: &SyntaxPalette,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     syntax.serialize(serializer)
 }
 
@@ -2060,11 +2065,7 @@ mod tests {
             assert_close("bg", parsed.bg, stock.bg);
             assert_close("surface", parsed.surface, stock.surface);
             assert_close("accent", parsed.accent, stock.accent);
-            assert_close(
-                "element_hover",
-                parsed.element_hover,
-                stock.element_hover,
-            );
+            assert_close("element_hover", parsed.element_hover, stock.element_hover);
             assert_close(
                 "syntax.keyword",
                 parsed.syntax.keyword,
@@ -2081,7 +2082,10 @@ mod tests {
     fn translucent_tokens_serialize_with_alpha_hex() {
         // Dark input_bg is a 3% white wash — must not round-trip as opaque.
         let json = serde_json::to_string(&ThemeColors::stock_dark()).unwrap();
-        assert!(json.contains("#FFFFFF08") || json.contains("#ffffff08"), "{json}");
+        assert!(
+            json.contains("#FFFFFF08") || json.contains("#ffffff08"),
+            "{json}"
+        );
     }
 
     #[test]
@@ -2095,12 +2099,18 @@ mod tests {
         assert_eq!(parsed.glass_overlay_tint, None);
 
         // Unknown id and appearance mismatch both degrade to stock.
-        assert_eq!(themes::resolve(Some("nope"), Appearance::Dark).id, themes::STOCK_DARK);
+        assert_eq!(
+            themes::resolve(Some("nope"), Appearance::Dark).id,
+            themes::STOCK_DARK
+        );
         assert_eq!(
             themes::resolve(Some(themes::STOCK_LIGHT), Appearance::Dark).id,
             themes::STOCK_DARK
         );
-        assert_eq!(themes::resolve(None, Appearance::Light).id, themes::STOCK_LIGHT);
+        assert_eq!(
+            themes::resolve(None, Appearance::Light).id,
+            themes::STOCK_LIGHT
+        );
     }
 
     #[test]
