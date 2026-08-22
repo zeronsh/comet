@@ -4626,9 +4626,8 @@ impl Shell {
         }
     }
 
-    /// Scope-aware sidebar identity and account menu. Local runtimes advertise
-    /// their storage boundary and offer sync; synced runtimes offer sign-out.
-    /// Small icon button for the sidebar footer's quick-action cluster.
+    /// Small icon button for the sidebar footer's quick-action cluster. The
+    /// scope-aware sync action remains available at the trailing edge.
     fn footer_action_button(
         &self,
         id: &'static str,
@@ -4643,12 +4642,6 @@ impl Shell {
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .on_hover(motion::hover_listener(id))
-            .bg(motion::hover_blend(
-                id,
-                theme.glass_hover().opacity(0.0),
-                theme.glass_hover().opacity(0.8),
-            ))
             .child(icon(path).size(px(14.0)).text_color(motion::hover_blend(
                 id,
                 theme.text_muted,
@@ -4666,22 +4659,18 @@ impl Shell {
             .id("sidebar-footer-actions")
             .flex_none()
             .rounded(px(8.0))
+            .w_full()
             .px(px(Theme::SPACE_SM))
             .py(px(Theme::SPACE_SM))
             .flex()
             .flex_row()
             .items_center()
-            .on_hover(motion::hover_listener("sidebar-footer-actions"))
-            .bg(motion::hover_blend(
-                "sidebar-footer-actions",
-                theme.glass_hover().opacity(0.0),
-                theme.glass_hover().opacity(0.8),
-            ))
             .child(
-                // Keep Pull Requests, sync, and Settings together in the
-                // leading slot previously occupied by the identity block.
+                // Keep Pull Requests and Settings together in the leading
+                // slot; the sync action is pushed to the trailing edge.
                 div()
-                    .flex_none()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -4697,6 +4686,18 @@ impl Shell {
                             this.open_pull_requests(cx);
                         })),
                     )
+                    .child(
+                        self.footer_action_button(
+                            "user-row-settings",
+                            icons::SETTINGS_MINIMALISTIC,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_settings(SettingsSection::Devices, cx);
+                        })),
+                    )
+                    .child(div().flex_1().min_w_0())
                     .when(
                         matches!(action, Some(AccountMenuAction::EnableSync)),
                         |row| {
@@ -4757,17 +4758,6 @@ impl Shell {
                                 })),
                             )
                         },
-                    )
-                    .child(
-                        self.footer_action_button(
-                            "user-row-settings",
-                            icons::SETTINGS_MINIMALISTIC,
-                            theme,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.open_settings(SettingsSection::Devices, cx);
-                        })),
                     ),
             );
         // Keep the footer compact: the action strip has no identity popover
