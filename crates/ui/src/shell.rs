@@ -85,14 +85,6 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
 }
 
-fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
-    if is_chat_route && has_selected_chat {
-        1.0
-    } else {
-        0.0
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -3354,12 +3346,6 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
-        // The titlebar is the single owner of the new-session action in both
-        // sidebar states. Hide it on the new-session canvas: opening another
-        // blank canvas from an already blank canvas has no effect and used to
-        // leave two competing + placements across the responsive variants.
-        let plus_alpha = self.titlebar_plus_alpha(cx);
-        let show_plus = plus_alpha > 0.01;
         div()
             .absolute()
             .top_0()
@@ -3408,28 +3394,7 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
                     )),
             )
-            .children(show_plus.then(|| {
-                div()
-                    .flex_none()
-                    .ml(px(TITLEBAR_GROUP_GAP))
-                    .opacity(plus_alpha)
-                    .child(window_control_button(
-                        "titlebar-new-session",
-                        icons::PLUS,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.open_new_session(cx)),
-                    ))
-            }))
             .into_any_element()
-    }
-
-    /// The titlebar owns new-session creation regardless of sidebar state. It
-    /// is useful only while an existing session is selected.
-    pub(super) fn titlebar_plus_alpha(&self, cx: &App) -> f32 {
-        titlebar_new_session_alpha(
-            matches!(self.route, Route::Chat),
-            self.state.read(cx).selected_chat.is_some(),
-        )
     }
 
     /// Native Windows caption controls integrated into Zeron's unified
@@ -4137,11 +4102,6 @@ impl Shell {
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (user, workspace_scope) = {
-            let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
-        };
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -4221,38 +4181,7 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let (user_line, trigger_subline, menu_identity): (
-            SharedString,
-            Option<SharedString>,
-            SharedString,
-        ) = match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart"
-                } else {
-                    "Local only"
-                };
-                (line.into(), None, "Stored on this device".into())
-            }
-            Some(WorkspaceScope::Development) => (
-                "Development".into(),
-                Some("Local development runtime".into()),
-                "Authentication disabled".into(),
-            ),
-            Some(WorkspaceScope::Synced) | None => {
-                let line: SharedString = user
-                    .as_ref()
-                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
-                let email = user
-                    .as_ref()
-                    .map(|u| SharedString::from(u.email.clone()))
-                    .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
-            }
-        };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        let footer_actions = self.render_footer_actions(theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -4370,36 +4299,6 @@ impl Shell {
             _ => search_row,
         };
 
-        let pull_requests_row = div()
-            .id("pull-requests-nav")
-            .mx(px(Theme::SPACE_SM))
-            .mb(px(Theme::SPACE_XS))
-            .px(px(10.0))
-            .py(px(7.0))
-            .rounded(px(8.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .text_size(px(12.5))
-            .text_color(if matches!(self.route, Route::PullRequests) {
-                theme.text
-            } else {
-                theme.text_muted
-            })
-            .when(matches!(self.route, Route::PullRequests), |el| {
-                el.bg(crate::theme::glass_selected_bg())
-            })
-            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.open_pull_requests(cx)))
-            .child(
-                icon(icons::PULL_REQUEST)
-                    .size(px(15.0))
-                    .text_color(theme.text_muted),
-            )
-            .child(SharedString::from("Pull Requests"));
-
         // "Pinned" section header — same hairline style as Active. Only when
         // a real boundary exists (some pinned, some not).
         let pinned_header = if has_split {
@@ -4482,7 +4381,6 @@ impl Shell {
             // Search and project navigation are separate controls in the
             // sidebar: search gets its own breathing room, while the project
             // selector stays visually aligned with the session list below.
-            .child(pull_requests_row)
             .child(search_row)
             .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
@@ -4578,7 +4476,7 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(footer_actions))
             .into_any_element()
     }
 
@@ -4728,203 +4626,148 @@ impl Shell {
         }
     }
 
-    /// Scope-aware sidebar identity and account menu. Local runtimes advertise
-    /// their storage boundary and offer sync; synced runtimes offer sign-out.
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        trigger_subline: Option<SharedString>,
-        menu_identity: SharedString,
+    /// Small icon button for the sidebar footer's quick-action cluster. The
+    /// scope-aware sync action remains available at the trailing edge.
+    fn footer_action_button(
+        &self,
+        id: &'static str,
+        path: &'static str,
         theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.user_menu.is_open();
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .size(px(26.0))
+            .rounded(px(7.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_hover(motion::hover_listener(id))
+            .bg(motion::hover_blend(
+                id,
+                theme.glass_hover().opacity(0.0),
+                theme.glass_hover().opacity(0.8),
+            ))
+            .child(icon(path).size(px(14.0)).text_color(motion::hover_blend(
+                id,
+                theme.text_muted,
+                theme.text,
+            )))
+    }
+
+    fn render_footer_actions(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Bottom-of-sidebar identity: avatar circle + scope/account label and
-        // its secondary status line.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
-        let mut trigger = div()
-            .id("user-menu")
+        // The footer is an action strip only. The local identity/avatar block
+        // was taking the leading space while duplicating information available
+        // elsewhere in the shell; keep the controls together at the leading
+        // edge of the strip instead.
+        let trigger = div()
+            .id("sidebar-footer-actions")
             .flex_none()
             .rounded(px(8.0))
+            .w_full()
             .px(px(Theme::SPACE_SM))
             .py(px(Theme::SPACE_SM))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
-            .cursor_pointer()
-            // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
-            // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
-            // the hover wash fades over `transition-colors`.
-            .bg(if open {
-                theme.glass_hover()
-            } else {
-                motion::hover_blend(
-                    "user-menu-trigger",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover().opacity(0.8),
-                )
-            })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                // A press that found the menu open closes it (the card's
-                // mouse-down-out already began the close) — never reopen.
-                if this.user_menu.take_press_was_open() {
-                    this.close_user_menu(cx);
-                } else {
-                    this.user_menu.open(());
-                }
-                cx.notify();
-            }))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
-            )
-            .child(
-                // Name with an optional status line underneath — no chip on the right.
+                // Keep Pull Requests and Settings together in the leading
+                // slot; the sync action is pushed to the trailing edge.
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .flex_col()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
                     .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .when_some(trigger_subline, |identity, subline| {
-                        identity.child(
-                            div()
-                                .text_size(px(11.0))
-                                .line_height(px(15.0))
-                                .text_color(theme.text_muted)
-                                .child(subline),
+                        self.footer_action_button(
+                            "user-row-pull-requests",
+                            icons::PULL_REQUEST,
+                            theme,
                         )
-                    }),
-            );
-        if self.user_menu.get().is_some() {
-            let closing = self.user_menu.closing_since();
-            // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
-            // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // the action selected by the runtime scope, then "Settings".
-            let menu = popover::popover_card(theme)
-                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.close_user_menu(cx);
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .pt(px(6.0))
-                        .pb(px(4.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.7))
-                        .truncate()
-                        .child(menu_identity),
-                )
-                .when_some(action, |menu, action| {
-                    let row = match action {
-                        AccountMenuAction::EnableSync => {
-                            popover::menu_row(theme, false, "user-menu-enable-sync")
-                                .id("user-menu-enable-sync")
-                                .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
-                                .child(
-                                    icon(icons::GLOBAL)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Enable sync"))
-                                .into_any_element()
-                        }
-                        AccountMenuAction::SyncInProgress => {
-                            popover::menu_row(theme, false, "user-menu-sync-progress")
-                                .id("user-menu-sync-progress")
-                                .opacity(0.6)
-                                .child(
-                                    icon(icons::GLOBAL)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Sync setup in progress"))
-                                .into_any_element()
-                        }
-                        AccountMenuAction::RestartPending => {
-                            popover::menu_row(theme, false, "user-menu-sync-restart")
-                                .id("user-menu-sync-restart")
-                                .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
-                                .child(
-                                    icon(icons::RESTART)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Finish sync setup"))
-                                .into_any_element()
-                        }
-                        AccountMenuAction::SignOut => {
-                            popover::menu_row(theme, false, "user-menu-signout")
-                                .id("user-menu-signout")
-                                .on_click(cx.listener(|this, _, _, cx| this.request_sign_out(cx)))
-                                .child(
-                                    icon(icons::LOGOUT_2)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Sign out"))
-                                .into_any_element()
-                        }
-                    };
-                    menu.child(row).child(popover::menu_separator())
-                })
-                .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
-                        .id("user-menu-settings")
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
-                        }))
-                        .child(
-                            icon(icons::SETTINGS_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
+                            cx.stop_propagation();
+                            this.open_pull_requests(cx);
+                        })),
+                    )
+                    .child(
+                        self.footer_action_button(
+                            "user-row-settings",
+                            icons::SETTINGS_MINIMALISTIC,
+                            theme,
                         )
-                        .child(SharedString::from("Settings")),
-                )
-                .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above(
-                "user-menu-popover",
-                menu,
-                closing,
-            ));
-        }
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.open_settings(SettingsSection::Devices, cx);
+                        })),
+                    )
+                    .child(div().flex_1().min_w_0())
+                    .when(
+                        matches!(action, Some(AccountMenuAction::EnableSync)),
+                        |row| {
+                            row.child(
+                                self.footer_action_button(
+                                    "user-row-enable-sync",
+                                    icons::GLOBAL,
+                                    theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.start_sign_in(cx);
+                                })),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(action, Some(AccountMenuAction::SyncInProgress)),
+                        |row| {
+                            row.child(
+                                self.footer_action_button(
+                                    "user-row-sync-progress",
+                                    icons::GLOBAL,
+                                    theme,
+                                )
+                                .opacity(0.5),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(action, Some(AccountMenuAction::RestartPending)),
+                        |row| {
+                            row.child(
+                                self.footer_action_button(
+                                    "user-row-sync-restart",
+                                    icons::RESTART,
+                                    theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.reopen_sync_notice(cx);
+                                })),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(action, Some(AccountMenuAction::SignOut)),
+                        |row| {
+                            row.child(
+                                self.footer_action_button(
+                                    "user-row-sign-out",
+                                    icons::LOGOUT_2,
+                                    theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.request_sign_out(cx);
+                                })),
+                            )
+                        },
+                    ),
+            );
+        // Keep the footer compact: the action strip has no identity popover
+        // and occupies the leading slot directly.
         trigger.into_any_element()
     }
 
@@ -8062,14 +7905,6 @@ mod tests {
     #[test]
     fn pane_resize_hitboxes_yield_the_titlebar_chrome() {
         assert_eq!(PANE_RESIZE_HITBOX_TOP, Theme::TITLEBAR_HEIGHT);
-    }
-
-    #[test]
-    fn new_session_action_lives_in_the_titlebar_only_when_useful() {
-        assert_eq!(titlebar_new_session_alpha(true, true), 1.0);
-        assert_eq!(titlebar_new_session_alpha(true, false), 0.0);
-        assert_eq!(titlebar_new_session_alpha(false, true), 0.0);
-        assert_eq!(titlebar_new_session_alpha(false, false), 0.0);
     }
 
     #[test]
