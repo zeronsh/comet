@@ -4102,11 +4102,6 @@ impl Shell {
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (user, workspace_scope) = {
-            let state = self.state.read(cx);
-            (state.auth_user().cloned(), state.workspace_scope)
-        };
-
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
@@ -4186,28 +4181,7 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let (user_line, trigger_subline) = match workspace_scope {
-            Some(WorkspaceScope::Local) => {
-                let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
-                    "Sync ready after restart"
-                } else {
-                    "Local only"
-                };
-                (line.into(), None)
-            }
-            Some(WorkspaceScope::Development) => (
-                "Development".into(),
-                Some("Local development runtime".into()),
-            ),
-            Some(WorkspaceScope::Synced) | None => {
-                let line: SharedString = user
-                    .as_ref()
-                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
-                (line, Some("Alpha".into()))
-            }
-        };
-        let user_menu = self.render_user_menu(user_line.clone(), trigger_subline, theme, cx);
+        let footer_actions = self.render_footer_actions(theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -4502,7 +4476,7 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(footer_actions))
             .into_any_element()
     }
 
@@ -4682,25 +4656,14 @@ impl Shell {
             )))
     }
 
-    fn render_user_menu(
-        &mut self,
-        user_line: SharedString,
-        trigger_subline: Option<SharedString>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_footer_actions(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Bottom-of-sidebar identity: avatar circle + scope/account label and
-        // its secondary status line. Actions are kept on this row so the
-        // footer never opens a second, overlapping menu.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
+        // The footer is an action strip only. The local identity/avatar block
+        // was taking the leading space while duplicating information available
+        // elsewhere in the shell; keep the controls together at the leading
+        // edge of the strip instead.
         let trigger = div()
-            .id("user-menu")
+            .id("sidebar-footer-actions")
             .flex_none()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
@@ -4708,59 +4671,15 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
-            .on_hover(motion::hover_listener("user-menu-trigger"))
+            .on_hover(motion::hover_listener("sidebar-footer-actions"))
             .bg(motion::hover_blend(
-                "user-menu-trigger",
+                "sidebar-footer-actions",
                 theme.glass_hover().opacity(0.0),
                 theme.glass_hover().opacity(0.8),
             ))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
-            )
-            .child(
-                // Name with an optional status line underneath — no chip on the right.
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .when_some(trigger_subline, |identity, subline| {
-                        identity.child(
-                            div()
-                                .text_size(px(11.0))
-                                .line_height(px(15.0))
-                                .text_color(theme.text_muted)
-                                .child(subline),
-                        )
-                    }),
-            )
-            .child(
-                // Quick actions live on the row itself: Pull Requests, Enable
-                // sync (local scope only), and Settings. Each stops
-                // propagation so tapping one never toggles the identity
-                // popup above.
+                // Keep Pull Requests, sync, and Settings together in the
+                // leading slot previously occupied by the identity block.
                 div()
                     .flex_none()
                     .flex()
@@ -4851,8 +4770,8 @@ impl Shell {
                         })),
                     ),
             );
-        // Keep the footer compact: actions live beside the identity instead
-        // of being duplicated in a popover above it.
+        // Keep the footer compact: the action strip has no identity popover
+        // and occupies the leading slot directly.
         trigger.into_any_element()
     }
 
