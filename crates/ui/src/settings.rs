@@ -46,6 +46,120 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 
 const FILE_NAME: &str = "ui-settings.json";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GitHistoryColumns {
+    pub author: bool,
+    pub date: bool,
+    pub sha: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistoryColumn {
+    Author,
+    Date,
+    Sha,
+}
+
+/// Stable order for the optional Git History columns. Hidden columns remain in
+/// the sequence so showing one again restores the position chosen by the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GitHistoryColumnOrder(pub Vec<GitHistoryColumn>);
+
+impl GitHistoryColumnOrder {
+    pub fn normalized(mut self) -> Self {
+        let mut columns = Vec::with_capacity(3);
+        for column in self.0.drain(..) {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        for column in [
+            GitHistoryColumn::Author,
+            GitHistoryColumn::Date,
+            GitHistoryColumn::Sha,
+        ] {
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        Self(columns)
+    }
+}
+
+impl Default for GitHistoryColumnOrder {
+    fn default() -> Self {
+        Self(vec![
+            GitHistoryColumn::Author,
+            GitHistoryColumn::Date,
+            GitHistoryColumn::Sha,
+        ])
+    }
+}
+
+/// Persisted widths for the fixed Git History data columns. The commit column
+/// remains elastic and occupies the space left after these columns and the
+/// topology graph, so resizing its first divider adjusts the adjacent column.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GitHistoryColumnWidths {
+    pub author: f32,
+    pub date: f32,
+    pub sha: f32,
+}
+
+impl GitHistoryColumnWidths {
+    pub const AUTHOR_MIN: f32 = 44.0;
+    pub const AUTHOR_MAX: f32 = 220.0;
+    pub const DATE_MIN: f32 = 68.0;
+    pub const DATE_MAX: f32 = 180.0;
+    pub const SHA_MIN: f32 = 58.0;
+    pub const SHA_MAX: f32 = 140.0;
+
+    pub fn clamped(mut self) -> Self {
+        let defaults = Self::default();
+        self.author = clamp_or(
+            self.author,
+            Self::AUTHOR_MIN,
+            Self::AUTHOR_MAX,
+            defaults.author,
+        );
+        self.date = clamp_or(self.date, Self::DATE_MIN, Self::DATE_MAX, defaults.date);
+        self.sha = clamp_or(self.sha, Self::SHA_MIN, Self::SHA_MAX, defaults.sha);
+        self
+    }
+}
+
+impl Default for GitHistoryColumnWidths {
+    fn default() -> Self {
+        Self {
+            author: 88.0,
+            date: 88.0,
+            sha: 74.0,
+        }
+    }
+}
+
+impl Default for GitHistoryColumns {
+    fn default() -> Self {
+        Self {
+            author: true,
+            date: true,
+            sha: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistoryAuthorDisplay {
+    #[default]
+    Avatar,
+    Name,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -97,6 +211,14 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Optional columns shown in every Git History pane.
+    pub git_history_columns: GitHistoryColumns,
+    /// User-adjusted widths for the resizable Git History columns.
+    pub git_history_column_widths: GitHistoryColumnWidths,
+    /// User-selected order for the optional Git History columns.
+    pub git_history_column_order: GitHistoryColumnOrder,
+    /// How authors are represented in Git History rows.
+    pub git_history_author_display: GitHistoryAuthorDisplay,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
 }
@@ -121,6 +243,10 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            git_history_columns: GitHistoryColumns::default(),
+            git_history_column_widths: GitHistoryColumnWidths::default(),
+            git_history_column_order: GitHistoryColumnOrder::default(),
+            git_history_author_display: GitHistoryAuthorDisplay::default(),
             diff_split: false,
         }
     }
@@ -318,6 +444,8 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.git_history_column_widths = self.git_history_column_widths.clamped();
+        self.git_history_column_order = self.git_history_column_order.normalized();
         self
     }
 
@@ -398,6 +526,22 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            git_history_columns: GitHistoryColumns {
+                author: false,
+                date: true,
+                sha: false,
+            },
+            git_history_column_widths: GitHistoryColumnWidths {
+                author: 132.0,
+                date: 104.0,
+                sha: 82.0,
+            },
+            git_history_column_order: GitHistoryColumnOrder(vec![
+                GitHistoryColumn::Sha,
+                GitHistoryColumn::Author,
+                GitHistoryColumn::Date,
+            ]),
+            git_history_author_display: GitHistoryAuthorDisplay::Name,
             diff_split: true,
         };
         settings.save(dir.path()).unwrap();
@@ -427,6 +571,26 @@ mod tests {
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
         );
+        assert_eq!(
+            loaded.git_history_columns,
+            GitHistoryColumns::default(),
+            "pre-column files show the complete History table"
+        );
+        assert_eq!(
+            loaded.git_history_column_widths,
+            GitHistoryColumnWidths::default(),
+            "pre-resize files use the original History column widths"
+        );
+        assert_eq!(
+            loaded.git_history_column_order,
+            GitHistoryColumnOrder::default(),
+            "pre-reorder files use the original History column order"
+        );
+        assert_eq!(
+            loaded.git_history_author_display,
+            GitHistoryAuthorDisplay::Avatar,
+            "pre-author-display files default to avatars"
+        );
     }
 
     #[test]
@@ -448,6 +612,37 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+    }
+
+    #[test]
+    fn git_history_column_widths_are_clamped_and_nan_heals() {
+        let widths = GitHistoryColumnWidths {
+            author: 10_000.0,
+            date: f32::NAN,
+            sha: 1.0,
+        }
+        .clamped();
+        assert_eq!(widths.author, GitHistoryColumnWidths::AUTHOR_MAX);
+        assert_eq!(widths.date, GitHistoryColumnWidths::default().date);
+        assert_eq!(widths.sha, GitHistoryColumnWidths::SHA_MIN);
+    }
+
+    #[test]
+    fn git_history_column_order_deduplicates_and_restores_missing_columns() {
+        let order = GitHistoryColumnOrder(vec![
+            GitHistoryColumn::Sha,
+            GitHistoryColumn::Sha,
+            GitHistoryColumn::Author,
+        ])
+        .normalized();
+        assert_eq!(
+            order,
+            GitHistoryColumnOrder(vec![
+                GitHistoryColumn::Sha,
+                GitHistoryColumn::Author,
+                GitHistoryColumn::Date,
+            ])
+        );
     }
 
     #[test]

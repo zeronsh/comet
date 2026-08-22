@@ -146,8 +146,13 @@ pub fn run_app(config: UiConfig) {
         // final one on the very first frame, or the window flashes the wrong
         // palette while settings load.
         let data_dir = config.boot().data_dir.clone();
-        appearance::init(
-            settings::UiSettings::load(&data_dir).appearance,
+        let ui_settings = settings::UiSettings::load(&data_dir);
+        appearance::init(ui_settings.appearance, data_dir.clone(), cx);
+        history::init(
+            ui_settings.git_history_columns,
+            ui_settings.git_history_column_widths,
+            ui_settings.git_history_column_order,
+            ui_settings.git_history_author_display,
             data_dir,
             cx,
         );
