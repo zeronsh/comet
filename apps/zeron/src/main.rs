@@ -31,6 +31,9 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
+    #[cfg(target_os = "linux")]
+    /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
+    Appshot,
     /// Manage `zeron headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -168,6 +171,11 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+        }
+        #[cfg(target_os = "linux")]
+        Some(Command::Appshot) => {
+            zeron_ui::appshots::request_running_appshot(&engine_config_from_env().data_dir)
+                .map_err(anyhow::Error::msg)
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;

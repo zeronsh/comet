@@ -8,7 +8,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::appshots::{AppshotDestination, PermissionState};
+use crate::appshots::{AppshotCapabilities, AppshotDestination, CapabilityState};
 use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -54,9 +54,9 @@ pub struct ShortcutsPage {
     focus: FocusHandle,
     appshots_enabled: bool,
     appshot_destination: AppshotDestination,
-    appshot_permissions: PermissionState,
-    screen_recording_prompted: bool,
-    accessibility_prompted: bool,
+    appshot_capabilities: AppshotCapabilities,
+    capture_access_prompted: bool,
+    semantic_access_prompted: bool,
     // The page never talks RPC; state is kept for parity with sibling pages
     // (and future per-device keymaps).
     _state: Entity<AppState>,
@@ -79,9 +79,9 @@ impl ShortcutsPage {
             focus: cx.focus_handle(),
             appshots_enabled,
             appshot_destination,
-            appshot_permissions: crate::appshots::permission_state(),
-            screen_recording_prompted: false,
-            accessibility_prompted: false,
+            appshot_capabilities: crate::appshots::capabilities(),
+            capture_access_prompted: false,
+            semantic_access_prompted: false,
             _state: state,
         }
     }
@@ -162,12 +162,12 @@ fn description(id: ShortcutId) -> &'static str {
 impl Render for ShortcutsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
-        self.appshot_permissions = crate::appshots::permission_state();
+        self.appshot_capabilities = crate::appshots::capabilities();
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let customized = self.keymap != KeymapConfig::default();
         let appshots_enabled = self.appshots_enabled;
-        let permissions = self.appshot_permissions;
+        let capabilities = self.appshot_capabilities;
 
         let rows = ShortcutId::ALL.into_iter().enumerate().map(|(ix, id)| {
             let combo = self.keymap.get(id).to_string();
@@ -312,12 +312,12 @@ impl Render for ShortcutsPage {
                         }))
                         .child(SharedString::from(destination.label()))
                 });
-        let screen_action: SharedString = if self.screen_recording_prompted {
+        let capture_action: SharedString = if self.capture_access_prompted {
             "Open System Settings".into()
         } else {
             "Allow".into()
         };
-        let accessibility_action: SharedString = if self.accessibility_prompted {
+        let semantic_action: SharedString = if self.semantic_access_prompted {
             "Open System Settings".into()
         } else {
             "Enable text capture".into()
@@ -402,7 +402,7 @@ impl Render for ShortcutsPage {
                             .child(
                                 widgets::page_subtitle(
                                     &theme,
-                                    "Set up once, one permission at a time. Screen Recording captures the window; Accessibility optionally adds off-screen application text.",
+                                    capabilities.setup_description(),
                                 )
                                 .max_w(px(560.0))
                                 .line_height(px(20.0)),
@@ -419,11 +419,11 @@ impl Render for ShortcutsPage {
                                             .min_w_0()
                                             .flex()
                                             .flex_col()
-                                            .child(widgets::row_title(&theme, "Capture Appshots"))
-                                            .child(widgets::meta_line(
-                                                &theme,
-                                                vec![div().child(SharedString::from("Global shortcut: Control-Option-Space (⌃⌥Space). Captures are staged, never sent automatically.")).into_any_element()],
-                                            )),
+                                    .child(widgets::row_title(&theme, "Capture Appshots"))
+                                    .child(widgets::meta_line(
+                                        &theme,
+                                        vec![div().child(SharedString::from("Captures are staged for review and never sent automatically.")).into_any_element()],
+                                    )),
                                     )
                                     .child(
                                         widgets::toggle_switch(&theme, appshots_enabled)
@@ -434,6 +434,52 @@ impl Render for ShortcutsPage {
                                                 this.commit_appshots(cx);
                                                 cx.notify();
                                             })),
+                                    ),
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::KEYBOARD))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Global shortcut",
+                                                    ))
+                                                    .child(if capabilities.global_shortcut
+                                                        == CapabilityState::Ready
+                                                    {
+                                                        widgets::badge_active(
+                                                            &theme,
+                                                            capabilities.global_shortcut.badge(),
+                                                        )
+                                                    } else {
+                                                        widgets::badge(
+                                                            &theme,
+                                                            capabilities.global_shortcut.badge(),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div()
+                                                    .child(SharedString::from(format!(
+                                                        "{} · {}",
+                                                        capabilities.shortcut_label(),
+                                                        capabilities.shortcut_description()
+                                                    )))
+                                                    .into_any_element()],
+                                            )),
                                     ),
                             )
                             .child(
@@ -478,36 +524,53 @@ impl Render for ShortcutsPage {
                                                     .gap(px(8.0))
                                                     .child(widgets::row_title(
                                                         &theme,
-                                                        "Screen Recording",
+                                                        "Active-window capture",
                                                     ))
-                                                    .child(if permissions.screen_recording {
-                                                        widgets::badge_active(&theme, "Ready")
+                                                    .child(if capabilities.window_capture
+                                                        == CapabilityState::Ready
+                                                    {
+                                                        widgets::badge_active(
+                                                            &theme,
+                                                            capabilities.window_capture.badge(),
+                                                        )
                                                     } else {
-                                                        widgets::badge(&theme, "Required")
+                                                        widgets::badge(
+                                                            &theme,
+                                                            capabilities.window_capture.badge(),
+                                                        )
                                                     }),
                                             )
                                             .child(widgets::meta_line(
                                                 &theme,
-                                                vec![div().child(SharedString::from("Allows Zeron to capture the frontmost window. macOS may ask you to quit and reopen Zeron once.")).into_any_element()],
+                                                vec![div().child(SharedString::from(capabilities.capture_description())).into_any_element()],
                                             )),
                                     )
-                                    .when(appshots_enabled && !permissions.screen_recording, |el| {
+                                    .when(
+                                        appshots_enabled
+                                            && capabilities.window_capture
+                                                == CapabilityState::PermissionRequired
+                                            && crate::appshots::capture_settings_url().is_some(),
+                                        |el| {
                                         el.child(
                                             widgets::ghost_action(&theme)
-                                                .id("appshots-screen-recording")
+                                                .id("appshots-capture-access")
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    if this.screen_recording_prompted {
-                                                        cx.open_url(crate::appshots::SCREEN_RECORDING_SETTINGS_URL);
+                                                    if this.capture_access_prompted {
+                                                        if let Some(url) = crate::appshots::capture_settings_url() {
+                                                            cx.open_url(url);
+                                                        }
                                                     } else {
-                                                        this.screen_recording_prompted = true;
-                                                        this.appshot_permissions = crate::appshots::request_screen_recording_permission();
+                                                        this.capture_access_prompted = true;
+                                                        crate::appshots::request_capture_access();
+                                                        this.appshot_capabilities = crate::appshots::capabilities();
                                                     }
                                                     cx.notify();
                                                 }))
-                                                .child(screen_action),
+                                                .child(capture_action),
                                         )
-                                    })
+                                    },
+                                    )
                             )
                             .child(
                                 widgets::card_row(&theme, false)
@@ -529,39 +592,57 @@ impl Render for ShortcutsPage {
                                                         &theme,
                                                         "Application text",
                                                     ))
-                                                    .child(if permissions.accessibility {
-                                                        widgets::badge_active(&theme, "Ready")
+                                                    .child(if capabilities.application_text
+                                                        == CapabilityState::Ready
+                                                    {
+                                                        widgets::badge_active(
+                                                            &theme,
+                                                            capabilities.application_text.badge(),
+                                                        )
                                                     } else {
-                                                        widgets::badge(&theme, "Optional")
+                                                        widgets::badge(
+                                                            &theme,
+                                                            capabilities.application_text.badge(),
+                                                        )
                                                     }),
                                             )
                                             .child(widgets::meta_line(
                                                 &theme,
-                                                vec![div().child(SharedString::from("Accessibility adds visible and off-screen application text. Screenshots work without it.")).into_any_element()],
+                                                vec![div().child(SharedString::from(capabilities.semantic_description())).into_any_element()],
                                             )),
                                     )
-                                    .when(appshots_enabled && !permissions.accessibility, |el| {
+                                    .when(
+                                        appshots_enabled
+                                            && capabilities.application_text
+                                                == CapabilityState::PermissionRequired
+                                            && crate::appshots::semantic_settings_url().is_some(),
+                                        |el| {
                                         el.child(
                                             widgets::ghost_action(&theme)
-                                                .id("appshots-accessibility")
+                                                .id("appshots-semantic-access")
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(|this, _, _, cx| {
-                                                    if this.accessibility_prompted {
-                                                        cx.open_url(crate::appshots::ACCESSIBILITY_SETTINGS_URL);
+                                                    if this.semantic_access_prompted {
+                                                        if let Some(url) = crate::appshots::semantic_settings_url() {
+                                                            cx.open_url(url);
+                                                        }
                                                     } else {
-                                                        this.accessibility_prompted = true;
-                                                        this.appshot_permissions = crate::appshots::request_accessibility_permission();
+                                                        this.semantic_access_prompted = true;
+                                                        crate::appshots::request_semantic_access();
+                                                        this.appshot_capabilities = crate::appshots::capabilities();
                                                     }
                                                     cx.notify();
                                                 }))
-                                                .child(accessibility_action),
+                                                .child(semantic_action),
                                         )
-                                    })
+                                    },
+                                    )
                             )
                             .when(
                                 appshots_enabled
-                                    && !(permissions.screen_recording
-                                        && permissions.accessibility),
+                                    && !(capabilities.global_shortcut.is_ready()
+                                        && capabilities.window_capture.is_ready()
+                                        && capabilities.application_text.is_ready()),
                                 |card| {
                                     card.child(
                                         widgets::card_row(&theme, false)
@@ -571,14 +652,14 @@ impl Render for ShortcutsPage {
                                                     .flex_1()
                                                     .text_size(px(11.5))
                                                     .text_color(theme.text_muted.opacity(0.65))
-                                                    .child(SharedString::from("Changed a permission in System Settings? Return here and check again.")),
+                                                    .child(SharedString::from("Changed a permission or desktop shortcut setting? Return here and check again.")),
                                             )
                                             .child(
                                                 widgets::ghost_action(&theme)
                                                     .id("appshots-refresh-permissions")
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.appshot_permissions = crate::appshots::permission_state();
+                                                        this.appshot_capabilities = crate::appshots::capabilities();
                                                         cx.notify();
                                                     }))
                                                     .child(SharedString::from("Check again")),

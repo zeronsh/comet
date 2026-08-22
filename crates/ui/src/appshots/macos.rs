@@ -25,7 +25,11 @@ use objc::rc::autoreleasepool;
 use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 
-use super::{AccessibilitySnapshot, CaptureError, CapturedAppshot, PermissionState};
+use super::{
+    ACCESSIBILITY_SETTINGS_URL, AccessibilitySnapshot, AppshotBackend, AppshotCapabilities,
+    AppshotPlatform, CapabilityState, CaptureError, CaptureTarget, CapturedAppshot,
+    SCREEN_RECORDING_SETTINGS_URL,
+};
 use crate::attachments::{self, StagedAttachment};
 
 const SPACE_KEYCODE: u32 = 49;
@@ -113,14 +117,57 @@ struct FrontmostWindow {
     title: Option<String>,
 }
 
-pub(super) fn permission_state() -> PermissionState {
-    PermissionState {
-        screen_recording: ScreenCaptureAccess.preflight(),
-        accessibility: unsafe { AXIsProcessTrusted() },
+pub struct MacOsBackend;
+
+#[async_trait::async_trait]
+impl AppshotBackend for MacOsBackend {
+    fn capabilities(&self) -> AppshotCapabilities {
+        AppshotCapabilities {
+            platform: AppshotPlatform::MacOs,
+            global_shortcut: CapabilityState::Ready,
+            window_capture: if ScreenCaptureAccess.preflight() {
+                CapabilityState::Ready
+            } else {
+                CapabilityState::PermissionRequired
+            },
+            application_text: if unsafe { AXIsProcessTrusted() } {
+                CapabilityState::Ready
+            } else {
+                CapabilityState::PermissionRequired
+            },
+            target: CaptureTarget::ActiveWindow,
+        }
+    }
+
+    fn start_global_shortcut(
+        &self,
+        _activation_dir: &std::path::Path,
+    ) -> mpsc::UnboundedReceiver<()> {
+        start_global_shortcut()
+    }
+
+    async fn capture_active_window(&self) -> Result<CapturedAppshot, CaptureError> {
+        capture_frontmost_window()
+    }
+
+    fn request_capture_access(&self) {
+        request_screen_recording_permission();
+    }
+
+    fn request_semantic_access(&self) {
+        request_accessibility_permission();
+    }
+
+    fn capture_settings_url(&self) -> Option<&'static str> {
+        Some(SCREEN_RECORDING_SETTINGS_URL)
+    }
+
+    fn semantic_settings_url(&self) -> Option<&'static str> {
+        Some(ACCESSIBILITY_SETTINGS_URL)
     }
 }
 
-pub(super) fn request_accessibility_permission() -> PermissionState {
+fn request_accessibility_permission() {
     autoreleasepool(|| unsafe {
         let prompt_value = CFBoolean::true_value();
         let prompt: *mut Object = msg_send![class!(NSDictionary),
@@ -129,15 +176,13 @@ pub(super) fn request_accessibility_permission() -> PermissionState {
         ];
         let _ = AXIsProcessTrustedWithOptions(prompt.cast());
     });
-    permission_state()
 }
 
-pub(super) fn request_screen_recording_permission() -> PermissionState {
+fn request_screen_recording_permission() {
     let _ = ScreenCaptureAccess.request();
-    permission_state()
 }
 
-pub(super) fn start_global_shortcut() -> mpsc::UnboundedReceiver<()> {
+fn start_global_shortcut() -> mpsc::UnboundedReceiver<()> {
     let (tx, rx) = mpsc::unbounded();
     // Carbon's global-hotkey API consumes the chord, needs no input-monitoring
     // permission, and keeps working while another app owns keyboard focus.
@@ -201,15 +246,15 @@ unsafe extern "C" fn appshot_hot_key_handler(
     0
 }
 
-pub(super) fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError> {
+fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError> {
     autoreleasepool(|| {
         let app = frontmost_application()?;
         if app.pid == std::process::id() as i32 {
             return Err(CaptureError::NoEligibleWindow);
         }
         if !ScreenCaptureAccess.preflight() {
-            let state = request_screen_recording_permission();
-            return Err(CaptureError::PermissionRequired(state));
+            request_screen_recording_permission();
+            return Err(CaptureError::PermissionRequired);
         }
         let (window, png) = match capture_with_screen_capture_kit(app.pid) {
             Ok(Some(capture)) => capture,

@@ -4,7 +4,7 @@ Status: implemented on the exploration branch; native validation ongoing
 
 Branch: `wip/appshots-exploration`
 
-Scope: desktop Zeron, macOS-first
+Scope: desktop Zeron on macOS, Windows, Linux X11, and Linux Wayland
 
 ## Summary
 
@@ -58,7 +58,7 @@ to Zeron, attach a file, and manually copy otherwise invisible text.
 - Automatically submitting a captured window to an agent.
 - Capturing from a headless or remote agent host.
 - OCR as the primary source of semantic context.
-- Linux support in the first platform slice.
+- Continuous recording or bypassing platform capture consent.
 - Replacing or changing the existing paperclip, paste, or drag-and-drop flows.
 
 ### User-visible behavior
@@ -163,8 +163,7 @@ and must not receive local desktop permissions.
 
 ### Native service
 
-Define a small platform-neutral Rust interface in the UI crate and implement it
-with a signed macOS helper initially:
+Define a small platform-neutral Rust interface in the UI crate:
 
 ```rust
 trait AppshotCaptureService {
@@ -173,6 +172,28 @@ trait AppshotCaptureService {
     async fn capture_frontmost_window(&self) -> Result<CapturedAppshot>;
 }
 ```
+
+The implementation uses platform backends with independent capability states:
+
+```text
+appshots/
+├── macos.rs
+├── windows.rs
+└── linux/
+    ├── mod.rs
+    ├── portal.rs
+    ├── x11.rs
+    └── atspi.rs
+```
+
+Windows uses a system hotkey, foreground HWND, Windows Graphics Capture, and UI
+Automation. Linux chooses its shortcut backend at runtime: Wayland uses XDG
+Desktop Portal and X11 uses a passive key grab. Capture prefers the portal's
+Active Window target wherever it is advertised, then uses the portal picker on
+Wayland or EWMH plus direct drawable capture on X11. AT-SPI enrichment is
+optional and independent on both Linux paths. Capability reporting
+distinguishes ready, permission required, setup required, user selection,
+checking, and unavailable.
 
 The macOS capture module is responsible for:
 
@@ -366,11 +387,12 @@ content, with provenance and prompt-injection framing.
 - Draft/pending-capture recovery across window restoration failures.
 - Full failure and offline coverage.
 
-### Slice 4: polish and second platform
+### Slice 4: polish and additional platforms
 
 - Configurable shortcut, sound, and capture transition.
 - Accessibility disclosure/inspection UI.
 - Windows implementation using Windows Graphics Capture and UI Automation.
+- Wayland portal and X11 implementations with AT-SPI enrichment.
 
 ## Verification strategy
 
@@ -415,7 +437,8 @@ content, with provenance and prompt-injection framing.
 
 ## Recommended initial decisions
 
-- macOS first;
+- keep macOS as the reference experience while Windows and Linux mature behind
+  the same composer contract;
 - screenshot-only degradation is allowed and clearly labeled;
 - one shortcut invocation always captures the frontmost eligible window;
 - no automatic submission;

@@ -209,8 +209,7 @@ pub fn run_app(config: UiConfig) {
             boot: config.boot(),
         });
         open_main_window(state, config.boot(), cx);
-        #[cfg(target_os = "macos")]
-        start_appshot_service(cx);
+        start_appshot_service(config.boot().data_dir, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -302,9 +301,8 @@ fn open_main_window(
     handle
 }
 
-#[cfg(target_os = "macos")]
-fn start_appshot_service(cx: &mut App) {
-    let mut shortcuts = appshots::start_global_shortcut();
+fn start_appshot_service(activation_dir: std::path::PathBuf, cx: &mut App) {
+    let mut shortcuts = appshots::start_global_shortcut(activation_dir);
     cx.spawn(async move |cx| {
         while shortcuts.next().await.is_some() {
             if !appshots::enabled() {
@@ -312,7 +310,7 @@ fn start_appshot_service(cx: &mut App) {
             }
             let capture = cx
                 .background_executor()
-                .spawn(async { appshots::capture_frontmost_window() })
+                .spawn(async { appshots::capture_active_window().await })
                 .await;
             cx.update(|cx| deliver_appshot(capture, cx));
         }
@@ -320,7 +318,6 @@ fn start_appshot_service(cx: &mut App) {
     .detach();
 }
 
-#[cfg(target_os = "macos")]
 fn deliver_appshot(
     result: Result<appshots::CapturedAppshot, appshots::CaptureError>,
     cx: &mut App,

@@ -20,7 +20,7 @@ checksum = "1e8c61bee90b42a772d39d06a740207dc71a4e780004ace1db8d99fb1baaa954"
 dependencies = [
  "accesskit",
  "accesskit_consumer 0.36.0",
- "atspi-common",
+ "atspi-common 0.13.0",
  "phf",
  "serde",
  "zvariant",
@@ -81,7 +81,7 @@ dependencies = [
  "async-channel",
  "async-executor",
  "async-task",
- "atspi",
+ "atspi 0.29.0",
  "futures-lite",
  "futures-util",
  "serde",
@@ -553,8 +553,19 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c77886257be21c9cd89a4ae7e64860c6f0eefca799bb79127913052bd0eefb3d"
 dependencies = [
- "atspi-common",
- "atspi-proxies",
+ "atspi-common 0.13.0",
+ "atspi-proxies 0.13.0",
+]
+
+[[package]]
+name = "atspi"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bf601cccedfffec598ec2db1f9d6745885458bccc0e8916d7023f017c94b3d0"
+dependencies = [
+ "atspi-common 0.14.0",
+ "atspi-connection",
+ "atspi-proxies 0.14.0",
 ]
 
 [[package]]
@@ -574,12 +585,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "atspi-common"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8a79bed3f5b408ce3152f36e07327a845e6ed5d7e2821a89264037dbcc11daf"
+dependencies = [
+ "enumflags2",
+ "serde",
+ "static_assertions",
+ "zbus",
+ "zbus-lockstep",
+ "zbus-lockstep-macros",
+ "zbus_names",
+ "zvariant",
+]
+
+[[package]]
+name = "atspi-connection"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fab8e4f574f5a7d3af280b38eff25fb6f47a537dac9ae39ce152f52b19fb10b"
+dependencies = [
+ "atspi-common 0.14.0",
+ "atspi-proxies 0.14.0",
+ "futures-lite",
+ "zbus",
+]
+
+[[package]]
 name = "atspi-proxies"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2230e48787ed3eb4088996eab66a32ca20c0b67bbd4fd6cdfe79f04f1f04c9fc"
 dependencies = [
- "atspi-common",
+ "atspi-common 0.13.0",
+ "serde",
+ "zbus",
+]
+
+[[package]]
+name = "atspi-proxies"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53403acd3ab2fdb5914f6558da22e540fc07656fce5510f8c02be0e6ef68413e"
+dependencies = [
+ "atspi-common 0.14.0",
  "serde",
  "zbus",
 ]
@@ -2572,7 +2622,7 @@ dependencies = [
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "x11-clipboard",
- "x11rb",
+ "x11rb 0.13.2",
  "xkbcommon",
  "zed-scap",
  "zed-xim",
@@ -8783,7 +8833,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "662d74b3d77e396b8e5beb00b9cad6a9eccf40b2ef68cc858784b14c41d535a3"
 dependencies = [
  "libc",
- "x11rb",
+ "x11rb 0.13.2",
 ]
 
 [[package]]
@@ -8796,8 +8846,19 @@ dependencies = [
  "gethostname",
  "libc",
  "rustix 1.1.4",
- "x11rb-protocol",
+ "x11rb-protocol 0.13.2",
  "xcursor",
+]
+
+[[package]]
+name = "x11rb"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a8885a854a8bfdf87a301e53e41b17c5f8f33639903131338b997b1eb614f44"
+dependencies = [
+ "gethostname",
+ "rustix 1.1.4",
+ "x11rb-protocol 0.14.0",
 ]
 
 [[package]]
@@ -8805,6 +8866,12 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x11rb-protocol"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
 
 [[package]]
 name = "xcb"
@@ -9078,7 +9145,7 @@ dependencies = [
  "ahash",
  "hashbrown 0.14.5",
  "log",
- "x11rb",
+ "x11rb 0.13.2",
  "xim-ctext",
  "xim-parser",
 ]
@@ -9347,7 +9414,9 @@ version = "0.2.27"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "ashpd",
  "async-trait",
+ "atspi 0.30.0",
  "base64",
  "block",
  "chrono",
@@ -9359,6 +9428,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "objc",
+ "png 0.18.1",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -9368,7 +9438,11 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-segmentation",
+ "url",
  "uuid",
+ "windows 0.62.2",
+ "windows-capture",
+ "x11rb 0.14.0",
  "zeron-doc",
  "zeron-engine",
  "zeron-harness",

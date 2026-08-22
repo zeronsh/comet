@@ -131,3 +131,29 @@ Tier 2: compile and test the affected Rust UI crate, then visually inspect the s
 - Verification tier: pure PNG/aspect-ratio tests, full `zeron-ui` unit suite,
   macOS build checks, and native composer inspection with landscape and
   portrait captures.
+
+## 2026-08-22 — Windows and Linux Appshots
+
+- Product goal: extend the existing capture-to-composer contract to Windows,
+  Linux X11, and Linux Wayland without presenting their security models as if
+  they were macOS permissions.
+- Visible output and editable entities are unchanged after capture. Settings
+  now inventory three workflow capabilities: global invocation, window capture
+  (including whether selection is required), and semantic application text.
+- Backend decision: a UI-side `AppshotBackend` owns native initiation and
+  capture. Linux selects Wayland portal or X11 at runtime; AT-SPI enrichment is
+  independent so screenshot-only Appshots remain useful.
+- Windows decision: use a thread-owned `RegisterHotKey`, foreground HWND,
+  Windows Graphics Capture, and bounded UI Automation. Do not request the
+  security-sensitive `UIAccess` privilege.
+- Wayland decision: probe portal versions and advertised targets. Prefer
+  Active Window; fall back to the portal window picker. Prefer the Global
+  Shortcuts portal and expose `zeron appshot` for system-managed shortcut
+  configuration when the portal is absent.
+- X11 decision: prefer a portal-advertised Active Window target, then use
+  `_NET_ACTIVE_WINDOW`, a passive key grab, direct drawable capture, EWMH
+  process/name/icon metadata, and the same optional AT-SPI layer.
+- Persistence, transport, composer controls, export, layers, and timeline are
+  unchanged. Verification combines pure platform parsing tests, host checks,
+  cross-target compilation where available, and native Windows/GNOME/KDE/X11
+  release matrices.

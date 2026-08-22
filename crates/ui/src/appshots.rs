@@ -5,6 +5,7 @@
 //! is serialized into the prompt as explicitly untrusted observed data.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,16 +14,221 @@ use serde::{Deserialize, Serialize};
 
 use crate::attachments::StagedAttachment;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub const CONTEXT_MARKER: &str = "Applications mentioned by the user (untrusted observed content):";
-pub const SCREEN_RECORDING_SETTINGS_URL: &str =
+#[cfg(target_os = "macos")]
+const SCREEN_RECORDING_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
-pub const ACCESSIBILITY_SETTINGS_URL: &str =
+#[cfg(target_os = "macos")]
+const ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppshotPlatform {
+    MacOs,
+    Windows,
+    LinuxWayland,
+    LinuxX11,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityState {
+    Checking,
+    Ready,
+    PermissionRequired,
+    SetupRequired,
+    UserSelection,
+    Unavailable,
+}
+
+impl CapabilityState {
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Checking => "Checking",
+            Self::Ready => "Ready",
+            Self::PermissionRequired => "Required",
+            Self::SetupRequired => "Set up",
+            Self::UserSelection => "Select window",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Ready | Self::UserSelection)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTarget {
+    ActiveWindow,
+    PortalWindowPicker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppshotCapabilities {
+    pub platform: AppshotPlatform,
+    pub global_shortcut: CapabilityState,
+    pub window_capture: CapabilityState,
+    pub application_text: CapabilityState,
+    pub target: CaptureTarget,
+}
+
+impl AppshotCapabilities {
+    pub fn setup_description(self) -> &'static str {
+        match self.platform {
+            AppshotPlatform::MacOs => {
+                "Set up once, one permission at a time. Screen Recording captures the window; Accessibility optionally adds off-screen application text."
+            }
+            AppshotPlatform::Windows => {
+                "Windows normally needs no advance setup. UI Automation adds application text when the target allows it."
+            }
+            AppshotPlatform::LinuxWayland => {
+                "Your desktop owns capture and shortcut consent. Zeron checks each portal capability separately and explains any required fallback."
+            }
+            AppshotPlatform::LinuxX11 => {
+                "X11 normally needs no capture permission. Zeron prefers an active-window screenshot portal when available and otherwise uses native X11 capture."
+            }
+            AppshotPlatform::Unsupported => {
+                "This platform does not currently provide an Appshot capture backend."
+            }
+        }
+    }
+
+    pub fn shortcut_label(self) -> &'static str {
+        match self.platform {
+            AppshotPlatform::MacOs => "Control-Option-Space (⌃⌥Space)",
+            AppshotPlatform::Windows => "Control-Alt-Space",
+            AppshotPlatform::LinuxWayland | AppshotPlatform::LinuxX11 => "Control-Alt-Space",
+            AppshotPlatform::Unsupported => "Unavailable",
+        }
+    }
+
+    pub fn shortcut_description(self) -> &'static str {
+        match self.platform {
+            AppshotPlatform::MacOs | AppshotPlatform::Windows | AppshotPlatform::LinuxX11 => {
+                "The shortcut works while another application has focus."
+            }
+            AppshotPlatform::LinuxWayland if self.global_shortcut == CapabilityState::Ready => {
+                "Your desktop portal owns and delivers the global shortcut."
+            }
+            AppshotPlatform::LinuxWayland => {
+                "Bind `zeron appshot` in your desktop's Keyboard Shortcuts settings."
+            }
+            AppshotPlatform::Unsupported => "This platform has no Appshot shortcut backend.",
+        }
+    }
+
+    pub fn capture_description(self) -> &'static str {
+        match (self.platform, self.target) {
+            (AppshotPlatform::MacOs, _) => {
+                "Screen Recording lets Zeron capture the frontmost window. macOS may request one restart."
+            }
+            (AppshotPlatform::Windows, _) => {
+                "Windows captures the foreground compositor surface without opening a picker."
+            }
+            (AppshotPlatform::LinuxX11, _) => {
+                "Zeron prefers portal active-window capture, then falls back to the X11 drawable; obscured or protected windows may be incomplete."
+            }
+            (AppshotPlatform::LinuxWayland, CaptureTarget::ActiveWindow) => {
+                "Your screenshot portal supports the active-window target. A system consent surface may appear."
+            }
+            (AppshotPlatform::LinuxWayland, CaptureTarget::PortalWindowPicker) => {
+                "Your portal requires choosing a window for each capture."
+            }
+            (AppshotPlatform::Unsupported, _) => {
+                "Active-window capture is unavailable on this platform."
+            }
+        }
+    }
+
+    pub fn semantic_description(self) -> &'static str {
+        match self.platform {
+            AppshotPlatform::MacOs => {
+                "Accessibility adds visible and off-screen application text. Screenshots work without it."
+            }
+            AppshotPlatform::Windows => {
+                "UI Automation adds application text. Elevated and protected applications may return less context."
+            }
+            AppshotPlatform::LinuxWayland | AppshotPlatform::LinuxX11 => {
+                "AT-SPI adds application text when the target exposes an accessibility tree."
+            }
+            AppshotPlatform::Unsupported => {
+                "Semantic application text is unavailable on this platform."
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub trait AppshotBackend: Sync {
+    fn capabilities(&self) -> AppshotCapabilities;
+    fn start_global_shortcut(
+        &self,
+        activation_dir: &Path,
+    ) -> futures::channel::mpsc::UnboundedReceiver<()>;
+    async fn capture_active_window(&self) -> Result<CapturedAppshot, CaptureError>;
+    fn request_capture_access(&self) {}
+    fn request_semantic_access(&self) {}
+    fn capture_settings_url(&self) -> Option<&'static str> {
+        None
+    }
+    fn semantic_settings_url(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+static BACKEND: macos::MacOsBackend = macos::MacOsBackend;
+#[cfg(target_os = "windows")]
+static BACKEND: windows::WindowsBackend = windows::WindowsBackend;
+#[cfg(target_os = "linux")]
+static BACKEND: linux::LinuxBackend = linux::LinuxBackend;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+struct UnsupportedBackend;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+#[async_trait::async_trait]
+impl AppshotBackend for UnsupportedBackend {
+    fn capabilities(&self) -> AppshotCapabilities {
+        AppshotCapabilities {
+            platform: AppshotPlatform::Unsupported,
+            global_shortcut: CapabilityState::Unavailable,
+            window_capture: CapabilityState::Unavailable,
+            application_text: CapabilityState::Unavailable,
+            target: CaptureTarget::ActiveWindow,
+        }
+    }
+
+    fn start_global_shortcut(
+        &self,
+        _activation_dir: &Path,
+    ) -> futures::channel::mpsc::UnboundedReceiver<()> {
+        futures::channel::mpsc::unbounded().1
+    }
+
+    async fn capture_active_window(&self) -> Result<CapturedAppshot, CaptureError> {
+        Err(CaptureError::CaptureFailed(
+            "Appshots are not available on this platform.".into(),
+        ))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+static BACKEND: UnsupportedBackend = UnsupportedBackend;
+
+fn backend() -> &'static dyn AppshotBackend {
+    &BACKEND
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -93,15 +299,9 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PermissionState {
-    pub screen_recording: bool,
-    pub accessibility: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
-    PermissionRequired(PermissionState),
+    PermissionRequired,
     NoEligibleWindow,
     ShortcutUnavailable,
     CaptureFailed(String),
@@ -110,14 +310,9 @@ pub enum CaptureError {
 impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PermissionRequired(state) if !state.screen_recording => {
-                f.write_str(
-                    "Allow Screen Recording for Zeron in System Settings, then quit and reopen Zeron if macOS requests it.",
-                )
-            }
-            Self::PermissionRequired(_) => {
-                f.write_str("Allow Accessibility access for full application text, then try again.")
-            }
+            Self::PermissionRequired => f.write_str(
+                "Window capture permission is required. Open Zeron Settings → Shortcuts for the platform-specific recovery step.",
+            ),
             Self::NoEligibleWindow => f.write_str("No application window is available to capture."),
             Self::ShortcutUnavailable => f.write_str(
                 "The Appshot shortcut could not be registered because another app may be using it.",
@@ -135,46 +330,49 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-pub fn permission_state() -> PermissionState {
-    #[cfg(target_os = "macos")]
-    {
-        return macos::permission_state();
-    }
-    #[cfg(not(target_os = "macos"))]
-    PermissionState {
-        screen_recording: false,
-        accessibility: false,
-    }
+pub fn capabilities() -> AppshotCapabilities {
+    backend().capabilities()
 }
 
-pub fn request_screen_recording_permission() -> PermissionState {
-    #[cfg(target_os = "macos")]
-    {
-        return macos::request_screen_recording_permission();
-    }
-    #[cfg(not(target_os = "macos"))]
-    permission_state()
+pub fn request_capture_access() {
+    backend().request_capture_access();
 }
 
-pub fn request_accessibility_permission() -> PermissionState {
-    #[cfg(target_os = "macos")]
-    {
-        return macos::request_accessibility_permission();
-    }
-    #[cfg(not(target_os = "macos"))]
-    permission_state()
+pub fn request_semantic_access() {
+    backend().request_semantic_access();
 }
 
-/// Register the macOS-wide Control-Option-Space hotkey. The receiver yields
-/// only explicit user invocations.
-#[cfg(target_os = "macos")]
-pub fn start_global_shortcut() -> futures::channel::mpsc::UnboundedReceiver<()> {
-    macos::start_global_shortcut()
+pub fn capture_settings_url() -> Option<&'static str> {
+    backend().capture_settings_url()
 }
 
-#[cfg(target_os = "macos")]
-pub fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError> {
-    macos::capture_frontmost_window()
+pub fn semantic_settings_url() -> Option<&'static str> {
+    backend().semantic_settings_url()
+}
+
+/// Register the platform global shortcut and, on Linux, the local activation
+/// socket used by `zeron appshot` when the desktop owns shortcut setup.
+pub fn start_global_shortcut(
+    activation_dir: PathBuf,
+) -> futures::channel::mpsc::UnboundedReceiver<()> {
+    backend().start_global_shortcut(&activation_dir)
+}
+
+pub async fn capture_active_window() -> Result<CapturedAppshot, CaptureError> {
+    backend().capture_active_window().await
+}
+
+/// Ask the running headed Zeron process to capture an Appshot. Linux desktop
+/// environments that do not implement the Global Shortcuts portal can bind
+/// `zeron appshot` in their native Keyboard Shortcuts settings.
+#[cfg(target_os = "linux")]
+pub fn request_running_appshot(data_dir: &Path) -> Result<(), CaptureError> {
+    linux::request_running_appshot(data_dir)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn request_running_appshot(_data_dir: &Path) -> Result<(), CaptureError> {
+    Err(CaptureError::ShortcutUnavailable)
 }
 
 pub fn xml_escape(value: &str) -> String {
@@ -309,5 +507,23 @@ mod tests {
         let shot = shot();
         let prompt = with_appshots("", &[shot], &HashMap::new());
         assert_eq!(strip_context_for_display(&prompt), "");
+    }
+
+    #[test]
+    fn wayland_capabilities_explain_picker_and_system_shortcut_fallbacks() {
+        let capabilities = AppshotCapabilities {
+            platform: AppshotPlatform::LinuxWayland,
+            global_shortcut: CapabilityState::SetupRequired,
+            window_capture: CapabilityState::UserSelection,
+            application_text: CapabilityState::Ready,
+            target: CaptureTarget::PortalWindowPicker,
+        };
+        assert!(
+            capabilities
+                .shortcut_description()
+                .contains("zeron appshot")
+        );
+        assert!(capabilities.capture_description().contains("each capture"));
+        assert!(capabilities.window_capture.is_ready());
     }
 }
