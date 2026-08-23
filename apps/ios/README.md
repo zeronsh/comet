@@ -22,6 +22,16 @@ automatically): [loro-swift 1.13.x](https://github.com/loro-dev/loro-swift)
 (cmark-gfm: tables/strikethrough/tasklists — the same feature set as the
 desktop's pulldown-cmark config).
 
+## TestFlight release
+
+Run the **TestFlight** workflow from GitHub Actions on `main`. It compiles the
+iOS app and tests, selects the next numeric build number from App Store
+Connect, archives with automatic signing, uploads an internal-only TestFlight
+build, and waits for Apple processing to report `VALID`.
+
+The workflow uses the `AC_API_KEY_P8`, `AC_API_KEY_ID`, and
+`AC_API_ISSUER_ID` repository secrets.
+
 ### Connecting
 
 - **WorkOS**: enter the edge URL, open the sign-in page on any device, paste
