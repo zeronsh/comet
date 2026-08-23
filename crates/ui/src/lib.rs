@@ -322,6 +322,25 @@ fn deliver_appshot(
     result: Result<appshots::CapturedAppshot, appshots::CaptureError>,
     cx: &mut App,
 ) {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+
+    fn pending() -> &'static Mutex<VecDeque<appshots::CapturedAppshot>> {
+        static PENDING: OnceLock<Mutex<VecDeque<appshots::CapturedAppshot>>> = OnceLock::new();
+        PENDING.get_or_init(|| Mutex::new(VecDeque::new()))
+    }
+
+    let mut captures = pending()
+        .lock()
+        .map(|mut queue| queue.drain(..).collect::<VecDeque<_>>())
+        .unwrap_or_default();
+    let error = match result {
+        Ok(appshot) => {
+            captures.push_back(appshot);
+            None
+        }
+        Err(error) => Some(error),
+    };
     let handle = cx
         .window_stack()
         .unwrap_or_else(|| cx.windows())
@@ -336,15 +355,26 @@ fn deliver_appshot(
             ))
         });
     let Some(handle) = handle else {
-        tracing::warn!("Appshot captured but no Zeron window could be opened");
+        if !captures.is_empty() {
+            let count = captures.len();
+            if let Ok(mut queue) = pending().lock() {
+                queue.extend(captures);
+            }
+            tracing::warn!(
+                count,
+                "Appshot captured with no Zeron window; preserving it for the next delivery"
+            );
+        }
         return;
     };
     cx.activate(true);
     let _ = handle.update(cx, |shell, window, cx| {
         window.activate_window();
-        match result {
-            Ok(appshot) => shell.receive_appshot(appshot, window, cx),
-            Err(error) => shell.show_appshot_error(error.to_string(), window, cx),
+        for appshot in captures {
+            shell.receive_appshot(appshot, window, cx);
+        }
+        if let Some(error) = error {
+            shell.show_appshot_error(error.to_string(), window, cx);
         }
     });
 }

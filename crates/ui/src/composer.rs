@@ -409,6 +409,25 @@ pub const APPSHOT_IMAGE_MAX_WIDTH: f32 = 208.0;
 pub const APPSHOT_IMAGE_MAX_HEIGHT: f32 = 132.0;
 pub const APPSHOT_TILE_HEIGHT: f32 = 192.0;
 
+struct AppshotActionTooltip(SharedString);
+
+impl Render for AppshotActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.0.clone())
+    }
+}
+
 /// Fit any source window into the shared Appshot stage without cropping.
 /// Returning exact dimensions also prevents GPUI's native image layer from
 /// falling back to its intrinsic pixel size while the image is decoding.
@@ -3638,6 +3657,24 @@ impl Composer {
         appshot: CapturedAppshot,
         cx: &mut Context<Self>,
     ) {
+        let staged_bytes = self
+            .appshots
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|shot| shot.screenshot.bytes().len() as u64)
+            .sum::<u64>();
+        let incoming = appshot.screenshot.bytes().len() as u64;
+        if incoming > attachments::MAX_ATTACHMENT_BYTES
+            || staged_bytes.saturating_add(incoming) > appshots::MAX_STAGED_APPSHOT_BYTES
+        {
+            self.failure = Some(
+                "Remove an Appshot before adding another (96 MB staged Appshot limit).".into(),
+            );
+            self.failure_key = Some(key);
+            cx.notify();
+            return;
+        }
         self.appshots.entry(key).or_default().push(appshot);
         self.failure = None;
         self.failure_key = None;
@@ -3863,7 +3900,13 @@ impl Composer {
                 name: appshot.screenshot.name.clone().into(),
                 image: appshot.screenshot.image.clone(),
             };
+            let preview_on_key = preview.clone();
+            let preview_on_a11y = preview.clone();
+            let composer_for_preview = cx.entity().downgrade();
             let remove_id = appshot.id.clone();
+            let remove_on_key_id = remove_id.clone();
+            let remove_on_a11y_id = remove_id.clone();
+            let composer_for_remove = cx.entity().downgrade();
             let source: SharedString = appshot
                 .window_title
                 .as_deref()
@@ -3871,6 +3914,10 @@ impl Composer {
                 .map(str::to_owned)
                 .unwrap_or_else(|| appshot.app_name.clone())
                 .into();
+            let preview_label: SharedString = format!("Preview {source}").into();
+            let remove_label: SharedString = format!("Remove {source}").into();
+            let preview_aria = preview_label.clone();
+            let remove_aria = remove_label.clone();
             let (image_width, image_height) = appshot_contained_size(appshot.screenshot_dimensions);
             let mut card = div()
                 .id(("composer-appshot", ix))
@@ -3886,6 +3933,36 @@ impl Composer {
                 .overflow_hidden()
                 .cursor_pointer()
                 .hover(|style| style.bg(crate::theme::ink(0.045)))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| AppshotActionTooltip(preview_label.clone()))
+                        .into()
+                })
+                .role(gpui::Role::Button)
+                .aria_label(preview_aria)
+                .tab_index(0)
+                .focus_visible(|style| {
+                    style
+                        .bg(crate::theme::ink(0.06))
+                        .border_1()
+                        .border_color(theme.accent)
+                })
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        this.preview = Some(preview_on_key.clone());
+                        this.preview_focus_pending = true;
+                        cx.notify();
+                    }
+                }))
+                .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                    composer_for_preview
+                        .update(cx, |this, cx| {
+                            this.preview = Some(preview_on_a11y.clone());
+                            this.preview_focus_pending = true;
+                            cx.notify();
+                        })
+                        .ok();
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.preview = Some(preview.clone());
                     this.preview_focus_pending = true;
@@ -3971,6 +4048,27 @@ impl Composer {
                     .shadow_sm()
                     .opacity(0.0)
                     .group_hover(group, |style| style.opacity(1.0))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| AppshotActionTooltip(remove_label.clone()))
+                            .into()
+                    })
+                    .role(gpui::Role::Button)
+                    .aria_label(remove_aria)
+                    .tab_index(0)
+                    .focus_visible(|style| style.opacity(1.0).border_1().border_color(theme.accent))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.remove_appshot(&remove_on_key_id, cx);
+                        }
+                    }))
+                    .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                        composer_for_remove
+                            .update(cx, |this, cx| {
+                                this.remove_appshot(&remove_on_a11y_id, cx);
+                            })
+                            .ok();
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.remove_appshot(&remove_id, cx);

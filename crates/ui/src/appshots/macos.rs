@@ -1,6 +1,7 @@
 use std::ffi::{CStr, c_void};
 use std::ptr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use block::ConcreteBlock;
@@ -30,7 +31,6 @@ use super::{
     AppshotPlatform, CapabilityState, CaptureError, CaptureTarget, CapturedAppshot,
     SCREEN_RECORDING_SETTINGS_URL,
 };
-use crate::attachments::{self, StagedAttachment};
 
 const SPACE_KEYCODE: u32 = 49;
 const OPTION_KEY: u32 = 1 << 11;
@@ -45,6 +45,7 @@ const MAX_AX_VALUE_CHARS: usize = 4_096;
 const AX_DEADLINE: Duration = Duration::from_millis(900);
 const SCREEN_CAPTURE_KIT_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_CAPTURE_DIMENSION: f64 = 4_096.0;
+static SHORTCUT_READY: AtomicBool = AtomicBool::new(true);
 
 type AXUIElementRef = *const c_void;
 type AXError = i32;
@@ -124,7 +125,11 @@ impl AppshotBackend for MacOsBackend {
     fn capabilities(&self) -> AppshotCapabilities {
         AppshotCapabilities {
             platform: AppshotPlatform::MacOs,
-            global_shortcut: CapabilityState::Ready,
+            global_shortcut: if SHORTCUT_READY.load(Ordering::Relaxed) {
+                CapabilityState::Ready
+            } else {
+                CapabilityState::SetupRequired
+            },
             window_capture: if ScreenCaptureAccess.preflight() {
                 CapabilityState::Ready
             } else {
@@ -221,6 +226,7 @@ fn start_global_shortcut() -> mpsc::UnboundedReceiver<()> {
         handler_status
     };
     if register_status != 0 {
+        SHORTCUT_READY.store(false, Ordering::Relaxed);
         tracing::error!(
             status = register_status,
             "Appshot global shortcut unavailable"
@@ -230,6 +236,8 @@ fn start_global_shortcut() -> mpsc::UnboundedReceiver<()> {
         if handler_status != 0 {
             unsafe { drop(Box::from_raw(sender.cast::<mpsc::UnboundedSender<()>>())) };
         }
+    } else {
+        SHORTCUT_READY.store(true, Ordering::Relaxed);
     }
     rx
 }
@@ -256,24 +264,25 @@ fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError> {
             request_screen_recording_permission();
             return Err(CaptureError::PermissionRequired);
         }
-        let (window, png) = match capture_with_screen_capture_kit(app.pid) {
+        // Resolve the actual front-to-back window once, before asynchronous
+        // ScreenCaptureKit work can allow focus to change. Every capture path
+        // remains bound to this exact CGWindowID.
+        let preserved_window = frontmost_window(app.pid)?;
+        let (window, png) = match capture_with_screen_capture_kit(app.pid, preserved_window.id) {
             Ok(Some(capture)) => capture,
             Ok(None) => {
-                let window = frontmost_window(app.pid)?;
-                let png = capture_png(window.id)?;
-                (window, png)
+                let png = capture_png(preserved_window.id)?;
+                (preserved_window, png)
             }
             Err(error) => {
                 // ScreenCaptureKit is the reliable path for fullscreen Spaces,
                 // but keep macOS 12/13 and transient framework failures useful.
                 tracing::warn!(%error, "ScreenCaptureKit Appshot failed; using CoreGraphics fallback");
-                let window = frontmost_window(app.pid)?;
-                let png = capture_png(window.id)?;
-                (window, png)
+                let png = capture_png(preserved_window.id)?;
+                (preserved_window, png)
             }
         };
-        let screenshot_dimensions = super::png_dimensions(&png);
-        let screenshot = stage_png(&app.name, png)?;
+        let (screenshot, screenshot_dimensions) = super::stage_appshot_png(&app.name, png)?;
         let accessibility = if unsafe { AXIsProcessTrusted() } {
             accessibility_snapshot(app.pid)
         } else {
@@ -286,7 +295,7 @@ fn capture_frontmost_window() -> Result<CapturedAppshot, CaptureError> {
             window_title: window.title,
             accessibility,
             screenshot,
-            screenshot_dimensions,
+            screenshot_dimensions: Some(screenshot_dimensions),
             app_icon: app.icon_png.map(|bytes| {
                 std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
             }),
@@ -352,7 +361,9 @@ fn frontmost_window(pid: i32) -> Result<FrontmostWindow, CaptureError> {
         kCGNullWindowID,
     )
     .ok_or(CaptureError::NoEligibleWindow)?;
-    let mut best: Option<(f64, FrontmostWindow)> = None;
+    // CGWindowList is front-to-back. The first eligible layer-zero window is
+    // the frontmost one; choosing by area can capture an unrelated background
+    // document owned by the same application.
     for item in list.iter() {
         let cf = unsafe { CFType::wrap_under_get_rule(*item as CFTypeRef) };
         let Some(dict) = cf.downcast::<CFDictionary>() else {
@@ -378,12 +389,9 @@ fn frontmost_window(pid: i32) -> Result<FrontmostWindow, CaptureError> {
             id,
             title: dictionary_string(&dict, unsafe { kCGWindowName }),
         };
-        if best.as_ref().is_none_or(|(best_area, _)| area > *best_area) {
-            best = Some((area, candidate));
-        }
+        return Ok(candidate);
     }
-    best.map(|(_, window)| window)
-        .ok_or(CaptureError::NoEligibleWindow)
+    Err(CaptureError::NoEligibleWindow)
 }
 
 fn dictionary_value(dict: &CFDictionary, key: CFStringRef) -> Option<CFType> {
@@ -411,7 +419,10 @@ fn dictionary_rect(dict: &CFDictionary, key: CFStringRef) -> Option<CGRect> {
 /// ScreenCaptureKit is Space-independent and is Apple's supported replacement
 /// for the deprecated CGWindowListCreateImage path. It is essential for
 /// fullscreen windows, which live in their own Space.
-fn capture_with_screen_capture_kit(pid: i32) -> Result<Option<(FrontmostWindow, Vec<u8>)>, String> {
+fn capture_with_screen_capture_kit(
+    pid: i32,
+    preserved_window_id: CGWindowID,
+) -> Result<Option<(FrontmostWindow, Vec<u8>)>, String> {
     if !load_screen_capture_kit() {
         return Ok(None);
     }
@@ -457,7 +468,7 @@ fn capture_with_screen_capture_kit(pid: i32) -> Result<Option<(FrontmostWindow, 
         .map_err(|_| "Timed out while enumerating capturable windows".to_string())??
         as *mut Object;
 
-    let selected = unsafe { select_screen_capture_kit_window(content, pid) };
+    let selected = unsafe { select_screen_capture_kit_window(content, pid, preserved_window_id) };
     unsafe {
         let _: () = msg_send![content, release];
     }
@@ -537,6 +548,7 @@ fn load_screen_capture_kit() -> bool {
 unsafe fn select_screen_capture_kit_window(
     content: *mut Object,
     pid: i32,
+    preserved_window_id: CGWindowID,
 ) -> Option<(*mut Object, FrontmostWindow, f64, f64)> {
     let windows: *mut Object = unsafe { msg_send![content, windows] };
     let count: usize = unsafe { msg_send![windows, count] };
@@ -553,6 +565,9 @@ unsafe fn select_screen_capture_kit_window(
             continue;
         }
         let id: CGWindowID = unsafe { msg_send![window, windowID] };
+        if id != preserved_window_id {
+            continue;
+        }
         let bounds = window_bounds(id);
         let (width, height, area) = bounds
             .map(|rect| {
@@ -644,22 +659,6 @@ fn encode_png(image: *mut c_void) -> Result<Vec<u8>, String> {
     }
 }
 
-fn stage_png(app_name: &str, bytes: Vec<u8>) -> Result<StagedAttachment, CaptureError> {
-    if bytes.len() as u64 > attachments::MAX_ATTACHMENT_BYTES {
-        return Err(CaptureError::CaptureFailed(
-            "The captured window is larger than Zeron's 24 MB image limit.".into(),
-        ));
-    }
-    let safe_name: String = app_name
-        .chars()
-        .map(|ch| if ch == '/' || ch == ':' { '-' } else { ch })
-        .collect();
-    Ok(attachments::stage_png_bytes(
-        format!("{safe_name} Appshot.png"),
-        bytes,
-    ))
-}
-
 fn accessibility_snapshot(pid: i32) -> AccessibilitySnapshot {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
@@ -710,9 +709,11 @@ impl AxTraversal {
         }
         self.nodes += 1;
         let role = unsafe { ax_string(element, "AXRole") }.unwrap_or_else(|| "AXElement".into());
+        let subrole = unsafe { ax_string(element, "AXSubrole") };
+        let secure = is_secure_ax_element(&role, subrole.as_deref());
         let title = unsafe { ax_string(element, "AXTitle") };
         let description = unsafe { ax_string(element, "AXDescription") };
-        let value = if role == "AXSecureTextField" {
+        let value = if secure {
             None
         } else {
             unsafe { ax_scalar_string(element, "AXValue") }
@@ -745,7 +746,7 @@ impl AxTraversal {
             return;
         }
         self.output.push_str(&line);
-        if role == "AXSecureTextField" {
+        if secure {
             return;
         }
         let Some(children_value) = (unsafe { copy_ax_value(element, "AXChildren") }) else {
@@ -760,6 +761,10 @@ impl AxTraversal {
             }
         }
     }
+}
+
+fn is_secure_ax_element(role: &str, subrole: Option<&str>) -> bool {
+    role == "AXSecureTextField" || subrole == Some("AXSecureTextField")
 }
 
 unsafe fn copy_ax_value(element: AXUIElementRef, attribute: &str) -> Option<CFType> {
@@ -823,7 +828,7 @@ unsafe fn nsstring(value: *mut Object) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::capture_dimensions;
+    use super::{capture_dimensions, is_secure_ax_element};
 
     #[test]
     fn capture_dimensions_use_retina_scale_for_ordinary_windows() {
@@ -833,5 +838,15 @@ mod tests {
     #[test]
     fn capture_dimensions_cap_large_fullscreen_windows() {
         assert_eq!(capture_dimensions(5_120.0, 2_880.0), (4_096, 2_304));
+    }
+
+    #[test]
+    fn secure_text_subroles_are_redacted() {
+        assert!(is_secure_ax_element(
+            "AXTextField",
+            Some("AXSecureTextField")
+        ));
+        assert!(is_secure_ax_element("AXSecureTextField", None));
+        assert!(!is_secure_ax_element("AXTextField", Some("AXSearchField")));
     }
 }

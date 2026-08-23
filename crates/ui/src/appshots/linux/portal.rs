@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read as _;
 use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
@@ -10,10 +11,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 
 use super::{WaylandStatus, atspi};
-use crate::appshots::{
-    CapabilityState, CaptureError, CaptureTarget, CapturedAppshot, png_dimensions,
-};
-use crate::attachments;
+use crate::appshots::{CapabilityState, CaptureError, CaptureTarget, CapturedAppshot};
 
 const SHORTCUT_ID: &str = "capture-appshot";
 
@@ -126,7 +124,7 @@ pub(super) async fn capture_target(target: CaptureTarget) -> Result<CapturedApps
     // Active-window targeting and semantic lookup refer to the same focused
     // app. For a portal picker, do not risk pairing one chosen window with
     // another app's accessibility tree.
-    let semantics = if target == CaptureTarget::ActiveWindow {
+    let semantics_before = if target == CaptureTarget::ActiveWindow {
         atspi::capture_focused().await.ok()
     } else {
         None
@@ -152,10 +150,43 @@ pub(super) async fn capture_target(target: CaptureTarget) -> Result<CapturedApps
     let path = uri.to_file_path().map_err(|_| {
         CaptureError::CaptureFailed("Screenshot portal returned a non-file URI.".into())
     })?;
-    let bytes = fs::read(path).map_err(|error| {
-        CaptureError::CaptureFailed(format!("Could not read portal screenshot: {error}"))
+    let file_len = fs::metadata(&path)
+        .map_err(|error| {
+            CaptureError::CaptureFailed(format!("Could not inspect portal screenshot: {error}"))
+        })?
+        .len();
+    if file_len > crate::attachments::MAX_ATTACHMENT_BYTES {
+        return Err(CaptureError::CaptureFailed(
+            "The portal screenshot is larger than Zeron's 24 MB image limit.".into(),
+        ));
+    }
+    let file = fs::File::open(path).map_err(|error| {
+        CaptureError::CaptureFailed(format!("Could not open portal screenshot: {error}"))
     })?;
-    let dimensions = png_dimensions(&bytes);
+    let mut bytes = Vec::with_capacity(file_len as usize);
+    file.take(crate::attachments::MAX_ATTACHMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            CaptureError::CaptureFailed(format!("Could not read portal screenshot: {error}"))
+        })?;
+    if bytes.len() as u64 > crate::attachments::MAX_ATTACHMENT_BYTES {
+        return Err(CaptureError::CaptureFailed(
+            "The portal screenshot changed size while it was being read.".into(),
+        ));
+    }
+    let semantics = if target == CaptureTarget::ActiveWindow {
+        let after = atspi::capture_focused().await.ok();
+        match (semantics_before, after) {
+            (Some(before), Some(after)) if before.same_window(&after) => Some(before),
+            (Some(_), Some(_)) => {
+                tracing::debug!("portal and AT-SPI focus identity changed; discarding context");
+                None
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (app_name, window_title, accessibility) = semantics
         .map(|value| (value.app_name, value.window_title, value.snapshot))
         .unwrap_or_else(|| {
@@ -165,7 +196,7 @@ pub(super) async fn capture_target(target: CaptureTarget) -> Result<CapturedApps
                 crate::appshots::AccessibilitySnapshot::unavailable(),
             )
         });
-    let screenshot = attachments::stage_png_bytes(format!("{app_name} Appshot.png"), bytes);
+    let (screenshot, dimensions) = super::super::stage_appshot_png(&app_name, bytes)?;
     Ok(CapturedAppshot {
         id: uuid::Uuid::new_v4().to_string(),
         app_name,
@@ -179,7 +210,7 @@ pub(super) async fn capture_target(target: CaptureTarget) -> Result<CapturedApps
         window_title,
         accessibility,
         screenshot,
-        screenshot_dimensions: dimensions,
+        screenshot_dimensions: Some(dimensions),
         app_icon: None,
         captured_at: chrono::Utc::now(),
     })

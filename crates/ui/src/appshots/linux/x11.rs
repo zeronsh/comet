@@ -14,9 +14,9 @@ use x11rb::rust_connection::RustConnection;
 
 use super::atspi;
 use crate::appshots::{
-    AccessibilitySnapshot, CapabilityState, CaptureError, CapturedAppshot, png_dimensions,
+    AccessibilitySnapshot, CapabilityState, CaptureError, CapturedAppshot,
+    validate_capture_dimensions,
 };
-use crate::attachments;
 
 const XK_SPACE: u32 = 0x20;
 static SHORTCUT_READY: AtomicBool = AtomicBool::new(true);
@@ -87,8 +87,28 @@ fn run_shortcut(tx: mpsc::UnboundedSender<()>) -> anyhow::Result<()> {
 }
 
 pub(super) async fn capture() -> Result<CapturedAppshot, CaptureError> {
-    let native = capture_native()?;
-    let semantic = atspi::capture_focused().await.ok();
+    let mut selected = None;
+    let mut last_native = None;
+    for _ in 0..2 {
+        let native = capture_native()?;
+        let semantic = atspi::capture_focused().await.ok();
+        if semantic.as_ref().is_none_or(|value| {
+            value.matches_x11(native.wm_class.as_deref(), native.title.as_deref())
+        }) {
+            selected = Some((native, semantic));
+            break;
+        }
+        tracing::debug!("X11 window and AT-SPI identity changed during Appshot; retrying");
+        last_native = Some(native);
+    }
+    let (native, semantic) = selected.unwrap_or_else(|| {
+        // Never serialize context from a different application. A useful
+        // screenshot is still preferable to failing the entire capture.
+        (
+            last_native.expect("capture loop always records a mismatch"),
+            None,
+        )
+    });
     let app_name = native
         .desktop
         .as_ref()
@@ -99,8 +119,7 @@ pub(super) async fn capture() -> Result<CapturedAppshot, CaptureError> {
     let accessibility = semantic
         .map(|value| value.snapshot)
         .unwrap_or_else(AccessibilitySnapshot::unavailable);
-    let dimensions = png_dimensions(&native.png);
-    let screenshot = attachments::stage_png_bytes(format!("{app_name} Appshot.png"), native.png);
+    let (screenshot, dimensions) = super::super::stage_appshot_png(&app_name, native.png)?;
     Ok(CapturedAppshot {
         id: uuid::Uuid::new_v4().to_string(),
         app_name,
@@ -112,7 +131,7 @@ pub(super) async fn capture() -> Result<CapturedAppshot, CaptureError> {
         window_title: native.title,
         accessibility,
         screenshot,
-        screenshot_dimensions: dimensions,
+        screenshot_dimensions: Some(dimensions),
         app_icon: native
             .icon_png
             .map(|bytes| Arc::new(Image::from_bytes(GpuiImageFormat::Png, bytes))),
@@ -143,6 +162,8 @@ fn capture_native() -> Result<NativeCapture, CaptureError> {
     if geometry.width == 0 || geometry.height == 0 {
         return Err(CaptureError::NoEligibleWindow);
     }
+    let rgba_len =
+        validate_capture_dimensions(u32::from(geometry.width), u32::from(geometry.height))?;
     let (image, visual_id) =
         XImage::get(&connection, active, 0, 0, geometry.width, geometry.height).map_err(failed)?;
     let visual = connection
@@ -155,8 +176,7 @@ fn capture_native() -> Result<NativeCapture, CaptureError> {
         .copied()
         .ok_or_else(|| CaptureError::CaptureFailed("X11 returned an unknown visual.".into()))?;
     let layout = PixelLayout::from_visual_type(visual).map_err(failed)?;
-    let mut rgba =
-        Vec::with_capacity(usize::from(geometry.width) * usize::from(geometry.height) * 4);
+    let mut rgba = Vec::with_capacity(rgba_len);
     for y in 0..geometry.height {
         for x in 0..geometry.width {
             let (red, green, blue) = layout.decode(image.get_pixel(x, y));
@@ -164,6 +184,13 @@ fn capture_native() -> Result<NativeCapture, CaptureError> {
         }
     }
     let png = encode_rgba(u32::from(geometry.width), u32::from(geometry.height), &rgba)?;
+    let still_active = property_u32(&connection, root, active_atom, AtomEnum::WINDOW.into())
+        .and_then(|values| values.first().copied());
+    if still_active != Some(active) {
+        return Err(CaptureError::CaptureFailed(
+            "The active X11 window changed during capture; try again.".into(),
+        ));
+    }
     let title = window_title(&connection, active);
     let wm_class = window_class(&connection, active);
     let desktop = wm_class.as_deref().and_then(find_desktop_entry);
@@ -261,6 +288,10 @@ fn property_icon(connection: &RustConnection, window: Window) -> Option<Vec<u8>>
         let height = values[offset + 1] as usize;
         offset += 2;
         let length = width.checked_mul(height)?;
+        if width > 512 || height > 512 || length > 512 * 512 {
+            offset = offset.checked_add(length)?;
+            continue;
+        }
         if width > 0 && height > 0 && offset + length <= values.len() {
             candidates.push((
                 width.abs_diff(64) + height.abs_diff(64),
@@ -285,17 +316,7 @@ fn property_icon(connection: &RustConnection, window: Window) -> Option<Vec<u8>>
 }
 
 fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CaptureError> {
-    let mut bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .and_then(|mut writer| writer.write_image_data(rgba))
-            .map_err(failed)?;
-    }
-    Ok(bytes)
+    super::super::encode_rgba_png(width, height, rgba, "X11")
 }
 
 #[derive(Clone)]

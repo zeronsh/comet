@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -50,9 +50,8 @@ use windows_capture::window::Window as CaptureWindow;
 
 use super::{
     AccessibilitySnapshot, AppshotBackend, AppshotCapabilities, AppshotPlatform, CapabilityState,
-    CaptureError, CaptureTarget, CapturedAppshot, png_dimensions,
+    CaptureError, CaptureTarget, CapturedAppshot, validate_capture_dimensions,
 };
-use crate::attachments;
 
 const HOTKEY_ID: i32 = 0x5A_41_50;
 const VK_SPACE: u32 = 0x20;
@@ -135,7 +134,6 @@ fn capture_foreground_window() -> Result<CapturedAppshot, CaptureError> {
     }
     let metadata = window_metadata(hwnd);
     let screenshot_png = capture_window_png(hwnd)?;
-    let dimensions = png_dimensions(&screenshot_png);
     let accessibility = capture_uia(hwnd).unwrap_or_else(|error| {
         tracing::debug!(?error, "UI Automation context unavailable for Appshot");
         AccessibilitySnapshot::unavailable()
@@ -143,8 +141,7 @@ fn capture_foreground_window() -> Result<CapturedAppshot, CaptureError> {
     let app_name = metadata
         .app_name
         .unwrap_or_else(|| "Windows application".into());
-    let screenshot =
-        attachments::stage_png_bytes(format!("{app_name} Appshot.png"), screenshot_png);
+    let (screenshot, dimensions) = super::stage_appshot_png(&app_name, screenshot_png)?;
     Ok(CapturedAppshot {
         id: uuid::Uuid::new_v4().to_string(),
         app_name,
@@ -157,7 +154,7 @@ fn capture_foreground_window() -> Result<CapturedAppshot, CaptureError> {
         window_title: metadata.title,
         accessibility,
         screenshot,
-        screenshot_dimensions: dimensions,
+        screenshot_dimensions: Some(dimensions),
         app_icon: metadata
             .icon_png
             .map(|bytes| Arc::new(Image::from_bytes(GpuiImageFormat::Png, bytes))),
@@ -257,6 +254,11 @@ impl GraphicsCaptureApiHandler for OneShotCapture {
     ) -> Result<(), Self::Error> {
         let width = frame.width();
         let height = frame.height();
+        if let Err(error) = validate_capture_dimensions(width, height) {
+            let _ = self.sender.send(Err(error.to_string()));
+            capture_control.stop();
+            return Ok(());
+        }
         let pixels = frame
             .buffer()
             .and_then(|mut buffer| buffer.as_nopadding_buffer().map(|pixels| pixels.to_vec()))
@@ -293,6 +295,13 @@ fn capture_window_png(hwnd: HWND) -> Result<Vec<u8>, CaptureError> {
 
 fn capture_uia(hwnd: HWND) -> windows::core::Result<AccessibilitySnapshot> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
+    struct ComApartment;
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+    let _apartment = ComApartment;
     let automation: IUIAutomation =
         unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)? };
     let root = unsafe { automation.ElementFromHandle(hwnd)? };
@@ -455,17 +464,7 @@ fn icon_to_png(
 }
 
 fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, CaptureError> {
-    let mut bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .and_then(|mut writer| writer.write_image_data(rgba))
-            .map_err(failed)?;
-    }
-    Ok(bytes)
+    super::encode_rgba_png(width, height, rgba, "Windows")
 }
 
 fn clean(value: &str) -> String {

@@ -19,6 +19,36 @@ pub(super) struct SemanticCapture {
     pub snapshot: AccessibilitySnapshot,
 }
 
+impl SemanticCapture {
+    pub(super) fn same_window(&self, other: &Self) -> bool {
+        normalized(&self.app_name) == normalized(&other.app_name)
+            && match (&self.window_title, &other.window_title) {
+                (Some(left), Some(right)) => normalized(left) == normalized(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(super) fn matches_x11(&self, wm_class: Option<&str>, title: Option<&str>) -> bool {
+        if let (Some(expected), Some(actual)) = (title, self.window_title.as_deref()) {
+            return normalized(expected) == normalized(actual);
+        }
+        wm_class.is_some_and(|class| {
+            let class = normalized(class);
+            let app = normalized(&self.app_name);
+            !class.is_empty() && (class.contains(&app) || app.contains(&class))
+        })
+    }
+}
+
+fn normalized(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 pub(super) async fn capture_focused() -> anyhow::Result<SemanticCapture> {
     let started = Instant::now();
     let connection = AccessibilityConnection::new().await?;
@@ -171,4 +201,33 @@ fn clean(value: &str) -> String {
         .chars()
         .take(MAX_TEXT_CHARS as usize)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn semantic(app: &str, title: Option<&str>) -> SemanticCapture {
+        SemanticCapture {
+            app_name: app.into(),
+            window_title: title.map(str::to_string),
+            snapshot: AccessibilitySnapshot::unavailable(),
+        }
+    }
+
+    #[test]
+    fn identity_requires_the_same_application_and_window() {
+        assert!(
+            semantic("Firefox", Some("Issue 216"))
+                .same_window(&semantic("firefox", Some("Issue 216")))
+        );
+        assert!(
+            !semantic("Firefox", Some("Issue 216"))
+                .same_window(&semantic("Terminal", Some("Issue 216")))
+        );
+        assert!(
+            !semantic("Firefox", Some("Issue 216"))
+                .same_window(&semantic("Firefox", Some("Passwords")))
+        );
+    }
 }

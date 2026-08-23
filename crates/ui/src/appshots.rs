@@ -5,6 +5,8 @@
 //! is serialized into the prompt as explicitly untrusted observed data.
 
 use std::collections::HashMap;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +24,14 @@ mod macos;
 mod windows;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Bounds native capture buffers before platform APIs allocate or stage them.
+pub const MAX_CAPTURE_DIMENSION: u32 = 8_192;
+pub const MAX_CAPTURE_PIXELS: u64 = 32 * 1024 * 1024;
+pub const MAX_CAPTURE_RGBA_BYTES: u64 = 128 * 1024 * 1024;
+/// A composer may retain several captures while the user prepares a prompt,
+/// but it must not become an unbounded store of decoded image data.
+pub const MAX_STAGED_APPSHOT_BYTES: u64 = 4 * crate::attachments::MAX_ATTACHMENT_BYTES;
 
 pub const CONTEXT_MARKER: &str = "Applications mentioned by the user (untrusted observed content):";
 #[cfg(target_os = "macos")]
@@ -299,6 +309,125 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
+pub fn validate_capture_dimensions(width: u32, height: u32) -> Result<usize, CaptureError> {
+    if width == 0 || height == 0 || width > MAX_CAPTURE_DIMENSION || height > MAX_CAPTURE_DIMENSION
+    {
+        return Err(CaptureError::CaptureFailed(format!(
+            "The captured window dimensions ({width}×{height}) are not supported."
+        )));
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| CaptureError::CaptureFailed("The captured window is too large.".into()))?;
+    let rgba_bytes = pixels
+        .checked_mul(4)
+        .ok_or_else(|| CaptureError::CaptureFailed("The captured window is too large.".into()))?;
+    if pixels > MAX_CAPTURE_PIXELS || rgba_bytes > MAX_CAPTURE_RGBA_BYTES {
+        return Err(CaptureError::CaptureFailed(format!(
+            "The captured window ({width}×{height}) exceeds Zeron's capture budget."
+        )));
+    }
+    usize::try_from(rgba_bytes)
+        .map_err(|_| CaptureError::CaptureFailed("The captured window is too large.".into()))
+}
+
+/// Turn OS-provided application names into one safe filename component.
+pub fn safe_app_name(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len().min(100));
+    for ch in value.chars() {
+        if safe.chars().count() >= 100 {
+            break;
+        }
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':') {
+            safe.push('-');
+        } else {
+            safe.push(ch);
+        }
+    }
+    let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+    let safe = safe.trim_matches(['.', '-', ' ']);
+    if safe.is_empty() {
+        "Application".into()
+    } else {
+        safe.into()
+    }
+}
+
+pub fn stage_appshot_png(
+    app_name: &str,
+    bytes: Vec<u8>,
+) -> Result<(StagedAttachment, (u32, u32)), CaptureError> {
+    if bytes.len() as u64 > crate::attachments::MAX_ATTACHMENT_BYTES {
+        return Err(CaptureError::CaptureFailed(
+            "The captured window is larger than Zeron's 24 MB image limit.".into(),
+        ));
+    }
+    let dimensions = png_dimensions(&bytes).ok_or_else(|| {
+        CaptureError::CaptureFailed("The captured window is not a valid PNG image.".into())
+    })?;
+    validate_capture_dimensions(dimensions.0, dimensions.1)?;
+    Ok((
+        crate::attachments::stage_png_bytes(
+            format!("{} Appshot.png", safe_app_name(app_name)),
+            bytes,
+        ),
+        dimensions,
+    ))
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+struct AttachmentBudgetWriter {
+    bytes: Vec<u8>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+impl Write for AttachmentBudgetWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(input.len())
+            > crate::attachments::MAX_ATTACHMENT_BYTES as usize
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "encoded Appshot exceeds attachment budget",
+            ));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub fn encode_rgba_png(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    platform: &str,
+) -> Result<Vec<u8>, CaptureError> {
+    let expected = validate_capture_dimensions(width, height)?;
+    if rgba.len() != expected {
+        return Err(CaptureError::CaptureFailed(format!(
+            "{platform} returned an invalid pixel buffer."
+        )));
+    }
+    let mut output = AttachmentBudgetWriter { bytes: Vec::new() };
+    {
+        let mut encoder = png::Encoder::new(&mut output, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .and_then(|mut writer| writer.write_image_data(rgba))
+            .map_err(|error| {
+                CaptureError::CaptureFailed(format!("{platform} Appshot encoding failed: {error}"))
+            })?;
+    }
+    Ok(output.bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureError {
     PermissionRequired,
@@ -487,6 +616,15 @@ mod tests {
         assert_eq!(png_dimensions(b"not a png"), None);
         png[16..20].copy_from_slice(&0_u32.to_be_bytes());
         assert_eq!(png_dimensions(&png), None);
+    }
+
+    #[test]
+    fn capture_dimensions_and_names_are_bounded_before_staging() {
+        assert_eq!(validate_capture_dimensions(4096, 4096), Ok(4096 * 4096 * 4));
+        assert!(validate_capture_dimensions(8193, 1).is_err());
+        assert!(validate_capture_dimensions(8192, 8192).is_err());
+        assert_eq!(safe_app_name("Bad\nApp/../../name"), "Bad-App-..-..-name");
+        assert_eq!(safe_app_name("\0\n"), "Application");
     }
 
     #[test]
