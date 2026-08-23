@@ -1409,8 +1409,7 @@ async fn drive_run(
     // the freeze must not mint a new doc entry or wedge the transcript back
     // into Streaming. Only a steer (UserMessage) legitimately REOPENS a
     // settled subagent: it announces more work is coming.
-    let mut settled_subagents: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut settled_subagents: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Live subagent sinks, parent tool-use id → transcript doc state.
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();

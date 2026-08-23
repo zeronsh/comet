@@ -135,11 +135,7 @@ impl CheckoutChangeRequests {
             .checkout_identity(cwd)
             .await
             .map_err(|_| ChangeRequestError::RepositoryUnavailable)?;
-        Ok(self.watch_checkout_for_branch(
-            cwd.to_owned(),
-            identity,
-            branch.map(str::to_owned),
-        ))
+        Ok(self.watch_checkout_for_branch(cwd.to_owned(), identity, branch.map(str::to_owned)))
     }
 
     #[cfg(test)]

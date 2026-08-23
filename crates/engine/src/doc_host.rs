@@ -2026,11 +2026,8 @@ impl DocHost {
             .as_ref()
             .and_then(|w| w.sync_status())
             .is_some_and(|s| s.connected);
-        let path_offline = grace.degraded(
-            GraceKey::OsPath,
-            zeron_sync::wake::path_is_offline(),
-            now,
-        );
+        let path_offline =
+            grace.degraded(GraceKey::OsPath, zeron_sync::wake::path_is_offline(), now);
         let registry_down = grace.degraded(GraceKey::Registry, !registry_connected, now);
         let (state, retry_at_ms, last_failure) = if path_offline {
             (

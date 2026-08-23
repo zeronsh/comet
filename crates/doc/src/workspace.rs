@@ -245,9 +245,10 @@ impl WorkspaceDoc {
         set_opt_str(&row, "branch", chat.branch.as_deref())?;
         set_opt_str(&row, "checkoutId", chat.checkout_id.as_deref())?;
         match &chat.source_context {
-            Some(context) => {
-                row.insert("sourceContext", LoroValue::from(serde_json::to_value(context)?))?
-            }
+            Some(context) => row.insert(
+                "sourceContext",
+                LoroValue::from(serde_json::to_value(context)?),
+            )?,
             None => row.delete("sourceContext")?,
         }
         match &chat.config {
@@ -871,10 +872,7 @@ mod tests {
             head_sha: Some("abc123".into()),
             observed_at: ts(8_000),
         };
-        assert!(
-            ws.set_chat_source_context("chat-1", &context)
-                .unwrap()
-        );
+        assert!(ws.set_chat_source_context("chat-1", &context).unwrap());
         let row = ws.chat("chat-1").unwrap().expect("row exists");
         assert_eq!(row.source_context, Some(context));
         assert_eq!(row.branch.as_deref(), Some("feature/sidebar"));

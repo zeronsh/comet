@@ -224,7 +224,10 @@ impl Repos {
     /// Commit checked out at `path`, or `None` for a repository without an
     /// initial commit.
     pub async fn head_sha(&self, path: &Path) -> Result<Option<String>, EngineError> {
-        match self.git(&["rev-parse", "--verify", "HEAD^{commit}"], Some(path)).await {
+        match self
+            .git(&["rev-parse", "--verify", "HEAD^{commit}"], Some(path))
+            .await
+        {
             Ok(sha) if !sha.is_empty() => Ok(Some(sha)),
             Ok(_) => Ok(None),
             Err(_) if self.is_repo(path).await => Ok(None),

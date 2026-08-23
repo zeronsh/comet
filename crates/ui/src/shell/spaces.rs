@@ -650,14 +650,12 @@ impl Shell {
                     format!("sidebar-view-row-{ix}"),
                 )
                 .id(("sidebar-view-row", ix))
-                .on_click(
-                    cx.listener(move |this, _, _, cx| {
-                        if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                            menu.active = None;
-                        }
-                        this.activate_sidebar_view_row(row, cx)
-                    }),
-                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                        menu.active = None;
+                    }
+                    this.activate_sidebar_view_row(row, cx)
+                }))
                 .child(
                     icon(icons[ix])
                         .size(px(15.0))
@@ -1107,9 +1105,7 @@ impl Shell {
                         .map(str::to_string);
                     let change_request = state.change_request_for_chat(&chat).cloned();
                     let group = match self.settings.sidebar_organization {
-                        SidebarOrganization::ByDevice => {
-                            Some((chat.device_id.clone(), device))
-                        }
+                        SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
                         SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
                     };
                     ActiveChatRow {
@@ -1288,9 +1284,7 @@ impl Shell {
                 .cloned()
                 .collect()
         };
-        rows.sort_by(|left, right| {
-            compare_sidebar_chats(self.settings.sidebar_sort, left, right)
-        });
+        rows.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
         if rows.is_empty() {
             return None;
         }
@@ -1683,8 +1677,7 @@ impl Shell {
         if rows.is_empty() {
             let text = flow.search.read(cx).text().to_string();
             if text.starts_with('/') || text.starts_with('~') {
-                if let Some(target) =
-                    crate::pickers::typed_path_target(&text, flow.home.as_deref())
+                if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
                 {
                     self.add_space_descend(target, false, cx);
                 }
@@ -2261,12 +2254,9 @@ impl Shell {
                     (SharedString::from(d.name.clone()), mount, at_mount)
                 });
                 let folded = 1 + match (&drive_crumb, home.as_deref()) {
-                    (Some((_, mount, _)), _) => {
-                        mount.split('/').filter(|s| !s.is_empty()).count()
-                    }
+                    (Some((_, mount, _)), _) => mount.split('/').filter(|s| !s.is_empty()).count(),
                     (None, Some(h))
-                        if listing.path == h
-                            || listing.path.starts_with(&format!("{h}/")) =>
+                        if listing.path == h || listing.path.starts_with(&format!("{h}/")) =>
                     {
                         h.split('/').filter(|s| !s.is_empty()).count()
                     }

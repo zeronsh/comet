@@ -5198,20 +5198,16 @@ fn chip_header_row(
         .when(running, |row| {
             // The sidebar working-row spinner, in the chip's trailing slot —
             // paint-local (fixed footprint), so it never moves the layout.
-            row.child(
-                div()
-                    .flex_none()
-                    .child(crate::loaders::mini_glyph_spinner(
-                        format!(
-                            "subagent-chip-{}",
-                            tool.subagent_ref.as_deref().unwrap_or_default()
-                        ),
-                        2.0,
-                        theme.glyph,
-                        view,
-                        cx,
-                    )),
-            )
+            row.child(div().flex_none().child(crate::loaders::mini_glyph_spinner(
+                format!(
+                    "subagent-chip-{}",
+                    tool.subagent_ref.as_deref().unwrap_or_default()
+                ),
+                2.0,
+                theme.glyph,
+                view,
+                cx,
+            )))
         })
         .when_some(trail, |row, trail| {
             // Trailing tile matching the group header's: a chevron for the
