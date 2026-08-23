@@ -1,9 +1,17 @@
 name: TestFlight
 
-run-name: TestFlight from ${{ github.ref_name }} by @${{ github.actor }}
+run-name: TestFlight (${{ inputs.audience || 'internal' }}) from ${{ github.ref_name }} by @${{ github.actor }}
 
 on:
   workflow_dispatch:
+    inputs:
+      audience:
+        description: 'TestFlight audience'
+        type: choice
+        options:
+          - internal
+          - external
+        default: internal
 
 permissions:
   contents: read
@@ -21,6 +29,7 @@ jobs:
       AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
       AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
       AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+      AUDIENCE: ${{ inputs.audience || 'internal' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -84,7 +93,7 @@ jobs:
           echo "AC_TOKEN_PATH=$token_path" >> "$GITHUB_ENV"
           echo "ASC_APP_ID=$app_id" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
-          echo "Preparing internal TestFlight build $build_number from $GITHUB_SHA."
+          echo "Preparing $AUDIENCE TestFlight build $build_number from $GITHUB_SHA."
 
       - name: Xcode version
         run: xcodebuild -version
@@ -108,7 +117,7 @@ jobs:
             -authenticationKeyIssuerID "$AC_API_ISSUER_ID" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
-      - name: Upload to internal TestFlight
+      - name: Upload to TestFlight
         run: |
           options="$RUNNER_TEMP/ExportOptions.plist"
           plutil -create xml1 "$options"
@@ -117,7 +126,9 @@ jobs:
           plutil -insert signingStyle -string automatic "$options"
           plutil -insert teamID -string 5XY3M483YQ "$options"
           plutil -insert manageAppVersionAndBuildNumber -bool false "$options"
-          plutil -insert testFlightInternalTestingOnly -bool true "$options"
+          if [ "$AUDIENCE" = "internal" ]; then
+            plutil -insert testFlightInternalTestingOnly -bool true "$options"
+          fi
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/Zeron.xcarchive" \
             -exportPath "$RUNNER_TEMP/TestFlightExport" \
@@ -161,6 +172,8 @@ jobs:
             case "$state" in
               VALID)
                 jq -c --arg version "$BUILD_NUMBER" '.data[] | select(.attributes.version == $version) | {id, version: .attributes.version, uploadedDate: .attributes.uploadedDate, processingState: .attributes.processingState, expired: .attributes.expired, minOsVersion: .attributes.minOsVersion}' "$builds"
+                build_id="$(jq -r --arg version "$BUILD_NUMBER" '[.data[] | select(.attributes.version == $version)][0].id' "$builds")"
+                echo "ASC_BUILD_ID=$build_id" >> "$GITHUB_ENV"
                 exit 0
                 ;;
               FAILED|INVALID)
@@ -172,6 +185,64 @@ jobs:
           done
           echo "Build $BUILD_NUMBER did not finish processing within ten minutes." >&2
           exit 5
+
+      - name: Distribute to external testers
+        if: inputs.audience == 'external'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$AC_KEY_PATH" "$AC_API_KEY_ID" "$AC_API_ISSUER_ID" > "$AC_TOKEN_PATH" <<'PY'
+          import sys
+          import time
+          import jwt
+
+          key_path, key_id, issuer_id = sys.argv[1:]
+          with open(key_path, "rb") as key_file:
+              private_key = key_file.read()
+          now = int(time.time())
+          print(jwt.encode(
+              {"iss": issuer_id, "iat": now, "exp": now + 1199, "aud": "appstoreconnect-v1"},
+              private_key,
+              algorithm="ES256",
+              headers={"kid": key_id, "typ": "JWT"},
+          ))
+          PY
+
+          token="$(cat "$AC_TOKEN_PATH")"
+          api() {
+            curl --globoff --fail-with-body --silent --show-error \
+              -H "Authorization: Bearer $token" \
+              -H 'Content-Type: application/json' "$@"
+          }
+
+          groups="$RUNNER_TEMP/beta-groups.json"
+          api "https://api.appstoreconnect.apple.com/v1/betaGroups?filter[app]=$ASC_APP_ID&fields[betaGroups]=name,isInternalGroup&limit=200" > "$groups"
+          external_count="$(jq '[.data[] | select(.attributes.isInternalGroup == false)] | length' "$groups")"
+          if [ "$external_count" -eq 0 ]; then
+            echo "No external beta group exists; creating one named 'External Testers' (no public link)."
+            created="$RUNNER_TEMP/created-group.json"
+            api -X POST 'https://api.appstoreconnect.apple.com/v1/betaGroups' \
+              --data "$(jq -n --arg app "$ASC_APP_ID" '{data: {type: "betaGroups", attributes: {name: "External Testers"}, relationships: {app: {data: {type: "apps", id: $app}}}}}')" \
+              > "$created"
+            group_id="$(jq -r '.data.id' "$created")"
+          elif [ "$external_count" -eq 1 ]; then
+            group_id="$(jq -r '[.data[] | select(.attributes.isInternalGroup == false)][0].id' "$groups")"
+            echo "Using external beta group '$(jq -r '[.data[] | select(.attributes.isInternalGroup == false)][0].attributes.name' "$groups")'."
+          else
+            echo "Found $external_count external beta groups; cannot pick one automatically:" >&2
+            jq -r '.data[] | select(.attributes.isInternalGroup == false) | "  \(.attributes.name) (\(.id))"' "$groups" >&2
+            exit 6
+          fi
+
+          api -X POST "https://api.appstoreconnect.apple.com/v1/betaGroups/$group_id/relationships/builds" \
+            --data "$(jq -n --arg build "$ASC_BUILD_ID" '{data: [{type: "builds", id: $build}]}')"
+          echo "Added build $BUILD_NUMBER to beta group $group_id."
+
+          review="$RUNNER_TEMP/beta-review.json"
+          api -X POST 'https://api.appstoreconnect.apple.com/v1/betaAppReviewSubmissions' \
+            --data "$(jq -n --arg build "$ASC_BUILD_ID" '{data: {type: "betaAppReviewSubmissions", relationships: {build: {data: {type: "builds", id: $build}}}}}')" \
+            > "$review"
+          echo "Submitted build $BUILD_NUMBER for beta review: $(jq -r '.data.attributes.betaReviewState // "SUBMITTED"' "$review")"
 
       - name: Remove temporary credentials
         if: always()
