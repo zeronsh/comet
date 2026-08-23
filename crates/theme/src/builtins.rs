@@ -1258,7 +1258,7 @@ fn shades_of_purple() -> ThemeVariant {
             "vscode",
             "https://github.com/ahmadawais/shades-of-purple-vscode",
             "e8eb49f33e5db05ceba6677367b33ddb27ad821c",
-            "MIT",
+            "MIT with additional upstream condition; see THIRD_PARTY_NOTICES.md",
         ),
     })
 }

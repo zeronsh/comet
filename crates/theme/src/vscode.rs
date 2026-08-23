@@ -17,6 +17,10 @@ use crate::{
     ThemeVariant, ValidationIssue,
 };
 
+const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_INCLUDE_DEPTH: usize = 32;
+const MAX_PACKAGE_VARIANTS: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
     pub id: String,
@@ -119,6 +123,7 @@ pub enum DetectedThemeSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VariantFailure {
+    pub id: String,
     pub name: String,
     pub path: PathBuf,
     pub message: String,
@@ -157,7 +162,12 @@ pub fn compile_source(path: &Path, options: CompileOptions) -> Result<SourceComp
 }
 
 fn compile_single_file(path: PathBuf, options: CompileOptions) -> Result<SourceCompilation> {
-    let normalized = load_theme(&path, &mut Vec::new())?;
+    let root = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?
+        .canonicalize()
+        .with_context(|| format!("could not resolve theme root for {}", path.display()))?;
+    let normalized = load_theme(&path, &root, &mut Vec::new())?;
     let appearance = detect_appearance(&path, None, &normalized);
     let name = theme_declared_name(&path).unwrap_or_else(|| options.family_name.clone());
     let imported = convert(
@@ -191,8 +201,7 @@ fn compile_package(
     package_json: &Path,
     options: CompileOptions,
 ) -> Result<SourceCompilation> {
-    let source = fs::read_to_string(package_json)
-        .with_context(|| format!("could not read {}", package_json.display()))?;
+    let source = read_bounded(package_json, "package manifest")?;
     let manifest: Value = json5::from_str(&source)
         .with_context(|| format!("could not parse {}", package_json.display()))?;
     let declarations = manifest
@@ -207,9 +216,19 @@ fn compile_package(
     if declarations.is_empty() {
         bail!("{} declares no theme variants", package_json.display());
     }
+    if declarations.len() > MAX_PACKAGE_VARIANTS {
+        bail!(
+            "{} declares {} theme variants; the limit is {MAX_PACKAGE_VARIANTS}",
+            package_json.display(),
+            declarations.len()
+        );
+    }
     let package_root = package_json
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", package_json.display()))?;
+    let package_root = package_root
+        .canonicalize()
+        .with_context(|| format!("could not resolve package root {}", package_root.display()))?;
     let family_name = manifest
         .get("displayName")
         .or_else(|| manifest.get("name"))
@@ -228,10 +247,16 @@ fn compile_package(
             .filter(|label| !label.trim().is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("Variant {}", index + 1));
+        let mut id = format!("{}-{}", options.family_id, slug(&label));
+        if !used_ids.insert(id.clone()) {
+            id = format!("{id}-{}", index + 1);
+            used_ids.insert(id.clone());
+        }
         let relative = match declaration.get("path").and_then(Value::as_str) {
             Some(path) => path,
             None => {
                 failures.push(VariantFailure {
+                    id,
                     name: label,
                     path: package_json.to_path_buf(),
                     message: "theme declaration has no path".into(),
@@ -240,13 +265,8 @@ fn compile_package(
             }
         };
         let theme_path = package_root.join(relative);
-        let mut id = format!("{}-{}", options.family_id, slug(&label));
-        if !used_ids.insert(id.clone()) {
-            id = format!("{id}-{}", index + 1);
-            used_ids.insert(id.clone());
-        }
         let result = (|| {
-            let normalized = load_theme(&theme_path, &mut Vec::new())?;
+            let normalized = load_theme(&theme_path, &package_root, &mut Vec::new())?;
             let appearance = detect_appearance(
                 &theme_path,
                 declaration.get("uiTheme").and_then(Value::as_str),
@@ -271,6 +291,7 @@ fn compile_package(
                 variants.push(imported.theme);
             }
             Err(error) => failures.push(VariantFailure {
+                id,
                 name: label,
                 path: theme_path,
                 message: error.to_string(),
@@ -299,7 +320,7 @@ fn compile_package(
 }
 
 fn theme_declared_name(path: &Path) -> Option<String> {
-    let source = fs::read_to_string(path).ok()?;
+    let source = read_bounded(path, "theme source").ok()?;
     let value: Value = json5::from_str(&source).ok()?;
     value
         .get("name")
@@ -322,7 +343,7 @@ fn detect_appearance(
             _ => {}
         }
     }
-    if let Ok(source) = fs::read_to_string(path)
+    if let Ok(source) = read_bounded(path, "theme source")
         && let Ok(value) = json5::from_str::<Value>(&source)
         && let Some(kind) = value.get("type").and_then(Value::as_str)
     {
@@ -369,20 +390,30 @@ fn slug(value: &str) -> String {
 }
 
 pub fn import_file(path: &Path, options: ImportOptions) -> Result<ImportResult> {
-    let normalized = load_theme(path, &mut Vec::new())?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("could not resolve {}", path.display()))?;
+    let root = canonical
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", canonical.display()))?
+        .to_path_buf();
+    let normalized = load_theme(&canonical, &root, &mut Vec::new())?;
     convert(normalized, options)
 }
 
-fn load_theme(path: &Path, stack: &mut Vec<PathBuf>) -> Result<NormalizedTheme> {
+fn load_theme(path: &Path, root: &Path, stack: &mut Vec<PathBuf>) -> Result<NormalizedTheme> {
     let path = path
         .canonicalize()
         .with_context(|| format!("could not resolve {}", path.display()))?;
+    ensure_contained(&path, root, "theme source")?;
     if stack.contains(&path) {
         bail!("VS Code theme include cycle: {}", path.display());
     }
+    if stack.len() >= MAX_INCLUDE_DEPTH {
+        bail!("VS Code theme include depth exceeds {MAX_INCLUDE_DEPTH}");
+    }
     stack.push(path.clone());
-    let source =
-        fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
+    let source = read_bounded(&path, "theme source")?;
     let value: Value = json5::from_str(&source)
         .with_context(|| format!("could not parse JSONC theme {}", path.display()))?;
     let object = value
@@ -391,7 +422,7 @@ fn load_theme(path: &Path, stack: &mut Vec<PathBuf>) -> Result<NormalizedTheme> 
 
     let mut theme = if let Some(include) = object.get("include").and_then(Value::as_str) {
         let include_path = resolve_relative(&path, include);
-        load_theme(&include_path, stack)?
+        load_theme(&include_path, root, stack)?
     } else {
         NormalizedTheme::default()
     };
@@ -410,6 +441,10 @@ fn load_theme(path: &Path, stack: &mut Vec<PathBuf>) -> Result<NormalizedTheme> 
             Value::Array(rules) => theme.token_colors.extend(parse_token_rules(rules)),
             Value::String(relative) => {
                 let token_path = resolve_relative(&path, relative);
+                let token_path = token_path
+                    .canonicalize()
+                    .with_context(|| format!("could not resolve {}", token_path.display()))?;
+                ensure_contained(&token_path, root, "external token file")?;
                 theme.files.push(token_path.clone());
                 theme.token_colors.extend(load_token_file(&token_path)?);
             }
@@ -426,6 +461,30 @@ fn load_theme(path: &Path, stack: &mut Vec<PathBuf>) -> Result<NormalizedTheme> 
     }
     stack.pop();
     Ok(theme)
+}
+
+fn ensure_contained(path: &Path, root: &Path, kind: &str) -> Result<()> {
+    if !path.starts_with(root) {
+        bail!(
+            "{kind} {} resolves outside selected theme root {}; symlinks are allowed only when their targets remain inside the root",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+fn read_bounded(path: &Path, kind: &str) -> Result<String> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("could not inspect {kind} {}", path.display()))?
+        .len();
+    if size > MAX_SOURCE_BYTES {
+        bail!(
+            "{kind} {} is {size} bytes; the limit is {MAX_SOURCE_BYTES}",
+            path.display()
+        );
+    }
+    fs::read_to_string(path).with_context(|| format!("could not read {kind} {}", path.display()))
 }
 
 fn resolve_relative(owner: &Path, relative: &str) -> PathBuf {
@@ -478,8 +537,7 @@ fn load_token_file(path: &Path) -> Result<Vec<TokenRule>> {
     if extension.eq_ignore_ascii_case("tmTheme") || extension.eq_ignore_ascii_case("plist") {
         return load_textmate_plist(path);
     }
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("could not read token file {}", path.display()))?;
+    let source = read_bounded(path, "token file")?;
     let value: Value = json5::from_str(&source)
         .with_context(|| format!("could not parse token file {}", path.display()))?;
     let values = value
@@ -490,6 +548,15 @@ fn load_token_file(path: &Path) -> Result<Vec<TokenRule>> {
 }
 
 fn load_textmate_plist(path: &Path) -> Result<Vec<TokenRule>> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("could not inspect TextMate plist {}", path.display()))?
+        .len();
+    if size > MAX_SOURCE_BYTES {
+        bail!(
+            "TextMate plist {} is {size} bytes; the limit is {MAX_SOURCE_BYTES}",
+            path.display()
+        );
+    }
     let value = plist::Value::from_file(path)
         .with_context(|| format!("could not parse TextMate plist {}", path.display()))?;
     let settings = value
@@ -819,8 +886,7 @@ fn convert(theme: NormalizedTheme, options: ImportOptions) -> Result<ImportResul
     harden_variant(&theme, &mut output, fallback_background, &mut report);
     let mut hasher = Sha256::new();
     for path in &theme.files {
-        hasher
-            .update(fs::read(path).with_context(|| format!("could not hash {}", path.display()))?);
+        hasher.update(read_bounded(path, "theme source while hashing")?.as_bytes());
     }
     report.source_hash = format!("sha256:{:x}", hasher.finalize());
     output.source = ThemeSource {
@@ -914,6 +980,21 @@ fn harden_variant(
         &text_backgrounds,
         4.5,
         Some(output.colors.text),
+    );
+    output.colors.text_faint = harden_foreground(
+        source,
+        report,
+        "textFaint",
+        output.colors.text_faint,
+        &[
+            "disabledForeground",
+            "input.placeholderForeground",
+            "descriptionForeground",
+            "foreground",
+        ],
+        &text_backgrounds,
+        3.0,
+        Some(output.colors.text_muted),
     );
     output.colors.on_solid = harden_foreground(
         source,
@@ -1359,6 +1440,137 @@ mod tests {
                 .iter()
                 .all(|issue| !issue.is_blocking())
         );
+    }
+
+    #[test]
+    fn hardens_and_reports_low_contrast_faint_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("faint.json");
+        fs::write(
+            &path,
+            r##"{
+              "colors": {
+                "editor.background": "#111111",
+                "foreground": "#eeeeee",
+                "descriptionForeground": "#aaaaaa",
+                "disabledForeground": "#202020"
+              }
+            }"##,
+        )
+        .unwrap();
+
+        let imported = import_file(&path, options()).unwrap();
+        let faint = imported.theme.colors.text_faint;
+        assert!(faint.contrast(imported.theme.colors.background) >= 3.0);
+        let adjustment = imported
+            .report
+            .adjustments
+            .iter()
+            .find(|adjustment| adjustment.zeron_role == "textFaint")
+            .expect("textFaint adjustment is reported");
+        assert_eq!(adjustment.original, "#202020");
+        assert_eq!(adjustment.resolved, faint.to_string());
+        assert!(adjustment.reason.contains("descriptionForeground"));
+        let mapping = imported
+            .report
+            .mappings
+            .iter()
+            .find(|mapping| mapping.zeron_role == "textFaint")
+            .unwrap();
+        assert_eq!(mapping.vscode_key, "descriptionForeground");
+        assert_eq!(mapping.value, faint.to_string());
+    }
+
+    #[test]
+    fn rejects_package_declarations_and_includes_outside_selected_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"contributes":{"themes":[{"label":"Escape","path":"../outside.json"}]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("outside.json"),
+            r##"{"colors":{"editor.background":"#111111"}}"##,
+        )
+        .unwrap();
+        let error = compile_source(
+            &package,
+            CompileOptions {
+                family_id: "escape".into(),
+                family_name: "Escape".into(),
+                source_url: "local".into(),
+                revision: "local".into(),
+                license: "User supplied".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside selected theme root"));
+
+        let nested = package.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("theme.json"),
+            r#"{"include":"../../outside.json"}"#,
+        )
+        .unwrap();
+        let error = import_file(&nested.join("theme.json"), options()).unwrap_err();
+        assert!(error.to_string().contains("outside selected theme root"));
+
+        fs::write(
+            nested.join("tokens.json"),
+            r#"{"tokenColors":"../../outside.json"}"#,
+        )
+        .unwrap();
+        let error = import_file(&nested.join("tokens.json"), options()).unwrap_err();
+        assert!(error.to_string().contains("outside selected theme root"));
+    }
+
+    #[test]
+    fn bounds_include_depth_and_source_size() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_INCLUDE_DEPTH {
+            let source = if index == MAX_INCLUDE_DEPTH {
+                "{}".to_string()
+            } else {
+                format!(r#"{{"include":"{}.json"}}"#, index + 1)
+            };
+            fs::write(dir.path().join(format!("{index}.json")), source).unwrap();
+        }
+        let error = import_file(&dir.path().join("0.json"), options()).unwrap_err();
+        assert!(error.to_string().contains("include depth exceeds"));
+
+        let large = dir.path().join("large.json");
+        let file = fs::File::create(&large).unwrap();
+        file.set_len(MAX_SOURCE_BYTES + 1).unwrap();
+        let error = import_file(&large, options()).unwrap_err();
+        assert!(error.to_string().contains("the limit is"));
+
+        let package = dir.path().join("package");
+        fs::create_dir_all(&package).unwrap();
+        let declarations = (0..=MAX_PACKAGE_VARIANTS)
+            .map(|index| format!(r#"{{"label":"{index}","path":"{index}.json"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            package.join("package.json"),
+            format!(r#"{{"contributes":{{"themes":[{declarations}]}}}}"#),
+        )
+        .unwrap();
+        let error = compile_source(
+            &package,
+            CompileOptions {
+                family_id: "large".into(),
+                family_name: "Large".into(),
+                source_url: "local".into(),
+                revision: "local".into(),
+                license: "User supplied".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("declares 129 theme variants"));
     }
 
     #[test]

@@ -237,7 +237,7 @@ impl ChangeRequestClientState {
 /// Active, fully identified checkouts that need host-side PR resolution.
 pub(crate) fn desired_watch_targets(
     chats: &[Chat],
-    spaces: &[Space],
+    _spaces: &[Space],
     is_unsupported: impl Fn(&str) -> bool,
 ) -> HashSet<ChangeRequestWatchKey> {
     chats
@@ -245,15 +245,12 @@ pub(crate) fn desired_watch_targets(
         .filter(|chat| !chat.archived)
         .filter(|chat| !is_unsupported(&chat.device_id))
         .filter_map(|chat| {
-            let (cwd, branch, checkout_id) = if let Some(source) = &chat.source_context {
-                (
-                    source.repo_root.as_str(),
-                    source.branch.as_str(),
-                    Some(source.checkout_id.clone()),
-                )
-            } else {
-                legacy_conversation_source(chat, spaces)?
-            };
+            let source = chat.source_context.as_ref()?;
+            let (cwd, branch, checkout_id) = (
+                source.repo_root.as_str(),
+                source.branch.as_str(),
+                Some(source.checkout_id.clone()),
+            );
             if branch.trim().is_empty() {
                 return None;
             }
@@ -288,9 +285,8 @@ pub(crate) fn watch_params(
 
 /// Resolve a snapshot for a row without trusting the cache key alone.
 ///
-/// Canonical checkout identity wins when the chat has one. Older rows without
-/// it fall back to device + effective cwd. Branch equality is mandatory in
-/// both cases so a branch switch hides the stale PR immediately.
+/// Only conversation-owned source context is trusted. Legacy scalar metadata
+/// cannot prove that a worktree has not switched branches since it was written.
 pub fn change_request_for_chat<'a>(
     chat: &Chat,
     spaces: &[Space],
@@ -300,11 +296,8 @@ pub fn change_request_for_chat<'a>(
     if branch.is_empty() {
         return None;
     }
-    let cwd = if let Some(source) = &chat.source_context {
-        source.repo_root.as_str()
-    } else {
-        legacy_conversation_source(chat, spaces)?.0
-    };
+    let source = chat.source_context.as_ref()?;
+    let cwd = source.repo_root.as_str();
     let checkout_id = chat
         .source_context
         .as_ref()
@@ -325,49 +318,13 @@ pub fn change_request_for_chat<'a>(
 }
 
 /// Branch metadata safe to render for this conversation. Pre-source-context
-/// rows that point at their project's shared root are intentionally rejected:
-/// old builds copied that checkout's current branch onto every chat.
-pub(crate) fn conversation_branch<'a>(chat: &'a Chat, spaces: &'a [Space]) -> Option<&'a str> {
+/// rows are intentionally rejected: their scalar branch may describe an old
+/// state of either a shared checkout or a worktree.
+pub(crate) fn conversation_branch<'a>(chat: &'a Chat, _spaces: &'a [Space]) -> Option<&'a str> {
     chat.source_context
         .as_ref()
         .map(|source| source.branch.as_str())
-        .or_else(|| legacy_conversation_source(chat, spaces).map(|(_, branch, _)| branch))
         .filter(|branch| !branch.trim().is_empty())
-}
-
-fn legacy_conversation_source<'a>(
-    chat: &'a Chat,
-    spaces: &'a [Space],
-) -> Option<(&'a str, &'a str, Option<String>)> {
-    let cwd = effective_chat_cwd(chat, spaces)?;
-    let branch = chat.branch.as_deref()?.trim();
-    if branch.is_empty() {
-        return None;
-    }
-    let shared_root = chat.space_id.as_deref().and_then(|space_id| {
-        spaces
-            .iter()
-            .find(|space| space.id == space_id && space.device_id == chat.device_id)
-            .map(|space| space.path.as_str())
-    });
-    if shared_root.is_some_and(|root| root == cwd) {
-        return None;
-    }
-    Some((cwd, branch, chat.checkout_id.clone()))
-}
-
-fn effective_chat_cwd<'a>(chat: &'a Chat, spaces: &'a [Space]) -> Option<&'a str> {
-    chat.cwd
-        .as_deref()
-        .filter(|cwd| !cwd.trim().is_empty())
-        .or_else(|| {
-            let space_id = chat.space_id.as_deref()?;
-            spaces
-                .iter()
-                .find(|space| space.id == space_id && space.device_id == chat.device_id)
-                .map(|space| space.path.as_str())
-                .filter(|path| !path.trim().is_empty())
-        })
 }
 
 #[cfg(test)]
@@ -462,8 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn local_chat_finds_local_snapshot() {
-        let chat = chat("chat", "local", Some("/repo"), Some("checkout"));
+    fn source_context_chat_finds_local_snapshot() {
+        let chat = with_source(
+            chat("chat", "local", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
         let status = snapshot("local", "/repo", "checkout");
         assert_eq!(
             change_request_for_chat(&chat, &[], [&status]).map(|pr| pr.number),
@@ -473,26 +433,32 @@ mod tests {
 
     #[test]
     fn remote_chat_requires_the_same_device() {
-        let chat = chat("chat", "remote", Some("/repo"), Some("checkout"));
+        let chat = with_source(
+            chat("chat", "remote", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
         let status = snapshot("local", "/repo", "checkout");
         assert!(change_request_for_chat(&chat, &[], [&status]).is_none());
     }
 
     #[test]
     fn mismatched_checkout_rejects_cwd_match() {
-        let chat = chat("chat", "local", Some("/repo"), Some("new-checkout"));
+        let mut chat = with_source(
+            chat("chat", "local", Some("/repo"), Some("new-checkout")),
+            "feature/pr",
+        );
+        chat.source_context.as_mut().unwrap().checkout_id = "new-checkout".into();
         let status = snapshot("local", "/repo", "old-checkout");
         assert!(change_request_for_chat(&chat, &[], [&status]).is_none());
     }
 
     #[test]
-    fn legacy_row_falls_back_to_cwd() {
+    fn source_less_worktree_hides_stale_legacy_metadata() {
         let chat = chat("chat", "local", Some("/repo"), None);
         let status = snapshot("local", "/repo", "checkout");
-        assert_eq!(
-            change_request_for_chat(&chat, &[], [&status]).map(|pr| pr.number),
-            Some(90)
-        );
+        assert!(change_request_for_chat(&chat, &[], [&status]).is_none());
+        assert!(conversation_branch(&chat, &[]).is_none());
+        assert!(desired_watch_targets(&[chat], &[], |_| false).is_empty());
     }
 
     #[test]
@@ -505,16 +471,25 @@ mod tests {
 
     #[test]
     fn different_branch_hides_snapshot() {
-        let mut chat = chat("chat", "local", Some("/repo"), Some("checkout"));
-        chat.branch = Some("feature/other".into());
+        let mut chat = with_source(
+            chat("chat", "local", Some("/repo"), Some("checkout")),
+            "feature/other",
+        );
+        chat.branch = Some("feature/pr".into());
         let status = snapshot("local", "/repo", "checkout");
         assert!(change_request_for_chat(&chat, &[], [&status]).is_none());
     }
 
     #[test]
     fn shared_chats_deduplicate_and_last_archive_removes_target() {
-        let first = chat("one", "local", Some("/repo"), Some("checkout"));
-        let mut second = chat("two", "local", Some("/repo"), Some("checkout"));
+        let first = with_source(
+            chat("one", "local", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
+        let mut second = with_source(
+            chat("two", "local", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
         let targets = desired_watch_targets(&[first.clone(), second.clone()], &[], |_| false);
         assert_eq!(targets.len(), 1);
 
@@ -529,7 +504,10 @@ mod tests {
 
     #[test]
     fn unsupported_device_has_no_targets_or_visible_snapshot() {
-        let chat = chat("chat", "old-engine", Some("/repo"), Some("checkout"));
+        let chat = with_source(
+            chat("chat", "old-engine", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
         let mut state = ChangeRequestClientState::default();
         state.store(
             ChangeRequestWatchKey {
@@ -550,7 +528,10 @@ mod tests {
 
     #[test]
     fn host_upgrade_reenables_a_previously_unsupported_device() {
-        let chat = chat("chat", "host", Some("/repo"), Some("checkout"));
+        let chat = with_source(
+            chat("chat", "host", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
         let mut state = ChangeRequestClientState::default();
         state.mark_unsupported("host".into(), Some("0.2.2".into()));
 
@@ -566,7 +547,10 @@ mod tests {
 
     #[test]
     fn successful_none_clears_a_previous_pr() {
-        let chat = chat("chat", "local", Some("/repo"), Some("checkout"));
+        let chat = with_source(
+            chat("chat", "local", Some("/repo"), Some("checkout")),
+            "feature/pr",
+        );
         let key = ChangeRequestWatchKey {
             device_id: "local".into(),
             cwd: "/repo".into(),

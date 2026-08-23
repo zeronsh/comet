@@ -733,8 +733,14 @@ impl SessionsEngine {
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
                 let harness_id = host.harness_for_request(&chat_id, &request);
-                match sessions
-                    .dispatch(&chat_id, harness_id, request, Some(user_id))
+                match host
+                    .dispatch_with_source_context(
+                        &sessions,
+                        &chat_id,
+                        harness_id,
+                        request,
+                        Some(user_id),
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -2130,8 +2136,18 @@ async fn drive_run(
                 request.resume = None;
                 request.attachments = Vec::new();
                 tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
-                if let Err(err) = engine
-                    .dispatch(&chat, harness_id, request, Some(steer.message_id.clone()))
+                let Some(host) = engine.inner.doc_host() else {
+                    tracing::warn!(chat = %chat, "orphaned steer lost: doc host unavailable");
+                    break;
+                };
+                if let Err(err) = host
+                    .dispatch_with_source_context(
+                        &engine,
+                        &chat,
+                        harness_id,
+                        request,
+                        Some(steer.message_id.clone()),
+                    )
                     .await
                 {
                     tracing::warn!(chat = %chat, error = %err, "orphaned steer re-dispatch failed");

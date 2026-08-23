@@ -22,6 +22,21 @@ struct ActiveChatRow {
     group: Option<(String, String)>,
 }
 
+fn compare_sidebar_chats(
+    sort: SidebarSort,
+    left: &zeron_proto::Chat,
+    right: &zeron_proto::Chat,
+) -> std::cmp::Ordering {
+    let primary = match sort {
+        SidebarSort::Created => right.created_at.cmp(&left.created_at),
+        SidebarSort::LastUpdated => right
+            .last_message_at
+            .unwrap_or(right.created_at)
+            .cmp(&left.last_message_at.unwrap_or(left.created_at)),
+    };
+    primary.then_with(|| left.id.cmp(&right.id))
+}
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -815,14 +830,22 @@ impl Shell {
         };
 
         let view_open = self.sidebar_view_menu.is_open();
+        let view_focus = self.sidebar_view_trigger_focus.clone();
         let view_trigger = div()
             .id("sidebar-view-options")
+            .role(gpui::Role::Button)
+            .aria_label("Sidebar view options")
+            .aria_expanded(view_open)
+            .track_focus(&view_focus)
             .size(px(29.0))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(8.0))
+            .border_1()
+            .border_color(theme.border.opacity(0.0))
+            .in_focus(|el| el.border_color(theme.border_strong))
             .cursor_pointer()
             .text_color(theme.text_muted)
             .bg(if view_open {
@@ -840,6 +863,21 @@ impl Shell {
                     this.close_sidebar_view_menu(cx);
                 } else {
                     this.open_sidebar_view_menu(window, cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if matches!(
+                    event.keystroke.key.to_ascii_lowercase().as_str(),
+                    "enter" | "space" | "arrowdown"
+                ) {
+                    cx.stop_propagation();
+                    if this.sidebar_view_menu.is_open()
+                        && !event.keystroke.key.eq_ignore_ascii_case("arrowdown")
+                    {
+                        this.close_sidebar_view_menu(cx);
+                    } else if !this.sidebar_view_menu.is_open() {
+                        this.open_sidebar_view_menu(window, cx);
+                    }
                 }
             }))
             .tooltip(|_, cx| cx.new(|_| SidebarViewOptionsTooltip).into())
@@ -1038,16 +1076,9 @@ impl Shell {
                 })
                 .map(|(status, chat)| (status, chat.clone()))
                 .collect();
-            match self.settings.sidebar_sort {
-                SidebarSort::Created => {
-                    chats.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
-                }
-                SidebarSort::LastUpdated => chats.sort_by(|a, b| {
-                    b.1.last_message_at
-                        .unwrap_or(b.1.created_at)
-                        .cmp(&a.1.last_message_at.unwrap_or(a.1.created_at))
-                }),
-            }
+            chats.sort_by(|left, right| {
+                compare_sidebar_chats(self.settings.sidebar_sort, &left.1, &right.1)
+            });
             chats
                 .into_iter()
                 .map(|(status, chat)| {
@@ -1257,14 +1288,9 @@ impl Shell {
                 .cloned()
                 .collect()
         };
-        match self.settings.sidebar_sort {
-            SidebarSort::Created => rows.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-            SidebarSort::LastUpdated => rows.sort_by(|a, b| {
-                b.last_message_at
-                    .unwrap_or(b.created_at)
-                    .cmp(&a.last_message_at.unwrap_or(a.created_at))
-            }),
-        }
+        rows.sort_by(|left, right| {
+            compare_sidebar_chats(self.settings.sidebar_sort, left, right)
+        });
         if rows.is_empty() {
             return None;
         }
@@ -2976,10 +3002,43 @@ impl Shell {
 
 #[cfg(test)]
 mod tests {
-    use super::promote_local_device_group;
+    use chrono::{TimeZone as _, Utc};
+
+    use super::{compare_sidebar_chats, promote_local_device_group};
+    use crate::settings::SidebarSort;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
         (Some((device.into(), device.into())), vec![value])
+    }
+
+    fn chat(id: &str) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: id.into(),
+            device_id: "device".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: Some(Utc.timestamp_opt(10, 0).unwrap()),
+            created_at: Utc.timestamp_opt(5, 0).unwrap(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn equal_sidebar_timestamps_sort_by_stable_chat_id() {
+        let alpha = chat("alpha");
+        let beta = chat("beta");
+        assert!(compare_sidebar_chats(SidebarSort::Created, &alpha, &beta).is_lt());
+        assert!(compare_sidebar_chats(SidebarSort::LastUpdated, &alpha, &beta).is_lt());
     }
 
     #[test]

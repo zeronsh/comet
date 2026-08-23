@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -12,6 +12,9 @@ use crate::vscode::{
 use crate::{ThemeFamily, ThemeRegistry, replace_custom_families};
 
 const LIBRARY_FILE: &str = "theme-library.json";
+const MAX_LIBRARY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LIBRARY_ENTRIES: usize = 256;
+const MAX_LIBRARY_VARIANTS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMode {
@@ -104,26 +107,31 @@ impl CustomThemeLibrary {
 
     pub fn load(data_dir: &Path) -> Result<Self> {
         let path = Self::path(data_dir);
-        let source = match fs::read_to_string(&path) {
+        let backup = backup_path(&path);
+        let load_path = if path.exists() { &path } else { &backup };
+        let source = match read_library_file(load_path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => {
                 return Err(error).with_context(|| format!("could not read {}", path.display()));
             }
         };
-        serde_json::from_str(&source).with_context(|| format!("could not parse {}", path.display()))
+        let library: Self = serde_json::from_str(&source)
+            .with_context(|| format!("could not parse {}", load_path.display()))?;
+        library.validate_capacity()?;
+        Ok(library)
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<()> {
+        self.validate_capacity()?;
         fs::create_dir_all(data_dir)
             .with_context(|| format!("could not create {}", data_dir.display()))?;
         let path = Self::path(data_dir);
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("could not write {}", temporary.display()))?;
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("could not replace {}", path.display()))?;
-        Ok(())
+        let encoded = serde_json::to_vec_pretty(self)?;
+        if encoded.len() as u64 > MAX_LIBRARY_BYTES {
+            bail!("custom theme library exceeds the {MAX_LIBRARY_BYTES}-byte limit");
+        }
+        replace_file_recoverably(&path, &encoded)
     }
 
     pub fn install_runtime(&self) {
@@ -166,6 +174,7 @@ impl CustomThemeLibrary {
         if family.variants.is_empty() {
             bail!("select at least one successfully compiled variant");
         }
+        self.ensure_capacity_for(family.variants.len())?;
         let entry_id = unique_id(
             &family.id,
             self.entries.iter().map(|entry| entry.id.as_str()),
@@ -214,6 +223,7 @@ impl CustomThemeLibrary {
             selected_variant_ids,
             status: CustomThemeStatus::Ready,
         });
+        self.validate_capacity()?;
         Ok(entry_id)
     }
 
@@ -254,19 +264,24 @@ impl CustomThemeLibrary {
             }
             CustomThemeSource::ImportedSnapshot { .. } => bail!("imported snapshots cannot reload"),
         };
+        let wanted: HashSet<_> = entry.selected_variant_ids.iter().cloned().collect();
         let compilation = match Self::compile(&path, &entry.id, &entry.name) {
-            Ok(compilation) if compilation.failures.is_empty() => compilation,
             Ok(compilation) => {
-                let message = compilation
+                let selected_failures = compilation
                     .failures
                     .iter()
+                    .filter(|failure| wanted.contains(&failure.id))
                     .map(|failure| format!("{}: {}", failure.name, failure.message))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                entry.status = CustomThemeStatus::Warning {
-                    message: message.clone(),
-                };
-                return Err(anyhow!(message));
+                    .collect::<Vec<_>>();
+                if selected_failures.is_empty() {
+                    compilation
+                } else {
+                    let message = selected_failures.join("; ");
+                    entry.status = CustomThemeStatus::Warning {
+                        message: message.clone(),
+                    };
+                    return Err(anyhow!(message));
+                }
             }
             Err(error) => {
                 entry.status = CustomThemeStatus::Warning {
@@ -275,7 +290,6 @@ impl CustomThemeLibrary {
                 return Err(error);
             }
         };
-        let wanted: HashSet<_> = entry.selected_variant_ids.iter().cloned().collect();
         let mut family = compilation.family;
         family
             .variants
@@ -324,6 +338,7 @@ impl CustomThemeLibrary {
             .find(|entry| entry.id == id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown custom theme `{id}`"))?;
+        self.ensure_capacity_for(original.family.variants.len())?;
         let new_id = unique_id(
             &format!("{}-copy", original.id),
             self.entries.iter().map(|entry| entry.id.as_str()),
@@ -373,6 +388,7 @@ impl CustomThemeLibrary {
             .find(|entry| entry.id == id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown custom theme `{id}`"))?;
+        self.ensure_capacity_for(original.family.variants.len())?;
         let new_id = unique_id(
             &format!("{}-copy", original.id),
             self.entries.iter().map(|entry| entry.id.as_str()),
@@ -385,11 +401,7 @@ impl CustomThemeLibrary {
         fs::create_dir_all(&editable_dir)
             .with_context(|| format!("could not create {}", editable_dir.display()))?;
         let path = editable_dir.join(format!("{new_id}.zeron-theme.json"));
-        let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(&family)?)
-            .with_context(|| format!("could not write {}", temporary.display()))?;
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("could not replace {}", path.display()))?;
+        replace_file_recoverably(&path, &serde_json::to_vec_pretty(&family)?)?;
 
         let selected_variant_ids = family
             .variants
@@ -413,10 +425,105 @@ impl CustomThemeLibrary {
         self.entries.retain(|entry| entry.id != id);
         self.entries.len() != before
     }
+
+    fn validate_capacity(&self) -> Result<()> {
+        if self.entries.len() > MAX_LIBRARY_ENTRIES {
+            bail!("custom theme library is limited to {MAX_LIBRARY_ENTRIES} entries");
+        }
+        let variants = self
+            .entries
+            .iter()
+            .try_fold(0usize, |count, entry| {
+                count.checked_add(entry.family.variants.len())
+            })
+            .ok_or_else(|| anyhow!("custom theme variant count overflow"))?;
+        if variants > MAX_LIBRARY_VARIANTS {
+            bail!("custom theme library is limited to {MAX_LIBRARY_VARIANTS} variants");
+        }
+        Ok(())
+    }
+
+    fn ensure_capacity_for(&self, additional_variants: usize) -> Result<()> {
+        if self.entries.len() >= MAX_LIBRARY_ENTRIES {
+            bail!("custom theme library is limited to {MAX_LIBRARY_ENTRIES} entries");
+        }
+        let current = self
+            .entries
+            .iter()
+            .try_fold(0usize, |count, entry| {
+                count.checked_add(entry.family.variants.len())
+            })
+            .ok_or_else(|| anyhow!("custom theme variant count overflow"))?;
+        if current
+            .checked_add(additional_variants)
+            .is_none_or(|total| total > MAX_LIBRARY_VARIANTS)
+        {
+            bail!("custom theme library is limited to {MAX_LIBRARY_VARIANTS} variants");
+        }
+        Ok(())
+    }
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
+}
+
+fn read_library_file(path: &Path) -> io::Result<String> {
+    let size = fs::metadata(path)?.len();
+    if size > MAX_LIBRARY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("custom theme library exceeds the {MAX_LIBRARY_BYTES}-byte limit"),
+        ));
+    }
+    fs::read_to_string(path)
+}
+
+/// Replace `path` without relying on rename-over-existing semantics (which
+/// Windows does not provide). The backup also lets startup recover if the
+/// process stops between the two renames. Symlinks are not followed here: the
+/// managed data-dir path itself is replaced.
+fn replace_file_recoverably(path: &Path, contents: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    let backup = backup_path(path);
+    let mut file = fs::File::create(&temporary)
+        .with_context(|| format!("could not create {}", temporary.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("could not write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("could not sync {}", temporary.display()))?;
+    drop(file);
+
+    if !path.exists() {
+        fs::rename(&temporary, path)
+            .with_context(|| format!("could not install {}", path.display()))?;
+        return Ok(());
+    }
+    if backup.exists() {
+        fs::remove_file(&backup)
+            .with_context(|| format!("could not remove stale backup {}", backup.display()))?;
+    }
+    fs::rename(path, &backup).with_context(|| format!("could not back up {}", path.display()))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let restore = fs::rename(&backup, path);
+        return match restore {
+            Ok(()) => Err(error).with_context(|| format!("could not replace {}", path.display())),
+            Err(restore_error) => Err(anyhow!(
+                "could not replace {}; recovery copy remains at {} ({error}); restore failed: {restore_error}",
+                path.display(),
+                backup.display()
+            )),
+        };
+    }
+    // The committed primary is authoritative. A stale backup is harmless and
+    // will be cleared before the next save; cleanup failure must not make the
+    // caller believe an already-committed replacement failed.
+    let _ = fs::remove_file(&backup);
+    Ok(())
 }
 
 fn load_editable_family(path: &Path, expected_id: &str) -> Result<ThemeFamily> {
-    let source = fs::read_to_string(path)
+    let source = read_library_file(path)
         .with_context(|| format!("could not read editable theme {}", path.display()))?;
     let family: ThemeFamily = serde_json::from_str(&source)
         .with_context(|| format!("could not parse editable theme {}", path.display()))?;
@@ -515,6 +622,34 @@ mod tests {
     }
 
     #[test]
+    fn linked_reload_ignores_failures_in_unselected_sibling_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        package(dir.path());
+        let compiled =
+            CustomThemeLibrary::compile(dir.path(), "test-family", "Test Family").unwrap();
+        let selected = vec!["test-family-test-light".to_string()];
+        let mut library = CustomThemeLibrary::default();
+        let id = library
+            .install(compiled, &selected, InstallMode::Link)
+            .unwrap();
+        fs::write(dir.path().join("themes/dark.json"), "not json").unwrap();
+        fs::write(
+            dir.path().join("themes/light.json"),
+            r##"{"colors":{"editor.background":"#fafafa","foreground":"#202020","focusBorder":"#0066cc"}}"##,
+        )
+        .unwrap();
+
+        library.reload(&id).unwrap();
+        let entry = library.entry(&id).unwrap();
+        assert_eq!(entry.family.variants.len(), 1);
+        assert_eq!(
+            entry.family.variants[0].colors.background,
+            "#fafafa".parse().unwrap()
+        );
+        assert_eq!(entry.status, CustomThemeStatus::Ready);
+    }
+
+    #[test]
     fn linked_reload_hardens_low_contrast_palette() {
         let dir = tempfile::tempdir().unwrap();
         package(dir.path());
@@ -565,7 +700,40 @@ mod tests {
 
         let data = tempfile::tempdir().unwrap();
         library.save(data.path()).unwrap();
+        library.save(data.path()).unwrap();
         assert_eq!(CustomThemeLibrary::load(data.path()).unwrap(), library);
+    }
+
+    #[test]
+    fn load_recovers_from_backup_left_between_replacement_renames() {
+        let data = tempfile::tempdir().unwrap();
+        let library = CustomThemeLibrary::default();
+        library.save(data.path()).unwrap();
+        let path = CustomThemeLibrary::path(data.path());
+        fs::rename(&path, backup_path(&path)).unwrap();
+
+        assert_eq!(CustomThemeLibrary::load(data.path()).unwrap(), library);
+    }
+
+    #[test]
+    fn rejects_libraries_above_entry_limit_before_serializing_or_cloning() {
+        let source = tempfile::tempdir().unwrap();
+        package(source.path());
+        let compiled =
+            CustomThemeLibrary::compile(source.path(), "test-family", "Test Family").unwrap();
+        let mut library = CustomThemeLibrary::default();
+        let id = library
+            .install(compiled, &[], InstallMode::Snapshot)
+            .unwrap();
+        let template = library.entry(&id).unwrap().clone();
+        while library.entries.len() <= MAX_LIBRARY_ENTRIES {
+            library.entries.push(template.clone());
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let error = library.save(data.path()).unwrap_err();
+        assert!(error.to_string().contains("limited to 256 entries"));
+        assert!(!CustomThemeLibrary::path(data.path()).exists());
     }
 
     #[test]

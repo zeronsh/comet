@@ -3136,11 +3136,6 @@ impl DocHost {
                             tracing::warn!(chat = %chat_id, error = %err, "worktree branch stamp failed");
                         }
                     }
-                    if let Some(context) = self.capture_source_context(&request.cwd).await
-                        && let Err(err) = ws.set_chat_source_context(chat_id, &context)
-                    {
-                        tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
-                    }
                 }
                 let harness = self.harness_for_request(chat_id, &request);
                 // A row with no config renders no harness glyph (and every
@@ -3175,9 +3170,14 @@ impl DocHost {
                 ) {
                     tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
                 }
-                sessions
-                    .dispatch(chat_id, harness, request, Some(message_id.clone()))
-                    .await?;
+                self.dispatch_with_source_context(
+                    sessions,
+                    chat_id,
+                    harness,
+                    request,
+                    Some(message_id.clone()),
+                )
+                .await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
@@ -3216,9 +3216,14 @@ impl DocHost {
                         // ride the prompt text.
                         request.attachments = Vec::new();
                         let harness = self.harness_for_request(chat_id, &request);
-                        sessions
-                            .dispatch(chat_id, harness, request, message_id.clone())
-                            .await?;
+                        self.dispatch_with_source_context(
+                            sessions,
+                            chat_id,
+                            harness,
+                            request,
+                            message_id.clone(),
+                        )
+                        .await?;
                         Ok((
                             SessionCommandStatus::Applied,
                             Some("queued as new turn".into()),
@@ -3290,7 +3295,8 @@ impl DocHost {
                         "orphaned input resolve failed");
                 }
                 let harness = self.harness_for_request(chat_id, &request);
-                sessions.dispatch(chat_id, harness, request, None).await?;
+                self.dispatch_with_source_context(sessions, chat_id, harness, request, None)
+                    .await?;
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("answered as new turn".into()),
@@ -3313,6 +3319,30 @@ impl DocHost {
             head_sha,
             observed_at: chrono::Utc::now(),
         })
+    }
+
+    /// Every fresh harness dispatch crosses this boundary, including
+    /// steer/input fallbacks and crash recovery. Capture immediately before
+    /// dispatch so the conversation records the checkout the harness will
+    /// actually observe, rather than whichever checkout state was current on
+    /// an earlier turn.
+    pub(crate) async fn dispatch_with_source_context(
+        &self,
+        sessions: &SessionsEngine,
+        chat_id: &str,
+        harness: HarnessId,
+        request: zeron_proto::RunRequest,
+        message_id: Option<String>,
+    ) -> Result<String, EngineError> {
+        if let Some(workspace) = self.workspace()
+            && let Some(context) = self.capture_source_context(&request.cwd).await
+            && let Err(err) = workspace.set_chat_source_context(chat_id, &context)
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "conversation source stamp failed");
+        }
+        sessions
+            .dispatch(chat_id, harness, request, message_id)
+            .await
     }
 
     /// Create (or reuse) the isolated worktree a Run's [`zeron_proto::WorktreeSpec`]
@@ -3547,6 +3577,63 @@ mod transfer_progress_tests {
         let rx = host.watch_transfers();
         assert_eq!(rx.borrow().len(), 1);
         assert_eq!(rx.borrow()[0].done, 750);
+    }
+}
+
+#[cfg(test)]
+mod source_context_tests {
+    use super::{DocHost, DocHostConfig};
+    use std::process::Command;
+    use std::sync::Arc;
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[tokio::test]
+    async fn capture_source_context_reads_the_dispatch_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "feature/captured"]);
+        git(&repo, &["config", "user.name", "Zeron Test"]);
+        git(&repo, &["config", "user.email", "zeron@example.com"]);
+        std::fs::write(repo.join("README.md"), "capture\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "capture"]);
+
+        let store =
+            Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).expect("store opens"));
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "device-a".into(),
+                default_harness: zeron_proto::HarnessId::Mock,
+                edge: None,
+            },
+        );
+        host.set_repos(crate::repos::Repos::new(
+            &dir.path().join("data"),
+            "device-a",
+        ));
+
+        let context = host
+            .capture_source_context(repo.to_str().unwrap())
+            .await
+            .expect("source context");
+        assert_eq!(context.branch, "feature/captured");
+        assert_eq!(context.cwd, repo.to_string_lossy());
+        assert_eq!(
+            context.repo_root,
+            repo.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(context.head_sha.is_some());
+        assert!(!context.checkout_id.is_empty());
     }
 }
 

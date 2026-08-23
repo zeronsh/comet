@@ -1,8 +1,8 @@
 # Sidebar view options and conversation links
 
 Status: implemented and verified locally
-Branch: `wip/sidebar-view-options`  
-Base: `origin/main` at `3fc7bb0` (`v0.2.20`)  
+Branch: `wip/sidebar-view-options`
+Base: `origin/main` at `92b5732` (`ci: add permanent internal TestFlight workflow (#213)`)
 Research date: 2026-08-22
 
 ## Goal

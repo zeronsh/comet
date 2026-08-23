@@ -23,18 +23,18 @@ pub fn workspace_locator(
     local_device_id: Option<&str>,
 ) -> Option<String> {
     let scope = scope?;
-    let identity = match (scope, auth) {
-        (
-            WorkspaceScope::Synced | WorkspaceScope::Development,
-            Some(AuthState::SignedIn { user, org_id }),
-        ) => {
+    let identity = match scope {
+        WorkspaceScope::Synced | WorkspaceScope::Development => {
+            let Some(AuthState::SignedIn { user, org_id }) = auth else {
+                return None;
+            };
             format!(
                 "user:{}:org:{}",
                 user.id,
                 org_id.as_deref().unwrap_or("personal")
             )
         }
-        _ => format!("device:{}", local_device_id?),
+        WorkspaceScope::Local => format!("device:{}", local_device_id?),
     };
     let mut hash = Sha256::new();
     hash.update(format!("{scope:?}\0{identity}"));
@@ -175,6 +175,45 @@ mod tests {
         let second = workspace_locator(Some(WorkspaceScope::Local), None, Some("device-b"));
         assert!(first.is_some());
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn synced_workspace_locator_waits_for_signed_in_identity() {
+        let scope = Some(WorkspaceScope::Synced);
+        assert_eq!(workspace_locator(scope, None, Some("device-a")), None);
+        assert_eq!(
+            workspace_locator(scope, Some(&AuthState::SignedOut), Some("device-a")),
+            None
+        );
+        assert_eq!(
+            workspace_locator(
+                scope,
+                Some(&AuthState::NeedsOrganization {
+                    user: zeron_proto::UserProfile {
+                        id: "user-a".into(),
+                        email: "user@example.com".into(),
+                        name: None,
+                    },
+                }),
+                Some("device-a"),
+            ),
+            None
+        );
+        assert!(
+            workspace_locator(
+                scope,
+                Some(&AuthState::SignedIn {
+                    user: zeron_proto::UserProfile {
+                        id: "user-a".into(),
+                        email: "user@example.com".into(),
+                        name: None,
+                    },
+                    org_id: Some("org-a".into()),
+                }),
+                None,
+            )
+            .is_some()
+        );
     }
 
     #[test]

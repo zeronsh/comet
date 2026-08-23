@@ -1002,6 +1002,8 @@ pub struct Shell {
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// Persisted organization/sort/metadata controls beside the project filter.
     sidebar_view_menu: popover::Popup<spaces::SidebarViewMenu>,
+    /// Natural-tab-order focus target for the icon-only view-options button.
+    sidebar_view_trigger_focus: gpui::FocusHandle,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -1270,6 +1272,7 @@ impl Shell {
             add_space: None,
             spaces_menu: popover::Popup::default(),
             sidebar_view_menu: popover::Popup::default(),
+            sidebar_view_trigger_focus: cx.focus_handle().tab_stop(true),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
