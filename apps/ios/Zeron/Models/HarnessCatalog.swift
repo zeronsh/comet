@@ -38,6 +38,7 @@ enum HarnessCatalog {
         "hermes": "Hermes",
         "pi": "Pi",
         "cursor": "Cursor",
+        "opencode": "OpenCode",
         "mock": "Mock",
     ]
 
@@ -71,6 +72,19 @@ enum HarnessCatalog {
                 ModelInfo(id: "default", label: "pi default",
                           description: "Runs the model configured in pi (`pi` settings)",
                           reasoningLevels: ["minimal", "low", "medium", "high", "xhigh", "max"]),
+            ]
+        case "opencode":
+            // Static fallback only — a reachable host answers `listModels`
+            // with its live discovery (connected providers). The anonymous
+            // OpenCode Zen tier is always available, so these always run.
+            return [
+                ModelInfo(id: "opencode/big-pickle", label: "Big Pickle",
+                          description: "OpenCode Zen's flagship coding model", reasoningLevels: []),
+                ModelInfo(id: "opencode/mimo-v2.5-free", label: "MiMo V2.5 Free",
+                          description: "Free tier on OpenCode Zen", reasoningLevels: []),
+                ModelInfo(id: "opencode/hy3-free", label: "Hy3 Free",
+                          description: "Free tier on OpenCode Zen",
+                          reasoningLevels: ["low", "medium", "high"]),
             ]
         case "codex":
             return [

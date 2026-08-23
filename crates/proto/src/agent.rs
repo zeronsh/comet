@@ -14,7 +14,9 @@ pub enum HarnessId {
     Hermes,
     /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
     Pi,
-    /// SST's opencode agent, driven over ACP (`opencode acp`).
+    /// SST's opencode agent, driven natively over its own HTTP/SSE server
+    /// protocol (`opencode serve` — the same wire the opencode desktop app
+    /// speaks).
     Opencode,
     /// Test harness; never shown in production pickers.
     Mock,

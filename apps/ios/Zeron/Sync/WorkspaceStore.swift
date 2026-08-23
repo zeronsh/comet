@@ -227,7 +227,11 @@ final class WorkspaceStore {
                 restartChangeRequestStreams(resetUnsupported: true)
             }
         case .rows(let seq, let rows):
-            doc.applyRows(seq: seq, rows: rows)
+            // A false return = seq gap (missed frames): the rows applied but
+            // the cursor held, so the next reconnect's hello backfills the
+            // window instead of skipping it forever. iOS sockets churn on
+            // every suspension, so convergence is quick without forcing one.
+            _ = doc.applyRows(seq: seq, rows: rows)
             project()
             saver?.poke()
         case .ack(let batch, let seq, _):

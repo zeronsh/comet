@@ -7,7 +7,7 @@
 import SwiftUI
 
 enum BrandMark {
-    case claude, openai, cursor, grok, hermes, pi
+    case claude, openai, cursor, grok, hermes, pi, opencode
 
     var viewBox: CGSize {
         switch self {
@@ -17,6 +17,7 @@ enum BrandMark {
         case .grok: return CGSize(width: 16, height: 16)
         case .hermes: return CGSize(width: 24, height: 24)
         case .pi: return CGSize(width: 800, height: 800)
+        case .opencode: return CGSize(width: 24, height: 30)
         }
     }
 
@@ -24,7 +25,7 @@ enum BrandMark {
     /// asset says so or the mark's holes fill in solid.
     var evenOddFill: Bool {
         switch self {
-        case .hermes, .pi: return true
+        case .hermes, .pi, .opencode: return true
         default: return false
         }
     }
@@ -43,6 +44,11 @@ enum BrandMark {
             return HermesMarkData.pathData
         case .pi:
             return "M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65ZM517.36 400H634.72V634.72H517.36Z"
+        case .opencode:
+            // opencode-mark.svg's frame (the desktop asset's second path is a
+            // 45%-opacity inner fill this single-path renderer skips — the
+            // mark reads identically at glyph sizes).
+            return "M24 0H0V30H24V0ZM18 6H6V24H18V6Z"
         }
     }
 
@@ -53,6 +59,7 @@ enum BrandMark {
         case "grok": return .grok
         case "hermes": return .hermes
         case "pi": return .pi
+        case "opencode": return .opencode
         default: return .claude  // claude-code + mock share the mark, like the desktop
         }
     }

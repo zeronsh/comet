@@ -59,7 +59,14 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(
     shell,
-    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+    [
+        ToggleSidebar,
+        ToggleChanges,
+        AddSpacePalette,
+        NewSession,
+        NextSession,
+        PrevSession
+    ]
 );
 
 /// Vertical pane resize hitboxes yield the global titlebar. Keeping this in
@@ -209,6 +216,22 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.new_session, "mod-n"),
             NewSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.next_session,
+                crate::settings::ShortcutId::NextSession.default_combo(),
+            ),
+            NextSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.prev_session,
+                crate::settings::ShortcutId::PrevSession.default_combo(),
+            ),
+            PrevSession,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -7061,6 +7084,10 @@ impl Render for Shell {
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
+            // Chat-scoped, unlike new-session — `cycle_session` holds the guard
+            // and says why.
+            .on_action(cx.listener(|this, _: &NextSession, _, cx| this.cycle_session(true, cx)))
+            .on_action(cx.listener(|this, _: &PrevSession, _, cx| this.cycle_session(false, cx)))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
@@ -7344,6 +7371,20 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_default_shortcut_binds_on_this_platform() {
+        // `apply_keymap` silently falls back on an unparseable combo, so a
+        // default gpui cannot parse would ship as a dead shortcut.
+        for id in crate::settings::ShortcutId::ALL {
+            let combo = platform_combo(id.default_combo());
+            assert!(
+                Keystroke::parse(&combo).is_ok(),
+                "{} default {combo:?} does not parse",
+                id.label()
+            );
+        }
+    }
 
     #[test]
     fn right_pane_ceiling_preserves_the_chat_floor() {

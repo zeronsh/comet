@@ -203,7 +203,6 @@ async fn real_all_harnesses_quiet_survey() {
         ("grok", AcpHarness::grok),
         ("hermes", AcpHarness::hermes),
         ("pi", AcpHarness::pi),
-        ("opencode", AcpHarness::opencode),
     ];
     let mut failures: Vec<String> = Vec::new();
     for (name, ctor) in agents {

@@ -549,6 +549,22 @@ impl WorkspaceHost {
             .is_some_and(|room| room.stats().connected)
     }
 
+    /// True once this replica has applied a server state this process (WS
+    /// hello answer or HTTPS pull) — or when no edge is configured at all
+    /// (local-only: the local table IS the whole truth). Destructive repair
+    /// (the orphan sweep) gates on this: a replica that has not heard from
+    /// the server this boot may be arbitrarily behind (gapped cursor,
+    /// pre-heal, offline at boot), and "row absent locally" on such a view
+    /// is not evidence of deletion.
+    pub fn registry_synced(&self) -> bool {
+        if self.inner.config.edge.is_none() {
+            return true;
+        }
+        lock(&self.inner.room)
+            .as_ref()
+            .is_some_and(|room| room.stats().synced)
+    }
+
     /// Probe the registry room's liveness NOW (window-focus sweep). Probes are
     /// deadline-checked in the client: an unanswered probe tears the session
     /// down for a fresh socket, so a deaf-receiving room (2026-08-04 incident)

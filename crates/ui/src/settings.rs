@@ -137,14 +137,18 @@ pub enum ShortcutId {
     ToggleChanges,
     ToggleTerminal,
     NewSession,
+    NextSession,
+    PrevSession,
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 4] = [
+    pub const ALL: [ShortcutId; 6] = [
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
+        ShortcutId::NextSession,
+        ShortcutId::PrevSession,
     ];
 
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
@@ -154,15 +158,39 @@ impl ShortcutId {
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
+            ShortcutId::NextSession => "Next session",
+            ShortcutId::PrevSession => "Previous session",
         }
     }
 
     pub fn default_combo(self) -> &'static str {
+        self.default_combo_on(cfg!(target_os = "macos"))
+    }
+
+    /// `default_combo` for an explicit platform, so the spelling invariant is
+    /// testable for both from any machine (see the tests below — the mismatch
+    /// this guards against only exists off macOS).
+    pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
             ShortcutId::ToggleSidebar => "mod-s",
             ShortcutId::ToggleChanges => "mod-b",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
+            // Ctrl+Tab on every platform — but spelled the way THAT platform's
+            // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
+            // ctrl IS the primary and stores as "mod"; on macOS it is its own
+            // modifier, and "mod" would mean Cmd+Tab, which the OS app
+            // switcher eats.
+            //
+            // Off macOS "ctrl-tab" and "mod-tab" resolve to the same keystroke
+            // through `platform_combo`, but conflict detection compares the
+            // STORED spelling — so a default the recorder cannot reproduce
+            // would let a rebind onto that same physical key pass as
+            // conflict-free, bind twice, and silently kill one shortcut.
+            ShortcutId::NextSession if mac => "ctrl-tab",
+            ShortcutId::NextSession => "mod-tab",
+            ShortcutId::PrevSession if mac => "ctrl-shift-tab",
+            ShortcutId::PrevSession => "mod-shift-tab",
         }
     }
 }
@@ -176,6 +204,8 @@ pub struct KeymapConfig {
     pub toggle_changes: String,
     pub toggle_terminal: String,
     pub new_session: String,
+    pub next_session: String,
+    pub prev_session: String,
 }
 
 impl Default for KeymapConfig {
@@ -185,6 +215,8 @@ impl Default for KeymapConfig {
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
+            next_session: ShortcutId::NextSession.default_combo().into(),
+            prev_session: ShortcutId::PrevSession.default_combo().into(),
         }
     }
 }
@@ -196,6 +228,8 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
+            ShortcutId::NextSession => &self.next_session,
+            ShortcutId::PrevSession => &self.prev_session,
         }
     }
 
@@ -205,6 +239,8 @@ impl KeymapConfig {
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
+            ShortcutId::NextSession => self.next_session = combo,
+            ShortcutId::PrevSession => self.prev_session = combo,
         }
     }
 
@@ -214,9 +250,22 @@ impl KeymapConfig {
 }
 
 /// Build a combo string from a recorded keystroke. The primary modifier
-/// (cmd on macOS, ctrl elsewhere — either recorded key maps in) becomes "mod";
-/// bare modifier presses record nothing.
+/// (cmd on macOS, ctrl elsewhere) becomes "mod"; bare modifier presses record
+/// nothing.
 pub fn combo_from_keystroke(
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    cmd: bool,
+    key: &str,
+) -> Option<String> {
+    combo_from_keystroke_on(cfg!(target_os = "macos"), ctrl, alt, shift, cmd, key)
+}
+
+/// [`combo_from_keystroke`] for an explicit platform — the ctrl spelling is
+/// platform-dependent, so both paths need to be exercisable from one machine.
+pub fn combo_from_keystroke_on(
+    mac: bool,
     ctrl: bool,
     alt: bool,
     shift: bool,
@@ -233,8 +282,15 @@ pub fn combo_from_keystroke(
         return None;
     }
     let mut parts: Vec<&str> = Vec::new();
-    if ctrl || cmd {
+    // On macOS ctrl stays its own modifier rather than folding into "mod":
+    // re-recording Ctrl+Tab as Cmd+Tab would hand the combo to the OS app
+    // switcher, which never delivers it to the window.
+    let ctrl_is_primary = ctrl && !mac;
+    if cmd || ctrl_is_primary {
         parts.push("mod");
+    }
+    if ctrl && !ctrl_is_primary {
+        parts.push("ctrl");
     }
     if alt {
         parts.push("alt");
@@ -262,11 +318,12 @@ pub fn conflicted_shortcuts(keymap: &KeymapConfig) -> Vec<ShortcutId> {
 
 /// Translate a stored combo into a bindable keystroke for this platform.
 pub fn platform_combo(combo: &str) -> String {
-    let primary = if cfg!(target_os = "macos") {
-        "cmd"
-    } else {
-        "ctrl"
-    };
+    platform_combo_on(cfg!(target_os = "macos"), combo)
+}
+
+/// [`platform_combo`] for an explicit platform (see [`combo_from_keystroke_on`]).
+pub fn platform_combo_on(mac: bool, combo: &str) -> String {
+    let primary = if mac { "cmd" } else { "ctrl" };
     combo
         .split('-')
         .map(|part| if part == "mod" { primary } else { part })
@@ -276,17 +333,16 @@ pub fn platform_combo(combo: &str) -> String {
 
 /// Human-readable combo for the shortcuts table ("mod-s" → "Cmd+S"/"Ctrl+S").
 pub fn display_combo(combo: &str) -> String {
+    display_combo_on(cfg!(target_os = "macos"), combo)
+}
+
+/// [`display_combo`] for an explicit platform (see [`combo_from_keystroke_on`]).
+pub fn display_combo_on(mac: bool, combo: &str) -> String {
     combo
         .split('-')
         .map(|part| match part {
-            "mod" => {
-                if cfg!(target_os = "macos") {
-                    "Cmd".to_string()
-                } else {
-                    "Ctrl".to_string()
-                }
-            }
-            "alt" => "Alt".to_string(),
+            "mod" => if mac { "Cmd" } else { "Ctrl" }.to_string(),
+            "alt" => if mac { "Opt" } else { "Alt" }.to_string(),
             "shift" => "Shift".to_string(),
             other => {
                 let mut chars = other.chars();
@@ -485,6 +541,16 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
         assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-b");
         assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-j");
+        let ctrl = if cfg!(target_os = "macos") {
+            "ctrl"
+        } else {
+            "mod"
+        };
+        assert_eq!(keymap.get(ShortcutId::NextSession), format!("{ctrl}-tab"));
+        assert_eq!(
+            keymap.get(ShortcutId::PrevSession),
+            format!("{ctrl}-shift-tab")
+        );
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
@@ -493,18 +559,29 @@ mod tests {
 
     #[test]
     fn combo_recording() {
-        // Primary modifier (ctrl or cmd) normalizes to "mod".
+        // How this platform spells a recorded ctrl (see `combo_from_keystroke_on`).
+        let ctrl_combo = |suffix: &str| {
+            if cfg!(target_os = "macos") {
+                format!("ctrl-{suffix}")
+            } else {
+                format!("mod-{suffix}")
+            }
+        };
         assert_eq!(
             combo_from_keystroke(true, false, false, false, "s"),
-            Some("mod-s".into())
+            Some(ctrl_combo("s"))
         );
         assert_eq!(
             combo_from_keystroke(false, false, false, true, "s"),
             Some("mod-s".into())
         );
         assert_eq!(
+            combo_from_keystroke(true, false, true, false, "tab"),
+            Some(ctrl_combo("shift-tab"))
+        );
+        assert_eq!(
             combo_from_keystroke(true, true, true, false, "K"),
-            Some("mod-alt-shift-k".into())
+            Some(ctrl_combo("alt-shift-k"))
         );
         // Plain keys record without modifiers (Esc is filtered by the caller).
         assert_eq!(
@@ -521,6 +598,48 @@ mod tests {
             None
         );
         assert_eq!(combo_from_keystroke(false, false, false, false, ""), None);
+    }
+
+    #[test]
+    fn every_default_is_spelled_the_way_the_recorder_spells_it() {
+        // The invariant `default_combo_on` documents. Checked for BOTH
+        // platforms because the hazard only exists off macOS, so a single-OS
+        // CI run would never see it.
+        for mac in [true, false] {
+            for id in ShortcutId::ALL {
+                let combo = id.default_combo_on(mac);
+                // Via the platform spelling, where modifier names are
+                // unambiguous, so the decode can't inherit the bug it checks.
+                let bound = platform_combo_on(mac, combo);
+                let mut parts: Vec<&str> = bound.split('-').collect();
+                let key = parts.pop().expect("a combo always ends in a key");
+                let recorded = combo_from_keystroke_on(
+                    mac,
+                    parts.contains(&"ctrl"),
+                    parts.contains(&"alt"),
+                    parts.contains(&"shift"),
+                    parts.contains(&"cmd"),
+                    key,
+                );
+                assert_eq!(
+                    recorded.as_deref(),
+                    Some(combo),
+                    "{} default {combo:?} is unreachable from the recorder (mac={mac})",
+                    id.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_are_distinct_physical_keys() {
+        // Distinct STRINGS is not enough — two defaults could still resolve to
+        // the same keystroke through `platform_combo`.
+        let mut seen = std::collections::HashSet::new();
+        for id in ShortcutId::ALL {
+            let bound = platform_combo(id.default_combo());
+            assert!(seen.insert(bound.clone()), "{bound:?} bound twice");
+        }
     }
 
     #[test]
@@ -555,6 +674,12 @@ mod tests {
             format!("{display_primary}+Shift+S")
         );
         assert_eq!(display_combo("f5"), "F5");
+        assert_eq!(display_combo_on(true, "mod-alt-up"), "Cmd+Opt+Up");
+        assert_eq!(display_combo_on(false, "mod-alt-up"), "Ctrl+Alt+Up");
+        // Literal ctrl passes through untouched — the macOS spelling of
+        // session cycling.
+        assert_eq!(platform_combo("ctrl-shift-tab"), "ctrl-shift-tab");
+        assert_eq!(display_combo("ctrl-shift-tab"), "Ctrl+Shift+Tab");
     }
 
     #[test]
@@ -565,6 +690,25 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+    }
+
+    #[test]
+    fn a_keymap_missing_newer_shortcuts_keeps_its_customizations() {
+        // Upgrade path: a file from a build that predates session cycling
+        // carries the user's rebinds and defaults only the new rows.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"toggleSidebar": "mod-shift-x"}}"#,
+        )
+        .unwrap();
+        let keymap = UiSettings::load(dir.path()).keymap;
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+        assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-j");
+        assert_eq!(
+            keymap.get(ShortcutId::NextSession),
+            ShortcutId::NextSession.default_combo()
+        );
     }
 
     #[test]

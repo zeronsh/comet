@@ -1210,6 +1210,7 @@ impl RpcService for EngineRpc {
                 fn room_json(s: &zeron_sync::RoomStatsSnapshot) -> serde_json::Value {
                     serde_json::json!({
                         "connected": s.connected,
+                        "synced": s.synced,
                         "lastPushedMs": s.last_pushed_ms,
                         "lastAckMs": s.last_ack_ms,
                         "rejoins": s.rejoins,

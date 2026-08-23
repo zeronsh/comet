@@ -400,6 +400,17 @@ enum ModelRail {
     Harness,
 }
 
+/// Cache key for the flattened model-row list: any input that changes the
+/// list's CONTENT (not its highlight/selection, which render per-row).
+#[derive(Clone, PartialEq, Eq)]
+struct ModelRowsKey {
+    query: String,
+    rail: ModelRail,
+    effective: Option<HarnessId>,
+    locked: bool,
+    catalog_rev: u64,
+}
+
 /// One row of the model list: the model plus the harness it belongs to —
 /// search results and the favorites view mix harnesses, and every row's
 /// subline names its harness (t3code ModelListRow `showProvider`).
@@ -485,9 +496,17 @@ pub struct Pickers {
     refs_space: Option<String>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
-    /// Models-list scroll — keyboard nav keeps the highlighted row in view
-    /// (`scroll_to_item`; the add-space palette standard).
-    model_scroll: gpui::ScrollHandle,
+    /// Models-list scroll — keyboard nav keeps the highlighted row in view.
+    /// A `UniformListScrollHandle`: the model list virtualizes (7k-model
+    /// catalogs must scroll smoothly), and this is its handle; the plain
+    /// base handle inside serves the floating scrollbar's metrics.
+    model_scroll: gpui::UniformListScrollHandle,
+    /// Flattened rows the list/keyboard/⌘N all walk, cached per
+    /// [`ModelRowsKey`]: a 7k-model catalog rebuilt+ranked on every
+    /// keystroke, arrow press AND render was the picker's open/scroll lag.
+    model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelRowData>>)>>,
+    /// Bumped on every catalog/favorites mutation; invalidates the cache.
+    catalog_rev: u64,
     /// Drag state for the floating model-list scrollbar.
     model_scrollbar_drag: Option<ModelScrollbarGrab>,
     /// The scrollbar is an on-demand affordance for the model-list surface.
@@ -539,7 +558,7 @@ impl Pickers {
                     }
                     if this.open_kind() == Some(PickerKind::HarnessModel) {
                         this.active = 0;
-                        this.model_scroll.set_offset(gpui::Point::default());
+                        this.model_scroll_base().set_offset(gpui::Point::default());
                     }
                 }
                 cx.notify();
@@ -580,6 +599,7 @@ impl Pickers {
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
                 this.models.clear();
+                this.catalog_rev += 1;
             }
             cx.notify();
         });
@@ -646,7 +666,9 @@ impl Pickers {
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
-            model_scroll: gpui::ScrollHandle::new(),
+            model_scroll: gpui::UniformListScrollHandle::new(),
+            model_rows_cache: std::cell::RefCell::new(None),
+            catalog_rev: 0,
             model_scrollbar_drag: None,
             model_list_hovered: false,
             model_scrollbar_hovered: false,
@@ -927,8 +949,9 @@ impl Pickers {
             PickerKind::Device => self.selected_device_index(cx),
         };
         if kind == PickerKind::HarnessModel {
-            self.model_scroll.set_offset(gpui::Point::default());
-            self.model_scroll.scroll_to_item(self.active);
+            self.model_scroll_base().set_offset(gpui::Point::default());
+            self.model_scroll
+                .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -1011,6 +1034,7 @@ impl Pickers {
         let target = self.space_target(cx);
         if !matches!(self.harnesses, Loadable::Ready(_)) {
             self.harnesses = Loadable::Loading;
+            self.catalog_rev += 1;
         }
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
@@ -1025,6 +1049,7 @@ impl Pickers {
                 .call(methods::LIST_HARNESSES, serde_json::Value::Object(params))
                 .await;
             this.update(cx, |pickers, cx| {
+                pickers.catalog_rev += 1;
                 pickers.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
@@ -1079,6 +1104,7 @@ impl Pickers {
         let target = self.space_target(cx);
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
             self.models.insert(harness, Loadable::Loading);
+            self.catalog_rev += 1;
         }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
@@ -1136,6 +1162,7 @@ impl Pickers {
                     }
                 }
                 pickers.models.insert(harness, loaded);
+                pickers.catalog_rev += 1;
                 // A list that landed while its popover is open re-anchors the
                 // keyboard highlight onto the selected row (it sat at 0 while
                 // loading).
@@ -1335,7 +1362,7 @@ impl Pickers {
         self.config.harness = Some(harness);
         self.defaults.harness = Some(harness);
         self.save_defaults();
-        self.model_scroll.set_offset(gpui::Point::default());
+        self.model_scroll_base().set_offset(gpui::Point::default());
         self.ensure_models(harness, false, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
@@ -1515,6 +1542,26 @@ impl Pickers {
     /// favorites across harnesses, or the effective harness's list with its
     /// starred rows floated to the top (t3 `groupFavorites`). A locked chat
     /// restricts every view to its own harness.
+    /// Cached [`Self::visible_model_rows`]: selection/highlight changes and
+    /// re-renders share one flattened list until an input actually changes.
+    fn model_rows(&self, cx: &App) -> std::sync::Arc<Vec<ModelRowData>> {
+        let key = ModelRowsKey {
+            query: self.search.read(cx).text().trim().to_string(),
+            rail: self.model_rail,
+            effective: self.effective_harness(cx),
+            locked: self.harness_locked(cx),
+            catalog_rev: self.catalog_rev,
+        };
+        if let Some((cached_key, rows)) = self.model_rows_cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return rows.clone();
+        }
+        let rows = std::sync::Arc::new(self.visible_model_rows(cx));
+        *self.model_rows_cache.borrow_mut() = Some((key, rows.clone()));
+        rows
+    }
+
     fn visible_model_rows(&self, cx: &App) -> Vec<ModelRowData> {
         let effective = self.effective_harness(cx);
         let mut descriptors = self.rail_descriptors(cx);
@@ -1526,6 +1573,14 @@ impl Pickers {
             harness_name: SharedString::from(descriptor.name.clone()),
             model: model.clone(),
         };
+        // Favorite lookups are per-row; the Vec scan made the flatten
+        // O(models × favorites).
+        let favorites: std::collections::HashSet<(HarnessId, &str)> = self
+            .defaults
+            .favorites
+            .iter()
+            .map(|f| (f.harness, f.model.as_str()))
+            .collect();
         let query = self.search.read(cx).text().trim().to_string();
         if !query.is_empty() {
             // Rank: label prefix < label substring < harness-name hit;
@@ -1539,13 +1594,21 @@ impl Pickers {
                 };
                 for model in models {
                     let by_label = popover::match_rank(&query, &model.label);
+                    // The wider haystack ranks behind label hits: harness
+                    // name AND the description (opencode's provider
+                    // attribution — "anthropic" must find its models).
                     let by_harness = popover::match_rank(
                         &query,
-                        &format!("{} {}", descriptor.name, model.label),
+                        &format!(
+                            "{} {} {}",
+                            descriptor.name,
+                            model.description.as_deref().unwrap_or(""),
+                            model.label
+                        ),
                     )
                     .map(|rank| rank + 2);
                     if let Some(rank) = by_label.into_iter().chain(by_harness).min() {
-                        let starred = !self.defaults.is_favorite(descriptor.id, &model.id);
+                        let starred = !favorites.contains(&(descriptor.id, model.id.as_str()));
                         ranked.push((rank, starred as usize, input_ix, row(descriptor, model)));
                     }
                     input_ix += 1;
@@ -1563,7 +1626,7 @@ impl Pickers {
                         continue;
                     };
                     for model in models {
-                        if self.defaults.is_favorite(descriptor.id, &model.id) {
+                        if favorites.contains(&(descriptor.id, model.id.as_str())) {
                             rows.push(row(descriptor, model));
                         }
                     }
@@ -1579,7 +1642,7 @@ impl Pickers {
                 };
                 let (starred, rest): (Vec<&Model>, Vec<&Model>) = models
                     .iter()
-                    .partition(|m| self.defaults.is_favorite(descriptor.id, &m.id));
+                    .partition(|m| favorites.contains(&(descriptor.id, m.id.as_str())));
                 starred
                     .into_iter()
                     .chain(rest)
@@ -1595,7 +1658,7 @@ impl Pickers {
     fn selected_model_index(&self, cx: &App) -> usize {
         let selected = self.selected_model(cx).map(|m| m.id.clone());
         let effective = self.effective_harness(cx);
-        self.visible_model_rows(cx)
+        self.model_rows(cx)
             .iter()
             .position(|row| {
                 Some(row.harness) == effective && selected.as_deref() == Some(row.model.id.as_str())
@@ -1605,7 +1668,7 @@ impl Pickers {
 
     /// The picker's visible row count (keyboard nav bounds).
     fn model_rows_len(&self, cx: &App) -> usize {
-        self.visible_model_rows(cx).len()
+        self.model_rows(cx).len()
     }
 
     /// Enter on the harness/model popover: pick the highlighted model.
@@ -1617,7 +1680,7 @@ impl Pickers {
     /// search) switches the harness first, exactly like clicking its rail
     /// icon and then the model.
     fn activate_model_index(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(row) = self.visible_model_rows(cx).into_iter().nth(ix) else {
+        let Some(row) = self.model_rows(cx).get(ix).cloned() else {
             return;
         };
         if self.effective_harness(cx) != Some(row.harness) {
@@ -1633,6 +1696,7 @@ impl Pickers {
     fn toggle_model_favorite(&mut self, harness: HarnessId, model: &str, cx: &mut Context<Self>) {
         self.defaults.toggle_favorite(harness, model);
         self.save_defaults();
+        self.catalog_rev += 1;
         // Starring REORDERS the list (stars float to the top / leave the
         // favorites view) — re-home the keyboard highlight onto the SELECTED
         // row so exactly one row reads highlighted afterwards. Following the
@@ -2112,7 +2176,8 @@ impl Pickers {
                 if self.open_kind() == Some(PickerKind::HarnessModel)
                     && self.active < self.model_rows_len(cx)
                 {
-                    self.model_scroll.scroll_to_item(self.active);
+                    self.model_scroll
+                        .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
                 }
                 cx.notify();
             }
@@ -2623,6 +2688,7 @@ impl Pickers {
                         PickerKind::HarnessModel | PickerKind::Traits => {
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
+                            this.catalog_rev += 1;
                             this.ensure_harnesses(false, cx);
                         }
                         // Projects/devices load nothing; no retry surface exists.
@@ -2633,12 +2699,19 @@ impl Pickers {
             .into_any_element()
     }
 
+    /// The virtualized list's plain scroll handle (bounds/offset for the
+    /// floating scrollbar; `UniformList` tracks it internally).
+    fn model_scroll_base(&self) -> gpui::ScrollHandle {
+        self.model_scroll.0.borrow().base_handle.clone()
+    }
+
     fn model_scrollbar_metrics(&self) -> Option<ModelScrollbarMetrics> {
-        let bounds = self.model_scroll.bounds();
+        let scroll = self.model_scroll_base();
+        let bounds = scroll.bounds();
         let viewport_height = f32::from(bounds.size.height);
         // GPUI stores the maximum as a positive distance; only the live
         // scroll offset is negative while content moves upward.
-        let max_scroll = f32::from(self.model_scroll.max_offset().y).max(0.0);
+        let max_scroll = f32::from(scroll.max_offset().y).max(0.0);
         if viewport_height <= 0.0 || max_scroll <= 0.0 {
             return None;
         }
@@ -2650,7 +2723,7 @@ impl Pickers {
         let thumb_height = (track_height * viewport_height / content_height)
             .max(MODEL_SCROLLBAR_MIN_THUMB)
             .min(track_height);
-        let current_scroll = (-f32::from(self.model_scroll.offset().y)).clamp(0.0, max_scroll);
+        let current_scroll = (-f32::from(scroll.offset().y)).clamp(0.0, max_scroll);
         let travel = (track_height - thumb_height).max(0.0);
         Some(ModelScrollbarMetrics {
             track_height,
@@ -2669,17 +2742,17 @@ impl Pickers {
         let Some(metrics) = self.model_scrollbar_metrics() else {
             return;
         };
-        let bounds = self.model_scroll.bounds();
+        let scroll = self.model_scroll_base();
+        let bounds = scroll.bounds();
         let pointer_in_track = f32::from(pointer_y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
         let thumb_top = (pointer_in_track - grab_offset).clamp(0.0, metrics.travel());
-        let scroll = if metrics.travel() <= 0.0 {
+        let scroll_to = if metrics.travel() <= 0.0 {
             0.0
         } else {
             thumb_top / metrics.travel() * metrics.max_scroll
         };
-        let offset = self.model_scroll.offset();
-        self.model_scroll
-            .set_offset(gpui::Point::new(offset.x, px(-scroll)));
+        let offset = scroll.offset();
+        scroll.set_offset(gpui::Point::new(offset.x, px(-scroll_to)));
         cx.notify();
     }
 
@@ -2724,7 +2797,7 @@ impl Pickers {
             return;
         };
         window.focus(&self.focus, cx);
-        let bounds = self.model_scroll.bounds();
+        let bounds = self.model_scroll_base().bounds();
         let pointer_in_track =
             f32::from(event.position.y - bounds.top()) - MODEL_SCROLLBAR_TRACK_INSET;
         let grab_offset = if (metrics.thumb_top..=metrics.thumb_top + metrics.thumb_height)
@@ -3106,9 +3179,7 @@ impl Pickers {
                 )
                 .into_any_element();
         }
-        let rows = self.visible_model_rows(cx);
-        let active = self.active;
-        let selected_id = self.selected_model(cx).map(|m| m.id.clone());
+        let rows = self.model_rows(cx);
 
         // ── rail: icons only (t3 ModelPickerSidebar) — the favorites star,
         //    a divider, one brand icon per harness. The selected tab wears a
@@ -3141,8 +3212,9 @@ impl Pickers {
                         // Anchor on the selected row when it's starred, else
                         // the top — never a stray second highlight.
                         this.active = this.selected_model_index(cx);
-                        this.model_scroll.set_offset(gpui::Point::default());
-                        this.model_scroll.scroll_to_item(this.active);
+                        this.model_scroll_base().set_offset(gpui::Point::default());
+                        this.model_scroll
+                            .scroll_to_item(this.active, gpui::ScrollStrategy::Nearest);
                         cx.notify();
                     }))
                     .child(
@@ -3237,133 +3309,40 @@ impl Pickers {
                     .child(self.search.clone()),
             );
 
-        // ── model rows, flat — the scroll container's direct children so
-        //    keyboard `scroll_to_item(active)` maps 1:1.
+        // ── model rows: a VIRTUALIZED uniform list — only the visible slice
+        //    renders, so a 7k-model catalog scrolls as smoothly as seven
+        //    (field report: the un-virtualized stack was the picker's lag).
+        //    Keyboard nav scrolls via the UniformListScrollHandle.
         let effective_models = effective.and_then(|h| self.models.get(&h));
-        let list_children: Vec<AnyElement> = if !rows.is_empty() {
-            rows.iter()
-                .enumerate()
-                .map(|(ix, row)| {
-                    let is_selected = Some(row.harness) == effective
-                        && selected_id.as_deref() == Some(row.model.id.as_str());
-                    let is_active = ix == active;
-                    let is_fav = self.defaults.is_favorite(row.harness, &row.model.id);
-                    let (icon_path, tint) = harness_brand_icon(row.harness);
-                    let label: SharedString = row.model.label.clone().into();
-                    let harness_name = row.harness_name.clone();
-                    let harness = row.harness;
-                    let star_model = row.model.id.clone();
-                    let mut el = div()
-                        .id(("model-row", ix))
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .rounded(px(8.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(10.0))
-                        .cursor_pointer();
-                    // ONE moving highlight (t3/Base-UI combobox): hovering
-                    // moves the keyboard cursor instead of painting its own
-                    // wash, so hover + arrow cursor can never wear two
-                    // washes at once. Selection is the distinct stronger
-                    // treatment (wash + ring).
-                    if is_selected {
-                        el = el
-                            .bg(crate::theme::card_selected_bg())
-                            .shadow(crate::theme::card_selected_shadows());
-                    } else if is_active {
-                        el = el.bg(crate::theme::ink(0.05));
-                    }
-                    el = el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        if *hovered && this.active != ix {
-                            this.active = ix;
-                            cx.notify();
-                        }
-                    }));
-                    el = el
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.activate_model_index(ix, cx);
-                        }))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .truncate()
-                                        .text_size(px(12.5))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child(label),
-                                )
-                                .child(
-                                    // Harness identity subline (t3
-                                    // `showProvider`) — replaces the model
-                                    // description.
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            crate::icons::icon(icon_path)
-                                                .size(px(11.0))
-                                                .flex_none()
-                                                .text_color(
-                                                    tint.unwrap_or(theme.text_muted.opacity(0.7)),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(px(11.0))
-                                                .text_color(theme.text_muted.opacity(0.7))
-                                                .child(harness_name),
-                                        ),
-                                ),
-                        );
-                    if ix < 9 {
-                        el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
-                    }
-                    el = el.child(
-                        div()
-                            .id(("model-star", ix))
-                            .flex_none()
-                            .w(px(22.0))
-                            .h(px(22.0))
-                            .rounded(px(6.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(crate::theme::ink(0.08)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_model_favorite(harness, &star_model, cx);
-                            }))
-                            .child(
-                                crate::icons::icon(if is_fav {
-                                    crate::icons::STAR_BOLD
-                                } else {
-                                    crate::icons::STAR
+        let model_list: Option<AnyElement> = if !rows.is_empty() {
+            let entity = cx.entity();
+            let row_data = rows.clone();
+            Some(
+                gpui::uniform_list(
+                    "model-menu-scroll",
+                    rows.len(),
+                    move |range, _window, app| {
+                        entity.update(app, |this, cx| {
+                            range
+                                .filter_map(|ix| {
+                                    row_data
+                                        .get(ix)
+                                        .map(|row| this.render_model_row(ix, row, cx))
                                 })
-                                .size(px(13.0))
-                                .text_color(if is_fav {
-                                    theme.warning
-                                } else {
-                                    theme.text_muted.opacity(0.45)
-                                }),
-                            ),
-                    );
-                    el.into_any_element()
-                })
-                .collect()
+                                .collect::<Vec<AnyElement>>()
+                        })
+                    },
+                )
+                .size_full()
+                .px(px(6.0))
+                .track_scroll(&model_scroll)
+                .into_any_element(),
+            )
+        } else {
+            None
+        };
+        let list_children: Vec<AnyElement> = if !rows.is_empty() {
+            Vec::new()
         } else if searching {
             vec![empty_list_note(&theme, "No models found")]
         } else if favorites_view {
@@ -3414,18 +3393,19 @@ impl Pickers {
                     .min_h_0()
                     .py(px(6.0))
                     .on_hover(cx.listener(Self::on_model_list_hover))
-                    .child(
-                        div()
+                    .child(match model_list {
+                        Some(list) => list,
+                        // Empty/loading/error notes: a plain static stack.
+                        None => div()
                             .id("model-menu-scroll")
                             .size_full()
                             .flex()
                             .flex_col()
                             .gap(px(2.0))
                             .px(px(6.0))
-                            .overflow_y_scroll()
-                            .track_scroll(&model_scroll)
-                            .children(list_children),
-                    )
+                            .children(list_children)
+                            .into_any_element(),
+                    })
                     // Absolute child: the hit rail and thumb float above the
                     // scroll content without consuming any list width.
                     .children(model_scrollbar),
@@ -3439,6 +3419,163 @@ impl Pickers {
             .children(rail)
             .child(pane)
             .into_any_element()
+    }
+
+    /// One model row for the virtualized list. `ix` is the row's GLOBAL index
+    /// (⌘N chips, hover-cursor, and activation all key on it). The 2px
+    /// inter-row gap is baked into each item's bottom padding so every item
+    /// is the same height (uniform_list measures the first).
+    fn render_model_row(
+        &mut self,
+        ix: usize,
+        row: &ModelRowData,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let effective = self.effective_harness(cx);
+        let is_selected = Some(row.harness) == effective
+            && self.selected_model(cx).map(|m| m.id.as_str()) == Some(row.model.id.as_str());
+        let is_active = ix == self.active;
+        let is_fav = self.defaults.is_favorite(row.harness, &row.model.id);
+        let (icon_path, tint) = harness_brand_icon(row.harness);
+        let label: SharedString = row.model.label.clone().into();
+        let harness_name = row.harness_name.clone();
+        let harness = row.harness;
+        let star_model = row.model.id.clone();
+        // Provider attribution (field report: several connected opencode
+        // providers advertise identically-named models — "GLM-5.2" exists
+        // under 64 providers — and rows were indistinguishable). The driver
+        // ships the provider display name in `description`; other harnesses'
+        // taglines read fine in the same slot. Skip when it just repeats the
+        // harness name.
+        let attribution: Option<SharedString> = row
+            .model
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(harness_name.as_ref()))
+            .map(|d| SharedString::from(d.to_owned()));
+        let mut el = div()
+            .id(("model-row", ix))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .cursor_pointer();
+        // ONE moving highlight (t3/Base-UI combobox): hovering moves the
+        // keyboard cursor instead of painting its own wash, so hover + arrow
+        // cursor can never wear two washes at once. Selection is the
+        // distinct stronger treatment (wash + ring).
+        if is_selected {
+            el = el
+                .bg(crate::theme::card_selected_bg())
+                .shadow(crate::theme::card_selected_shadows());
+        } else if is_active {
+            el = el.bg(crate::theme::ink(0.05));
+        }
+        el = el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered && this.active != ix {
+                this.active = ix;
+                cx.notify();
+            }
+        }));
+        el = el
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.activate_model_index(ix, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(label),
+                    )
+                    .child(
+                        // Harness identity subline (t3 `showProvider`), plus
+                        // the model's own attribution when it carries one.
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                crate::icons::icon(icon_path)
+                                    .size(px(11.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7))),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .child(harness_name),
+                            )
+                            .when_some(attribution, |el, attribution| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted.opacity(0.45))
+                                        .child(SharedString::from("·")),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted.opacity(0.7))
+                                        .child(attribution),
+                                )
+                            }),
+                    ),
+            );
+        if ix < 9 {
+            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+        }
+        el = el.child(
+            div()
+                .id(("model-star", ix))
+                .flex_none()
+                .w(px(22.0))
+                .h(px(22.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(crate::theme::ink(0.08)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_model_favorite(harness, &star_model, cx);
+                }))
+                .child(
+                    crate::icons::icon(if is_fav {
+                        crate::icons::STAR_BOLD
+                    } else {
+                        crate::icons::STAR
+                    })
+                    .size(px(13.0))
+                    .text_color(if is_fav {
+                        theme.warning
+                    } else {
+                        theme.text_muted.opacity(0.45)
+                    }),
+                ),
+        );
+        div().pb(px(2.0)).child(el).into_any_element()
     }
 
     /// The traits dropdown body (t3code TraitsPicker): the reasoning ladder
@@ -3762,7 +3899,6 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
         })
         .collect()
 }
-
 
 /// Attach the (single) open popover overlay to its trigger chip.
 fn attach_overlay(

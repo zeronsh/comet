@@ -127,6 +127,15 @@ pub enum MessagePart {
         id: String,
         text: String,
     },
+    /// Model thinking. Carries its body in a dedicated doc field (`reasoning`,
+    /// never `text`) so pre-reasoning desktop builds — whose unknown-kind
+    /// fallback renders `text` as prose — degrade to an invisible empty text
+    /// part instead of leaking raw thinking into the transcript. iOS drops
+    /// unknown kinds entirely.
+    Reasoning {
+        id: String,
+        text: String,
+    },
     #[serde(rename_all = "camelCase")]
     Tool {
         id: String,
@@ -194,6 +203,7 @@ impl MessagePart {
     pub fn id(&self) -> &str {
         match self {
             MessagePart::Text { id, .. }
+            | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. } => id,
@@ -202,7 +212,7 @@ impl MessagePart {
 
     pub fn byte_len(&self) -> usize {
         match self {
-            MessagePart::Text { text, .. } => text.len(),
+            MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => text.len(),
             MessagePart::Tool {
                 call,
                 output,
@@ -256,8 +266,21 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::ReasoningDelta { .. } => {
-            // Reasoning is not rendered as a transcript part (matches zeron).
+        AgentEvent::ReasoningDelta { text } => {
+            // Empty deltas are liveness heartbeats (redacted thinking) — the
+            // engine drops them before the fold, but stay tolerant here too.
+            if text.is_empty() {
+                return;
+            }
+            if let Some(MessagePart::Reasoning { text: tail, .. }) = out.last_mut() {
+                tail.push_str(text);
+            } else {
+                let id = format!("r{}", out.len());
+                out.push(MessagePart::Reasoning {
+                    id,
+                    text: text.clone(),
+                });
+            }
         }
         AgentEvent::ToolCall { id, call } => {
             if let Some(existing) = out.iter_mut().find_map(|p| match p {
@@ -569,34 +592,48 @@ pub fn split_parts(parts: &[MessagePart]) -> Vec<Vec<MessagePart>> {
     };
 
     for part in parts {
-        match part {
-            MessagePart::Text { id, text } if text.len() > MSG_INLINE_MAX => {
-                // Chunk oversized text at char boundaries.
-                let mut start = 0usize;
-                let mut piece = 0usize;
-                while start < text.len() {
-                    let mut end = (start + MSG_INLINE_MAX).min(text.len());
-                    while end < text.len() && !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    // Guard: ensure forward progress on pathological boundaries.
-                    if end <= start {
-                        end = text.len();
-                    }
-                    let sub = MessagePart::Text {
-                        id: if piece == 0 {
-                            id.clone()
-                        } else {
-                            format!("{id}~{piece}")
-                        },
-                        text: text[start..end].to_string(),
-                    };
-                    push_part(&mut chunks, &mut current_bytes, sub);
-                    start = end;
-                    piece += 1;
-                }
+        // Both text-bodied kinds chunk the same way; extended thinking can
+        // exceed the cap just as easily as a long reply.
+        let (id, text, reasoning) = match part {
+            MessagePart::Text { id, text } if text.len() > MSG_INLINE_MAX => (id, text, false),
+            MessagePart::Reasoning { id, text } if text.len() > MSG_INLINE_MAX => (id, text, true),
+            other => {
+                push_part(&mut chunks, &mut current_bytes, other.clone());
+                continue;
             }
-            other => push_part(&mut chunks, &mut current_bytes, other.clone()),
+        };
+        // Chunk oversized text at char boundaries.
+        let mut start = 0usize;
+        let mut piece = 0usize;
+        while start < text.len() {
+            let mut end = (start + MSG_INLINE_MAX).min(text.len());
+            while end < text.len() && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Guard: ensure forward progress on pathological boundaries.
+            if end <= start {
+                end = text.len();
+            }
+            let sub_id = if piece == 0 {
+                id.clone()
+            } else {
+                format!("{id}~{piece}")
+            };
+            let body = text[start..end].to_string();
+            let sub = if reasoning {
+                MessagePart::Reasoning {
+                    id: sub_id,
+                    text: body,
+                }
+            } else {
+                MessagePart::Text {
+                    id: sub_id,
+                    text: body,
+                }
+            };
+            push_part(&mut chunks, &mut current_bytes, sub);
+            start = end;
+            piece += 1;
         }
     }
     chunks
@@ -613,6 +650,64 @@ mod tests {
 
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
+    }
+
+    #[test]
+    fn reasoning_deltas_fold_into_their_own_part() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "let me ".into(),
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "think".into(),
+            },
+        );
+        // Empty deltas (redacted-thinking heartbeats) never mint a part.
+        fold_event_into_parts(&mut parts, &AgentEvent::ReasoningDelta { text: "".into() });
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0],
+            MessagePart::Reasoning {
+                id: "r0".into(),
+                text: "let me think".into()
+            }
+        );
+        // Text breaks the reasoning block; a later thought starts a new part.
+        fold_event_into_parts(&mut parts, &text_delta("Answer"));
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "more".into(),
+            },
+        );
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(
+            &parts[2],
+            MessagePart::Reasoning { id, text } if id == "r2" && text == "more"
+        ));
+    }
+
+    #[test]
+    fn oversized_reasoning_splits_like_text() {
+        let big = "x".repeat(MSG_INLINE_MAX + 10);
+        let parts = vec![MessagePart::Reasoning {
+            id: "r0".into(),
+            text: big,
+        }];
+        let chunks = split_parts(&parts);
+        let flat = join_continuations(chunks);
+        assert!(flat.len() >= 2, "{}", flat.len());
+        assert!(
+            flat.iter()
+                .all(|p| matches!(p, MessagePart::Reasoning { .. }))
+        );
+        assert!(flat.iter().all(|p| p.byte_len() <= MSG_INLINE_MAX));
+        assert_eq!(flat[1].id(), "r0~1");
     }
 
     #[test]

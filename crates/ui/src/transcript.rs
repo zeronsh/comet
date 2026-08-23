@@ -296,6 +296,13 @@ pub struct ToolItem {
     /// per-delta header rewrites read as noise). Never rendered; still
     /// fingerprinted so an old doc's chips re-splice correctly.
     pub subagent_tail: Option<SharedString>,
+    /// A REASONING part riding the tool group as a chip (user request: the
+    /// thought process belongs inside the combined "Ran N commands"
+    /// accordion, opening/closing with the same tween). Synthesized in
+    /// [`rows_for_entry`] — never comes from a doc tool part. The thought
+    /// text is the `detail`; `resolved == false` means it is still
+    /// streaming (the chip then defaults open).
+    pub is_thought: bool,
 }
 
 /// Subagent spawn chips — [`ToolCall::is_subagent_spawn`], the shared genus
@@ -325,6 +332,97 @@ fn is_spawn_link(item: &ToolItem) -> bool {
 /// render as their own always-open row.
 fn tool_group_collapses(tools: &[ToolItem]) -> bool {
     tools.iter().any(|t| !is_agent_tool(t))
+}
+
+/// Column budget for soft-wrapping thought text into detail lines. The
+/// detail body is preformatted (no element wrapping), so the wrap happens
+/// here — conservative enough to fit the card at typical transcript widths.
+const THOUGHT_WRAP_COLS: usize = 96;
+
+/// Soft-wrap a thought's prose at word boundaries into detail lines.
+/// Overlong single words hard-split at the column budget.
+fn wrap_thought_lines(text: &str) -> Vec<SharedString> {
+    let mut lines: Vec<SharedString> = Vec::new();
+    for paragraph in text.lines() {
+        let paragraph = paragraph.trim_end();
+        if paragraph.is_empty() {
+            if !lines.is_empty() {
+                lines.push(SharedString::default());
+            }
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if !current.is_empty()
+                && current.chars().count() + 1 + word.chars().count() > THOUGHT_WRAP_COLS
+            {
+                lines.push(SharedString::from(std::mem::take(&mut current)));
+            }
+            if word.chars().count() > THOUGHT_WRAP_COLS {
+                // Hard-split a pathological token.
+                let mut chunk = String::new();
+                for c in word.chars() {
+                    chunk.push(c);
+                    if chunk.chars().count() == THOUGHT_WRAP_COLS {
+                        lines.push(SharedString::from(std::mem::take(&mut chunk)));
+                    }
+                }
+                current = chunk;
+                continue;
+            }
+            if current.is_empty() {
+                current = word.to_owned();
+            } else {
+                current.push(' ');
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            lines.push(SharedString::from(current));
+        }
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// A reasoning part as a tool-group chip: "Thought process" header over the
+/// wrapped thought text as an output-style detail (analytic height — the
+/// group's fold tween needs it). Capped like tool outputs, with the counted
+/// tail. `live` = the part is still streaming (chip defaults open).
+fn thought_item(text: &str, live: bool) -> ToolItem {
+    let mut lines = wrap_thought_lines(text);
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    if truncated_by > 0 {
+        // Keep the TAIL while streaming (the fresh thinking is the signal);
+        // settled thoughts keep the head like tool outputs do.
+        if live {
+            lines.drain(..truncated_by);
+        } else {
+            lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+        }
+    }
+    ToolItem {
+        call: ToolCall::Unknown {
+            name: "Thought process".into(),
+            input: None,
+        },
+        is_error: false,
+        resolved: !live,
+        detail: Some(Arc::new(ToolDetail::Output {
+            lines,
+            truncated_by,
+        })),
+        invocation: None,
+        output_ref: None,
+        output_bytes: None,
+        diff_ref: None,
+        subagent_ref: None,
+        subagent_status: None,
+        subagent_tail: None,
+        is_thought: true,
+    }
 }
 
 /// A chip's expandable detail payload.
@@ -875,6 +973,7 @@ pub fn rows_for_entry(
                     subagent_ref: subagent_ref.clone().map(SharedString::from),
                     subagent_status: *subagent_status,
                     subagent_tail: subagent_tail.clone().map(SharedString::from),
+                    is_thought: false,
                 };
                 // Agent chips don't share a fold with ordinary tools: flush
                 // whenever the genus flips so each group is uniform.
@@ -882,6 +981,30 @@ pub fn rows_for_entry(
                     .first()
                     .is_some_and(|head| is_agent_tool(head) != is_agent_tool(&item))
                 {
+                    flush_group(
+                        &mut rows,
+                        &mut pending_group,
+                        &mut group_ix,
+                        group_last_part_ix,
+                    );
+                }
+                pending_group.push(item);
+                group_last_part_ix = part_ix;
+            }
+            // Thinking rides the SAME accordion as the tools around it
+            // (user request) — a thought chip in the group, not its own row.
+            MessagePart::Reasoning { id: _, text } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                // Live only while it is the tail of a streaming reply — once
+                // text or a tool follows, the thought is finished even though
+                // the entry still streams.
+                let live = streaming && part_ix == last_part_ix;
+                let item = thought_item(text, live);
+                // Thoughts join ordinary tool groups; agent (spawn-link)
+                // groups stay pure, exactly like the tool genus rule.
+                if pending_group.first().is_some_and(is_agent_tool) {
                     flush_group(
                         &mut rows,
                         &mut pending_group,
@@ -986,8 +1109,9 @@ pub fn rows_for_entry(
                             copy_text: None,
                         });
                     }
-                    // Tools are grouped by the outer arm; nothing reaches here.
-                    MessagePart::Tool { .. } => {}
+                    // Tools and thoughts are grouped by the outer arms;
+                    // nothing reaches here.
+                    MessagePart::Tool { .. } | MessagePart::Reasoning { .. } => {}
                 }
             }
         }
@@ -1183,8 +1307,28 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 /// The rule lives in `zeron_proto::view` so the terminal viewport reports the
 /// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
-    let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
-    zeron_proto::view::tool_group_summary(&pairs)
+    let pairs: Vec<(ToolCall, bool)> = tools
+        .iter()
+        .filter(|t| !t.is_thought)
+        .map(|t| (t.call.clone(), t.is_error))
+        .collect();
+    let thoughts = tools.iter().filter(|t| t.is_thought).count();
+    // The shared summary answers "used 0 tools" for an empty set — a
+    // thought-only group must not inherit that.
+    let base = if pairs.is_empty() {
+        String::new()
+    } else {
+        zeron_proto::view::tool_group_summary(&pairs)
+    };
+    // Thought chips ride the group (they are UI-synthesized, so the shared
+    // view summary never sees them): name them on the collapsed line.
+    match (base.is_empty(), thoughts) {
+        (_, 0) => base,
+        (true, 1) => "Thought process".into(),
+        (true, n) => format!("Thought {n} times"),
+        (false, 1) => format!("Thought · {base}"),
+        (false, n) => format!("Thought {n} times · {base}"),
+    }
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
@@ -4276,8 +4420,13 @@ impl Transcript {
             .iter()
             .zip(&invocations)
             .zip(&detail_folds)
-            .map(|((detail, invocation), fold)| {
-                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(false)
+            .zip(tools.iter())
+            .map(|(((detail, invocation), fold), tool)| {
+                // A STREAMING thought chip defaults open (the live thinking
+                // is the point); settled chips default closed. A user toggle
+                // overrides either way.
+                let default_open = tool.is_thought && !tool.resolved;
+                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(default_open)
             })
             .collect();
         let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
@@ -4948,7 +5097,11 @@ fn chip_header_row(
     view: gpui::EntityId,
     cx: &mut gpui::App,
 ) -> gpui::Div {
-    let (label, detail) = tool_chip_content(&tool.call);
+    let (label, detail) = if tool.is_thought {
+        ("Thought process", String::new())
+    } else {
+        tool_chip_content(&tool.call)
+    };
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -4982,9 +5135,13 @@ fn chip_header_row(
                 .items_center()
                 .justify_center()
                 .child(
-                    crate::icons::icon(tool_icon_path(&tool.call))
-                        .size(px(12.0))
-                        .text_color(theme.text_muted),
+                    crate::icons::icon(if tool.is_thought {
+                        crate::icons::CHAT_ROUND_LINE
+                    } else {
+                        tool_icon_path(&tool.call)
+                    })
+                    .size(px(12.0))
+                    .text_color(theme.text_muted),
                 ),
         )
         .child(
@@ -5957,6 +6114,113 @@ mod tests {
         }
     }
 
+    fn reasoning_part(id: &str, text: &str) -> MessagePart {
+        MessagePart::Reasoning {
+            id: id.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn reasoning_joins_the_tool_group_accordion() {
+        // Thought → tool → thought → tool folds into ONE group row (user
+        // request: the thought process lives inside the combined accordion),
+        // and the collapsed summary names the thinking.
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                reasoning_part("r0", "planning the first step"),
+                tool_part("t1", "ls"),
+                reasoning_part("r2", "now the second step"),
+                tool_part("t3", "pwd"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1, "one combined accordion row");
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("expected a tool group");
+        };
+        assert_eq!(tools.len(), 4);
+        assert!(tools[0].is_thought && tools[2].is_thought);
+        assert!(!tools[1].is_thought && !tools[3].is_thought);
+        // Thought chips carry their text as an output-style detail with an
+        // ANALYTIC height, so the group's fold tween covers them.
+        assert!(matches!(
+            tools[0].detail.as_deref(),
+            Some(ToolDetail::Output { lines, .. }) if !lines.is_empty()
+        ));
+        let summary = tool_group_summary(&tools);
+        assert!(summary.starts_with("Thought 2 times"), "{summary}");
+        assert!(summary.contains("2 commands"), "{summary}");
+
+        // A lone thought is still an accordion (with the group tween), named
+        // plainly.
+        let entry = assistant(
+            "a2",
+            MessageStatus::Complete,
+            vec![reasoning_part("r0", "just thinking")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("expected a tool group");
+        };
+        assert_eq!(tool_group_summary(&tools), "Thought process");
+
+        // Empty reasoning renders nothing.
+        let entry = assistant(
+            "a3",
+            MessageStatus::Complete,
+            vec![reasoning_part("r0", "   ")],
+        );
+        assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn live_thought_streams_open_and_settles_closed() {
+        let entry = assistant(
+            "a1",
+            MessageStatus::Streaming,
+            vec![reasoning_part("r0", "thinking hard")],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ToolGroup { tools, auto_open } = &rows[0].kind else {
+            panic!("expected a tool group");
+        };
+        // The live tail auto-opens the group; the chip itself is unresolved
+        // (defaults open) until the part stops being the tail.
+        assert!(*auto_open);
+        assert!(!tools[0].resolved);
+
+        let entry = assistant(
+            "a2",
+            MessageStatus::Streaming,
+            vec![
+                reasoning_part("r0", "thinking hard"),
+                text_part("t1", "answer"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("expected a tool group");
+        };
+        assert!(tools[0].resolved, "a followed thought is settled");
+    }
+
+    #[test]
+    fn thought_wrap_is_word_aware_and_bounded() {
+        let lines = wrap_thought_lines("one two three");
+        assert_eq!(lines.len(), 1);
+        let long = "word ".repeat(200);
+        let lines = wrap_thought_lines(&long);
+        assert!(lines.iter().all(|l| l.chars().count() <= THOUGHT_WRAP_COLS));
+        assert!(lines.len() > 5);
+        let pathological = "x".repeat(300);
+        let lines = wrap_thought_lines(&pathological);
+        assert!(lines.iter().all(|l| l.chars().count() <= THOUGHT_WRAP_COLS));
+    }
+
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
             id: id.into(),
@@ -6506,6 +6770,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            is_thought: false,
         };
         let edit = |p: &str| ToolItem {
             call: ToolCall::EditFile {
@@ -6523,6 +6788,7 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            is_thought: false,
         };
         let tools = vec![
             exec("ls"),
@@ -6556,6 +6822,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                is_thought: false,
             },
             ToolItem {
                 call: ToolCall::Glob {
@@ -6571,6 +6838,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                is_thought: false,
             },
             ToolItem {
                 call: ToolCall::WebSearch { query: "q".into() },
@@ -6584,6 +6852,7 @@ mod tests {
                 subagent_ref: None,
                 subagent_status: None,
                 subagent_tail: None,
+                is_thought: false,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");

@@ -631,7 +631,13 @@ pub(crate) struct RawChat {
     branch: Option<String>,
     #[serde(default)]
     checkout_id: Option<String>,
-    #[serde(default)]
+    /// LENIENT: a config this build can't decode (a harness/reasoning/sandbox
+    /// id from a NEWER peer — field incident: pre-v0.2.10 laptops dropped
+    /// every `"opencode"` chat row wholesale, so new sessions silently never
+    /// appeared in the sidebar) degrades to `None` instead of failing the
+    /// row. The chat stays visible and selectable with generic defaults;
+    /// up-to-date devices still see the real config.
+    #[serde(default, deserialize_with = "lenient_chat_config")]
     config: Option<ChatConfig>,
     #[serde(default)]
     last_message_preview: Option<String>,
@@ -649,6 +655,24 @@ pub(crate) struct RawChat {
     last_seen_at: Option<i64>,
     #[serde(default)]
     room_gen: Option<u32>,
+}
+
+/// Decode a chat row's `config` leniently: unknown enum values (a newer
+/// peer's harness id, reasoning level or sandbox mode) cost the CONFIG, not
+/// the row. Mirrors the transcript salvage rule: a missing field must cost
+/// at most what the field carried.
+fn lenient_chat_config<'de, D>(deserializer: D) -> Result<Option<ChatConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match serde_json::from_value::<ChatConfig>(value) {
+        Ok(config) => Some(config),
+        Err(err) => {
+            tracing::warn!(error = %err, "chat config from a newer peer; showing the row without it");
+            None
+        }
+    }))
 }
 
 impl From<RawChat> for Chat {

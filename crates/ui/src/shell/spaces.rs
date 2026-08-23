@@ -585,10 +585,7 @@ impl Shell {
             state
                 .overview_chats(now)
                 .into_iter()
-                .filter(|(_, chat)| match &filter {
-                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
-                    None => true,
-                })
+                .filter(|(_, chat)| super::tabs::in_space_filter(chat, filter.as_deref()))
                 .map(|(status, chat)| {
                     // Line 1 is "project @ device" (t3code's project row);
                     // project-less sessions read as their home-dir cwd `~`.
