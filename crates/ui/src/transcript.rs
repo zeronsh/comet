@@ -2037,6 +2037,7 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    OpenLink(SharedString),
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -3970,6 +3971,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    link: Some(self.link_ui(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -4012,6 +4014,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    link: Some(self.link_ui(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -4233,6 +4236,20 @@ impl Transcript {
                     .ok();
             });
         render::CopyUi { handler, copied_ix }
+    }
+
+    fn link_ui(&self, cx: &mut Context<Self>) -> render::LinkUi {
+        let entity = cx.weak_entity();
+        render::LinkUi {
+            handler: Rc::new(move |url, _, cx| {
+                entity
+                    .update(cx, |_this, cx| {
+                        cx.emit(TranscriptEvent::OpenLink(url));
+                        cx.notify();
+                    })
+                    .ok();
+            }),
+        }
     }
 
     /// Request highlights for the code blocks of a tree. `only` limits to one

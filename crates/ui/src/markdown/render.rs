@@ -79,6 +79,9 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Link activation is owned by the transcript host. This lets project
+    /// paths navigate to the in-app diff while web links still open externally.
+    pub link: Option<LinkUi>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -90,6 +93,11 @@ pub struct CopyUi {
     pub copied_ix: Option<usize>,
 }
 
+#[derive(Clone)]
+pub struct LinkUi {
+    pub handler: Rc<dyn Fn(SharedString, &mut Window, &mut gpui::App)>,
+}
+
 impl RenderOptions {
     /// Options for a completed (non-streaming) row — no veil, no cache.
     pub fn settled(row_key: SharedString) -> Self {
@@ -99,6 +107,7 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+            link: None,
         }
     }
 }
@@ -662,11 +671,16 @@ fn flat_text_element(
         styled.into_any_element()
     } else {
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
+        let link = opts.link.clone();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
         InteractiveText::new(id, styled)
-            .on_click(ranges, move |clicked_ix, _window, cx| {
+            .on_click(ranges, move |clicked_ix, window, cx| {
                 if let Some(url) = urls.get(clicked_ix) {
-                    cx.open_url(url);
+                    if let Some(link) = &link {
+                        (link.handler)(url.clone().into(), window, cx);
+                    } else {
+                        cx.open_url(url);
+                    }
                 }
             })
             .into_any_element()
