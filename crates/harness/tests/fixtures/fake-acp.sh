@@ -65,6 +65,15 @@ if has "$line" '"method":"session/load"'; then
     fi
   fi
 elif has "$line" '"method":"session/new"'; then
+  # Reject one marker cwd once, then require the retry to use a different
+  # directory. Exercises the deleted-worktree path.
+  if has "$line" '"cwd":"/tmp/reject-cwd"'; then
+    emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32602,\"message\":\"bad cwd\"}}"
+    read -r line || exit 1
+    has "$line" '"method":"session/new"' || exit 1
+    has "$line" '"cwd":"/tmp/reject-cwd"' && exit 1
+    RETRIED=1
+  fi
   has "$line" '"mcpServers":[]' || exit 1
   # Advertise config options: model (current differs from the tests' request,
   # forcing a set) and thought_level (current high). The model config option
@@ -74,6 +83,18 @@ elif has "$line" '"method":"session/new"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"currentModelId\":\"grok-4-fast\",\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]}}}"
   else
     emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-1\",\"models\":{\"availableModels\":[{\"modelId\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"modelId\":\"grok-4.5\",\"name\":\"Grok 4.5\"}],\"currentModelId\":\"grok-4.5\"},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"grok-4-fast\",\"options\":[{\"value\":\"grok-4-fast\",\"name\":\"Grok 4 Fast\",\"description\":\"Fast tier\"},{\"value\":\"grok-4.5\",\"name\":\"Grok 4.5\"}]},{\"id\":\"effort\",\"name\":\"Reasoning effort\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":\"high\",\"options\":[{\"value\":\"low\",\"name\":\"Low\"},{\"value\":\"medium\",\"name\":\"Medium\"},{\"value\":\"high\",\"name\":\"High\"}]}]}}"
+  fi
+  # Marker cwd: advertise commands the way claude-agent-acp does — as an
+  # update sent right after the session/new response, inside the handshake
+  # window where request_draining used to discard notifications.
+  if has "$line" '"cwd":"/tmp/live-commands"'; then
+    update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"live","description":"From the session"}]}'
+  fi
+  # The reject-cwd retry succeeded: prove discovery actually consumed the
+  # retried session, not just the pre-retry error, by advertising a command
+  # only the retry's own session/new response can trigger.
+  if [ "$RETRIED" = "1" ]; then
+    update '{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"home-retry","description":"Answered after the retry from home"}]}'
   fi
 else
   exit 1

@@ -323,20 +323,30 @@ exit 1
             let shell = fake_shell(
                 dir.path(),
                 &format!(
-                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/zeron-test/fallback/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
+                    // `/usr/bin` must stay on the fixture's PATH: the probe
+                    // script runs `env`, which lives only at /usr/bin/env on
+                    // macOS. Without it the shell finds no `env`, prints the
+                    // markers with nothing between them, and the fallback looks
+                    // like a failure that only reproduces off Linux.
+                    "#!/bin/sh\ncase \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=\"/zeron-test/fallback/bin:/usr/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
                 ),
             );
             let start = Instant::now();
-            let path = snapshot_path(&shell, Duration::from_millis(400)).unwrap();
+            // The budget is PER attempt, and the second (non-interactive) one
+            // has to spawn a shell and run `env`. At 400ms that attempt was
+            // starved whenever the machine was busy running the rest of the
+            // suite in parallel — `snapshot_path` returned None and the unwrap
+            // blew up. 2s is still nowhere near the 60s hang this guards.
+            let path = snapshot_path(&shell, Duration::from_secs(2)).unwrap();
             assert!(
                 path.to_string_lossy()
                     .starts_with("/zeron-test/fallback/bin"),
                 "got: {}",
                 path.to_string_lossy()
             );
-            // First attempt burned ~400ms then was killed; the whole resolve
-            // must not have waited out the sleep.
-            assert!(start.elapsed() < Duration::from_secs(5));
+            // The first attempt was killed at the budget; the whole resolve
+            // must not have waited out the 60s sleep.
+            assert!(start.elapsed() < Duration::from_secs(20));
         }
 
         #[test]

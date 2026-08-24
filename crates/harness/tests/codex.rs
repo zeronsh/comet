@@ -780,7 +780,7 @@ async fn live_real_app_server_single_turn() {
 #[tokio::test]
 async fn commands_come_from_skills_list() {
     let h = harness();
-    let commands = h.commands().await.expect("discovery succeeds");
+    let commands = h.commands(None).await.expect("discovery succeeds");
     assert_eq!(
         commands.len(),
         2,
@@ -796,7 +796,7 @@ async fn commands_come_from_skills_list() {
         commands[1].description, "No interface block",
         "top-level description is the fallback"
     );
-    assert_eq!(h.commands().await.expect("cache hit"), commands);
+    assert_eq!(h.commands(None).await.expect("cache hit"), commands);
 }
 
 /// Live smoke against the real CLI: `cargo test -p zeron-harness --test
@@ -805,6 +805,6 @@ async fn commands_come_from_skills_list() {
 #[ignore]
 async fn live_commands_discovery() {
     let h = CodexHarness::new();
-    let commands = h.commands().await.expect("live discovery");
+    let commands = h.commands(None).await.expect("live discovery");
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }
