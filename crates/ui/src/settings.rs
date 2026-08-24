@@ -123,6 +123,10 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// macOS viewer-side Appshot capture. Device-local because the shortcut
+    /// and TCC permissions belong to this desktop.
+    pub appshots_enabled: bool,
+    pub appshot_destination: crate::appshots::AppshotDestination,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Independently selected light and dark theme variants.
@@ -163,6 +167,8 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            appshots_enabled: false,
+            appshot_destination: crate::appshots::AppshotDestination::Automatic,
             appearance: crate::appearance::AppearanceMode::default(),
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
@@ -662,6 +668,8 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            appshots_enabled: false,
+            appshot_destination: crate::appshots::AppshotDestination::NewSession,
             appearance: crate::appearance::AppearanceMode::Light,
             theme_selection: zeron_theme::ThemeSelection {
                 light: "catppuccin-latte".into(),

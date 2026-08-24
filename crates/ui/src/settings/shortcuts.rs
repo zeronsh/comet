@@ -8,6 +8,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::appshots::{AppshotCapabilities, AppshotDestination, CapabilityState};
 use crate::settings::{KeymapConfig, ShortcutId, combo_from_keystroke, display_combo};
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -37,6 +38,10 @@ pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> R
 pub enum ShortcutsEvent {
     /// The keymap changed — persist + re-apply.
     Changed(KeymapConfig),
+    AppshotsChanged {
+        enabled: bool,
+        destination: AppshotDestination,
+    },
 }
 
 pub struct ShortcutsPage {
@@ -47,6 +52,11 @@ pub struct ShortcutsPage {
     /// conflicts never persist; they're refused at record time, as in zeron.
     conflict_notice: Option<SharedString>,
     focus: FocusHandle,
+    appshots_enabled: bool,
+    appshot_destination: AppshotDestination,
+    appshot_capabilities: AppshotCapabilities,
+    capture_access_prompted: bool,
+    semantic_access_prompted: bool,
     // The page never talks RPC; state is kept for parity with sibling pages
     // (and future per-device keymaps).
     _state: Entity<AppState>,
@@ -55,12 +65,23 @@ pub struct ShortcutsPage {
 impl EventEmitter<ShortcutsEvent> for ShortcutsPage {}
 
 impl ShortcutsPage {
-    pub fn new(state: Entity<AppState>, keymap: KeymapConfig, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        keymap: KeymapConfig,
+        appshots_enabled: bool,
+        appshot_destination: AppshotDestination,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             keymap,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
+            appshots_enabled,
+            appshot_destination,
+            appshot_capabilities: crate::appshots::capabilities(),
+            capture_access_prompted: false,
+            semantic_access_prompted: false,
             _state: state,
         }
     }
@@ -68,6 +89,13 @@ impl ShortcutsPage {
     fn commit(&mut self, cx: &mut Context<Self>) {
         cx.emit(ShortcutsEvent::Changed(self.keymap.clone()));
         cx.notify();
+    }
+
+    fn commit_appshots(&self, cx: &mut Context<Self>) {
+        cx.emit(ShortcutsEvent::AppshotsChanged {
+            enabled: self.appshots_enabled,
+            destination: self.appshot_destination,
+        });
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -271,9 +299,12 @@ fn description(id: ShortcutId) -> &'static str {
 impl Render for ShortcutsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::settings::widgets;
+        self.appshot_capabilities = crate::appshots::capabilities();
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let customized = self.keymap != KeymapConfig::default();
+        let appshots_enabled = self.appshots_enabled;
+        let capabilities = self.appshot_capabilities;
 
         // One card per group, each under its small section label — the flat
         // 16-row table read as one undifferentiated wall. `ix` (the id's
@@ -306,6 +337,53 @@ impl Render for ShortcutsPage {
             notice
         } else {
             "Shortcuts must be unique.".into()
+        };
+
+        let appshot_destination =
+            AppshotDestination::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(ix, destination)| {
+                    let selected = self.appshot_destination == destination;
+                    div()
+                        .id(("appshot-destination", ix))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(if selected {
+                            theme.text.opacity(0.24)
+                        } else {
+                            theme.border
+                        })
+                        .bg(if selected {
+                            crate::theme::ink(0.09)
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_size(px(11.0))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.appshot_destination = destination;
+                            this.commit_appshots(cx);
+                            cx.notify();
+                        }))
+                        .child(SharedString::from(destination.label()))
+                });
+        let capture_action: SharedString = if self.capture_access_prompted {
+            "Open System Settings".into()
+        } else {
+            "Allow".into()
+        };
+        let semantic_action: SharedString = if self.semantic_access_prompted {
+            "Open System Settings".into()
+        } else {
+            "Enable text capture".into()
         };
 
         div()
@@ -386,6 +464,279 @@ impl Render for ShortcutsPage {
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
                             .child(helper),
+                    )
+                    .child(
+                        div()
+                            .mt(px(36.0))
+                            .child(widgets::page_header(&theme, "Appshots", None))
+                            .child(
+                                widgets::page_subtitle(
+                                    &theme,
+                                    capabilities.setup_description(),
+                                )
+                                .max_w(px(560.0))
+                                .line_height(px(20.0)),
+                            ),
+                    )
+                    .child(
+                        widgets::section_card(&theme)
+                            .child(
+                                widgets::card_row(&theme, true)
+                                    .child(widgets::row_tile(&theme, crate::icons::MONITOR))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                    .child(widgets::row_title(&theme, "Capture Appshots"))
+                                    .child(widgets::meta_line(
+                                        &theme,
+                                        vec![div().child(SharedString::from("Captures are staged for review and never sent automatically.")).into_any_element()],
+                                    )),
+                                    )
+                                    .child(
+                                        widgets::toggle_switch(&theme, appshots_enabled)
+                                            .id("appshots-enabled")
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.appshots_enabled = !this.appshots_enabled;
+                                                this.commit_appshots(cx);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::KEYBOARD))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Global shortcut",
+                                                    ))
+                                                    .child(if capabilities.global_shortcut
+                                                        == CapabilityState::Ready
+                                                    {
+                                                        widgets::badge_active(
+                                                            &theme,
+                                                            capabilities.global_shortcut.badge(),
+                                                        )
+                                                    } else {
+                                                        widgets::badge(
+                                                            &theme,
+                                                            capabilities.global_shortcut.badge(),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div()
+                                                    .child(SharedString::from(format!(
+                                                        "{} · {}",
+                                                        capabilities.shortcut_label(),
+                                                        capabilities.shortcut_description()
+                                                    )))
+                                                    .into_any_element()],
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::KEYBOARD))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(widgets::row_title(&theme, "Destination"))
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(SharedString::from("Choose where a completed capture is staged.")).into_any_element()],
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .gap(px(6.0))
+                                            .children(appshot_destination),
+                                    ),
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::MONITOR))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Active-window capture",
+                                                    ))
+                                                    .child(if capabilities.window_capture
+                                                        == CapabilityState::Ready
+                                                    {
+                                                        widgets::badge_active(
+                                                            &theme,
+                                                            capabilities.window_capture.badge(),
+                                                        )
+                                                    } else {
+                                                        widgets::badge(
+                                                            &theme,
+                                                            capabilities.window_capture.badge(),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(SharedString::from(capabilities.capture_description())).into_any_element()],
+                                            )),
+                                    )
+                                    .when(
+                                        appshots_enabled
+                                            && capabilities.window_capture
+                                                == CapabilityState::PermissionRequired
+                                            && crate::appshots::capture_settings_url().is_some(),
+                                        |el| {
+                                        el.child(
+                                            widgets::ghost_action(&theme)
+                                                .id("appshots-capture-access")
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if this.capture_access_prompted {
+                                                        if let Some(url) = crate::appshots::capture_settings_url() {
+                                                            cx.open_url(url);
+                                                        }
+                                                    } else {
+                                                        this.capture_access_prompted = true;
+                                                        crate::appshots::request_capture_access();
+                                                        this.appshot_capabilities = crate::appshots::capabilities();
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(capture_action),
+                                        )
+                                    },
+                                    )
+                            )
+                            .child(
+                                widgets::card_row(&theme, false)
+                                    .when(!appshots_enabled, |el| el.opacity(0.55))
+                                    .child(widgets::row_tile(&theme, crate::icons::CHECKLIST))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(widgets::row_title(
+                                                        &theme,
+                                                        "Application text",
+                                                    ))
+                                                    .child(if capabilities.application_text
+                                                        == CapabilityState::Ready
+                                                    {
+                                                        widgets::badge_active(
+                                                            &theme,
+                                                            capabilities.application_text.badge(),
+                                                        )
+                                                    } else {
+                                                        widgets::badge(
+                                                            &theme,
+                                                            capabilities.application_text.badge(),
+                                                        )
+                                                    }),
+                                            )
+                                            .child(widgets::meta_line(
+                                                &theme,
+                                                vec![div().child(SharedString::from(capabilities.semantic_description())).into_any_element()],
+                                            )),
+                                    )
+                                    .when(
+                                        appshots_enabled
+                                            && capabilities.application_text
+                                                == CapabilityState::PermissionRequired
+                                            && crate::appshots::semantic_settings_url().is_some(),
+                                        |el| {
+                                        el.child(
+                                            widgets::ghost_action(&theme)
+                                                .id("appshots-semantic-access")
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if this.semantic_access_prompted {
+                                                        if let Some(url) = crate::appshots::semantic_settings_url() {
+                                                            cx.open_url(url);
+                                                        }
+                                                    } else {
+                                                        this.semantic_access_prompted = true;
+                                                        crate::appshots::request_semantic_access();
+                                                        this.appshot_capabilities = crate::appshots::capabilities();
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(semantic_action),
+                                        )
+                                    },
+                                    )
+                            )
+                            .when(
+                                appshots_enabled
+                                    && !(capabilities.global_shortcut.is_ready()
+                                        && capabilities.window_capture.is_ready()
+                                        && capabilities.application_text.is_ready()),
+                                |card| {
+                                    card.child(
+                                        widgets::card_row(&theme, false)
+                                            .child(div().w(px(36.0)).flex_none())
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.text_muted.opacity(0.65))
+                                                    .child(SharedString::from("Changed a permission or desktop shortcut setting? Return here and check again.")),
+                                            )
+                                            .child(
+                                                widgets::ghost_action(&theme)
+                                                    .id("appshots-refresh-permissions")
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.appshot_capabilities = crate::appshots::capabilities();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(SharedString::from("Check again")),
+                                            ),
+                                    )
+                                },
+                            ),
                     ),
             )
     }
