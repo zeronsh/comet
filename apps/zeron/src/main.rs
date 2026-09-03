@@ -90,9 +90,13 @@ fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     }
 }
 
-/// mimalloc: system malloc (macOS libmalloc especially) never returns the
-/// streaming churn's high-water pages, so transient allocation became
-/// permanent RSS (docs/memory-plan.md §1).
+/// mimalloc, macOS only: libmalloc never returns the streaming churn's
+/// high-water pages, so transient allocation became permanent RSS
+/// (docs/memory-plan.md §1). Pinned to mimalloc v2 in the workspace manifest —
+/// the crate's default v3 has the same pathology (churn retained as permanent
+/// RSS, ~6x glibc's growth on identical workloads, no idle recovery). Linux
+/// measured flat on glibc, so it keeps the system allocator.
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
