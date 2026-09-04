@@ -84,8 +84,10 @@ pub const CHIP_CARD_HEIGHT: f32 = 30.0;
 /// header inside a 30px bordered card clips 2px off the bottom and every
 /// glyph/icon reads high (user report).
 const CHIP_HEADER_HEIGHT: f32 = CHIP_CARD_HEIGHT - 2.0;
-/// Border around the inset output panel of an ordinary activity row.
-const ACTIVITY_DETAIL_BORDER: f32 = 2.0;
+/// Shared columns keep the group summary, tool labels, and expanded text aligned.
+const ACTIVITY_GUTTER_WIDTH: f32 = 26.0;
+const ACTIVITY_TEXT_GAP: f32 = 4.0;
+const TOOL_TEXT_SIZE: f32 = 12.0;
 
 /// Signed list scroll step for a pointer near a viewport edge.
 ///
@@ -4914,11 +4916,7 @@ impl Transcript {
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
                 .map(|(((detail, invocation), affordance), _)| {
-                    (if collapses {
-                        ACTIVITY_DETAIL_BORDER
-                    } else {
-                        0.0
-                    }) + invocation.as_deref().map_or(0.0, detail_height)
+                    invocation.as_deref().map_or(0.0, detail_height)
                         + detail.as_deref().map_or(0.0, detail_height)
                         + if affordance.is_some() {
                             BLOB_AFFORDANCE_HEIGHT
@@ -4938,11 +4936,11 @@ impl Transcript {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .px(px(4.0))
+            .gap(px(ACTIVITY_TEXT_GAP))
+            .pr(px(4.0))
             .h(px(26.0))
             .cursor_pointer()
-            .text_size(px(12.0))
+            .text_size(px(TOOL_TEXT_SIZE))
             .line_height(px(18.0))
             // Quiet even when children failed: agents routinely have failed
             // probes mid-work, and a red HEADER read as "this whole step
@@ -4957,7 +4955,8 @@ impl Transcript {
             }))
             .child(
                 div()
-                    .size(px(18.0))
+                    .w(px(ACTIVITY_GUTTER_WIDTH))
+                    .h(px(18.0))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -5036,16 +5035,11 @@ impl Transcript {
                 let open = detail_opens[ix];
                 let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
-                // Ordinary tools expand into an inset output panel. Subagent
-                // fallbacks retain their card; both use explicit heights so
-                // the row and group fold animations stay in sync.
+                // Ordinary tools expand into muted text along the same column.
+                // Subagent fallbacks retain their card; explicit heights keep
+                // the row and group fold animations in sync.
                 let closed_h = CHIP_CARD_HEIGHT;
                 let open_h = CHIP_CARD_HEIGHT
-                    + if collapses {
-                        ACTIVITY_DETAIL_BORDER
-                    } else {
-                        0.0
-                    }
                     + invocation.as_deref().map_or(0.0, detail_height)
                     + detail.as_deref().map_or(0.0, detail_height)
                     + affordance_h;
@@ -5058,7 +5052,7 @@ impl Transcript {
                 let group_key = row_id.clone();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
-                    .when(collapses, |el| el.ml(px(12.0)))
+                    .when(collapses, |el| el.ml(px(ACTIVITY_TEXT_GAP)))
                     .min_w_0()
                     .flex_1()
                     .flex()
@@ -5113,28 +5107,21 @@ impl Transcript {
                     );
                 // The body stays mounted while the close tween shrinks over it.
                 // Invocation first (what was asked), then output/diff (what
-                // came back), each under its own hairline.
+                // came back), separated by a small gap.
                 if open || animating {
                     let mut panel = div()
                         .flex_none()
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .overflow_hidden()
-                        .when(collapses, |panel| {
-                            panel
-                                .rounded(px(9.0))
-                                .border_1()
-                                .border_color(crate::theme::hairline(0.09))
-                                .bg(crate::theme::ink(0.025))
-                        });
+                        .overflow_hidden();
                     if let Some(invocation) = invocation.as_deref() {
                         panel = panel
                             .child(
                                 div()
                                     .h(px(DETAIL_SEPARATOR))
                                     .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
+                                    .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
                             )
                             .child(detail_body(invocation, None, theme));
                     }
@@ -5144,7 +5131,7 @@ impl Transcript {
                                 div()
                                     .h(px(DETAIL_SEPARATOR))
                                     .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
+                                    .when(!collapses, |line| line.bg(crate::theme::hairline(0.06))),
                             )
                             .child(detail_body(detail, detail_highlights[ix].clone(), theme));
                     }
@@ -5157,10 +5144,9 @@ impl Transcript {
                             .id(SharedString::from(format!("{key}-blob")))
                             .h(px(BLOB_AFFORDANCE_HEIGHT))
                             .flex_none()
-                            .px(px(12.0))
                             .flex()
                             .items_center()
-                            .text_size(px(10.5))
+                            .text_size(px(TOOL_TEXT_SIZE))
                             .text_color(theme.text_faint)
                             .child(label);
                         if !loading {
@@ -5193,7 +5179,7 @@ impl Transcript {
                     .flex_none()
                     .flex()
                     .flex_row()
-                    // Stretch the line alongside the entire output panel.
+                    // Stretch the line alongside the expanded text.
                     .when(collapses, |row| {
                         row.child(activity_rail(tool, ix + 1 < tools.len(), theme))
                     })
@@ -5500,13 +5486,12 @@ fn detail_body(
         ToolDetail::Stats { stats } => body
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
+            .text_size(px(TOOL_TEXT_SIZE))
             .children(stats.iter().map(|stat| {
                 div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
-                    .px(px(12.0))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -5515,7 +5500,7 @@ fn detail_body(
                             .min_w_0()
                             .flex_1()
                             .truncate()
-                            .text_color(theme.text.opacity(0.85))
+                            .text_color(theme.text_faint)
                             .child(SharedString::from(stat.path.clone())),
                     )
                     .child(
@@ -5538,16 +5523,15 @@ fn detail_body(
         } => body
             .py(px(6.0))
             .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
+            .text_size(px(TOOL_TEXT_SIZE))
             .children(lines.iter().map(|line| {
                 div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
-                    .px(px(12.0))
                     .flex()
                     .items_center()
-                    .text_color(theme.text.opacity(0.85))
+                    .text_color(theme.text_faint)
                     .child(div().w_full().min_w_0().truncate().child(line.clone()))
             }))
             .when(*truncated_by > 0, |block| {
@@ -5559,13 +5543,12 @@ fn detail_body(
             truncated_by,
         } => body
             .py(px(6.0))
-            .text_size(px(12.0))
+            .text_size(px(TOOL_TEXT_SIZE))
             .children(lines.iter().map(|line| {
                 let row = div()
                     .h(px(OUTPUT_LINE_HEIGHT))
                     .w_full()
                     .min_w_0()
-                    .px(px(12.0))
                     .flex()
                     .items_center();
                 let Some((text, runs)) = thought_line_text(line, theme) else {
@@ -5590,16 +5573,15 @@ fn detail_body(
 fn more_lines_row(truncated_by: usize, theme: &Theme) -> gpui::Div {
     div()
         .h(px(OUTPUT_LINE_HEIGHT))
-        .px(px(12.0))
         .flex()
         .items_center()
-        .text_size(px(10.5))
+        .text_size(px(TOOL_TEXT_SIZE))
         .text_color(theme.text_faint)
         .child(SharedString::from(format!("… {truncated_by} more lines")))
 }
 
 /// Shape one flattened thought line into gpui text runs — the detail-body
-/// palette: muted foreground prose, semibold for bold, violet mono for code,
+/// palette: faint foreground prose, semibold for bold, mono for code,
 /// underlined links (NOT clickable — a thought is a record, not a surface).
 fn thought_line_text(line: &[InlineRun], theme: &Theme) -> Option<(SharedString, Vec<TextRun>)> {
     let mut text = String::new();
@@ -5611,7 +5593,7 @@ fn thought_line_text(line: &[InlineRun], theme: &Theme) -> Option<(SharedString,
         let mut f = if run.style.code {
             gpui::font(theme.font_mono.clone())
         } else {
-            gpui::font(theme.font_sans.clone())
+            gpui::font(theme.font_sans_fixed.clone())
         };
         if run.style.bold {
             f.weight = gpui::FontWeight::SEMIBOLD;
@@ -5622,20 +5604,16 @@ fn thought_line_text(line: &[InlineRun], theme: &Theme) -> Option<(SharedString,
         runs.push(TextRun {
             len: run.text.len(),
             font: f,
-            color: if run.style.code {
-                render::inline_code_text(theme)
-            } else {
-                theme.text.opacity(0.85)
-            },
+            color: theme.text_faint,
             background_color: None,
             underline: run.style.link.is_some().then_some(gpui::UnderlineStyle {
-                color: Some(theme.text_muted),
+                color: Some(theme.text_faint),
                 thickness: px(1.0),
                 wavy: false,
             }),
             strikethrough: run.style.strikethrough.then_some(gpui::StrikethroughStyle {
                 thickness: px(1.0),
-                color: Some(theme.text_muted),
+                color: Some(theme.text_faint),
             }),
         });
         text.push_str(&run.text);
@@ -5707,7 +5685,7 @@ fn chip_header_row(
         .items_center()
         .gap(px(8.0))
         .px(px(if activity { 0.0 } else { 8.0 }))
-        .text_size(px(12.0))
+        .text_size(px(TOOL_TEXT_SIZE))
         .line_height(px(18.0))
         .when(!activity, |row| {
             row.child(
@@ -5931,7 +5909,7 @@ fn activity_rail(tool: &ToolItem, continues: bool, theme: &Theme) -> gpui::Div {
     };
     div()
         .relative()
-        .w(px(26.0))
+        .w(px(ACTIVITY_GUTTER_WIDTH))
         .flex_none()
         .child(
             div()
@@ -5985,7 +5963,7 @@ fn tool_chip(
         .when(rail, |row| row.child(activity_rail(tool, continues, theme)))
         .child(
             div()
-                .when(rail, |el| el.ml(px(12.0)))
+                .when(rail, |el| el.ml(px(ACTIVITY_TEXT_GAP)))
                 .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
                 .h(px(CHIP_CARD_HEIGHT))
                 .min_w_0()
