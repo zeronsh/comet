@@ -19,6 +19,7 @@ pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
+pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
@@ -47,6 +48,13 @@ pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
+
+pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
+pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
+pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
+pub const FILES_EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const FILES_EDITOR_FONT_SIZE_MIN: f32 = 9.0;
+pub const FILES_EDITOR_FONT_SIZE_MAX: f32 = 24.0;
 
 const FILE_NAME: &str = "ui-settings.json";
 
@@ -255,6 +263,16 @@ pub struct UiSettings {
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
+    /// Save edited workspace files automatically after the configured delay.
+    pub files_autosave_enabled: bool,
+    /// Idle time before an edited workspace file is saved automatically.
+    pub files_autosave_delay_ms: u64,
+    /// Wrap long lines in workspace file editors and previews.
+    pub files_word_wrap: bool,
+    /// Font size used by editable workspace-file buffers.
+    pub files_editor_font_size: f32,
+    /// Include hidden and ignored entries in workspace file trees.
+    pub files_show_all: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
@@ -294,6 +312,11 @@ impl Default for UiSettings {
             ui_font_size: crate::typography::UiFontSize::default(),
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
+            files_autosave_enabled: false,
+            files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
+            files_word_wrap: false,
+            files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
+            files_show_all: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             legacy_accent_color: None,
@@ -695,6 +718,15 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.files_autosave_delay_ms = self
+            .files_autosave_delay_ms
+            .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
+        self.files_editor_font_size = clamp_or(
+            self.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MIN,
+            FILES_EDITOR_FONT_SIZE_MAX,
+            FILES_EDITOR_FONT_SIZE_DEFAULT,
+        );
         self.ui_font_size = self.ui_font_size.normalized();
         self.keymap.heal_jump_slots();
         self
@@ -799,6 +831,11 @@ mod tests {
                 dark: "catppuccin-mocha".into(),
             },
             diff_split: true,
+            files_autosave_enabled: true,
+            files_autosave_delay_ms: 1_500,
+            files_word_wrap: true,
+            files_editor_font_size: 15.0,
+            files_show_all: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
@@ -870,6 +907,17 @@ mod tests {
         assert_eq!(loaded.surface, zeron_theme::SurfacePreference::ThemeDefault);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert_eq!(
+            loaded.files_autosave_delay_ms,
+            FILES_AUTOSAVE_DELAY_DEFAULT_MS
+        );
+        assert!(!loaded.files_autosave_enabled);
+        assert!(!loaded.files_word_wrap);
+        assert_eq!(
+            loaded.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_DEFAULT
+        );
+        assert!(!loaded.files_show_all);
         assert!(
             loaded.notifications_enabled,
             "pre-banner files default banners on"
@@ -963,6 +1011,24 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+        assert_eq!(
+            UiSettings {
+                files_autosave_delay_ms: 1,
+                ..Default::default()
+            }
+            .clamped()
+            .files_autosave_delay_ms,
+            FILES_AUTOSAVE_DELAY_MIN_MS
+        );
+        assert_eq!(
+            UiSettings {
+                files_editor_font_size: 100.0,
+                ..Default::default()
+            }
+            .clamped()
+            .files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MAX
+        );
     }
 
     #[test]

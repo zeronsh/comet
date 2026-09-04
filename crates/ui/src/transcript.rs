@@ -2220,6 +2220,7 @@ pub struct Transcript {
     /// frames reuse settled blocks' text+runs; the incremental parser's stable
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
+    workspace_link: Option<render::LinkUi>,
     /// Last UI typography generation reflected in `list` item measurements.
     /// Family and size changes can alter prose wrapping without changing row
     /// identity, so the virtual list must explicitly discard cached heights.
@@ -2329,6 +2330,9 @@ pub enum TranscriptEvent {
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
 
 impl Transcript {
+    pub(crate) fn set_workspace_link_handler(&mut self, handler: render::LinkUi) {
+        self.workspace_link = Some(handler);
+    }
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self::build(state, None, true, cx)
     }
@@ -2416,6 +2420,7 @@ impl Transcript {
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
+            workspace_link: None,
             typography_generation: crate::typography::generation(cx),
             highlights: HighlightStore::default(),
             show_jump_button: false,
@@ -4250,6 +4255,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    link: self.workspace_link.clone(),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -4292,6 +4298,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    link: self.workspace_link.clone(),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {

@@ -42,7 +42,7 @@ use gpui::{
 use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
 use zeron_rpc::methods;
 
-use crate::comments::{self, CommentSide, DiffComment};
+use crate::comments::{self, CommentSide, ReviewComment};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
 use crate::markdown::render;
@@ -505,7 +505,7 @@ pub fn body_height(file: &FileDiff) -> f32 {
 
 pub fn body_height_with(
     file: &FileDiff,
-    comments: &[DiffComment],
+    comments: &[ReviewComment],
     draft: Option<(CommentSide, u32)>,
     mode: DiffMode,
 ) -> f32 {
@@ -849,7 +849,10 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
     }
 }
 
-fn comment_state_key(comments: &[DiffComment], draft: Option<&(String, CommentSide, u32)>) -> u64 {
+fn comment_state_key(
+    comments: &[ReviewComment],
+    draft: Option<&(String, CommentSide, u32)>,
+) -> u64 {
     let mut parts: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
     if let Some((path, side, line)) = draft {
         parts.push(format!("draft:{path}:{}:{line}", side.tag()));
@@ -1089,7 +1092,7 @@ pub enum DiffRow {
 impl DiffRow {
     /// `FoldingBody` is height-animated, so it reports 0 and never lands in a
     /// height sum.
-    fn height(self, comments: &[DiffComment]) -> f32 {
+    fn height(self, comments: &[ReviewComment]) -> f32 {
         match self {
             DiffRow::FileHeader { .. } => FILE_HEADER_HEIGHT,
             DiffRow::Notice { .. } => NOTICE_HEIGHT,
@@ -1116,20 +1119,20 @@ pub fn body_row_count(file: &FileDiff) -> usize {
 pub fn body_rows(
     file_ix: u32,
     file: &FileDiff,
-    comments: &[DiffComment],
+    comments: &[ReviewComment],
     draft: Option<(CommentSide, u32)>,
     mode: DiffMode,
 ) -> Vec<DiffRow> {
     fn push_cards(
         rows: &mut Vec<DiffRow>,
         file_ix: u32,
-        comments: &[DiffComment],
+        comments: &[ReviewComment],
         draft: Option<(CommentSide, u32)>,
         anchors: &[Option<(CommentSide, u32)>],
     ) {
         for anchor in anchors.iter().flatten() {
             for (ix, comment) in comments.iter().enumerate() {
-                if comment.anchor() == *anchor {
+                if comment.diff_anchor() == Some(*anchor) {
                     rows.push(DiffRow::CommentCard {
                         file: file_ix,
                         card: ix as u32,
@@ -1192,7 +1195,7 @@ pub fn body_rows(
 /// path's slice.
 pub fn flatten_rows(
     files: &[FileDiff],
-    comments: &[DiffComment],
+    comments: &[ReviewComment],
     draft: Option<(&str, CommentSide, u32)>,
     mode: DiffMode,
     mut collapsed: impl FnMut(usize) -> bool,
@@ -1203,9 +1206,9 @@ pub fn flatten_rows(
         let start = rows.len();
         rows.push(DiffRow::FileHeader { file: ix as u32 });
         if !collapsed(ix) {
-            let file_comments: Vec<DiffComment> = comments
+            let file_comments: Vec<ReviewComment> = comments
                 .iter()
-                .filter(|comment| comment.path == file.path)
+                .filter(|comment| !comment.is_file() && comment.path == file.path)
                 .cloned()
                 .collect();
             let file_draft = draft
@@ -2216,9 +2219,9 @@ impl Changes {
                 0
             } else {
                 let file = &files[file_ix];
-                let comments: Vec<DiffComment> = staged
+                let comments: Vec<ReviewComment> = staged
                     .iter()
-                    .filter(|comment| comment.path == file.path)
+                    .filter(|comment| !comment.is_file() && comment.path == file.path)
                     .cloned()
                     .collect();
                 body_rows(
@@ -2309,15 +2312,15 @@ impl Changes {
     }
 
     /// Cloned because rendering borrows `self` mutably a moment later.
-    fn staged_comments(&self, cx: &App) -> Vec<DiffComment> {
+    fn staged_comments(&self, cx: &App) -> Vec<ReviewComment> {
         let state = self.state.read(cx);
-        state.diff_comments(&state.composer_key()).to_vec()
+        state.review_comments(&state.composer_key()).to_vec()
     }
 
-    fn comments_for(&self, path: &str, cx: &App) -> Vec<DiffComment> {
+    fn comments_for(&self, path: &str, cx: &App) -> Vec<ReviewComment> {
         self.staged_comments(cx)
             .into_iter()
-            .filter(|comment| comment.path == path)
+            .filter(|comment| !comment.is_file() && comment.path == path)
             .collect()
     }
 
@@ -2390,9 +2393,9 @@ impl Changes {
             {
                 continue;
             }
-            let comments: Vec<DiffComment> = staged
+            let comments: Vec<ReviewComment> = staged
                 .iter()
-                .filter(|comment| comment.path == file.path)
+                .filter(|comment| !comment.is_file() && comment.path == file.path)
                 .cloned()
                 .collect();
             let body = body_rows(
@@ -2484,13 +2487,13 @@ impl Changes {
             cx.notify();
             return;
         }
-        let comment =
-            DiffComment::new(draft.path, draft.side, draft.line, body).renamed_from(draft.old_path);
+        let comment = ReviewComment::new(draft.path, draft.side, draft.line, body)
+            .renamed_from(draft.old_path);
         // `draft.key`, not the live one: the note stages onto the composer it
         // was written against even if the selection moved under it.
         let key = draft.key;
         self.state.update(cx, |state, cx| {
-            state.add_diff_comment(&key, comment);
+            state.add_review_comment(&key, comment);
             cx.notify();
         });
         self.sync_comment_rows(cx);
@@ -2500,7 +2503,7 @@ impl Changes {
     fn remove_comment(&mut self, id: &str, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             let key = state.composer_key();
-            state.remove_diff_comment(&key, id);
+            state.remove_review_comment(&key, id);
             cx.notify();
         });
         self.sync_comment_rows(cx);
@@ -4079,7 +4082,11 @@ fn render_comment_adder(
         .into_any_element()
 }
 
-fn render_comment_card(comment: &DiffComment, theme: &Theme, cx: &Context<Changes>) -> AnyElement {
+fn render_comment_card(
+    comment: &ReviewComment,
+    theme: &Theme,
+    cx: &Context<Changes>,
+) -> AnyElement {
     let group: SharedString = format!("cmt-card-{}", comment.id).into();
     let id = comment.id.clone();
     div()
@@ -4166,7 +4173,7 @@ fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
     div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
 }
 
-/// Mirrors [`DiffComment::cite_path`] for the not-yet-staged note.
+/// Mirrors [`ReviewComment::cite_path`] for the not-yet-staged note.
 fn draft_cite_path(draft: &CommentDraft) -> &str {
     match draft.side {
         CommentSide::Old => draft.old_path.as_deref().unwrap_or(&draft.path),
@@ -5058,7 +5065,7 @@ rename to new_name.rs
     fn split_rows_carry_the_comments_of_both_columns() {
         let files = parse_patch(PATCH);
         // A context row must not stack the same card twice.
-        let comment = DiffComment::new("src/main.rs", CommentSide::New, 1, "why");
+        let comment = ReviewComment::new("src/main.rs", CommentSide::New, 1, "why");
         let rows = body_rows(0, &files[0], &[comment], None, DiffMode::Split);
         assert_eq!(
             rows.iter()
@@ -5069,8 +5076,8 @@ rename to new_name.rs
 
         // Both sides of one paired row hang off that row, in column order.
         let staged = vec![
-            DiffComment::new("src/main.rs", CommentSide::Old, 2, "left"),
-            DiffComment::new("src/main.rs", CommentSide::New, 2, "right"),
+            ReviewComment::new("src/main.rs", CommentSide::Old, 2, "left"),
+            ReviewComment::new("src/main.rs", CommentSide::New, 2, "right"),
         ];
         let rows = body_rows(0, &files[0], &staged, None, DiffMode::Split);
         let edit = rows
