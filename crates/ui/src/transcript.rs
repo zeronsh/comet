@@ -5673,6 +5673,7 @@ fn chip_header_row(
         theme.text_muted
     };
     div()
+        .group("tool-header")
         .h(px(if activity {
             CHIP_CARD_HEIGHT
         } else {
@@ -5724,10 +5725,11 @@ fn chip_header_row(
         )
         .child(
             div()
-                .flex_1()
+                .when(!activity, |detail| detail.flex_1())
                 .min_w_0()
                 .h(px(if file_path.is_some() { 24.0 } else { 18.0 }))
                 .flex()
+                .when(activity && detail.is_empty(), |detail| detail.hidden())
                 .items_center()
                 .truncate()
                 .text_color(if failed {
@@ -5811,6 +5813,10 @@ fn chip_header_row(
             let tile = div()
                 .size(px(18.0))
                 .flex_none()
+                .when(activity, |tile| {
+                    tile.opacity(0.0)
+                        .group_hover("tool-header", |style| style.opacity(1.0))
+                })
                 .when(!activity, |tile| {
                     tile.rounded(px(5.0)).bg(crate::theme::ink(0.06))
                 })
