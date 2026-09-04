@@ -61,7 +61,7 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
+    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item, notification_thread_id,
     route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
 };
 
@@ -933,6 +933,7 @@ async fn run_session(session: Session) {
     // Deltas seen per agent-message item, so a model that never streams
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
+    let mut reasoning_streams: HashMap<String, ReasoningStream> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
@@ -1020,10 +1021,9 @@ async fn run_session(session: Session) {
                                         .into_iter()
                                         .collect(),
                                     "item/reasoning/textDelta"
-                                    | "item/reasoning/summaryTextDelta" => delta_text(&params)
-                                        .map(|text| AgentEvent::ReasoningDelta { text })
-                                        .into_iter()
-                                        .collect(),
+                                    | "item/reasoning/summaryTextDelta"
+                                    | "item/reasoning/summaryPartAdded" => reasoning_streams
+                                        .entry(nthread.clone()).or_default().map(&method, &params),
                                     "item/started" | "item/completed" => {
                                         let phase = if method == "item/started" {
                                             Phase::Started
@@ -1111,11 +1111,14 @@ async fn run_session(session: Session) {
                         }
                     }
 
-                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
-                        if let Some(text) = delta_text(&params)
-                            && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
+                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta"
+                    | "item/reasoning/summaryPartAdded" => {
+                        for event in reasoning_streams.entry(thread_id.clone()).or_default()
+                            .map(&method, &params)
                         {
-                            break 'main;
+                            if !send(&event_tx, event).await {
+                                break 'main;
+                            }
                         }
                     }
 

@@ -67,6 +67,24 @@ tid=$(rid "$turnline")
 
 case "$turnline" in
 
+*scenario:reasoning*)
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"item/started","params":{"threadId":"th-1","item":{"id":"call_alpha","type":"subAgentActivity","kind":"spawned","agentThreadId":"child-1","agentPath":"/root/alpha"}}}'
+  emit '{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"th-1","itemId":"r1","summaryIndex":0}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"th-1","itemId":"r1","summaryIndex":0,"delta":"**Implementing file"}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"child-1","itemId":"r1","summaryIndex":0,"delta":"**Checking"}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"th-1","itemId":"r1","summaryIndex":0,"delta":" badges**"}}'
+  emit '{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"th-1","itemId":"r1","summaryIndex":1}}'
+  emit '{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"th-1","itemId":"r1","summaryIndex":1}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"th-1","itemId":"r1","summaryIndex":1,"delta":"**Preparing fixture screenshots**"}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"child-1","itemId":"r1","summaryIndex":0,"delta":" layout**"}}'
+  emit '{"method":"item/reasoning/summaryPartAdded","params":{"threadId":"child-1","itemId":"r1","summaryIndex":1}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"child-1","itemId":"r1","delta":"Inspecting the output panel."}}'
+  emit '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"th-1","itemId":"r2","summaryIndex":0,"delta":"Checking the final result."}}'
+  emit '{"method":"turn/completed","params":{"threadId":"child-1","turn":{"id":"ct-1"}}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:happy*)
   # Verify the turn/start + thread/start params the harness must send.
   for want in '"method":"turn/start"' '"effort":"ultra"' '"model":"gpt-5.6-sol"' \

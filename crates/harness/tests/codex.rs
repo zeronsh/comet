@@ -89,6 +89,30 @@ async fn run_to_end(
 }
 
 #[tokio::test]
+async fn reasoning_preserves_summary_parts_and_item_boundaries_per_thread() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:reasoning"), controls).await;
+    let mut parent = String::new();
+    let mut child = String::new();
+    for event in &events {
+        match event {
+            AgentEvent::ReasoningDelta { text } => parent.push_str(text),
+            AgentEvent::Subagent { event, .. } => {
+                if let AgentEvent::ReasoningDelta { text } = event.as_ref() {
+                    child.push_str(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        parent,
+        "**Implementing file badges**\n\n**Preparing fixture screenshots**\n\nChecking the final result."
+    );
+    assert_eq!(child, "**Checking layout**\n\nInspecting the output panel.");
+}
+
+#[tokio::test]
 async fn happy_path_maps_deltas_items_usage_and_done() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:happy");
