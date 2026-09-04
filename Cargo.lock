@@ -9180,6 +9180,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-crypto"
+version = "0.2.33"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "zeron-doc"
 version = "0.2.33"
 dependencies = [
