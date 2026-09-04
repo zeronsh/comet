@@ -5667,6 +5667,9 @@ fn chip_header_row(
     let failed = tool.is_error
         || (tool.subagent_ref.is_some()
             && matches!(tool.subagent_status, Some(SubagentStatus::Failed)));
+    // Text resolves its color during layout, so group-hover text needs stable
+    // child IDs under the keyed, expandable header to retain hover state.
+    let hover_text = activity && trail.is_some() && !failed;
     let tint = if failed {
         theme.danger
     } else {
@@ -5721,7 +5724,17 @@ fn chip_header_row(
                     label.font_weight(gpui::FontWeight::MEDIUM)
                 })
                 .text_color(tint)
-                .child(SharedString::from(label)),
+                .child(SharedString::from(label))
+                .map(|label| {
+                    if hover_text {
+                        label
+                            .id("tool-label")
+                            .group_hover("tool-header", |style| style.text_color(theme.text))
+                            .into_any_element()
+                    } else {
+                        label.into_any_element()
+                    }
+                }),
         )
         .child(
             div()
@@ -5757,9 +5770,26 @@ fn chip_header_row(
                         .child(
                             crate::icons::icon(crate::icons::for_file(path))
                                 .size(px(14.0))
-                                .text_color(tint),
+                                .text_color(tint)
+                                .when(activity && !failed, |icon| {
+                                    icon.group_hover("tool-header", |style| {
+                                        style.text_color(theme.text)
+                                    })
+                                }),
                         )
-                        .child(div().min_w_0().truncate().child(SharedString::from(detail)));
+                        .child(div().min_w_0().truncate().child(SharedString::from(detail)))
+                        .map(|badge| {
+                            if hover_text {
+                                badge
+                                    .id("tool-file-badge")
+                                    .group_hover("tool-header", |style| {
+                                        style.text_color(theme.text)
+                                    })
+                                    .into_any_element()
+                            } else {
+                                badge.into_any_element()
+                            }
+                        });
                     crate::frost::frosted(5.0, 16.0, badge).into_any_element()
                 } else {
                     div()
@@ -5767,6 +5797,16 @@ fn chip_header_row(
                         .truncate()
                         .child(SharedString::from(detail))
                         .into_any_element()
+                })
+                .map(|detail| {
+                    if hover_text {
+                        detail
+                            .id("tool-detail")
+                            .group_hover("tool-header", |style| style.text_color(theme.text))
+                            .into_any_element()
+                    } else {
+                        detail.into_any_element()
+                    }
                 }),
         )
         .when_some(tool.call.subagent_model(), |row, model| {
@@ -5832,7 +5872,12 @@ fn chip_header_row(
                         crate::icons::ALT_ARROW_RIGHT
                     })
                     .size(px(12.0))
-                    .text_color(theme.text_faint),
+                    .text_color(theme.text_faint)
+                    .when(activity, |caret| {
+                        caret.group_hover("tool-header", |style| {
+                            style.text_color(if failed { theme.danger } else { theme.text })
+                        })
+                    }),
                 ),
                 ChipTrail::OpenArrow => tile.child(
                     crate::icons::icon(crate::icons::ARROW_UP_RIGHT)
