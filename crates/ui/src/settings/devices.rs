@@ -155,8 +155,10 @@ impl DevicesPage {
         let theme = Theme::of(cx).clone();
         let dialog = self.rename.as_ref()?;
         let input = dialog.input.clone();
-        let card = popover::dialog_card(&theme)
-            .child(popover::dialog_title(&theme, "Rename device"))
+        let card = popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+            this.rename = None;
+        })
+        .child(popover::dialog_title(&theme, "Rename device"))
             .child(
                 div()
                     .mt(px(12.0))

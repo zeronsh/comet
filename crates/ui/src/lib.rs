@@ -24,6 +24,7 @@ pub mod edge_fade;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub mod identity;
 pub mod links;
 pub mod loaders;
 pub mod markdown;
@@ -144,6 +145,7 @@ pub fn run_app(config: UiConfig) {
             ui_settings.theme_selection,
             ui_settings.accent,
             ui_settings.surface,
+            ui_settings.frost,
             cx,
         );
         composer::init(cx);

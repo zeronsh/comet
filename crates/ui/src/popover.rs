@@ -19,6 +19,60 @@ use gpui::{
 use crate::motion::{self, ZERON_PULSE};
 use crate::theme::{Theme, hairline, ink};
 
+gpui::actions!(popover, [Dismiss]);
+
+/// Key context carried by every dismissible float ([`dialog_card`] and the
+/// menu surfaces). Escape binds to [`Dismiss`] here and to route-level exits
+/// further out; gpui resolves ties by context DEPTH, so the innermost open
+/// float always wins and the route only closes once nothing is left to
+/// dismiss. That layering is the whole reason this is a context and not a
+/// global binding.
+pub const DISMISSIBLE: &str = "Dismissible";
+
+/// Bind Escape for the dismissible layer. Called from the shell's keymap pass,
+/// which clears bindings on every re-apply.
+pub fn init(cx: &mut gpui::App) {
+    cx.bind_keys([gpui::KeyBinding::new("escape", Dismiss, Some(DISMISSIBLE))]);
+}
+
+/// Wire a float's Escape handling: `on_dismiss` runs when Escape reaches this
+/// card and nothing deeper consumed it.
+///
+/// Owners call this instead of hand-rolling a key-down comparison, so every
+/// float dismisses through one path and participates in the depth ordering.
+///
+/// A card only receives Escape while something inside it holds focus — that is
+/// what puts [`DISMISSIBLE`] on the dispatch path. Cards that own a text input
+/// get this for free; cards that do not (confirmations) must take focus
+/// themselves, which is what [`focus_card`] is for.
+pub fn dismissible<T: 'static>(
+    card: Div,
+    cx: &mut Context<T>,
+    on_dismiss: impl Fn(&mut T, &mut Context<T>) + 'static,
+) -> Div {
+    card.on_action(cx.listener(move |this, _: &Dismiss, _, cx| {
+        on_dismiss(this, cx);
+        cx.notify();
+    }))
+}
+
+/// Focus a card that owns no input, so Escape reaches its [`dismissible`]
+/// handler. `pending` is taken by the caller on the frame the dialog opens —
+/// re-focusing every frame would fight anything the user tabs to inside it.
+/// Self-arming: takes focus the first frame the card is up and leaves it alone
+/// afterwards, so anything the user tabs to inside the card keeps it.
+pub fn focus_card(
+    card: Div,
+    focus: &gpui::FocusHandle,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> Div {
+    if !focus.contains_focused(window, cx) {
+        window.focus(focus, cx);
+    }
+    card.track_focus(focus)
+}
+
 // ---------------------------------------------------------------------------
 // Loadable — async slot state shared by pickers/settings pages
 // ---------------------------------------------------------------------------
@@ -953,6 +1007,7 @@ pub fn menu_section() -> gpui::Div {
 /// border-white/[0.1] bg-popover/95 p-5 shadow-2xl` — popover tone ≈ #101010.
 pub fn dialog_card(theme: &Theme) -> gpui::Div {
     div()
+        .key_context(DISMISSIBLE)
         .w(px(360.0))
         .p(px(20.0))
         .rounded(px(16.0))

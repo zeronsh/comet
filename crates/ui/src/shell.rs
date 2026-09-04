@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, IntoElement,
-    KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, Point, Render, SharedString, Subscription, Task, Window, WindowControlArea, actions,
-    div, prelude::*, px,
+    Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, Focusable as _, Hsla,
+    IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseUpEvent, Pixels, Point, Render, SharedString, Subscription, Task, Window,
+    WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -68,6 +68,7 @@ actions!(
         AddSpacePalette,
         NewSession,
         OpenSettings,
+        CloseSettings,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -253,11 +254,15 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     }
     cx.clear_key_bindings();
     crate::composer::init(cx);
+    crate::popover::init(cx);
     // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
+        // Not rebindable and not global: scoped to the settings outlet's key
+        // context so a terminal or composer never loses its own Escape.
+        KeyBinding::new("escape", CloseSettings, Some("Settings")),
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
             ToggleSidebar,
@@ -321,8 +326,14 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Persisted as [`crate::settings::UiSettings::settings_section`] so reopening
+/// settings lands where it was left; an unknown value in a hand-edited file
+/// falls back to [`Self::Devices`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SettingsSection {
+    #[default]
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
@@ -366,6 +377,24 @@ pub enum Route {
     Chat,
     Settings(SettingsSection),
 }
+
+/// Which window edge a hover-peek belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeekSide {
+    Left,
+    Right,
+}
+
+/// How wide the invisible hover target along a collapsed pane's outer edge is.
+/// Wide enough to catch a deliberate throw at the edge, narrow enough that
+/// crossing the window does not trip it.
+const PEEK_EDGE: f32 = 12.0;
+
+/// Backdrop-blur sigma for a peeked pane. Lighter than [`crate::frost::MENU_BLUR`]:
+/// the panel floats over the user's own content, which should stay recognizable
+/// underneath rather than dissolve. Scaled by the frost strength like every
+/// other frosted surface.
+const PEEK_BLUR: f32 = 20.0;
 
 /// Maximum width the right pane may occupy while retaining the conversation
 /// floor. On unusually small windows this deliberately falls below the right
@@ -1048,6 +1077,11 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Focus target shared by the confirmation dialogs. They own no input, so
+    /// without focus their `Dismissible` context never reaches the dispatch
+    /// path and Escape would fall through to the route below them. One handle
+    /// is enough: the confirmations are mutually exclusive.
+    modal_focus: gpui::FocusHandle,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -1062,6 +1096,19 @@ pub struct Shell {
     sidebar_view_menu: popover::Popup<spaces::SidebarViewMenu>,
     /// Natural-tab-order focus target for the icon-only view-options button.
     sidebar_view_trigger_focus: gpui::FocusHandle,
+    /// Focus target for the settings outlet. Carries the "Settings" key
+    /// context that scopes the Escape binding to this route.
+    settings_focus: gpui::FocusHandle,
+    /// Pointer is inside the collapsed left edge: the sidebar floats back in
+    /// over the content until it leaves. Transient — collapsing stays the
+    /// persisted state, so a peek never survives a restart.
+    sidebar_peek: bool,
+    /// Same for the collapsed right pane.
+    right_peek: bool,
+    /// Width tweens for the two peek overlays. Separate from the collapse
+    /// tweens on purpose: a peek must not move the conversation column.
+    sidebar_peek_tween: Option<WidthTween>,
+    right_peek_tween: Option<WidthTween>,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -1326,6 +1373,7 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            modal_focus: cx.focus_handle(),
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
@@ -1333,6 +1381,11 @@ impl Shell {
             spaces_menu: popover::Popup::default(),
             sidebar_view_menu: popover::Popup::default(),
             sidebar_view_trigger_focus: cx.focus_handle().tab_stop(true),
+            settings_focus: cx.focus_handle(),
+            sidebar_peek: false,
+            right_peek: false,
+            sidebar_peek_tween: None,
+            right_peek_tween: None,
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
@@ -1749,8 +1802,53 @@ impl Shell {
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         let from = self.sidebar_target();
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
+        // Expanding out from under a live peek would leave the overlay stacked
+        // on the real column for the length of one tween.
+        self.set_sidebar_peek(false, cx);
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
+        cx.notify();
+    }
+
+    // ---- edge peek (hover a collapsed pane back into view) ----
+
+    /// Width the left peek overlay is heading toward: the user's sidebar width
+    /// while the pointer holds it open, otherwise closed.
+    fn sidebar_peek_target(&self) -> f32 {
+        if self.sidebar_peek && self.settings.sidebar_collapsed {
+            self.settings.sidebar_width
+        } else {
+            0.0
+        }
+    }
+
+    fn right_peek_target(&self, cx: &App) -> f32 {
+        if self.right_peek && !self.right_pane_open(cx) {
+            self.settings
+                .right_pane_width
+                .min(right_pane_max_width(self.viewport_width, 0.0))
+        } else {
+            0.0
+        }
+    }
+
+    fn set_sidebar_peek(&mut self, peek: bool, cx: &mut Context<Self>) {
+        if self.sidebar_peek == peek {
+            return;
+        }
+        let from = self.eval_tween(self.sidebar_peek_tween, self.sidebar_peek_target());
+        self.sidebar_peek = peek;
+        self.sidebar_peek_tween = Some(WidthTween::new(from, self.sidebar_peek_target()));
+        cx.notify();
+    }
+
+    fn set_right_peek(&mut self, peek: bool, cx: &mut Context<Self>) {
+        if self.right_peek == peek {
+            return;
+        }
+        let from = self.eval_tween(self.right_peek_tween, self.right_peek_target(cx));
+        self.right_peek = peek;
+        self.right_peek_tween = Some(WidthTween::new(from, self.right_peek_target(cx)));
         cx.notify();
     }
 
@@ -2243,6 +2341,7 @@ impl Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
+        self.settings.frost = crate::appearance::frost(cx);
         self.settings.ui_font_family = crate::typography::requested(cx);
         self.settings.ui_font_size = crate::typography::font_size(cx);
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
@@ -2329,7 +2428,12 @@ impl Shell {
         cx.notify();
     }
 
-    fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+    fn open_settings(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
         if section == SettingsSection::Harnesses {
@@ -2337,9 +2441,30 @@ impl Shell {
         }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
+        self.remember_settings_section(section, cx);
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
+        // Focus the outlet so the "Settings" key context is on the dispatch
+        // path and Escape resolves to [`CloseSettings`]. Pages that own an
+        // input take focus from here on their own.
+        window.focus(&self.settings_focus, cx);
         cx.notify();
+    }
+
+    /// The section the next Cmd-, or user-menu open lands on.
+    fn last_settings_section(&self) -> SettingsSection {
+        self.settings.settings_section
+    }
+
+    /// Rides the shell's own settings copy — [`Self::schedule_save`] replaces
+    /// the whole file from it, so a write that skipped this copy would be
+    /// undone by the next geometry save.
+    fn remember_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.settings.settings_section == section {
+            return;
+        }
+        self.settings.settings_section = section;
+        self.schedule_save(cx);
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -2376,6 +2501,7 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
+                self.remember_settings_section(section, cx);
             }
         }
         self.close_user_menu(cx);
@@ -3668,7 +3794,10 @@ impl Shell {
         out
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// `peek` renders the same column against the hover-peek tween instead of
+    /// the collapse tween — the content is identical, only the width clock
+    /// differs, so the two can never drift apart.
+    fn render_sidebar(&mut self, peek: bool, cx: &mut Context<Self>) -> AnyElement {
         // The sidebar is part of the resolved theme. A second fixed-Zeron
         // palette here made imported families look split in half and froze
         // activity/glyph personality independently of the selected variant.
@@ -3677,13 +3806,17 @@ impl Shell {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
             Route::Chat => self.render_chat_sidebar(&theme, cx),
         };
-        let target = self.sidebar_target();
+        let (tween, target) = if peek {
+            (self.sidebar_peek_tween, self.sidebar_peek_target())
+        } else {
+            (self.sidebar_tween, self.sidebar_target())
+        };
         // Transparent — the sidebar sits directly on the frost shell; the main
         // card's own border provides the separation. The content row spans the
         // full window height (the titlebar overlays it), so the column pads
         // itself below the chrome.
         self.pane_container(
-            self.sidebar_tween,
+            tween,
             target,
             div()
                 .h_full()
@@ -3691,6 +3824,66 @@ impl Shell {
                 .child(inner)
                 .into_any_element(),
         )
+    }
+
+    /// The hover target and float for one collapsed edge.
+    ///
+    /// One element does both jobs: at rest it is a [`PEEK_EDGE`]-wide invisible
+    /// strip against the window edge; while open it is exactly as wide as the
+    /// floated pane, so the pointer stays inside it and the pane holds. Leaving
+    /// it closes the pane. It is absolutely positioned, so nothing in the
+    /// conversation column reflows — the cost of a peek is a repaint, not a
+    /// layout pass.
+    ///
+    /// `pane` arrives already width-tweened by [`Self::pane_container`]; a
+    /// fully closed float still renders so the strip keeps its hover
+    /// subscription.
+    fn peek_edge(
+        &self,
+        side: PeekSide,
+        width: f32,
+        glass: Hsla,
+        border: Hsla,
+        pane: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let float = div()
+            .h_full()
+            .when(width > 0.0, |float| {
+                float
+                    .bg(glass)
+                    .shadow_lg()
+                    .map(|float| match side {
+                        PeekSide::Left => float.border_r_1(),
+                        PeekSide::Right => float.border_l_1(),
+                    })
+                    .border_color(border)
+            })
+            .child(pane);
+        div()
+            .id(match side {
+                PeekSide::Left => "sidebar-peek-edge",
+                PeekSide::Right => "right-pane-peek-edge",
+            })
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .map(|zone| match side {
+                PeekSide::Left => zone.left_0(),
+                PeekSide::Right => zone.right_0(),
+            })
+            .w(px(width.max(PEEK_EDGE)))
+            .flex()
+            .map(|zone| match side {
+                PeekSide::Left => zone.justify_start(),
+                PeekSide::Right => zone.justify_end(),
+            })
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| match side {
+                PeekSide::Left => this.set_sidebar_peek(*hovered, cx),
+                PeekSide::Right => this.set_right_peek(*hovered, cx),
+            }))
+            .child(crate::frost::frosted(0.0, PEEK_BLUR, float))
+            .into_any_element()
     }
 
     /// Settings-mode sidebar (zeron settings-sidebar.tsx): window-control
@@ -3763,7 +3956,9 @@ impl Shell {
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                                 .on_click(
-                                    cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.open_settings(item, window, cx)
+                                    }),
                                 )
                                 .child(
                                     icon(section_icon(item))
@@ -4335,8 +4530,19 @@ impl Shell {
                 (line, Some("Alpha".into()), email)
             }
         };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        // Keyed on the account id, not the email: changing a work address must
+        // not orphan the picture that was chosen for that account.
+        let user_picture_key = user
+            .as_ref()
+            .map(|u| SharedString::from(crate::identity::user_key(&u.id)));
+        let user_menu = self.render_user_menu(
+            user_line.clone(),
+            trigger_subline,
+            menu_identity,
+            user_picture_key,
+            theme,
+            cx,
+        );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -4575,6 +4781,7 @@ impl Shell {
         user_line: SharedString,
         trigger_subline: Option<SharedString>,
         menu_identity: SharedString,
+        picture_key: Option<SharedString>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4582,12 +4789,6 @@ impl Shell {
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
         // Bottom-of-sidebar identity: avatar circle + scope/account label and
         // its secondary status line.
-        let initial: SharedString = user_line
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into())
-            .into();
         let mut trigger = div()
             .id("user-menu")
             .flex_none()
@@ -4627,19 +4828,17 @@ impl Shell {
                 cx.notify();
             }))
             .child(
-                // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
-                div()
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.bg)
-                    .child(initial),
+                // Was a flat white circle for every account. Seeded on the
+                // account identity rather than the display name, so switching
+                // between a personal and a work login is visible at a glance
+                // and does not change color when the display name does.
+                match &picture_key {
+                    Some(key) => {
+                        crate::identity::avatar_for(key, &menu_identity, &user_line, 28.0, theme, cx)
+                    }
+                    None => crate::identity::avatar(&menu_identity, &user_line, 28.0, theme)
+                        .into_any_element(),
+                },
             )
             .child(
                 // Name with an optional status line underneath — no chip on the right.
@@ -4748,8 +4947,9 @@ impl Shell {
                 .child(
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_settings(SettingsSection::Devices, cx)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let section = this.last_settings_section();
+                            this.open_settings(section, window, cx)
                         }))
                         .child(
                             icon(icons::SETTINGS_MINIMALISTIC)
@@ -5330,14 +5530,10 @@ impl Shell {
                 window.focus(&dialog.input.focus_handle(cx), cx);
             }
             let input = dialog.input.clone();
-            let card = popover::dialog_card(&theme)
-                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                    if ev.keystroke.key == "escape" {
-                        this.rename_dialog = None;
-                        cx.notify();
-                    }
-                }))
-                .child(popover::dialog_title(&theme, "Rename session"))
+            let card = popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+                this.rename_dialog = None;
+            })
+            .child(popover::dialog_title(&theme, "Rename session"))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -5386,8 +5582,15 @@ impl Shell {
                     .and_then(|c| c.title.clone())
                     .unwrap_or_else(|| "New session".into()),
             );
-            let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Delete session?"))
+            let card = popover::focus_card(
+                popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+                    this.delete_confirm = None;
+                }),
+                &self.modal_focus.clone(),
+                window,
+                cx,
+            )
+            .child(popover::dialog_title(&theme, "Delete session?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
                     format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
@@ -5503,6 +5706,8 @@ impl Shell {
         if let Route::Settings(section) = self.route {
             let outlet = self.settings_outlet(section, cx);
             return div()
+                .key_context("Settings")
+                .track_focus(&self.settings_focus)
                 .flex_1()
                 .min_w_0()
                 .h_full()
@@ -5952,10 +6157,13 @@ impl Shell {
     /// default, drag-resizable. Content is the ACTIVE surface — the Diff
     /// page (its options row + the lazy [`Changes`] viewer), an embedded
     /// terminal, or the surface picker when no tabs exist.
-    fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// `peek` swaps the collapse tween for the hover-peek tween. The pane is
+    /// otherwise identical — a peek shows exactly what opening it would, so
+    /// there is no second, thinner "preview" pane to keep in sync.
+    fn render_right_pane(&mut self, peek: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
-        let content: AnyElement = if self.right_pane_open(cx) {
+        let content: AnyElement = if self.right_pane_open(cx) || peek {
             match self.resolved_right_active(cx) {
                 RightSurface::Diff(id) if self.diffs.contains_key(&id) => {
                     let changes = self.diffs.get(&id).cloned().expect("checked");
@@ -6060,9 +6268,13 @@ impl Shell {
             // row; the panel's own chrome starts below it.
             .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
-        let target = self.right_target(cx);
+        let (tween, target) = if peek {
+            (self.right_peek_tween, self.right_peek_target(cx))
+        } else {
+            (self.right_tween, self.right_target(cx))
+        };
         self.right_pane_container(
-            self.right_tween,
+            tween,
             target,
             div().h_full().relative().child(panel).into_any_element(),
         )
@@ -7306,6 +7518,7 @@ impl Render for Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
+        self.settings.frost = crate::appearance::frost(cx);
         let theme = Theme::of(cx);
         // The shell tone (zeron `.frost`): the surface the sidebar sits on and
         // the main panel floats over as an inset rounded card. On macOS the
@@ -7411,9 +7624,18 @@ impl Render for Shell {
             // to chat itself, so Settings is not a dead spot.
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
             // Native Settings menu item and the platform convention (Cmd+, on
-            // macOS, Ctrl+, elsewhere) always land on the default section.
-            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
-                this.open_settings(SettingsSection::Devices, cx)
+            // macOS, Ctrl+, elsewhere) reopen the last section used.
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                let section = this.last_settings_section();
+                this.open_settings(section, window, cx)
+            }))
+            // Escape leaves settings. Bound in the "Settings" key context, so
+            // it never competes with the terminal's escape or the composer's
+            // mention dismissal.
+            .on_action(cx.listener(|this, _: &CloseSettings, _, cx| {
+                if matches!(this.route, Route::Settings(_)) {
+                    this.close_settings(cx);
+                }
             }))
             // Chat-scoped, unlike new-session — `cycle_session` holds the guard
             // and says why.
@@ -7525,7 +7747,13 @@ impl Render for Shell {
                     t.set_bottom_clearance(stack_h, cx);
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                // A settled-collapsed pane renders into the edge float instead
+                // of the row — built once either way, one parent. It stays in
+                // the row while the collapse tween runs so the conversation
+                // column still reflows against it.
+                let sidebar_floating =
+                    self.settings.sidebar_collapsed && !self.tween_active(self.sidebar_tween);
+                let sidebar = self.render_sidebar(sidebar_floating, cx);
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     || SidebarResize,
@@ -7555,8 +7783,12 @@ impl Render for Shell {
                     // seam; the panel's 1px border remains the visual divider.
                     .left(px(-6.0))
                 });
+                // Same rule as the sidebar: float it only once the close tween
+                // has settled, and only on the chat route, where the pane
+                // exists at all.
+                let right_floating = on_chat && !right_open && !self.tween_active(self.right_tween);
                 let right: AnyElement = if on_chat {
-                    self.render_right_pane(cx)
+                    self.render_right_pane(right_floating, cx)
                 } else {
                     Empty.into_any_element()
                 };
@@ -7637,6 +7869,29 @@ impl Render for Shell {
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
+                let (sidebar_row, sidebar_float) = if sidebar_floating {
+                    (Empty.into_any_element(), Some(sidebar))
+                } else {
+                    (sidebar, None)
+                };
+                let (right_row, right_float) = if right_floating {
+                    (Empty.into_any_element(), Some(right))
+                } else {
+                    (right, None)
+                };
+                let glass = Theme::of(cx).glass();
+                let peeks = [
+                    sidebar_float.map(|pane| {
+                        let width =
+                            self.eval_tween(self.sidebar_peek_tween, self.sidebar_peek_target());
+                        self.peek_edge(PeekSide::Left, width, glass, border_color, pane, cx)
+                    }),
+                    right_float.map(|pane| {
+                        let width =
+                            self.eval_tween(self.right_peek_tween, self.right_peek_target(cx));
+                        self.peek_edge(PeekSide::Right, width, glass, border_color, pane, cx)
+                    }),
+                ];
                 let page = div()
                     .size_full()
                     .relative()
@@ -7645,12 +7900,13 @@ impl Render for Shell {
                             .size_full()
                             .flex()
                             .flex_row()
-                            .child(sidebar)
+                            .child(sidebar_row)
                             .child(sidebar_seam)
                             .child(card)
                             .child(right_seam)
-                            .child(right),
+                            .child(right_row),
                     )
+                    .children(peeks.into_iter().flatten())
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);

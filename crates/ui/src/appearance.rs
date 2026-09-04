@@ -21,7 +21,7 @@
 
 use gpui::{App, Global, Subscription, Window};
 use serde::{Deserialize, Serialize};
-use zeron_theme::{AccentSelection, SurfacePreference, ThemeSelection};
+use zeron_theme::{AccentSelection, FrostStrength, SurfacePreference, ThemeSelection};
 
 use crate::settings::{self, SavePolicy};
 use crate::theme::{Appearance, Theme};
@@ -61,6 +61,10 @@ pub struct AppearanceState {
     pub themes: ThemeSelection,
     pub accent: AccentSelection,
     pub surface: SurfacePreference,
+    /// Blur depth for frosted surfaces. Held here rather than on [`Theme`]
+    /// because it scales a paint-time sigma and touches no color role — a
+    /// change repaints without rebuilding the palette.
+    pub frost: FrostStrength,
 }
 
 impl Global for AppearanceState {}
@@ -82,6 +86,7 @@ pub fn init(
     themes: ThemeSelection,
     accent: AccentSelection,
     surface: SurfacePreference,
+    frost: FrostStrength,
     cx: &mut App,
 ) {
     let system = Appearance::from_window(cx.window_appearance());
@@ -92,6 +97,7 @@ pub fn init(
         themes: themes.clone(),
         accent,
         surface,
+        frost,
     });
     sync_ns_appearance(mode);
     let appearance = resolve(mode, system);
@@ -126,6 +132,12 @@ pub fn accent(cx: &App) -> AccentSelection {
 pub fn surface(cx: &App) -> SurfacePreference {
     cx.try_global::<AppearanceState>()
         .map(|state| state.surface)
+        .unwrap_or_default()
+}
+
+pub fn frost(cx: &App) -> FrostStrength {
+    cx.try_global::<AppearanceState>()
+        .map(|state| state.frost)
         .unwrap_or_default()
 }
 
@@ -194,6 +206,23 @@ pub fn set_surface(surface: SurfacePreference, cx: &mut App) {
     apply(cx);
     settings::update(SavePolicy::Immediate, cx, |settings| {
         settings.surface = surface;
+    });
+}
+
+/// Change how deep frosted surfaces blur. No palette rebuild: the sigma is read
+/// at paint time, so a repaint is the whole update.
+pub fn set_frost(frost: FrostStrength, cx: &mut App) {
+    if !cx.has_global::<AppearanceState>() {
+        return;
+    }
+    let state = cx.global_mut::<AppearanceState>();
+    if state.frost == frost {
+        return;
+    }
+    state.frost = frost;
+    cx.refresh_windows();
+    settings::update(SavePolicy::Immediate, cx, |settings| {
+        settings.frost = frost;
     });
 }
 

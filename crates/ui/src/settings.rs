@@ -95,6 +95,13 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
 }
 
 /// Latest settings, including mutations still inside the debounce window.
+/// Root of the active profile's data directory, for the stores that keep files
+/// beside `ui-settings.json` (see [`crate::identity`]).
+pub fn data_dir(cx: &App) -> Option<PathBuf> {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+}
+
 pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
@@ -259,6 +266,19 @@ pub struct UiSettings {
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
+    /// How strongly frosted surfaces blur what sits behind them. Only read when
+    /// the resolved treatment is frosted.
+    pub frost: zeron_theme::FrostStrength,
+    /// The settings section to reopen. Written when a section is selected, so
+    /// Cmd-, and the user menu return to the last one used rather than always
+    /// landing on Devices.
+    pub settings_section: crate::shell::SettingsSection,
+    /// Chosen pictures for projects and accounts, keyed as `space:{id}` /
+    /// `user:{id}` and valued by a file name under `{data_dir}/images`.
+    /// Device-local: the registry doc carries no picture field, so an entry
+    /// here is deliberately not synced (see [`crate::identity`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub images: std::collections::BTreeMap<String, String>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -296,6 +316,9 @@ impl Default for UiSettings {
             diff_split: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
+            frost: zeron_theme::FrostStrength::default(),
+            settings_section: crate::shell::SettingsSection::default(),
+            images: std::collections::BTreeMap::new(),
             legacy_accent_color: None,
         }
     }
@@ -801,6 +824,12 @@ mod tests {
             diff_split: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
+            frost: zeron_theme::FrostStrength::Heavy,
+            settings_section: crate::shell::SettingsSection::Appearance,
+            images: std::collections::BTreeMap::from([(
+                "space:space-1".to_string(),
+                "3a7f0c1d9b2e4f56.png".to_string(),
+            )]),
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -1305,6 +1334,47 @@ mod tests {
             ShortcutId::NextSession.default_combo()
         );
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
+    }
+
+    #[test]
+    fn a_file_predating_frost_and_the_settings_section_loads_their_defaults() {
+        // Upgrade path: an older `ui-settings.json` has neither key. Both must
+        // read as their defaults rather than failing the whole load and
+        // dropping every other preference in the file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "surface": "frosted"}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert_eq!(loaded.surface, zeron_theme::SurfacePreference::Frosted);
+        assert_eq!(loaded.frost, zeron_theme::FrostStrength::Regular);
+        assert_eq!(
+            loaded.settings_section,
+            crate::shell::SettingsSection::Devices
+        );
+    }
+
+    #[test]
+    fn an_unknown_settings_section_takes_the_whole_file_down_to_defaults() {
+        // Not a guard, a record: `settingsSection` is no more forgiving than
+        // `surface` or `sidebarOrganization` — an unreadable enum anywhere
+        // fails the parse and `load` falls back to defaults wholesale. Pinned
+        // so that making any of them tolerant stays a deliberate change.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "settingsSection": "telepathy"}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.settings_section,
+            crate::shell::SettingsSection::Devices
+        );
+        assert_eq!(loaded.sidebar_width, SIDEBAR_DEFAULT);
     }
 
     #[test]

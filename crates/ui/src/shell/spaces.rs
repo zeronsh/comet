@@ -771,12 +771,23 @@ impl Shell {
                     this.open_spaces_menu(window, cx);
                 }
             }))
-            .child(
-                icon(icons::FOLDER)
+            // "All spaces" keeps the neutral folder; a selected project gets
+            // its own tile, so the trigger says WHICH project at a glance.
+            .child(match &filter {
+                Some(id) => crate::identity::tile_for(
+                    &crate::identity::space_key(id),
+                    id,
+                    label.as_ref(),
+                    16.0,
+                    theme,
+                    cx,
+                ),
+                None => icon(icons::FOLDER)
                     .size(px(16.0))
                     .flex_none()
-                    .text_color(theme.text_muted),
-            )
+                    .text_color(theme.text_muted)
+                    .into_any_element(),
+            })
             // flex_1 pushes the caret to the trigger's right edge and gives
             // long space names a bound to truncate against; the "@ device"
             // tag hugs the name inside it rather than sitting by the caret.
@@ -974,9 +985,25 @@ impl Shell {
                             SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
                             SpacesMenuRow::AddSpace => false,
                         };
-                        let leading = match &row {
-                            SpacesMenuRow::AddSpace => icons::PLUS,
-                            _ => icons::FOLDER,
+                        let leading: AnyElement = match &row {
+                            SpacesMenuRow::Space(id) => crate::identity::tile_for(
+                                &crate::identity::space_key(id),
+                                id,
+                                label.as_ref(),
+                                15.0,
+                                theme,
+                                cx,
+                            ),
+                            SpacesMenuRow::AddSpace => icon(icons::PLUS)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .into_any_element(),
+                            SpacesMenuRow::All => icon(icons::FOLDER)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8))
+                                .into_any_element(),
                         };
                         let menu_space = match &row {
                             SpacesMenuRow::Space(id) => Some(id.clone()),
@@ -1002,12 +1029,7 @@ impl Shell {
                                 }),
                             )
                         })
-                        .child(
-                            icon(leading)
-                                .size(px(15.0))
-                                .flex_none()
-                                .text_color(theme.text_muted.opacity(0.8)),
-                        )
+                        .child(leading)
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .when_some(tag, |el, tag| {
                             el.child(
@@ -2909,6 +2931,57 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                .child({
+                    let key = crate::identity::space_key(&space_id);
+                    let has_picture = crate::identity::picture(&key, cx).is_some();
+                    let pick_key = key.clone();
+                    popover::menu_row(&theme, false, format!("space-menu-picture-{space_id}"))
+                        .id("space-menu-picture")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_space_menu(cx);
+                            crate::identity::pick_picture(
+                                pick_key.clone(),
+                                window,
+                                cx,
+                                |_, _, _| {},
+                            );
+                        }))
+                        .child(
+                            icon(icons::WIDGET)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from(if has_picture {
+                            "Change picture…"
+                        } else {
+                            "Set picture…"
+                        }))
+                })
+                .when(
+                    crate::identity::picture(&crate::identity::space_key(&space_id), cx).is_some(),
+                    |menu| {
+                        let key = crate::identity::space_key(&space_id);
+                        menu.child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("space-menu-picture-clear-{space_id}"),
+                            )
+                            .id("space-menu-picture-clear")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_space_menu(cx);
+                                crate::identity::clear_picture(&key, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                icon(icons::CLOSE_CIRCLE)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Remove picture")),
+                        )
+                    },
+                )
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-delete-{space_id}"))
@@ -2940,14 +3013,10 @@ impl Shell {
                 window.focus(&dialog.input.focus_handle(cx), cx);
             }
             let input = dialog.input.clone();
-            let card = popover::dialog_card(&theme)
-                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                    if ev.keystroke.key == "escape" {
-                        this.rename_space_dialog = None;
-                        cx.notify();
-                    }
-                }))
-                .child(popover::dialog_title(&theme, "Rename project"))
+            let card = popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+                this.rename_space_dialog = None;
+            })
+            .child(popover::dialog_title(&theme, "Rename project"))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -3004,8 +3073,15 @@ impl Shell {
                     "Removing “{name}” permanently deletes its {count} sessions on {device}. This can’t be undone."
                 )
             };
-            let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Remove project?"))
+            let card = popover::focus_card(
+                popover::dismissible(popover::dialog_card(&theme), cx, |this, _| {
+                    this.delete_space_confirm = None;
+                }),
+                &self.modal_focus.clone(),
+                window,
+                cx,
+            )
+            .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
                     div()
