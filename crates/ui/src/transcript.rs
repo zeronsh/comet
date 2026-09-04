@@ -5655,13 +5655,13 @@ fn chip_header_row(
         tool_chip_content(&tool.call)
     };
     let activity = !is_agent_tool(tool);
-    let file = matches!(
-        tool.call,
-        ToolCall::ReadFile { .. }
-            | ToolCall::WriteFile { .. }
-            | ToolCall::EditFile { .. }
-            | ToolCall::ApplyPatch { path: Some(_) }
-    );
+    let file_path = match &tool.call {
+        ToolCall::ReadFile { path }
+        | ToolCall::WriteFile { path, .. }
+        | ToolCall::EditFile { path, .. }
+        | ToolCall::ApplyPatch { path: Some(path) } => Some(path.as_str()),
+        _ => None,
+    };
     let running = tool.subagent_ref.is_some()
         && matches!(tool.subagent_status, Some(SubagentStatus::Running));
     let failed = tool.is_error
@@ -5726,7 +5726,7 @@ fn chip_header_row(
             div()
                 .flex_1()
                 .min_w_0()
-                .h(px(if file { 24.0 } else { 18.0 }))
+                .h(px(if file_path.is_some() { 24.0 } else { 18.0 }))
                 .flex()
                 .items_center()
                 .truncate()
@@ -5737,24 +5737,35 @@ fn chip_header_row(
                 } else {
                     theme.text.opacity(0.85)
                 })
-                .child(
+                .child(if let Some(path) = file_path {
+                    let badge = div()
+                        .min_w_0()
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.0))
+                        .px(px(6.0))
+                        .rounded(px(5.0))
+                        .bg(crate::theme::ink(0.06))
+                        .text_color(if failed {
+                            theme.danger
+                        } else {
+                            theme.text.opacity(0.85)
+                        })
+                        .child(
+                            crate::icons::icon(crate::icons::for_file(path))
+                                .size(px(14.0))
+                                .text_color(tint),
+                        )
+                        .child(div().min_w_0().truncate().child(SharedString::from(detail)));
+                    crate::frost::frosted(5.0, 16.0, badge).into_any_element()
+                } else {
                     div()
                         .min_w_0()
                         .truncate()
-                        .when(file, |name| {
-                            name.px(px(6.0))
-                                .py(px(1.0))
-                                .rounded(px(5.0))
-                                .border_1()
-                                .border_color(crate::theme::hairline(0.09))
-                                .text_color(if failed {
-                                    theme.danger
-                                } else {
-                                    theme.text.opacity(0.85)
-                                })
-                        })
-                        .child(SharedString::from(detail)),
-                ),
+                        .child(SharedString::from(detail))
+                        .into_any_element()
+                }),
         )
         .when_some(tool.call.subagent_model(), |row, model| {
             // Which model the child runs on, when the spawn named one.
