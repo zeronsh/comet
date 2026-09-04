@@ -5949,9 +5949,9 @@ fn activity_rail(tool: &ToolItem, continues: bool, theme: &Theme) -> gpui::Div {
                 tool_icon_path(&tool.call)
             })
             .absolute()
-            .left(px(5.0))
-            .top(px(11.0))
-            .size(px(16.0))
+            .left(px(6.0))
+            .top(px(12.0))
+            .size(px(14.0))
             .text_color(tint),
         )
 }
