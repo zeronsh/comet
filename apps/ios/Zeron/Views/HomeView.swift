@@ -1,7 +1,8 @@
 // Home — the mobile shell. The desktop sidebar collapses into one screen: a
-// space dropdown in the nav bar (default "All") scopes the attention-sorted
-// session list below it. Tabs-as-sessions don't fit a phone; close=archive
-// becomes swipe-to-archive.
+// space dropdown on the bottom bar (default "All") scopes the attention-sorted
+// session list above it, with "+" at the other end of the same bar. Both sit in
+// thumb reach. Tabs-as-sessions don't fit a phone; close=archive becomes
+// swipe-to-archive.
 
 import SwiftUI
 
@@ -35,6 +36,8 @@ struct HomeView: View {
             .contentMargins(.top, 2, for: .scrollContent)
             .scrollContentBackground(.hidden)
             .scrollEdgeEffectStyle(.soft, for: .top)
+            // The list now scrolls under the bottom bar's glass.
+            .scrollEdgeEffectStyle(.soft, for: .bottom)
             .background(Theme.surface.ignoresSafeArea())
             .navigationTitle("Zeron")  // feeds the back menu; not displayed
             .navigationBarTitleDisplayMode(.inline)
@@ -47,63 +50,52 @@ struct HomeView: View {
                 }
             }
             .toolbar {
-                // One leading item: a second topBarLeading entry gets folded
-                // into a "…" overflow next to the dropdown. The item's SHARED
-                // glass is hidden and the selector wears its own capsule, so
-                // the connect spinner sits bare on the bar beside it instead
-                // of inside the button's glass.
+                // Connecting reads at the top-leading corner, the nav bar's
+                // status slot. The space filter moved to the bottom bar, so
+                // this item carries the connection state on its own; the
+                // item's shared glass is hidden, so it sits bare on the bar.
+                //
+                // In the bar, not the list: as a list row it appeared and
+                // vanished with the connection and shoved the content down.
+                // Degraded states are GRACED (4s of continuous raw
+                // degradation before anything shows; recovery hides
+                // instantly) and quiet — a bare grayscale spinner or dot
+                // with a faint caption, no surface, no border (shell.rs
+                // render_connection_pill).
                 ToolbarItem(placement: .topBarLeading) {
-                    HStack(spacing: 10) {
-                        spaceDropdown
-                            // The hidden shared glass still reserves its
-                            // content inset, landing the capsule's edge at
-                            // ~30pt while the list rows' rail starts at 20 —
-                            // pull it back onto the content's left line.
-                            .padding(.leading, -10)
-                        // In the bar, not the list: as a list row it appeared
-                        // and vanished with the connection and shoved the
-                        // content down. Degraded states are GRACED (4s of
-                        // continuous raw degradation before anything shows;
-                        // recovery hides instantly) and quiet — a bare
-                        // grayscale spinner or dot with a faint caption, no
-                        // surface, no border (shell.rs render_connection_pill).
-                        switch model.connectivity.state {
-                        case .offline:
-                            HStack(spacing: 5) {
-                                Circle()
-                                    .fill(Theme.warning)
-                                    .frame(width: 5, height: 5)
-                                Text("Offline — sends are saved")
-                                    .font(Theme.sans(11))
-                                    .foregroundStyle(Theme.textFaint)
-                            }
-                            .transition(.opacity)
-                        case .reconnecting:
-                            HStack(spacing: 5) {
-                                ProgressView()
-                                    .controlSize(.mini)
-                                    .tint(Theme.textMuted)
-                                Text("Reconnecting…")
-                                    .font(Theme.sans(11))
-                                    .foregroundStyle(Theme.textFaint)
-                            }
-                            .transition(.opacity)
-                        case .connected:
-                            // Initial catch-up (within the grace): the old
-                            // quiet "connecting" spinner, gone on first sync.
-                            if !model.connected {
-                                ProgressView()
-                                    .controlSize(.mini)
-                                    .tint(Theme.textMuted)
-                                    .accessibilityLabel("Connecting")
-                            }
+                    switch model.connectivity.state {
+                    case .offline:
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(Theme.warning)
+                                .frame(width: 5, height: 5)
+                            Text("Offline — sends are saved")
+                                .font(Theme.sans(11))
+                                .foregroundStyle(Theme.textFaint)
+                        }
+                        .transition(.opacity)
+                    case .reconnecting:
+                        HStack(spacing: 5) {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(Theme.textMuted)
+                            Text("Reconnecting…")
+                                .font(Theme.sans(11))
+                                .foregroundStyle(Theme.textFaint)
+                        }
+                        .transition(.opacity)
+                    case .connected:
+                        // Initial catch-up (within the grace): the old
+                        // quiet "connecting" spinner, gone on first sync.
+                        if !model.connected {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(Theme.textMuted)
+                                .accessibilityLabel("Connecting")
                         }
                     }
                 }
                 .sharedBackgroundVisibility(.hidden)
-                ToolbarItem(placement: .topBarTrailing) {
-                    newButton
-                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         if model.demo != nil {
@@ -113,6 +105,37 @@ struct HomeView: View {
                     } label: {
                         Image(systemName: "person.circle")
                     }
+                }
+                // The bottom bar carries both ends of the screen's reach: the
+                // space filter on the leading side, "+" on the trailing.
+                // Bottom-bar items lay out leading-first, so the flexible
+                // spacer between them does the trailing alignment.
+                //
+                // The selector wears its own glass capsule, so the item's
+                // shared glass is hidden — two of them would stack.
+                ToolbarItem(placement: .bottomBar) {
+                    spaceDropdown
+                }
+                .sharedBackgroundVisibility(.hidden)
+                ToolbarSpacer(.flexible, placement: .bottomBar)
+                ToolbarItem(placement: .bottomBar) {
+                    // Violet marks "create" — the one tinted control on the
+                    // screen (the hue markdown already gives inline code).
+                    // borderedProminent fills the disc with the tint; the
+                    // glass styles reach the glyph only. menuStyle is what
+                    // makes the Menu branch adopt the button style at all.
+                    //
+                    // KNOWN: the Menu branch (the All filter) draws a 52x48
+                    // pill where the Button branches draw a 48pt circle —
+                    // SwiftUI lays a menu-as-button out 4pt wider. A toolbar
+                    // item bridges to UIKit and drops the shape modifiers on
+                    // the way, so buttonBorderShape(.circle), clipShape,
+                    // menuIndicator(.hidden) and Label-vs-Image all no-op
+                    // here. Only dropping the Menu makes it a circle.
+                    newButton
+                        .tint(Theme.violetStrong)
+                        .buttonStyle(.borderedProminent)
+                        .menuStyle(.button)
                 }
             }
             .sheet(isPresented: $showNewSpace) {
@@ -145,7 +168,7 @@ struct HomeView: View {
 
     // MARK: Space dropdown
 
-    /// The nav-bar dropdown that scopes the session list — a NATIVE glass
+    /// The bottom-bar dropdown that scopes the session list — a NATIVE glass
     /// menu. Rows are Buttons, not a Picker: Picker menu rows drop two-Text
     /// subtitles, while Button rows map to UIAction subtitles, so each space
     /// shows its owning device ("@ mac") on the small second line without the
@@ -216,16 +239,14 @@ struct HomeView: View {
             Button {
                 path.append(.newSession(spaceId: space.id))
             } label: {
-                Image(systemName: "plus")
+                Label("New session", systemImage: "plus")
             }
-            .accessibilityLabel("New session")
         } else if model.spaces.isEmpty {
             Button {
                 showNewSpace = true
             } label: {
-                Image(systemName: "plus")
+                Label("New space", systemImage: "plus")
             }
-            .accessibilityLabel("New space")
         } else {
             Menu {
                 Section("New session in…") {
@@ -241,9 +262,8 @@ struct HomeView: View {
                     }
                 }
             } label: {
-                Image(systemName: "plus")
+                Label("New session", systemImage: "plus")
             }
-            .accessibilityLabel("New session")
         }
     }
 
