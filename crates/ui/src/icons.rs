@@ -180,6 +180,7 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    (CLINE_MARK, "cline-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
