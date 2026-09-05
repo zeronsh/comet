@@ -202,6 +202,13 @@ pub struct CachedCode {
 }
 
 impl RenderCache {
+    /// Keep rows laid out in the previous viewport, including GPUI overdraw.
+    /// Scrolling back regenerates these derived strings and code-line runs.
+    pub(crate) fn retain_rows(&mut self, rows: &std::collections::HashSet<SharedString>) {
+        self.flats.retain(|(row, _, _), _| rows.contains(row));
+        self.code.retain(|(row, _, _), _| rows.contains(row));
+    }
+
     /// Drop every cached entry for `row`.
     pub fn invalidate_row(&mut self, row: &str) {
         self.flats.retain(|(r, _, _), _| r.as_ref() != row);
@@ -1863,6 +1870,37 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+    }
+
+    #[test]
+    fn viewport_cache_releases_offscreen_paint_data() {
+        let mut cache = RenderCache::default();
+        for row in ["visible", "offscreen"] {
+            cache.flats.insert(
+                (row.into(), 0, 0),
+                Rc::new(FlatText {
+                    text: "text".into(),
+                    runs: Vec::new(),
+                    links: Vec::new(),
+                    code_ranges: Vec::new(),
+                }),
+            );
+            cache.code.insert(
+                (row.into(), 0, 0),
+                Rc::new(CachedCode {
+                    code_len: 0,
+                    hl_key: (0, 0),
+                    lines: Vec::new(),
+                }),
+            );
+        }
+        cache.retain_rows(&std::collections::HashSet::from(["visible".into()]));
+        assert_eq!(cache.flats.len(), 1);
+        assert_eq!(cache.code.len(), 1);
+        assert!(cache.flats.keys().all(|(row, _, _)| row == "visible"));
+        cache.retain_rows(&std::collections::HashSet::new());
+        assert!(cache.flats.is_empty());
+        assert!(cache.code.is_empty());
     }
 
     #[test]

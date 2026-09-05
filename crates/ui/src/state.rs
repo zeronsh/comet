@@ -624,6 +624,9 @@ pub struct AppState {
     /// empty transcript is otherwise indistinguishable from the pre-replay
     /// gap after selection, where optimistic echoes may already be visible.
     pub transcript_replayed: bool,
+    /// Changes only when transcript/optimistic content changes. Presence,
+    /// catalogs and other app-state notifications need no row derivation.
+    pub(crate) transcript_revision: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -686,6 +689,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             transcript_replayed: false,
+            transcript_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             upload_progress: None,
@@ -760,6 +764,7 @@ impl AppState {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
             self.transcript.clear();
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
             self.transcript_replayed = false;
             self.transcript_task = None;
         }
@@ -915,6 +920,7 @@ impl AppState {
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         // Doc frames supersede optimistic echoes carrying the same id.
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
@@ -932,6 +938,7 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         if is_reset {
@@ -974,6 +981,7 @@ impl AppState {
     /// Tab closed: drop the watch task (cancels the engine-side watch and
     /// unpins the doc from the engine LRU) and the rows.
     pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(doc_id);
         self.sub_transcripts.remove(doc_id);
     }
@@ -981,6 +989,7 @@ impl AppState {
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
     /// watch needed (and any in-flight watch is superseded).
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.sub_watch_tasks.remove(&doc_id);
         self.sub_transcripts.insert(doc_id, entries);
     }
@@ -990,13 +999,18 @@ impl AppState {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
         }
     }
 
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
+            let previous_len = echoes.len();
             echoes.retain(|e| e.id != message_id);
+            if echoes.len() != previous_len {
+                self.transcript_revision = self.transcript_revision.wrapping_add(1);
+            }
         }
     }
 
@@ -1372,6 +1386,7 @@ impl AppState {
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.echoes.clear();
         self.pending_sends.clear();
@@ -1583,6 +1598,7 @@ impl AppState {
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
@@ -2048,6 +2064,7 @@ fn spawn_subagent_watch(
                 let alive = this.update(cx, |state, cx| {
                     // A stale pump racing a snapshot/unwatch finds no key.
                     if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        state.transcript_revision = state.transcript_revision.wrapping_add(1);
                         if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
@@ -2658,6 +2675,53 @@ mod tests {
             status: None,
             continuation_of: None,
         }
+    }
+
+    #[test]
+    fn transcript_revision_tracks_replay_echoes_and_subagent_content() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c".into());
+        let initial = state.transcript_revision;
+        state.apply_transfers(Vec::new());
+        state.apply_auth(AuthState::SignedOut);
+        assert_eq!(
+            state.transcript_revision, initial,
+            "unrelated notifications are inert"
+        );
+
+        state.push_echo("c", user_entry("m1"));
+        let echo = state.transcript_revision;
+        assert_ne!(echo, initial);
+        state.push_echo("c", user_entry("m1"));
+        state.remove_echo("c", "absent");
+        assert_eq!(
+            state.transcript_revision, echo,
+            "unchanged echoes do not invalidate"
+        );
+        state.apply_transcript(vec![user_entry("m1")]);
+        assert!(state.pending_echoes().is_empty());
+        assert_ne!(
+            state.transcript_revision, echo,
+            "echo-to-replay handoff invalidates"
+        );
+
+        let before_reset = state.transcript_revision;
+        state
+            .apply_transcript_frame(TranscriptFrame::Reset { reset: Vec::new() })
+            .unwrap();
+        assert!(state.transcript_replayed);
+        assert_ne!(
+            state.transcript_revision, before_reset,
+            "empty replay is authoritative"
+        );
+
+        let before_subagent = state.transcript_revision;
+        state.set_subagent_snapshot("sub".into(), vec![user_entry("nested")]);
+        assert_ne!(state.transcript_revision, before_subagent);
+        let before_close = state.transcript_revision;
+        state.unwatch_subagent_doc("sub");
+        assert!(state.sub_transcript("sub").is_empty());
+        assert_ne!(state.transcript_revision, before_close);
     }
 
     fn device(id: &str, name: &str) -> Device {

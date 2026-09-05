@@ -171,8 +171,8 @@ fn should_anchor_live_stream(pinned: bool, distance_from_bottom: f32, streaming:
     pinned && streaming && distance_from_bottom <= AT_BOTTOM_PX
 }
 
-/// Keep the spring loop warm this long after landing, so a streaming pause
-/// resumes at cruise instead of re-accelerating from zero.
+/// Retain the spring's state this long after landing, so a streaming pause
+/// resumes at cruise. Retaining state does not require drawing idle frames.
 pub const SPRING_SETTLE_GRACE_MS: u64 = 500;
 /// Teleport when farther than this many viewports from the end; glide the rest.
 pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
@@ -246,6 +246,13 @@ impl StickSpring {
     /// < .05`)?
     pub fn is_idle(&self) -> bool {
         self.velocity < 0.05 && self.target_vel < 0.05
+    }
+
+    fn needs_frame(distance: f32) -> bool {
+        // The spring is clamped to the target. Residual velocity cannot move
+        // a viewport already there; virtual-list height estimates can keep
+        // that velocity nonzero indefinitely even after a turn completes.
+        distance > 0.5
     }
 
     #[cfg(test)]
@@ -1464,6 +1471,34 @@ fn frame_stats_enabled() -> bool {
 
 const FRAME_STATS_WINDOW: usize = 240;
 
+/// Opt-in cadence counters complement per-row timings: inexpensive rows can
+/// still exhaust a battery when an unrelated animation rebuilds them at 120Hz.
+pub(crate) fn record_view_frame(view: &'static str) -> bool {
+    if !frame_stats_enabled() {
+        return false;
+    }
+    thread_local! {
+        static COUNTERS: RefCell<HashMap<&'static str, (Instant, u64)>> = RefCell::default();
+    }
+    COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        let (start, frames) = counters.entry(view).or_insert_with(|| (Instant::now(), 0));
+        *frames += 1;
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            tracing::warn!(
+                view,
+                frames_per_second = *frames as f64 / elapsed,
+                "view render cadence"
+            );
+            *start = Instant::now();
+            *frames = 0;
+            return true;
+        }
+        false
+    })
+}
+
 /// `ZERON_NO_RENDER_CACHE=1` bypasses the cross-frame flatten cache — the
 /// A/B knob for the frame-cost measurement above.
 fn render_cache_disabled() -> bool {
@@ -2221,6 +2256,7 @@ pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
+    last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
     chat_id: Option<String>,
     /// `Some(doc_id)` pins this instance to a SUBAGENT doc: rows come from
     /// `AppState::sub_transcript(doc_id)` instead of the selected chat, and
@@ -2302,6 +2338,7 @@ pub struct Transcript {
     /// frames reuse settled blocks' text+runs; the incremental parser's stable
     /// boundary invalidates only the live tail per commit.
     render_cache: Rc<RefCell<RenderCache>>,
+    rendered_rows: HashSet<SharedString>,
     /// Last UI typography generation reflected in `list` item measurements.
     /// Family and size changes can alter prose wrapping without changing row
     /// identity, so the virtual list must explicitly discard cached heights.
@@ -2486,6 +2523,7 @@ impl Transcript {
             state,
             list,
             rows: Vec::new(),
+            last_source: None,
             // Pre-set so `sync` never sees an attach edge — an override
             // instance must not reset (or re-pin) on selection changes.
             chat_id: doc_override.clone(),
@@ -2513,6 +2551,7 @@ impl Transcript {
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
+            rendered_rows: HashSet::new(),
             typography_generation: crate::typography::generation(cx),
             code_fences_generation: crate::settings::code_fences_generation(cx),
             highlights: HighlightStore::default(),
@@ -3358,17 +3397,20 @@ impl Transcript {
     /// Arm the per-frame spring driver — `render` schedules the next frame
     /// while [`Self::spring_should_run`].
     fn wake_spring(&mut self) {
+        if self.spring_settled_at.is_some_and(|settled| {
+            settled.elapsed() >= Duration::from_millis(SPRING_SETTLE_GRACE_MS)
+        }) {
+            self.spring.reset();
+            self.spring_last_tick = None;
+        }
         self.spring_settled_at = None;
         self.spring_kick = true;
     }
 
-    /// Whether the spring loop needs another frame: off the bottom, carrying
-    /// residual motion, or inside the post-landing settle grace.
+    /// A layout kick needs one observation; otherwise only unfinished motion
+    /// needs another frame. The settle grace retains state without repainting.
     fn spring_should_run(&self) -> bool {
-        self.spring_kick
-            || self.distance_from_bottom() > 0.5
-            || !self.spring.is_idle()
-            || self.spring_settled_at.is_some()
+        self.spring_kick || StickSpring::needs_frame(self.distance_from_bottom())
     }
 
     /// Whether the scroll offset is in a bottom-glued representation (`None`
@@ -3379,7 +3421,7 @@ impl Transcript {
     }
 
     /// One spring frame: observe target growth, step the stepper, apply the
-    /// delta, park after the settle grace. Runs from `window.on_next_frame`,
+    /// delta, and park on landing. Runs from `window.on_next_frame`,
     /// i.e. after layout — measurements are fresh.
     fn step_spring(&mut self, cx: &mut Context<Self>) {
         self.spring_kick = false;
@@ -3388,6 +3430,13 @@ impl Transcript {
             return;
         }
         let now = Instant::now();
+        if self.spring_settled_at.is_some_and(|settled| {
+            now.duration_since(settled) >= Duration::from_millis(SPRING_SETTLE_GRACE_MS)
+        }) {
+            self.spring.reset();
+            self.spring_last_tick = None;
+            self.spring_settled_at = None;
+        }
         let frames = match self.spring_last_tick {
             Some(last) => (now.duration_since(last).as_secs_f32() * 1000.0 / SPRING_FRAME_MS)
                 .min(SPRING_MAX_CATCHUP_FRAMES),
@@ -3412,36 +3461,32 @@ impl Transcript {
         self.last_scroll_distance = (target - next).max(0.0);
 
         if target - next <= 0.5 {
-            let settled = *self.spring_settled_at.get_or_insert(now);
-            if now.duration_since(settled) >= Duration::from_millis(SPRING_SETTLE_GRACE_MS)
-                && self.spring.is_idle()
-            {
-                // Park: stop scheduling frames until the next wake.
-                self.spring.reset();
-                self.spring_last_tick = None;
-                self.spring_settled_at = None;
-                return;
-            }
+            // Land on the final item, not the scrollbar's estimated pixel
+            // total. Remeasuring virtual rows can otherwise move that total
+            // after every landing and restart the glide indefinitely.
+            self.list.scroll_to_end();
+            self.spring_settled_at.get_or_insert(now);
         } else {
             self.spring_settled_at = None;
         }
-        cx.notify();
+        // A stationary spring used to repaint throughout the 500ms grace.
+        // Repeated layout kicks kept that loop alive for entire streams even
+        // at distance=0, velocity=0. Preserve the final movement's paint and
+        // every moving frame; a settled spring wakes on the next layout kick.
+        if next > pos || StickSpring::needs_frame(self.last_scroll_distance) {
+            cx.notify();
+        }
     }
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, entries, echoes, replay) = {
+        let (selected, replay) = {
             let s = self.state.read(cx);
             match &self.doc_override {
                 // Pinned to a subagent doc: `selected` equals `chat_id` by
                 // construction, so the attach/reset branch below never fires,
                 // and echoes stay empty (nothing is ever sent from here).
-                Some(doc_id) => (
-                    Some(doc_id.clone()),
-                    s.sub_transcript(doc_id).to_vec(),
-                    Vec::new(),
-                    TranscriptReplayState::Populated,
-                ),
+                Some(doc_id) => (Some(doc_id.clone()), TranscriptReplayState::Populated),
                 None => {
                     let replay = if !s.transcript_replayed {
                         TranscriptReplayState::Pending
@@ -3450,15 +3495,20 @@ impl Transcript {
                     } else {
                         TranscriptReplayState::Populated
                     };
-                    (
-                        s.selected_chat.clone(),
-                        s.transcript.clone(),
-                        s.pending_echoes().to_vec(),
-                        replay,
-                    )
+                    (s.selected_chat.clone(), replay)
                 }
             }
         };
+
+        let source = (
+            selected.clone(),
+            replay,
+            self.state.read(cx).transcript_revision,
+        );
+        if self.last_source.as_ref() == Some(&source) {
+            return;
+        }
+        self.last_source = Some(source);
 
         let attached = selected != self.chat_id;
         if attached {
@@ -3537,12 +3587,31 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        for entry in &entries {
-            new_rows.extend(self.rows_for(entry, false));
-        }
-        for echo in &echoes {
-            new_rows.extend(self.rows_for(echo, true));
-        }
+        // Borrow the transcript only while deriving rows. Cloning the entity
+        // handle lets rows_for mutate our caches without copying every text
+        // and tool payload on each app-state notification.
+        let (entries_empty, tail_streaming) = {
+            let state = self.state.clone();
+            let state = state.read(cx);
+            let entries = match &self.doc_override {
+                Some(doc_id) => state.sub_transcript(doc_id),
+                None => state.transcript.as_slice(),
+            };
+            for entry in entries {
+                new_rows.extend(self.rows_for(entry, false));
+            }
+            if self.doc_override.is_none() {
+                for echo in state.pending_echoes() {
+                    new_rows.extend(self.rows_for(echo, true));
+                }
+            }
+            (
+                entries.is_empty(),
+                entries
+                    .last()
+                    .is_some_and(|e| e.status == Some(MessageStatus::Streaming)),
+            )
+        };
 
         // Runtime scroll handles follow the stable code rows exactly. A live
         // block keeps its handle through completion; deleted/reindexed tail
@@ -3577,7 +3646,7 @@ impl Transcript {
             self.veil_baseline.clear();
             self.veil_attach_pending = true;
         }
-        if self.veil_attach_pending && !entries.is_empty() {
+        if self.veil_attach_pending && !entries_empty {
             self.veil_attach_pending = false;
             self.veil_baseline = new_rows
                 .iter()
@@ -3605,13 +3674,8 @@ impl Transcript {
         // keeps the in-flow working trailer at the same viewport position as
         // transcript lines grow above it. Nothing about the trailer's layout
         // or coordinates changes.
-        let live_following = should_anchor_live_stream(
-            self.pinned,
-            self.distance_from_bottom(),
-            entries
-                .last()
-                .is_some_and(|entry| entry.status == Some(MessageStatus::Streaming)),
-        );
+        let live_following =
+            should_anchor_live_stream(self.pinned, self.distance_from_bottom(), tail_streaming);
         let was_empty = self.rows.is_empty();
         let old_last = self.rows.len().checked_sub(1);
         match diff_rows(&self.rows, &new_rows) {
@@ -3721,7 +3785,13 @@ impl Transcript {
     /// Cached row build for one entry (streaming entries bypass the cache).
     fn rows_for(&mut self, entry: &SessionMessageEntry, pending: bool) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
-        let fingerprint = entry_fingerprint(entry, pending);
+        // Live entries always rebuild; don't allocate a fingerprint that the
+        // streaming path cannot use.
+        let fingerprint = if streaming {
+            0
+        } else {
+            entry_fingerprint(entry, pending)
+        };
         if !streaming
             && let Some(cached) = self.row_cache.get(&entry.id)
             && cached.fingerprint == fingerprint
@@ -4615,6 +4685,7 @@ impl Transcript {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
+        self.rendered_rows.insert(row.id.clone());
         let theme = Theme::of(cx).clone();
         // The viewport spans the full window (under the titlebar): the first
         // row's gap adds the titlebar's height so a top-scrolled transcript
@@ -4805,11 +4876,11 @@ impl Transcript {
                 if let Some(veil) = &veil {
                     veil.borrow_mut().finish_seeding();
                 }
-                // Drive the veil clock: while any chunk is still dissolving,
-                // repaint next frame (self-limiting — one callback per frame).
+                // Share the loaders' bounded clock. A display-frame callback
+                // here would pin the transcript to 60/120Hz for the whole
+                // stream, bypassing the clock even with no loader mounted.
                 if veil.is_some_and(|v| v.borrow().is_fading()) {
-                    let id = cx.entity_id();
-                    window.on_next_frame(move |_, cx| cx.notify(id));
+                    motion::pulse_lease(cx.entity_id(), cx);
                 }
                 el
             }
@@ -6613,6 +6684,21 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if record_view_frame("transcript") {
+            tracing::warn!(
+                distance = self.distance_from_bottom(),
+                spring = self.spring_should_run(),
+                velocity = self.spring.velocity,
+                target_velocity = self.spring.target_vel,
+                own_turn = self.own_turn.is_some(),
+                veils = self.veils.len(),
+                "transcript motion state"
+            );
+        }
+        self.render_cache
+            .borrow_mut()
+            .retain_rows(&self.rendered_rows);
+        self.rendered_rows.clear();
         let code_fences_generation = crate::settings::code_fences_generation(cx);
         if self.code_fences_generation != code_fences_generation {
             self.code_fences_generation = code_fences_generation;
@@ -6883,6 +6969,45 @@ mod tests {
     }
 
     // ---- stick-to-bottom spring ----
+
+    #[test]
+    fn stationary_spring_does_not_keep_requesting_frames() {
+        let mut spring = StickSpring::new();
+        let mut pos = 600.0;
+        for _ in 0..120 {
+            let next = spring.step(pos, 600.0, 1.0);
+            assert_eq!(next, pos);
+            assert!(!StickSpring::needs_frame(600.0 - next));
+            pos = next;
+        }
+        // Real growth must still wake and complete the same smooth glide.
+        let target = 900.0;
+        let mut moving_frames = 0;
+        while StickSpring::needs_frame(target - pos) && moving_frames < 600 {
+            let next = spring.step(pos, target, 1.0);
+            assert!(next >= pos && next <= target);
+            pos = next;
+            moving_frames += 1;
+        }
+        assert_eq!(pos, target);
+        assert!(moving_frames > 1 && moving_frames < 600);
+        assert!(!StickSpring::needs_frame(0.0));
+    }
+
+    #[test]
+    fn estimated_height_growth_at_the_bottom_cannot_keep_spring_awake() {
+        let mut spring = StickSpring::new();
+        // Virtualized height estimates can grow while the viewport remains
+        // anchored to exactly the same final row. This previously kept the
+        // feed-forward velocity and the redraw loop alive after completion.
+        for frame in 0..120 {
+            let target = 10000.0 + frame as f32 * 400.0;
+            let next = spring.step(target, target, 1.0);
+            assert_eq!(next, target);
+            assert!(!StickSpring::needs_frame(target - next));
+        }
+        assert!(spring.target_vel() > 1.0, "exercise a nonzero estimate");
+    }
 
     #[test]
     fn spring_converges_to_a_fixed_target() {

@@ -123,7 +123,7 @@ pub struct HighlightRequest<'a> {
     pub fence_tag: Option<&'a str>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum HighlightError {
     #[error("the source language is not registered")]
     UnknownLanguage,
@@ -310,35 +310,20 @@ pub fn highlight_with_limits(
         return Err(HighlightError::GrammarUnavailable(language));
     }
 
-    let mut primary_configuration = configuration(language)?;
-    primary_configuration.configure(CAPTURE_NAMES);
-    let injected = if matches!(
-        language,
-        LanguageId::Html | LanguageId::Markdown | LanguageId::Dockerfile
-    ) {
-        injected_languages(language)
-            .into_iter()
-            .filter_map(|language| {
-                let mut config = configuration(language).ok()?;
-                config.configure(CAPTURE_NAMES);
-                Some((language, config))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let primary_configuration = cached_configuration(language)?;
+    let injected = injected_languages(language);
     let mut highlighter = Highlighter::new();
     let events = highlighter
         .highlight(
-            &primary_configuration,
+            primary_configuration,
             request.source.as_bytes(),
             cancellation_flag,
             |name| {
                 let language = language_for_alias(name)?;
-                injected
-                    .iter()
-                    .find(|(candidate, _)| *candidate == language)
-                    .map(|(_, config)| config)
+                if !injected.contains(&language) {
+                    return None;
+                }
+                cached_configuration(language).ok()
             },
         )
         .map_err(|error| HighlightError::Parser(error.to_string()))?;
@@ -378,6 +363,36 @@ fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
         Dockerfile => vec![Bash, Json, Yaml, Toml],
         _ => Vec::new(),
     }
+}
+
+/// Compiled queries contain no document/theme state and are immutable after
+/// capture configuration. Keep one per used grammar instead of recompiling
+/// for every fence or eagerly compiling all 27 Markdown injection targets.
+/// Each grammar has its own cell: concurrent requests compile it only once,
+/// while unrelated languages never wait on a global compilation lock.
+fn cached_configuration(
+    language: LanguageId,
+) -> Result<&'static HighlightConfiguration, HighlightError> {
+    macro_rules! registry {
+        ($($variant:ident),+ $(,)?) => {
+            match language {
+                $(LanguageId::$variant => {
+                    static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> =
+                        std::sync::OnceLock::new();
+                    CONFIG.get_or_init(|| {
+                        let mut config = configuration(language)?;
+                        config.configure(CAPTURE_NAMES);
+                        Ok(config)
+                    }).as_ref().map_err(Clone::clone)
+                }),+
+            }
+        };
+    }
+    registry!(
+        Rust, JavaScript, Jsx, TypeScript, Tsx, Python, Go, Json, Jsonc, Bash, Toml, Markdown,
+        Html, Css, Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Dockerfile, Nix,
+        Make,
+    )
 }
 
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
@@ -782,6 +797,28 @@ fn language_for_shebang(line: &str) -> Option<LanguageId> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiled_queries_are_shared_across_concurrent_documents() {
+        let config = super::cached_configuration(super::LanguageId::Rust).unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                scope.spawn(move || {
+                    let shared = super::cached_configuration(super::LanguageId::Rust).unwrap();
+                    assert!(std::ptr::eq(config, shared));
+                    let source = format!("fn example_{i}() {{ let value = {i}; }}");
+                    let document = super::highlight(super::HighlightRequest {
+                        source: &source,
+                        path: None,
+                        fence_tag: Some("rust"),
+                    })
+                    .unwrap();
+                    assert_eq!(document.language, super::LanguageId::Rust);
+                    assert!(document.lines.iter().flatten().next().is_some());
+                });
+            }
+        });
+    }
+
     use super::*;
 
     #[test]

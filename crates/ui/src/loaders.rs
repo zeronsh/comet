@@ -2,10 +2,9 @@
 //! splash content. All motion routes through `crate::motion` pure helpers, so
 //! the math is unit-tested and these elements are testable-by-compile.
 //!
-//! Rendering pattern: each cell is its own `with_animation` repeating element
-//! sharing one period; per-cell offsets come from [`motion::staggered_phase`],
-//! so all cells stay phase-locked (they start on the same frame) without a
-//! shared clock. Cells animate inside fixed-size slots — opacity and inner size
+//! Rendering pattern: cells share a self-parking pulse clock; per-cell offsets
+//! come from [`motion::staggered_phase`], so all cells stay phase-locked.
+//! Cells animate inside fixed-size slots — opacity and inner size
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
@@ -122,7 +121,7 @@ pub fn gradient_spinner(
 ) -> impl IntoElement {
     let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
     let max = MATRIX_SIDE as f32 - 1.0 + center;
-    let delta = motion::pulse_delta(&GRADIENT_SPIN, view, cx);
+    let delta = motion::pulse_delta_slow(&GRADIENT_SPIN, view, cx);
     div()
         .flex()
         .flex_col()
