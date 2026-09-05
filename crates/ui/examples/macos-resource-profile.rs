@@ -87,6 +87,25 @@ fn main() -> anyhow::Result<()> {
                     chat.title = Some(format!("Background conversation {}", index + 1));
                     state.chats.push(chat);
                 }
+                if std::env::var_os("ZERON_VERIFY_SIDEBAR_ROWS").is_some() {
+                    state.chats[0].title = Some("Short".into());
+                    state.chats[0].branch = Some("main".into());
+                    for (index, chat) in state.chats.iter_mut().skip(1).enumerate() {
+                        chat.title = Some(if index == 0 { "Brief".into() } else {
+                            "A deliberately long conversation title that must truncate inside the sidebar".into()
+                        });
+                        chat.branch = Some(if index == 0 { "main".into() } else {
+                            "feature/a-deliberately-long-branch-name-that-must-also-truncate".into()
+                        });
+                    }
+                    for chat in &mut state.chats {
+                        chat.source_context = Some(zeron_proto::ConversationSourceContext {
+                            checkout_id: "layout-checkout".into(), repo_root: "/tmp/resource-profile".into(),
+                            cwd: "/tmp/resource-profile".into(), branch: chat.branch.clone().unwrap(),
+                            head_sha: None, observed_at: chrono::Utc::now(),
+                        });
+                    }
+                }
                 state
             });
             let boot = EngineBootConfig { data_dir:data, ipc_port:0,
@@ -184,6 +203,9 @@ fn main() -> anyhow::Result<()> {
     // measured phases; screenshot readback and forced refreshes add work.
     if std::env::var_os("ZERON_VERIFY_CACHE").is_some() {
         let mut scenarios = vec!["settled", "sidebar-hidden", "sidebar-restored", "scrolled"];
+        if std::env::var_os("ZERON_VERIFY_SIDEBAR_ROWS").is_some() {
+            scenarios.extend(["sidebar-hover-short", "sidebar-hover-long"]);
+        }
         // These hit coordinates target the bundled 80-section fixture. General
         // frame replays can still use the cache checks above on their own.
         if std::env::var_os("ZERON_VERIFY_INTERACTIONS").is_some() {
@@ -225,6 +247,12 @@ fn main() -> anyhow::Result<()> {
                             assert!(markdown::selection::selected_text().is_some_and(|text| text.len() > 20),
                                 "The fixed 80-section fixture must support dragging across text after scene reuse");
                         }
+                        "sidebar-hover-short" | "sidebar-hover-long" => {
+                            window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                position: gpui::point(px(100.), px(if scenario == "sidebar-hover-short" { 115. } else { 180. })),
+                                ..Default::default()
+                            }), cx);
+                        }
                         "typed" => {
                             click(window, cx, 550., 839.);
                             for key in ["c", "a", "c", "h", "e", "space", "c", "h", "e", "c", "k"] {
@@ -263,6 +291,27 @@ fn main() -> anyhow::Result<()> {
             });
             cached.save(output.join(format!("{scenario}-cached.png")))?;
             fresh.save(output.join(format!("{scenario}-fresh.png")))?;
+            if std::env::var_os("ZERON_VERIFY_SIDEBAR_ROWS").is_some()
+                && scenario != "sidebar-hidden"
+            {
+                // This fixture uses a 256-point sidebar at 2x scale. Check
+                // actual geometry, not just equality with another render of
+                // the same potentially broken layout. Text must leave the
+                // right padding clear and selected/hovered fills must span it.
+                let mut painted = 0;
+                for y in 180..800 {
+                    let left = cached.get_pixel(20, y).0;
+                    if left[0] >= 30 && left[0] <= 60
+                        && left[0] == left[1] && left[1] == left[2]
+                    {
+                        anyhow::ensure!(cached.get_pixel(491, y).0 == left,
+                            "Sidebar row does not fill its width at y={y}: {scenario}");
+                        painted += 1;
+                    }
+                }
+                anyhow::ensure!(painted > 40, "Selected sidebar row missing: {scenario}");
+                eprintln!("sidebar row widths match: {scenario}");
+            }
             if scenario == "model-menu" {
                 // With no engine catalog the menu animates its loading bars.
                 // Their phase advances between readbacks; compare the rest of

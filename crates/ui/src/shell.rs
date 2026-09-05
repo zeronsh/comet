@@ -999,94 +999,6 @@ impl Render for SidebarPane {
     }
 }
 
-#[derive(Clone, PartialEq)]
-struct ChatRowProps {
-    id: String,
-    title: SharedString,
-    time_ago: SharedString,
-    space_name: SharedString,
-    branch: Option<SharedString>,
-    change_request: Option<zeron_proto::ChangeRequestSummary>,
-    harness: Option<zeron_proto::HarnessId>,
-    status: zeron_proto::ChatIndicator,
-    selected: bool,
-    archived: bool,
-    jump_label: Option<SharedString>,
-}
-
-#[derive(IntoElement)]
-struct CachedChatRow {
-    shell: gpui::WeakEntity<Shell>,
-    props: ChatRowProps,
-}
-
-impl gpui::RenderOnce for CachedChatRow {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let height = chat_row_height(
-            self.props.branch.is_some(),
-            self.props.change_request.is_some(),
-        );
-        let key: SharedString = format!("sidebar-row-{}", self.props.id).into();
-        let view = window.with_global_id(key.into(), |id, window| {
-            window.with_element_state(id, |previous: Option<Entity<ChatRowView>>, _| {
-                let view = previous.unwrap_or_else(|| {
-                    cx.new(|cx| ChatRowView {
-                        shell: self.shell.clone(),
-                        props: self.props.clone(),
-                        _shell_changes: self
-                            .shell
-                            .upgrade()
-                            .map(|shell| cx.observe(&shell, |_, _, cx| cx.notify())),
-                    })
-                });
-                view.update(cx, |view, cx| {
-                    if view.props != self.props {
-                        view.props = self.props;
-                        cx.notify();
-                    }
-                });
-                (view.clone(), view)
-            })
-        });
-        view.cached(gpui::StyleRefinement::default().w_full().h(px(height)))
-    }
-}
-
-struct ChatRowView {
-    shell: gpui::WeakEntity<Shell>,
-    props: ChatRowProps,
-    _shell_changes: Option<Subscription>,
-}
-
-impl Render for ChatRowView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(shell) = self.shell.upgrade() else {
-            return div().into_any_element();
-        };
-        let props = self.props.clone();
-        let animation_view = cx.entity_id();
-        shell.update(cx, |shell, cx| {
-            let theme = Theme::of(cx).clone();
-            shell.render_chat_row_inner(
-                props.id,
-                props.title,
-                props.time_ago,
-                props.space_name,
-                props.branch,
-                props.change_request,
-                props.harness,
-                props.status,
-                props.selected,
-                props.archived,
-                props.jump_label,
-                animation_view,
-                &theme,
-                cx,
-            )
-        })
-    }
-}
-
 pub struct Shell {
     state: Entity<AppState>,
     sidebar_pane: Entity<SidebarPane>,
@@ -3953,47 +3865,6 @@ impl Shell {
         // nine chips appear together instead of leaving a hole on whichever
         // row is busy or under the pointer.
         jump_label: Option<SharedString>,
-        _theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        CachedChatRow {
-            shell: cx.weak_entity(),
-            props: ChatRowProps {
-                id,
-                title,
-                time_ago,
-                space_name,
-                branch,
-                change_request,
-                harness,
-                status,
-                selected,
-                archived,
-                jump_label,
-            },
-        }
-        .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_chat_row_inner(
-        &self,
-        id: String,
-        title: SharedString,
-        time_ago: SharedString,
-        space_name: SharedString,
-        branch: Option<SharedString>,
-        change_request: Option<zeron_proto::ChangeRequestSummary>,
-        harness: Option<zeron_proto::HarnessId>,
-        status: zeron_proto::ChatIndicator,
-        selected: bool,
-        archived: bool,
-        // This row's jump combo while the hint overlay is up. It takes the
-        // corner outright — above hover and above the status word — so all
-        // nine chips appear together instead of leaving a hole on whichever
-        // row is busy or under the pointer.
-        jump_label: Option<SharedString>,
-        animation_view: gpui::EntityId,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -4120,7 +3991,7 @@ impl Shell {
                             format!("chat-working-{id}"),
                             2.0,
                             theme.glyph,
-                            animation_view,
+                            self.sidebar_pane.entity_id(),
                             cx,
                         )
                         .into_any_element()

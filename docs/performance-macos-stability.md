@@ -1,5 +1,12 @@
 # macOS streaming stability follow-up
 
+v0.2.41 removes the sidebar conversation-row cache introduced here because it
+broke row widths and text truncation. The measurements below describe v0.2.40;
+they are not performance claims for the hotfix. The crash, sync-recovery and
+Metal drawable fixes remain. The earlier cached/fresh pixel checks did not catch
+the incorrect geometry shared by both renders; sidebar layout checks now include
+short and long titles/branches with selected and hovered rows.
+
 This follow-up starts from v0.2.39 (`d97f4c2`). It fixes a reproduced native
 scrolling abort and recovery defects found while investigating stuck sends.
 It also reduces redundant UI work and the Metal window drawable pool. Animation
