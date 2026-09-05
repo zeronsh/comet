@@ -605,6 +605,38 @@ final class WorkspaceStore {
         }
     }
 
+    /// Slash commands for one harness in one workspace. `cwd` is a path on the
+    /// HOST device and travels unexpanded — the host expands `~`
+    /// (crates/engine/src/commands.rs:109-117). Absent means the host's home,
+    /// which is what an engine older than that field always answered.
+    func listCommands(deviceId: String, harness: String,
+                      cwd: String?) async throws -> [SlashCommand] {
+        var params: [String: Any] = ["harness": harness]
+        if let cwd, !cwd.isEmpty { params["cwd"] = cwd }
+        return try await relay(for: deviceId).call(method: "ListCommands", params: params)
+    }
+
+    /// Fuzzy file search inside a chat's checkout or a space. The engine needs
+    /// exactly one of `chatId` or `spaceId` (crates/engine/src/rpc.rs:484-493)
+    /// and rejects a query longer than 256 characters (rpc.rs:1551). A `chatId`
+    /// search only works on the device that owns the chat (rpc.rs:501-502), so
+    /// dial the chat's host.
+    func searchFiles(deviceId: String, chatId: String?, spaceId: String?,
+                     query: String) async throws -> [FileSearchMatch] {
+        // Truncate on UNICODE SCALARS, not Characters. The engine's cap is
+        // `p.query.chars().count() > 256` (crates/engine/src/rpc.rs:1551), and a
+        // Rust `char` is a scalar value, while Swift's `prefix` counts extended
+        // grapheme clusters. One flag emoji is 1 Character but 2 scalars, so a
+        // Character-based truncation is a no-op on input the engine then
+        // rejects with BadParams.
+        var params: [String: Any] = [
+            "query": String(String.UnicodeScalarView(query.unicodeScalars.prefix(256)))
+        ]
+        if let chatId { params["chatId"] = chatId }
+        if let spaceId { params["spaceId"] = spaceId }
+        return try await relay(for: deviceId).call(method: "SearchFiles", params: params)
+    }
+
     /// SwitchRef — `git checkout` in the given folder on the target device.
     /// Returns git's error message on failure (dirty tree, held ref, …).
     func switchRef(deviceId: String, repoPath: String, refName: String) async -> String? {

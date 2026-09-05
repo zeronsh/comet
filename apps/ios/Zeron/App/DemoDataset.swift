@@ -128,6 +128,32 @@ final class DemoDataset {
 
     private static let repoNames: Set<String> = ["zeron", "dotfiles", "blog", "playground", "edge", "landing"]
 
+    /// What a harness advertises, for the composer's `/` popover. Live mode
+    /// asks the host device; demo mode has no host, and an empty answer left
+    /// the popover permanently on "No matching commands.". Long enough to
+    /// scroll, so the panel's height cap is exercised too.
+    static let commands: [SlashCommand] = [
+        SlashCommand(name: "review", description: "Review the working tree", inputHint: nil),
+        SlashCommand(name: "plan", description: "Write an implementation plan first", inputHint: nil),
+        SlashCommand(name: "test", description: "Run the suite and read the failures", inputHint: nil),
+        SlashCommand(name: "commit", description: "Stage and commit the current change", inputHint: nil),
+        SlashCommand(name: "explain", description: "Explain this file, top to bottom", inputHint: nil),
+        SlashCommand(name: "clear", description: "Start the conversation over", inputHint: nil),
+    ]
+
+    /// Fuzzy file search over the fake tree — the demo twin of `SearchFiles`.
+    /// Directories only, because the tree holds only directories.
+    func searchFiles(query: String) -> [FileSearchMatch] {
+        let needle = query.lowercased()
+        var matches: [FileSearchMatch] = []
+        for (parent, children) in Self.fileTree.sorted(by: { $0.key < $1.key }) {
+            for child in children where needle.isEmpty || child.lowercased().contains(needle) {
+                matches.append(FileSearchMatch(path: "\(parent)/\(child)", isDir: true))
+            }
+        }
+        return Array(matches.prefix(20))
+    }
+
     func listFolders(deviceId: String, path: String) -> FolderListing {
         let entries = (Self.fileTree[path] ?? []).map { name in
             FolderEntry(name: name, isDir: true, isRepo: Self.repoNames.contains(name))

@@ -355,3 +355,26 @@ enum SessionCommandPayload {
 func nowMs() -> Int64 {
     Int64(Date().timeIntervalSince1970 * 1000)
 }
+
+// MARK: - Composer autocomplete
+
+/// One entry from `ListCommands`. Mirrors `SlashCommand`
+/// (crates/proto/src/agent.rs:195). `description` is `#[serde(default)]` on the
+/// Rust side and always serialized; `inputHint` is skipped when absent.
+struct SlashCommand: Decodable, Identifiable, Hashable {
+    let name: String
+    let description: String
+    let inputHint: String?
+
+    var id: String { name }
+}
+
+/// One entry from `SearchFiles`. Mirrors `FileSearchMatch`
+/// (crates/proto/src/entities.rs:299). Paths are relative to the search root
+/// and already ranked and capped by the host (crates/engine/src/repos.rs:1082).
+struct FileSearchMatch: Decodable, Identifiable, Hashable {
+    let path: String
+    let isDir: Bool
+
+    var id: String { path }
+}
