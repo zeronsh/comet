@@ -11,3 +11,7 @@ separators bring the combined short reply to 52,624 bytes.
 Use `ZERON_REPLAY_REPEAT=10 ZERON_REPLAY_DELAY_MS=8` for the synthetic long
 workload. See [the profiling report](../../docs/performance-resource-usage.md)
 for build settings, commands and measured results.
+
+`runway-short-stream.jsonl` is a synthetic short reply in 24-character chunks.
+It keeps the own-send runway active through completion. Use a 400 ms replay
+delay for the [runway performance comparison](../../docs/performance-runway-scroll.md).
