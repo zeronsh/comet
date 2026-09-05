@@ -62,9 +62,16 @@ render timings for this workload, not a guarantee about every display or GPU.
 ## Idle memory interpretation
 
 An approximately one-minute sample of the installed v0.2.39 app reproduced physical
-footprint changes from 186 to 416 MiB. Heap allocation stayed near 11 MiB; paired
+footprint changes from 186 to 416 MiB. Tracked malloc-zone allocations stayed near 11 MiB; paired
 footprint reports attributed most of the difference to owned, unmapped graphics
 memory, about 11 versus 221 MiB. Most main-thread samples were asleep.
+
+The malloc-zone figure is not a complete inventory of Rust allocator memory.
+In the candidate's 371 MiB sample, `vmmap` reported about 222 MiB of owned
+unmapped memory, 75 MiB of dirty/swapped IOAccelerator memory and 36 MiB of
+IOSurface memory. The paired installed-build footprint reports identify the large
+changing unmapped category as graphics memory. Its individual allocation owners
+have not yet been established.
 
 That evidence does not show a 230 MiB Rust heap leak. Nor does it identify every
 driver/compositor allocation responsible for the changing charge. The drawable
