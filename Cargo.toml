@@ -39,34 +39,25 @@ loro = "1.13"
 # frames, cross-checked by its js_snapshots tests).
 loro-protocol = "0.3"
 
-# gpui — the wingleeio/zed fork: upstream f14fea9 + commits on
-# `comet/edge-fade-horizontal` (tip of `comet/line-wrap-closing-punctuation`
-# + 5d1f83d horizontal per-pixel EdgeFade for quads/images; rebase when bumping the
-# upstream rev): a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
-# line_layout's shaped-text duplicate); 14baea0 adds the EdgeFade primitive
-# (Window::with_edge_fade — per-primitive scroll-edge fades for the glass
-# sidebar); a6c1ad5 adds BackdropBlur + horizontal EdgeFade + glass fixes;
-# 9b672fa bounds renderer GPU memory (region-sized backdrop blur scratch,
-# idle release of blur/path intermediates, instance pool shrink,
-# ZERON_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
-# sprite-atlas tiles — remove_asset alone leaked them, see
-# attachments::flush_evicted); ac135eb adds device memory to the stats line;
-# f596cde fixes destination alpha on transparent windows (Porter-Duff OVER,
-# not additive); 53518c0 merges the edge-fade line: per-edge fade bands +
-# per-pixel EdgeFade for quads/images (true fade-into-glass), and
-# object-fit Cover cropping via atlas-tile UVs so image corner radii hold;
-# 8a8954c switches the macOS blurred view to UnderWindowBackground (macOS 26
-# stopped vending CABackdropLayer for Selection — window blur went dead);
-# b68970e rasterizes BackdropBlur in the wgpu renderer (frosted floats on
-# Linux — the Metal path's snapshot/blur/composite, ported).
-gpui = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a", features = [
+# gpui — zeronsh/zui: our GPUI fork extracted from wingleeio/zed into a
+# standalone workspace (gpui + gpui_platform + gpui_tokio and their in-tree
+# dependency closure only — cargo no longer clones all of zed). Snapshot of
+# wingleeio/zed @ e2ddcc6 = upstream f14fea9 + the comet patch line
+# (line-wrap closing punctuation, EdgeFade per-edge bands + per-pixel
+# quad/image fades, BackdropBlur incl. the wgpu/Linux rasterization, GPU
+# memory bounding + ZERON_GPU_STATS=1, ImageSource::evict, transparent-window
+# destination alpha, macOS 26 UnderWindowBackground blur, object-fit Cover
+# via atlas-tile UVs). Full per-commit history: zui's README and this
+# comment's git history. Crate paths in zui match zed's layout, so upstream
+# zed patches still apply there unchanged.
+gpui = { git = "https://github.com/zeronsh/zui", rev = "0b18592c541a2692726cf5a14a2fb8badb7abfc3" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "0b18592c541a2692726cf5a14a2fb8badb7abfc3", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "0b18592c541a2692726cf5a14a2fb8badb7abfc3" }
 
 # diffs
 similar = "2"
