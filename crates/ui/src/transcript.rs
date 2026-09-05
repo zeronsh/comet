@@ -2429,6 +2429,7 @@ pub struct Transcript {
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
     _observe: Subscription,
+    _text_changes: Subscription,
 }
 
 /// One sidecar blob fetch's lifecycle.
@@ -2509,6 +2510,18 @@ impl Transcript {
             .ok();
         });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
+        let text_changes = cx.subscribe(
+            &state,
+            |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
+                let doc_id = this
+                    .doc_override
+                    .as_deref()
+                    .or_else(|| state.read(cx).selected_chat.as_deref());
+                if doc_id == Some(event.doc_id.as_str()) {
+                    this.sync(cx);
+                }
+            },
+        );
         // The rail is sized for the conversation column; a narrow right-pane
         // tab has no width gate driving it, so override instances skip it.
         let rail_enabled = doc_override.is_none();
@@ -2587,6 +2600,7 @@ impl Transcript {
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
             _observe: observe,
+            _text_changes: text_changes,
         };
         this.sync(cx);
         this

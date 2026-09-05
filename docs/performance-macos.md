@@ -1,5 +1,10 @@
 # Native macOS resource follow-up
 
+For the subsequent v0.2.39 native scrolling crash, stuck-send recovery and
+populated-chat measurements, see the [stability follow-up](performance-macos-stability.md).
+The measurements below predate those regressions and do not establish stability
+for consecutive native composer sends.
+
 This follows PR #255 at `f10ef38c`. The app pins zui `0003b923`, which gates
 unnecessary main-queue frame callbacks and bounds native Metal blur resources.
 The Linux software-Vulkan results in [the earlier report](performance-resource-usage.md)

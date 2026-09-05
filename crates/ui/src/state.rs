@@ -666,6 +666,20 @@ pub struct AppState {
     sub_watch_tasks: HashMap<String, Task<()>>,
 }
 
+/// Text/reasoning growth changes the transcript without changing session
+/// status, tools, navigation, or composer state. Keep those frames local to
+/// the affected transcript instead of rebuilding every app-state observer.
+pub(crate) struct TranscriptTextChanged {
+    pub doc_id: String,
+}
+
+impl gpui::EventEmitter<TranscriptTextChanged> for AppState {}
+
+fn is_text_append(frame: &TranscriptFrame) -> bool {
+    matches!(frame, TranscriptFrame::Delta { upsert, append, remove, .. }
+        if upsert.is_empty() && remove.is_empty() && !append.is_empty())
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -952,6 +966,30 @@ impl AppState {
         }
         self.ack_pending_send_from_transcript();
         Ok(())
+    }
+
+    /// Apply an incoming frame and invalidate only its affected presentation.
+    pub fn receive_transcript_frame(
+        &mut self,
+        frame: TranscriptFrame,
+        cx: &mut Context<Self>,
+    ) -> Result<(), TranscriptDesync> {
+        let text_doc = self
+            .selected_chat
+            .as_ref()
+            .filter(|id| {
+                is_text_append(&frame)
+                    && !self.pending_sends.contains_key(*id)
+                    && self.pending_echoes().is_empty()
+            })
+            .cloned();
+        let result = self.apply_transcript_frame(frame);
+        if let Some(doc_id) = text_doc.filter(|_| result.is_ok()) {
+            cx.emit(TranscriptTextChanged { doc_id });
+        } else {
+            cx.notify();
+        }
+        result
     }
 
     /// A subagent doc's current transcript copy (empty until its watch's
@@ -1998,11 +2036,10 @@ fn spawn_transcript_watch(
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        if let Err(err) = state.apply_transcript_frame(frame) {
+                        if let Err(err) = state.receive_transcript_frame(frame, cx) {
                             tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
                             desync = true;
                         }
-                        cx.notify();
                     }
                 });
                 if alive.is_err() {
@@ -2064,12 +2101,19 @@ fn spawn_subagent_watch(
                 let alive = this.update(cx, |state, cx| {
                     // A stale pump racing a snapshot/unwatch finds no key.
                     if let Some(rows) = state.sub_transcripts.get_mut(&doc_id) {
+                        let text_only = is_text_append(&frame);
                         state.transcript_revision = state.transcript_revision.wrapping_add(1);
                         if let Err(err) = zeron_doc::apply_transcript_frame(rows, frame) {
                             tracing::warn!(%doc_id, error = %err, "resubscribing subagent watch");
                             desync = true;
                         }
-                        cx.notify();
+                        if text_only && !desync {
+                            cx.emit(TranscriptTextChanged {
+                                doc_id: doc_id.clone(),
+                            });
+                        } else {
+                            cx.notify();
+                        }
                     }
                 });
                 if alive.is_err() {

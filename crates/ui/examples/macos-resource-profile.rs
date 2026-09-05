@@ -79,6 +79,14 @@ fn main() -> anyhow::Result<()> {
                     "archived":false, "createdAt":"2026-09-05T00:00:00Z",
                     "config":{"harness":"claude-code", "model":"claude-haiku-4-5", "reasoning":null, "sandbox":"workspace-write"}
                 })).unwrap()];
+                let background_chats = std::env::var("ZERON_PROFILE_BACKGROUND_CHATS")
+                    .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                for index in 0..background_chats {
+                    let mut chat = state.chats[0].clone();
+                    chat.id = format!("background-{index}");
+                    chat.title = Some(format!("Background conversation {}", index + 1));
+                    state.chats.push(chat);
+                }
                 state
             });
             let boot = EngineBootConfig { data_dir:data, ipc_port:0,
@@ -92,6 +100,11 @@ fn main() -> anyhow::Result<()> {
             *captured.borrow_mut() = Some((state,window));
         });
     let (state, window) = handles.borrow_mut().take().unwrap();
+    let notifications = Rc::new(std::cell::Cell::new(0usize));
+    let observed = notifications.clone();
+    let _notification_probe = app.update(|cx| cx.observe(&state, move |_, _| {
+        observed.set(observed.get() + 1);
+    }));
     let dispatcher = executor.dispatcher().as_bench().unwrap();
     let start = Instant::now();
     let first_at = frames[0].at;
@@ -103,9 +116,13 @@ fn main() -> anyhow::Result<()> {
             let elapsed = start.elapsed().as_millis() as u64;
             while frames.peek().is_some_and(|f| f.at - first_at <= elapsed) {
                 let frame = frames.next().unwrap();
+                let text_only = matches!(&frame.frame, zeron_doc::TranscriptFrame::Delta {
+                    upsert, append, remove, ..
+                } if upsert.is_empty() && remove.is_empty() && !append.is_empty());
+                let before = notifications.get();
                 app.update(|cx| {
                     state.update(cx, |state, cx| {
-                        state.apply_transcript_frame(frame.frame).unwrap();
+                        state.receive_transcript_frame(frame.frame, cx).unwrap();
                         let streaming = state
                             .transcript
                             .iter()
@@ -121,9 +138,12 @@ fn main() -> anyhow::Result<()> {
                             started_at: Some(chrono::Utc::now()),
                             updated_at: chrono::Utc::now(),
                         }]);
-                        cx.notify();
                     })
                 });
+                if text_only {
+                    assert_eq!(notifications.get(), before,
+                        "text growth must not notify unrelated app-state observers");
+                }
             }
             app.update(|cx| {
                 window

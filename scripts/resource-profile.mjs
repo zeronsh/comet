@@ -14,8 +14,6 @@ import { fileURLToPath } from 'node:url';
 
 const macOS = process.platform === 'darwin';
 const nativeWindowSource = fileURLToPath(new URL('./macos-profile-window.swift', import.meta.url));
-if (macOS && process.env.ZERON_PROFILE_SUBMIT_UI === '1')
-  throw Error('Composer submission profiling currently requires Linux/X11; use RPC submission on macOS');
 if (macOS) execFileSync('swift', [nativeWindowSource]);
 
 const [binaryArg, outputArg, harness = 'claude-code'] = process.argv.slice(2);
@@ -151,6 +149,13 @@ try {
   await call('Mutate', { op: 'createChat', chatId, spaceId,
     config: { harness, model: harness === 'mock' ? 'fable-5' : 'claude-haiku-4-5', reasoning: null, sandbox: 'workspace-write' } });
   await call('Mutate', { op: 'renameChat', chatId, title: 'Resource profile' });
+  const backgroundChats = Number(process.env.ZERON_PROFILE_BACKGROUND_CHATS ?? 0);
+  if (!Number.isSafeInteger(backgroundChats) || backgroundChats < 0) throw Error('Invalid background chat count');
+  for (let index = 0; index < backgroundChats; index++) {
+    const backgroundId = randomUUID();
+    await call('Mutate', { op: 'createChat', chatId: backgroundId, spaceId });
+    await call('Mutate', { op: 'renameChat', chatId: backgroundId, title: `Background conversation ${index + 1}` });
+  }
   pending.set(++id, { reject: e => { streamError = e; }, item: frame => {
     // apply() reuses reset/upsert objects as the mutable transcript. Capture
     // first so later append frames cannot rewrite earlier replay records.
@@ -191,31 +196,51 @@ try {
   phase = 'stream';
   const prompt = process.env.ZERON_PROFILE_PROMPT ??
     'Do not use tools. Write a detailed tutorial of Rust ownership in exactly 80 numbered sections. Each section should have a heading, a paragraph of at least 60 words and a short Rust code example. Continue through all 80 sections without asking questions.';
-  if (process.env.ZERON_PROFILE_SUBMIT_UI === '1') {
-    // Functional mode exercises the composer's own-turn scroll anchoring.
-    // Use a dedicated display; the driver focused the app's composer above.
-    execFileSync('xdotool', ['type', '--clearmodifiers', '--delay', '0', '--', prompt]);
-    execFileSync('xdotool', ['key', 'Return']);
-  } else {
-    await call('QueueCommand', { chatId, command: { kind: 'run', messageId: randomUUID(), request: {
-      prompt, model: harness === 'mock' ? null : 'haiku', reasoning: null, modelOptions: {}, cwd,
-      sandbox: 'workspace-write', autoApprove: true, resume: null,
-    } } });
-  }
-  const timeoutMs = Number(process.env.ZERON_PROFILE_TIMEOUT_MS ?? 240000);
-  const deadline = Date.now() + timeoutMs;
-  let complete = false;
-  while (Date.now() < deadline) {
-    await sleep(500);
-    if (streamError) throw streamError;
-    const assistants = transcript.filter(e => e.role === 'assistant');
-    if (assistants.length && assistants.at(-1).status !== 'streaming') {
-      if (assistants.at(-1).status !== 'complete') throw Error('Harness turn did not complete successfully');
-      complete = true; break;
+  const turns = Number(process.env.ZERON_PROFILE_TURNS ?? 1);
+  if (!Number.isSafeInteger(turns) || turns < 1) throw Error('ZERON_PROFILE_TURNS must be a positive integer');
+  for (let turn = 0; turn < turns; turn++) {
+    const priorAssistants = new Set(transcript.filter(e => e.role === 'assistant').map(e => e.id));
+    if (process.env.ZERON_PROFILE_SUBMIT_UI === '1') {
+      // Functional mode exercises the composer's own-turn scroll anchoring.
+      // Use a dedicated display; the driver focused the app's composer above.
+      if (macOS) {
+        const promptFile = `${output}/prompt.txt`;
+        writeFileSync(promptFile, prompt);
+        execFileSync(nativeWindow, [String(ui.pid), '--submit', promptFile]);
+      } else {
+        execFileSync('xdotool', ['type', '--clearmodifiers', '--delay', '0', '--', prompt]);
+        execFileSync('xdotool', ['key', 'Return']);
+      }
+    } else {
+      await call('QueueCommand', { chatId, command: { kind: 'run', messageId: randomUUID(), request: {
+        prompt, model: harness === 'mock' ? null : 'haiku', reasoning: null, modelOptions: {}, cwd,
+        sandbox: 'workspace-write', autoApprove: true, resume: null,
+      } } });
     }
-    if (ui.exitCode != null || engine.exitCode != null) throw Error('Profiled process exited');
+    const timeoutMs = Number(process.env.ZERON_PROFILE_TIMEOUT_MS ?? 240000);
+    const deadline = Date.now() + timeoutMs;
+    let complete = false;
+    while (Date.now() < deadline) {
+      await sleep(500);
+      if (streamError) throw streamError;
+      const assistants = transcript.filter(e => e.role === 'assistant' && !priorAssistants.has(e.id));
+      if (assistants.length && assistants.at(-1).status !== 'streaming') {
+        if (assistants.at(-1).status !== 'complete') throw Error('Harness turn did not complete successfully');
+        if (assistants.some(e => e.parts.some(p => p.kind === 'error'))) {
+          throw Error('Harness turn returned an error part');
+        }
+        complete = true; break;
+      }
+      if (ui.exitCode != null || engine.exitCode != null) throw Error('Profiled process exited');
+    }
+    if (!complete) throw Error(`Turn did not complete within ${timeoutMs / 1000} seconds`);
+    if (process.env.ZERON_PROFILE_SUBMIT_UI === '1') {
+      const sent = transcript.filter(e => e.role === 'user').at(-1)?.parts
+        .filter(p => p.kind === 'text').map(p => p.text).join('');
+      if (sent !== prompt) throw Error('Composer input did not submit the exact requested prompt');
+    }
+    if (turn + 1 < turns) await sleep(500);
   }
-  if (!complete) throw Error(`Turn did not complete within ${timeoutMs / 1000} seconds`);
   phase = 'settled';
   await sleep(Number(process.env.ZERON_PROFILE_IDLE_MS ?? 15000));
   if (streamError) throw streamError;
@@ -225,7 +250,7 @@ try {
   const summary = { binary, binarySha256, harness, mode: process.env.ZERON_REPLAY_JOURNAL ? 'replay' : 'live',
     platform: process.platform, arch: process.arch,
     renderThreads: process.env.LP_NUM_THREADS ?? 'default', frameStats: env.ZERON_FRAME_STATS,
-    submission: process.env.ZERON_PROFILE_SUBMIT_UI === '1' ? 'composer' : 'rpc', prompt,
+    submission: process.env.ZERON_PROFILE_SUBMIT_UI === '1' ? 'composer' : 'rpc', turns, backgroundChats, prompt,
     replySha256: createHash('sha256').update(reply).digest('hex'), replyBytes: Buffer.byteLength(reply),
     transcriptBytes: Buffer.byteLength(JSON.stringify(transcript)), frames: frames.length, phases: {} };
   for (const p of ['idle', 'stream', 'settled']) {

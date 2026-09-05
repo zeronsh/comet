@@ -22,10 +22,6 @@ if not any(e["type"] == "done" and e["status"] == "completed" for e in events):
     raise ValueError("Replay requires a successfully completed journal")
 if any(e["type"] in ("toolCall", "toolResult", "subagent", "error") for e in events):
     raise ValueError("Only text/reasoning journals are supported")
-if not sys.stdin.readline():
-    sys.exit(1)
-
-
 def emit(frame):
     print(json.dumps(frame), flush=True)
 
@@ -36,19 +32,21 @@ delay = float(os.environ.get("ZERON_REPLAY_DELAY_MS", "40")) / 1000
 repeats = int(os.environ.get("ZERON_REPLAY_REPEAT", "1"))
 if repeats < 1:
     raise ValueError("ZERON_REPLAY_REPEAT must be positive")
-for _ in range(repeats):
-    for event in events:
-        kind = event["type"]
-        if kind not in ("textDelta", "reasoningDelta"):
-            continue
-        text = event["text"]
-        delta = {"type": "text_delta", "text": text} if kind == "textDelta" else {
-            "type": "thinking_delta", "thinking": text}
-        emit({"type": "stream_event", "parent_tool_use_id": None,
-              "event": {"type": "content_block_delta", "delta": delta}})
-        time.sleep(delay)
-emit({"type": "result", "subtype": "success", "is_error": False,
-      "session_id": "resource-profile-replay", "result": ""})
-# Match the live CLI's persistent stdin lifecycle until the engine retires it.
-for _ in sys.stdin:
-    pass
+# The adapter keeps one CLI alive across turns. Replay each prompt so native
+# composer tests can exercise sends into an already populated transcript.
+for request in sys.stdin:
+    if not request.strip():
+        continue
+    for _ in range(repeats):
+        for event in events:
+            kind = event["type"]
+            if kind not in ("textDelta", "reasoningDelta"):
+                continue
+            text = event["text"]
+            delta = {"type": "text_delta", "text": text} if kind == "textDelta" else {
+                "type": "thinking_delta", "thinking": text}
+            emit({"type": "stream_event", "parent_tool_use_id": None,
+                  "event": {"type": "content_block_delta", "delta": delta}})
+            time.sleep(delay)
+    emit({"type": "result", "subtype": "success", "is_error": False,
+          "session_id": "resource-profile-replay", "result": ""})
