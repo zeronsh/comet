@@ -10684,6 +10684,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "zeron-crypto",
  "zeron-doc",
  "zeron-proto",
 ]
