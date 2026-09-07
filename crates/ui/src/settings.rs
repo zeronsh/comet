@@ -20,6 +20,7 @@ pub mod archived;
 pub mod composer;
 pub mod devices;
 pub mod files;
+pub mod encryption;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;

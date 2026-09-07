@@ -10640,6 +10640,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "zeron-crypto",
  "zeron-doc",
  "zeron-harness",
  "zeron-proto",
