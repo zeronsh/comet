@@ -1,0 +1,31 @@
+[package]
+name = "zeron-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+zeron-proto.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+libc.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+bytes = "1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+webrtc = "0.20.2"
+
+[dev-dependencies]
+tempfile.workspace = true

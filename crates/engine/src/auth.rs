@@ -1181,3 +1181,10 @@ mod tests {
         );
     }
 }
+
+#[async_trait::async_trait]
+impl zeron_preview::signaling::TokenSource for Auth {
+    async fn token(&self) -> Option<String> {
+        self.access_token().await
+    }
+}

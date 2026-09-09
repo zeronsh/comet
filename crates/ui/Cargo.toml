@@ -14,6 +14,10 @@ name = "macos-resource-profile"
 required-features = ["resource-profile"]
 
 [[example]]
+name = "preview-fixture"
+required-features = ["browser-fixture"]
+
+[[example]]
 name = "browser-fixture"
 required-features = ["browser-fixture"]
 

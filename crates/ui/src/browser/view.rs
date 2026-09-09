@@ -101,7 +101,188 @@ impl BrowserSurface {
         cx.stop_propagation();
     }
 
+    fn preview_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let snapshot = &self.previews;
+        let available = snapshot.error.is_none();
+        let title = snapshot
+            .project_name
+            .clone()
+            .unwrap_or_else(|| "Local previews".into());
+        let subtitle = if snapshot.remote {
+            "Running on your device"
+        } else {
+            "Running locally"
+        };
+        let mut content = div()
+            .w_full()
+            .max_w(px(380.0))
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(
+                div().flex().flex_col().gap(px(6.0)).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            icons::icon(icons::GLOBE)
+                                .size(px(18.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(15.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .truncate()
+                                .child(title),
+                        ),
+                ),
+            )
+            .child(
+                div()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.text_muted)
+                    .child(subtitle),
+            );
+        for service in &snapshot.services {
+            let url = service.url(snapshot.proxy_port);
+            let label = if snapshot.remote {
+                format!("{} · localhost:{}", service.device_name, service.port)
+            } else {
+                format!("localhost:{}", service.port)
+            };
+            content = content.child(
+                div()
+                    .w_full()
+                    .p(px(12.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface_raised.opacity(0.5))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(theme.success),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text)
+                                    .truncate()
+                                    .child(service.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .text_color(theme.text_muted)
+                                    .truncate()
+                                    .child(label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(gpui::SharedString::from(format!(
+                                "open-preview-{}",
+                                service.id
+                            )))
+                            .h(px(28.0))
+                            .px(px(12.0))
+                            .flex_shrink_0()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.surface_raised)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text)
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("Open {} preview", service.name))
+                            .when(available, |el| {
+                                el.cursor_pointer()
+                                    .hover(|style| style.bg(crate::theme::wash(0.10)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.navigate(&url, window, cx)
+                                    }))
+                            })
+                            .when(!available, |el| el.opacity(0.4))
+                            .child("Open"),
+                    ),
+            );
+        }
+        if snapshot.services.is_empty() {
+            let message = if self.previews_loading {
+                "Looking for dev servers…"
+            } else if snapshot.remote {
+                "Start a dev server in this project on your other device. Its preview will appear here when that device is online."
+            } else {
+                "Start a dev server in this project. It will appear here automatically, ready to open."
+            };
+            content = content.child(
+                div()
+                    .p(px(16.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .line_height(px(19.0))
+                    .text_color(theme.text_muted)
+                    .child(message),
+            );
+        }
+        if let Some(error) = &snapshot.error {
+            content = content.child(
+                div()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .line_height(px(17.0))
+                    .text_color(theme.text_muted)
+                    .child(error.clone()),
+            );
+        }
+        content = content.child(
+            div()
+                .id("preview-enter-address")
+                .mt(px(4.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .role(gpui::Role::Button)
+                .aria_label("Enter a website address")
+                .on_click(cx.listener(|this, _, window, cx| this.focus_address(window, cx)))
+                .child("Or enter a website address above"),
+        );
+        div()
+            .id("browser-previews")
+            .size_full()
+            .overflow_y_scroll()
+            .p(px(24.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(content)
+            .into_any_element()
+    }
+
     fn empty_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.page.url.is_none() && self.previews_task.is_some() {
+            return self.preview_body(theme, cx);
+        }
         let external = !cfg!(any(target_os = "macos", target_os = "linux"));
         let has_error = self.page.error.is_some();
         let title = if has_error {
@@ -447,7 +628,12 @@ impl Render for BrowserSurface {
                 .url
                 .as_deref()
                 .and_then(|s| url::Url::parse(s).ok())
-                .is_some_and(|u| super::model::loopback(&u));
+                .is_some_and(|u| {
+                    super::model::loopback(&u)
+                        && !(u.port() == Some(zeron_proto::PREVIEW_PROXY_PORT)
+                            && u.host_str()
+                                .is_some_and(|host| host.ends_with(".localhost")))
+                });
         div().id("browser-surface").size_full().flex().flex_col().track_focus(&self.focus)
             .key_context("Browser").on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(|this,event: &gpui::KeyUpEvent,w,cx| {
@@ -466,7 +652,7 @@ impl Render for BrowserSurface {
             .when_some(self.validation.clone(), |el, message| el.child(div().px(px(12.0)).py(px(8.0)).text_size(crate::typography::ui_rems(11.0)).text_color(theme.danger).child(message)))
             .when(remote_loopback, |el| el.child(div().px(px(12.0)).py(px(8.0)).border_b_1().border_color(theme.border)
                 .text_size(crate::typography::ui_rems(11.0)).text_color(theme.text_muted)
-                .child("Localhost opens on this device. For your remote session, use a reachable server address.")))
+                .child("Localhost opens on this device. Open a detected preview from a new tab to reach your other device.")))
             .child(body)
             .when(external, |el| el.child(div().h(px(26.0)).px(px(10.0)).flex().items_center().gap(px(5.0)).border_t_1().border_color(theme.border)
                 .text_size(crate::typography::ui_rems(10.0)).text_color(theme.text_faint)

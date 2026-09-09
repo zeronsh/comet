@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+zeron-preview.workspace = true
 zeron-proto.workspace = true
 zeron-doc.workspace = true
 zeron-sync.workspace = true

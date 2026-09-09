@@ -2299,6 +2299,10 @@ impl Shell {
         let browser = cx.new(|cx| {
             crate::browser::BrowserSurface::new(self.browser_context.clone(), remote, window, cx)
         });
+        if let Some(handle) = self.state.read(cx).engine().cloned() {
+            let chat_id = self.active_chat.clone();
+            browser.update(cx, |browser, cx| browser.watch_previews(handle, chat_id, cx));
+        }
         let owner = key.clone();
         let sub = cx.subscribe_in(&browser, window, move |this, _, event, window, cx| {
             match event {

@@ -124,6 +124,7 @@ pub struct EngineCore {
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -246,6 +247,12 @@ impl EngineCore {
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
+        let previews = zeron_preview::PreviewService::new(
+            profile.store_root().join("previews.json"),
+            device_id.clone(),
+            local_device_name(&device_id),
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
@@ -295,6 +302,7 @@ impl EngineCore {
             repos,
             workspace_files,
             terminals,
+            previews,
             change_requests,
             diff_sync,
             spaces_sync,
@@ -432,7 +440,8 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
-        .with_auth(self.auth());
+        .with_auth(self.auth())
+        .with_previews(self.previews.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -449,6 +458,7 @@ impl EngineCore {
     /// draining. Connected sockets remain authorized by their handshake, so
     /// clearing credentials alone is not a security boundary.
     pub fn disconnect_edge(&self) {
+        self.previews.stop();
         if let Some(links) = self.links() {
             links.disconnect_all();
         }
@@ -460,6 +470,7 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.previews.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
@@ -738,6 +749,7 @@ impl Engine {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
+        let preview_org = profile.org_id().to_string();
         let core = match lock {
             Some(lock) => EngineCore::assemble_with_profile_locked(
                 profile,
@@ -754,6 +766,23 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        let preview_workspace = core.workspace.clone();
+        let preview_device = core.device_id.clone();
+        let projects = Arc::new(move || {
+            preview_workspace
+                .read_chats()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|chat| chat.device_id == preview_device)
+                .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
+                .collect()
+        });
+        let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
+            edge_url: config.edge_url.clone(),
+            org_id: preview_org,
+            tokens: Arc::new(auth.clone()),
+        });
+        core.previews.start(projects, preview_signaling).await;
         if edge_enabled {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated

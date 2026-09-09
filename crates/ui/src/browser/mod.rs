@@ -84,6 +84,9 @@ pub struct BrowserSurface {
     address_edited: bool,
     validation: Option<String>,
     remote: bool,
+    previews: zeron_proto::PreviewSnapshot,
+    previews_loading: bool,
+    previews_task: Option<gpui::Task<()>>,
     presentation: Presentation,
     _input_sub: Subscription,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -152,6 +155,9 @@ impl BrowserSurface {
             address_edited: false,
             validation: None,
             remote,
+            previews: zeron_proto::PreviewSnapshot::default(),
+            previews_loading: true,
+            previews_task: None,
             presentation: Presentation::Hidden,
             _input_sub: input_sub,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -207,6 +213,64 @@ impl BrowserSurface {
             native.present(presentation);
         }
         cx.notify();
+    }
+
+    #[cfg(feature = "browser-fixture")]
+    pub fn fixture_previews(&self) -> zeron_proto::PreviewSnapshot {
+        self.previews.clone()
+    }
+
+    /// The daemon resolves the session's current cwd for every update, so a
+    /// checkout change cannot leave this tab discovering the previous project.
+    pub fn watch_previews(
+        &mut self,
+        handle: crate::state::EngineHandle,
+        chat_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.previews_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let subscription = handle
+                    .client()
+                    .subscribe(
+                        zeron_rpc::methods::WATCH_PREVIEWS,
+                        serde_json::json!({"chatId": chat_id}),
+                    )
+                    .await;
+                if let Ok(mut updates) = subscription {
+                    while let Some(value) = updates.recv().await {
+                        if let Ok(snapshot) =
+                            serde_json::from_value::<zeron_proto::PreviewSnapshot>(value)
+                        {
+                            if this
+                                .update(cx, |this, cx| {
+                                    this.previews = snapshot;
+                                    this.previews_loading = false;
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if this
+                    .update(cx, |this, cx| {
+                        this.previews.services.clear();
+                        this.previews.error = Some("Connecting to preview discovery…".into());
+                        this.previews_loading = false;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+            }
+        }));
     }
 
     pub fn navigate(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {

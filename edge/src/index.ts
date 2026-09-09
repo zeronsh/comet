@@ -40,12 +40,14 @@ import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
+import { previewRoute } from "./preview-route";
+import { PreviewRoom } from "./preview-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
 import { ChatRoom } from "./chat-room";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom };
+export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -158,6 +160,9 @@ export default {
 
     const auth = await authenticate(env, request);
     if (!auth) return json({ error: "unauthenticated" }, 401);
+
+    const preview = previewRoute(request, env, auth);
+    if (preview) return preview;
 
     // ── session rooms ───────────────────────────────────────────────────────
     if (parts[0] === "session" && parts[1] && ID_RE.test(parts[1]) && parts[2] === "ws") {

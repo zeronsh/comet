@@ -470,6 +470,7 @@ pub struct EngineRpc {
     repos: Repos,
     workspace_files: crate::WorkspaceFiles,
     terminals: Terminals,
+    previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
@@ -510,6 +511,7 @@ impl EngineRpc {
             repos,
             workspace_files,
             terminals,
+            previews: None,
             change_requests,
             diff_sync,
             uploads,
@@ -520,6 +522,11 @@ impl EngineRpc {
             local_import: None,
             engine_info,
         }
+    }
+
+    pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
+        self.previews = Some(previews);
+        self
     }
 
     /// Attach the auth service (AuthStatus + AuthRpc mutations).
@@ -1447,6 +1454,69 @@ impl RpcService for EngineRpc {
             methods::WATCH_TRANSFERS => Ok(RpcReply::Stream(watch_stream(
                 self.doc_host.watch_transfers(),
             ))),
+            methods::WATCH_PREVIEWS => {
+                let p: zeron_proto::WatchPreviewsParams = parse_params(params)?;
+                if self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .is_none()
+                {
+                    return Err(RpcError::Failed("Project session not found".into()));
+                }
+                let previews = self
+                    .previews
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("Preview discovery unavailable".into()))?;
+                let catalog = previews.catalog().clone();
+                let changes = catalog.subscribe();
+                let chats = self.workspace.watch_chats();
+                let workspace = self.workspace.clone();
+                // This subscription stays on the viewing device. A remote chat
+                // selects advertised services, but its URL uses our local proxy.
+                let stream = futures::stream::unfold(
+                    (changes, chats, true, workspace, catalog, p.chat_id),
+                    |(mut changes, mut chats, first, workspace, catalog, chat_id)| async move {
+                        if !first {
+                            tokio::select! {
+                                result = changes.changed() => { if result.is_err() { return None; } }
+                                result = chats.changed() => { if result.is_err() { return None; } }
+                            }
+                        }
+                        let mut snapshot = changes.borrow_and_update().clone();
+                        chats.borrow_and_update();
+                        let chat = workspace.chat(&chat_id).ok().flatten();
+                        let device = chat
+                            .as_ref()
+                            .map(|c| c.device_id.clone())
+                            .unwrap_or_default();
+                        snapshot.remote = device != catalog.device_id();
+                        let cwd = chat.and_then(|c| c.cwd);
+                        let cwd = cwd.map(|cwd| {
+                            if snapshot.remote {
+                                std::path::PathBuf::from(cwd)
+                            } else {
+                                std::path::PathBuf::from(&cwd)
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| cwd.into())
+                            }
+                        });
+                        snapshot.project_name = cwd
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|s| s.to_string_lossy().into_owned());
+                        snapshot.services.retain(|service| {
+                            service.device_id == device
+                                && cwd.as_ref().is_some_and(|cwd| {
+                                    cwd == std::path::Path::new(&service.project_cwd)
+                                })
+                        });
+                        let value = serde_json::to_value(snapshot).ok()?;
+                        Some((value, (changes, chats, false, workspace, catalog, chat_id)))
+                    },
+                );
+                Ok(RpcReply::Stream(Box::pin(stream)))
+            }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }
