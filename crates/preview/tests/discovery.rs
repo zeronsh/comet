@@ -14,7 +14,10 @@ impl Drop for Child {
 fn launch(cwd: &std::path::Path, http: bool) -> Child {
     let mut command = std::process::Command::new("python3");
     if http {
-        command.args(["-m", "http.server", "0", "--bind", "127.0.0.1"]);
+        // HTTPServer.server_bind does a reverse DNS lookup before listen(),
+        // which can stall on isolated macOS runners. TCPServer exercises the
+        // same real HTTP handler without depending on external DNS readiness.
+        command.args(["-c", "import http.server,socketserver; socketserver.TCPServer(('127.0.0.1',0),http.server.SimpleHTTPRequestHandler).serve_forever()"]);
     } else {
         command.args(["-c", "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(30)"]);
     }
@@ -22,7 +25,7 @@ fn launch(cwd: &std::path::Path, http: bool) -> Child {
         command
             .current_dir(cwd)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .unwrap(),
     )
