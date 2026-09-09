@@ -200,11 +200,17 @@ define_class!(
         }
         #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
         fn provisional_error(&self, _view: &WKWebView, _navigation: Option<&WKNavigation>, error: &NSError) {
-            if error.code() != -999 { self.fail("Check the address and make sure your server is running, then try again."); }
+            if error.code() != -999 {
+                tracing::warn!(domain = %error.domain(), code = error.code(), "browser provisional navigation failed");
+                self.fail("Check the address and make sure your server is running, then try again.");
+            }
         }
         #[unsafe(method(webView:didFailNavigation:withError:))]
         fn navigation_error(&self, _view: &WKWebView, _navigation: Option<&WKNavigation>, error: &NSError) {
-            if error.code() != -999 { self.fail("The connection was interrupted. Try loading this page again."); }
+            if error.code() != -999 {
+                tracing::warn!(domain = %error.domain(), code = error.code(), "browser navigation failed");
+                self.fail("The connection was interrupted. Try loading this page again.");
+            }
         }
         #[unsafe(method(webViewWebContentProcessDidTerminate:))]
         fn terminated(&self, _view: &WKWebView) {

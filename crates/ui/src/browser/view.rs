@@ -435,25 +435,11 @@ impl Render for BrowserSurface {
         .when(has_page, |el| {
             el.on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
         });
-        let address = div()
+        let address = surface_chrome::input()
             .id("browser-address")
-            .flex_1()
-            .min_w_0()
-            .h(px(26.0))
-            .px(px(7.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(if self.validation.is_some() {
-                theme.danger
-            } else if focused {
-                theme.border_strong
-            } else {
-                theme.border
+            .when(self.validation.is_some(), |el| {
+                el.border_1().border_color(theme.danger)
             })
-            .bg(theme.surface_raised.opacity(0.65))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
@@ -475,7 +461,7 @@ impl Render for BrowserSurface {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .h(px(18.0))
+                    .h(px(16.0))
                     .overflow_hidden()
                     .child(self.address.clone()),
             )

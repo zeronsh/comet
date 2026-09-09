@@ -962,17 +962,7 @@ impl FilesSurface {
         let include_ignored = self.tree.include_ignored();
         toolbar(theme)
             .child(
-                div()
-                    .h(px(TOOLBAR_BUTTON_SIZE))
-                    .min_w_0()
-                    .flex_1()
-                    .px(px(8.0))
-                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                    .bg(crate::theme::ink(0.035))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_size(px(11.5))
+                crate::surface_chrome::input()
                     .child(
                         crate::icons::icon(crate::icons::MAGNIFER)
                             .size(px(12.0))

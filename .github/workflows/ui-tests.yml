@@ -80,7 +80,7 @@ jobs:
         env:
           RUST_BACKTRACE: 1
         run: |
-          target/release/examples/browser-fixture "$RUNNER_TEMP/browser-captures"
+          bash scripts/run-macos-browser-fixture.sh target/release/examples/browser-fixture "$RUNNER_TEMP/browser-captures"
           test -f "$RUNNER_TEMP/browser-captures/result.txt"
       - name: Upload browser screenshots
         if: always()
@@ -99,7 +99,7 @@ jobs:
         env:
           ZERON_PREVIEW_AUTO_OPEN: 1
         run: |
-          VITE_BINARY="$GITHUB_WORKSPACE/edge/node_modules/vite/bin/vite.js" target/release/examples/preview-fixture "$RUNNER_TEMP/preview-captures"
+          VITE_BINARY="$GITHUB_WORKSPACE/edge/node_modules/vite/bin/vite.js" bash scripts/run-macos-browser-fixture.sh target/release/examples/preview-fixture "$RUNNER_TEMP/preview-captures"
           test -f "$RUNNER_TEMP/preview-captures/result.txt"
       - name: Upload preview screenshots
         if: always()
