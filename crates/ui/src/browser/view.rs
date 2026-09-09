@@ -524,7 +524,9 @@ impl Render for BrowserSurface {
             .flex_1()
             .min_h_0()
             .overflow_hidden()
-            .bg(theme.bg);
+            // Empty tabs share the shell's glass, like the sidebar tab picker.
+            // Keep an opaque backing while native web content is loading.
+            .when(has_page, |body| body.bg(theme.bg));
         #[cfg(target_os = "macos")]
         let body = if let Some(native) = &self.native {
             if self.page.error.is_some() {
