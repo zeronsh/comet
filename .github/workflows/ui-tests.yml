@@ -8,6 +8,8 @@ on:
       - 'rust-toolchain.toml'
       - 'crates/**'
       - 'scripts/test-linux-browser.sh'
+      - 'scripts/run-macos-browser-fixture.sh'
+      - 'dist/macos/Info.plist'
       - 'apps/ios/**'
       - '.github/workflows/ui-tests.yml'
   push:
@@ -18,6 +20,8 @@ on:
       - 'rust-toolchain.toml'
       - 'crates/**'
       - 'scripts/test-linux-browser.sh'
+      - 'scripts/run-macos-browser-fixture.sh'
+      - 'dist/macos/Info.plist'
       - 'apps/ios/**'
       - '.github/workflows/ui-tests.yml'
   workflow_dispatch:
