@@ -74,7 +74,7 @@ jobs:
       - name: Check macOS application
         run: cargo check --release --locked -p zeron
       - name: Build native browser fixture
-        run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture
+        run: cargo build --release --locked -p zeron-ui --example browser-fixture --example preview-fixture --features browser-fixture
       - name: Native browser regression and screenshots
         timeout-minutes: 3
         env:
@@ -88,6 +88,25 @@ jobs:
         with:
           name: browser-macos-captures
           path: ${{ runner.temp }}/browser-captures
+          if-no-files-found: ignore
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install preview fixture server
+        run: npm ci --prefix edge
+      - name: Project discovery, stable URLs and HMR in native WebKit
+        timeout-minutes: 3
+        env:
+          ZERON_PREVIEW_AUTO_OPEN: 1
+        run: |
+          VITE_BINARY="$GITHUB_WORKSPACE/edge/node_modules/vite/bin/vite.js" target/release/examples/preview-fixture "$RUNNER_TEMP/preview-captures"
+          test -f "$RUNNER_TEMP/preview-captures/result.txt"
+      - name: Upload preview screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-macos-captures
+          path: ${{ runner.temp }}/preview-captures
           if-no-files-found: ignore
       - name: Native frame-source recovery regression
         working-directory: frame-source-tests

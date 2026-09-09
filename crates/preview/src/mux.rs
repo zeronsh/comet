@@ -163,6 +163,9 @@ impl Mux {
             slot.cancel.cancel();
         }
     }
+    pub async fn closed(&self) {
+        self.0.stop.cancelled().await;
+    }
     pub fn is_closed(&self) -> bool {
         self.0.stop.is_cancelled()
     }

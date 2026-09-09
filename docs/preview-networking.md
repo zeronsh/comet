@@ -40,6 +40,12 @@ checkout therefore changes the list without copying paths or entering ports.
 
 ## HTTP and stream transport
 
+On macOS 14 and later, WebKit receives a per-domain HTTP CONNECT configuration
+for preview hostnames, avoiding older macOS DNS behavior without system changes.
+The CONNECT endpoint admits only known preview names at the proxy port, and its
+tunnels share bounded limits and account cancellation. Other website traffic
+retains normal routing.
+
 The loopback proxy validates the Host against its catalog, then opens an opaque
 service ID through a transport-independent multiplexer. Locally, framed streams
 travel over a socket pair. Remotely, the identical frames travel over one ordered,
@@ -56,8 +62,8 @@ END half-closes; CANCEL tears down both directions. Graceful shutdown drains the
 last buffered bytes, whereas dropping an unfinished request cancels promptly.
 
 Hyper streams request and response bodies. The proxy removes hop-by-hop headers,
-sets the upstream Host, preserves the original hostname in X-Forwarded-Host,
-and rewrites same-preview Origin and localhost redirects. Set-Cookie and other
+preserves Host and Origin together (including Next.js Server Actions), sets
+X-Forwarded-Host, and rewrites absolute localhost redirects. Set-Cookie and other
 end-to-end headers remain intact. WebSocket upgrades retain their byte stream,
 subprotocol and close handshake, allowing Vite HMR through the same URL.
 
@@ -102,3 +108,8 @@ an isolated project, discovers them through daemon RPC and waits for a native
 click on Vite's Open button. It then verifies HMR, disappearance and a port-change
 restart while capturing the native UI. Screenshots/videos belong in PR user
 attachments, not the repository.
+
+The opt-in `coordinator` integration test connects two authenticated clients to a
+local Worker, advertises a service, pairs over SDP/ICE, then transfers a 4 MiB
+HTTP response through the remote hostname. Run it with
+`ZERON_PREVIEW_TEST_EDGE=http://127.0.0.1:27641 cargo test -p zeron-preview --test coordinator -- --ignored`.

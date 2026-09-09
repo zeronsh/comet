@@ -14,6 +14,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     WebSocketStream,
@@ -201,6 +202,45 @@ async fn streaming_headers_websocket_cancellation_and_restart() {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
+        let mut tunnel = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        tunnel
+            .write_all(
+                format!(
+                    "CONNECT {}:{port} HTTP/1.1\r\nHost: {}:{port}\r\n\r\n",
+                    service.hostname, service.hostname
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        while !reply.ends_with(b"\r\n\r\n") {
+            reply.push(tunnel.read_u8().await.unwrap());
+        }
+        assert!(reply.starts_with(b"HTTP/1.1 200"));
+        tunnel
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {}:{port}\r\nConnection: close\r\n\r\n",
+                    service.hostname
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut page = String::new();
+        tunnel.read_to_string(&mut page).await.unwrap();
+        assert!(page.contains(&format!("server:{backend_port}")));
+        drop(tunnel);
+        let rejected = client
+            .request(reqwest::Method::CONNECT, format!("http://127.0.0.1:{port}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 502);
+        drop(rejected);
         let response = client
             .get(format!("{url}/headers?q=yes"))
             .header("connection", "x-hop")
@@ -211,14 +251,11 @@ async fn streaming_headers_websocket_cancellation_and_restart() {
             .unwrap();
         assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
         let headers: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(headers["host"], format!("localhost:{backend_port}"));
+        assert_eq!(headers["host"], format!("{}:{port}", service.hostname));
         assert_eq!(headers["forwarded"], format!("{}:{port}", service.hostname));
         assert_eq!(headers["hop"], false);
         assert_eq!(headers["query"], "q=yes");
-        assert_eq!(
-            headers["origin"],
-            format!("http://localhost:{backend_port}")
-        );
+        assert_eq!(headers["origin"], url);
         let body = vec![5u8; 2 * 1024 * 1024 + 17];
         let received = client
             .post(format!("{url}/echo"))

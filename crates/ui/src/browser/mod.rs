@@ -244,6 +244,12 @@ impl BrowserSurface {
                         {
                             if this
                                 .update(cx, |this, cx| {
+                                    #[cfg(target_os = "macos")]
+                                    for service in &snapshot.services {
+                                        this.context
+                                            .data
+                                            .register_preview(&service.url(snapshot.proxy_port));
+                                    }
                                     this.previews = snapshot;
                                     this.previews_loading = false;
                                     cx.notify();

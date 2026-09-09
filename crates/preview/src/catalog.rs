@@ -266,12 +266,20 @@ impl Catalog {
             .chain(state.remote.values().flatten().cloned())
             .collect();
         services.sort_by(|a, b| {
-            (&a.device_id, &a.project_cwd, a.hostname.len(), &a.hostname).cmp(&(
-                &b.device_id,
-                &b.project_cwd,
-                b.hostname.len(),
-                &b.hostname,
-            ))
+            (
+                &a.device_id,
+                &a.project_cwd,
+                !matches!(a.name.as_str(), "Vite" | "Next.js" | "Astro"),
+                a.hostname.len(),
+                &a.hostname,
+            )
+                .cmp(&(
+                    &b.device_id,
+                    &b.project_cwd,
+                    !matches!(b.name.as_str(), "Vite" | "Next.js" | "Astro"),
+                    b.hostname.len(),
+                    &b.hostname,
+                ))
         });
         let next = PreviewSnapshot {
             services,

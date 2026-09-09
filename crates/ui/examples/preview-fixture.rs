@@ -182,6 +182,14 @@ fn main() -> anyhow::Result<()> {
                 let stable = snapshot.services.iter().find(|s|s.name=="Vite").unwrap().url(snapshot.proxy_port);
                 capture(&output,"preview-servers-dark")?;
                 std::fs::write(output.join("ready.txt"),&stable)?;
+                if std::env::var_os("ZERON_PREVIEW_AUTO_OPEN").is_some() {
+                    // CI sends a real GPUI pointer sequence through hit testing.
+                    window.update(cx,|_,w,cx| {
+                        let position = gpui::point(px(985.),px(207.));
+                        w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position,button:gpui::MouseButton::Left,click_count:1,..Default::default() }),cx);
+                        w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position,button:gpui::MouseButton::Left,click_count:1,..Default::default() }),cx);
+                    })?;
+                }
                 // A native mouse click on Open drives navigation; the runner can
                 // inspect the initial screenshot before choosing its coordinates.
                 for _ in 0..1200 { if browser.read_with(cx,|b,_|b.page.title=="Fieldnotes" && !b.page.loading) { break; } pause(cx,100).await; }

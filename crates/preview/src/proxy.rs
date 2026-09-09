@@ -18,6 +18,10 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
+fn tunnel_slot() -> anyhow::Result<tokio::sync::SemaphorePermit<'static>> {
+    static TUNNELS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
+    Ok(TUNNELS.try_acquire()?)
+}
 #[derive(Clone)]
 pub struct Router {
     pub catalog: Catalog,
@@ -32,9 +36,51 @@ impl Router {
             self.peers.open(device, service, websocket).await
         }
     }
-    async fn request(&self, mut request: Request<Incoming>) -> anyhow::Result<Response<Body>> {
+    /// WebKit on older macOS releases delegates `.localhost` DNS to the OS.
+    /// Its per-domain CONNECT proxy reaches this same loopback HTTP listener
+    /// without a hosts-file entry. Targets are catalog names at our port only.
+    async fn connect_loopback(
+        &self,
+        mut request: Request<Incoming>,
+    ) -> anyhow::Result<Response<Body>> {
+        let authority = request
+            .uri()
+            .authority()
+            .ok_or_else(|| anyhow::anyhow!("invalid preview CONNECT"))?;
+        let port = self.catalog.snapshot().proxy_port;
         anyhow::ensure!(
-            request.method() != hyper::Method::CONNECT && request.uri().scheme().is_none(),
+            authority.port_u16() == Some(port)
+                && self
+                    .catalog
+                    .by_hostname(&authority.host().to_ascii_lowercase())
+                    .is_some(),
+            "unknown preview CONNECT target"
+        );
+        let permit = tunnel_slot()?;
+        let lifecycle = self.local.clone();
+        let mut socket =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        let upgrade = hyper::upgrade::on(&mut request);
+        tokio::spawn(async move {
+            let _permit = permit;
+            tokio::select! { _ = lifecycle.closed() => {}, _ = async {
+                if let Ok(browser) = upgrade.await {
+                    let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(browser), &mut socket).await;
+                }
+            } => {} }
+        });
+        Ok(Response::new(
+            Full::new(Bytes::new())
+                .map_err(|never: Infallible| match never {})
+                .boxed_unsync(),
+        ))
+    }
+    async fn request(&self, mut request: Request<Incoming>) -> anyhow::Result<Response<Body>> {
+        if request.method() == hyper::Method::CONNECT {
+            return self.connect_loopback(request).await;
+        }
+        anyhow::ensure!(
+            request.uri().scheme().is_none(),
             "only origin-form HTTP requests are supported"
         );
         let host = request
@@ -58,23 +104,17 @@ impl Router {
             .get(header::UPGRADE)
             .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
             && connection_has(request.headers(), "upgrade");
+        let tunnel_permit = upgrade.then(tunnel_slot).transpose()?;
         let browser_upgrade = upgrade.then(|| hyper::upgrade::on(&mut request));
         let upstream_host = format!("localhost:{}", service.port);
         let preview_origin = format!("http://{host}");
-        if request
-            .headers()
-            .get(header::ORIGIN)
-            .is_some_and(|v| v.as_bytes() == preview_origin.as_bytes())
-        {
-            request.headers_mut().insert(
-                header::ORIGIN,
-                HeaderValue::from_str(&format!("http://{upstream_host}"))?,
-            );
-        }
+        // Preserve the browser's origin and authority together. In particular,
+        // Next.js Server Actions compare Origin with X-Forwarded-Host; rewriting
+        // only Origin to the ephemeral backend would reject valid submissions.
         strip_hop_headers(request.headers_mut(), upgrade);
         request
             .headers_mut()
-            .insert(header::HOST, HeaderValue::from_str(&upstream_host)?);
+            .insert(header::HOST, HeaderValue::from_str(&host)?);
         request
             .headers_mut()
             .insert("x-forwarded-host", HeaderValue::from_str(&host)?);
@@ -97,15 +137,15 @@ impl Router {
             anyhow::ensure!(upgrade, "unsolicited server upgrade");
             let server_upgrade = hyper::upgrade::on(&mut response);
             let browser_upgrade = browser_upgrade.unwrap();
+            let lifecycle = self.local.clone();
             tokio::spawn(async move {
                 let _guard = guard;
-                if let Ok((browser, server)) = tokio::try_join!(browser_upgrade, server_upgrade) {
-                    let _ = tokio::io::copy_bidirectional(
-                        &mut TokioIo::new(browser),
-                        &mut TokioIo::new(server),
-                    )
-                    .await;
-                }
+                let _permit = tunnel_permit;
+                tokio::select! { _ = lifecycle.closed() => {}, _ = async {
+                    if let Ok((browser, server)) = tokio::try_join!(browser_upgrade, server_upgrade) {
+                        let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(browser), &mut TokioIo::new(server)).await;
+                    }
+                } => {} }
             });
         } else {
             // The response body's guard aborts the connection on cancellation;
