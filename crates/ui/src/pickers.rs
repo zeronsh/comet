@@ -1928,7 +1928,7 @@ impl Pickers {
     }
 
     /// The project popover: search + one row per project on the picked device
-    /// (check on the current pick), then the opt-out and "New project…" rows. Rows
+    /// (check on the current pick), then "New project…" and the opt-out rows. Rows
     /// are device-scoped, so no per-row `@ device` tag — the device chip next
     /// door names the host.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1989,7 +1989,19 @@ impl Pickers {
         )
         .id("project-none")
         .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
-        .child("Don't work in a project");
+        .child(
+            crate::icons::icon(crate::icons::CLOSE)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.7)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child("Don't work in a project"),
+        );
         // Action row under a hairline: mint a project.
         let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
             .id("project-new")
@@ -2028,8 +2040,8 @@ impl Pickers {
                     .flex_none()
                     .bg(theme.border.opacity(0.6)),
             )
-            .child(no_project)
             .child(new_project)
+            .child(no_project)
             .into_any_element()
     }
 
