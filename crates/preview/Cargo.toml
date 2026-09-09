@@ -29,3 +29,4 @@ webrtc = "0.20.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true

@@ -11690,6 +11690,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webrtc",
  "zeron-proto",

@@ -90,6 +90,7 @@ impl Peers {
         tokio::select! { _ = self.0.stop.cancelled() => anyhow::bail!("preview networking stopped"), result = self.0.output.send(OutgoingSignal { to: to.into(), signal }) => { result?; Ok(()) } }
     }
     async fn create(&self, session: String, initiator: bool) -> anyhow::Result<Arc<Peer>> {
+        tracing::debug!(initiator, "creating preview peer");
         let (ready, receiver) = watch::channel(None);
         let (gathered, gathering) = watch::channel(false);
         let stop = self.0.stop.child_token();
@@ -120,6 +121,7 @@ impl Peers {
             let channel = pc.create_data_channel("zeron-preview-v1", None).await?;
             handler.attach(channel);
         }
+        tracing::debug!(initiator, "created preview peer");
         Ok(Arc::new(Peer {
             session,
             pc,
@@ -129,12 +131,14 @@ impl Peers {
         }))
     }
     async fn description(&self, peer: &Peer, offer: bool) -> anyhow::Result<RTCSessionDescription> {
+        tracing::debug!(offer, "creating preview description");
         let description = if offer {
             peer.pc.create_offer(None).await?
         } else {
             peer.pc.create_answer(None).await?
         };
         peer.pc.set_local_description(description).await?;
+        tracing::debug!(offer, "gathering preview candidates");
         // Include candidates gathered so far. A STUN probe on an unreachable
         // interface/server may never report Complete; that must not discard
         // usable host or server-reflexive candidates from the other probes.
@@ -152,6 +156,7 @@ impl Peers {
             .local_description()
             .await
             .context("missing local preview SDP")?;
+        tracing::debug!(offer, "sending preview description");
         anyhow::ensure!(
             description.sdp.contains("a=candidate:"),
             "No local preview connection candidates are available"

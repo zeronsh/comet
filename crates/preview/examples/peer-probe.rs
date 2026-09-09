@@ -26,6 +26,10 @@ impl Connector for Backend {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter("zeron_preview=debug,webrtc=warn")
+        .with_writer(std::io::stderr)
+        .init();
     let args: Vec<_> = std::env::args().skip(1).collect();
     let host = args.first().is_some_and(|s| s == "host");
     anyhow::ensure!(
@@ -57,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Some(line) = lines.next_line().await? {
             let signal: Signal = serde_json::from_str(&line)?;
+            eprintln!("INPUT signal {}", signal.kind);
             incoming_peers
                 .signal(if host { "b" } else { "a" }, signal)
                 .await?;
