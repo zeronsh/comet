@@ -174,8 +174,14 @@ final class TranscriptLayoutTests: XCTestCase {
             attachment.lifetime = .keepAlways
             add(attachment)
             XCTAssertEqual(gaps.count, 30)
-            XCTAssertGreaterThan(Set(heights.map { Int($0.rounded()) }).count, 5)
-            XCTAssertGreaterThan(abs(heights.last! - start), 100)
+            // Task.sleep is a minimum delay, not a display-frame clock. A
+            // loaded simulator can sample a 200ms transition fewer than six
+            // times. Require actual interpolation rather than a frame count.
+            let end = heights.last!
+            XCTAssertTrue(heights.contains {
+                $0 > min(start, end) + 1 && $0 < max(start, end) - 1
+            }, "Disclosure must render an intermediate height, not snap between endpoints")
+            XCTAssertGreaterThan(abs(end - start), 100)
             XCTAssertLessThan((gaps.max() ?? .infinity) - (gaps.min() ?? 0), 4)
             assertTailVisible()
         }
@@ -194,11 +200,13 @@ final class TranscriptLayoutTests: XCTestCase {
         let path = IndexPath(row: index, section: 0)
         let closedHeight = table.rectForRow(at: path).height
         var heights = [closedHeight]
+        var sampleTimes = [CACurrentMediaTime()]
         for open in [true, false, true, false, true, false] {
             withAnimation(Motion.resize) { harness.folds.values[id] = open }
             for tick in 0..<5 {
                 try? await Task.sleep(for: .milliseconds(16))
                 heights.append(table.rectForRow(at: path).height)
+                sampleTimes.append(CACurrentMediaTime())
                 assertTailVisible() // Inspect the rendered frame before applying the next network update.
                 if tick == 2 {
                     var entries = harness.store.entries
@@ -211,7 +219,18 @@ final class TranscriptLayoutTests: XCTestCase {
         await settle()
         XCTAssertEqual(table.rectForRow(at: path).height, closedHeight, accuracy: 1)
         XCTAssertGreaterThan(Set(heights.map { Int($0.rounded()) }).count, 10)
-        XCTAssertLessThan(zip(heights, heights.dropFirst()).map { abs($1 - $0) }.max() ?? .infinity, 100)
+        // A late wake-up can span several rendered frames. Compare movement
+        // per nominal 60Hz frame, not the entire unsampled interval, while
+        // retaining the original 100pt bound for on-time samples.
+        let frameSteps = (1..<heights.count).map { index in
+            let elapsed = max(sampleTimes[index] - sampleTimes[index - 1], 1.0 / 60)
+            return abs(heights[index] - heights[index - 1]) / CGFloat(elapsed * 60)
+        }
+        let attachment = XCTAttachment(string: "heights=\(heights)\nsampleTimes=\(sampleTimes)\nframeSteps=\(frameSteps)")
+        attachment.name = "tool-reversal-motion"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        XCTAssertLessThan(frameSteps.max() ?? .infinity, 100)
         assertTailVisible()
     }
 
