@@ -3033,6 +3033,7 @@ mod tests {
 
     fn device(id: &str, name: &str) -> Device {
         Device {
+            vault_device_id: None,
             id: id.into(),
             name: name.into(),
             platform: "macos".into(),
@@ -3892,6 +3893,7 @@ mod tests {
             "unknown device conservatively fails the gate"
         );
         s.devices = vec![Device {
+            vault_device_id: None,
             id: "d1".into(),
             name: "laptop".into(),
             platform: "macos".into(),
@@ -3949,6 +3951,7 @@ mod tests {
         local.device_id = "local".into();
         s.chats = vec![remote, local];
         s.devices = vec![Device {
+            vault_device_id: None,
             id: "remote".into(),
             name: "vps".into(),
             platform: "linux".into(),

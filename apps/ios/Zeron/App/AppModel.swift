@@ -23,6 +23,15 @@ final class AppModel {
     /// Graced connectivity truth — one stream every consumer inherits calm
     /// from (home pill, composer notice, Queued/Failed badges).
     let connectivity = ConnectivityCenter()
+    /// Encrypted-sync vault state for the active profile (RFC 0001 §4.3).
+    /// Stores are built only after the vault decides whether this profile
+    /// syncs in the clear (no vault anywhere), encrypted (approved), or not
+    /// at all (a vault exists but this device is not yet approved).
+    private(set) var vaultStatus: MobileVaultStatus?
+    private(set) var vaultBusy = false
+    /// Keep the reapproval flow visible through pending/key-delivery states.
+    private(set) var requiresVaultApproval = false
+    @ObservationIgnored private var vaultTask: Task<Void, Never>?
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
@@ -230,11 +239,16 @@ final class AppModel {
     }
 
     func signOut() {
+        vaultTask?.cancel()
+        vaultTask = nil
+        config?.invalidate()
         workspace?.stop()
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
         config = nil
+        vaultStatus = nil
+        requiresVaultApproval = false
         demo = nil
         Keychain.delete(key: "accessToken")
         Keychain.delete(key: "refreshToken")
@@ -254,11 +268,89 @@ final class AppModel {
                                deviceId: deviceId, deviceName: deviceName,
                                tokens: tokens, devBearer: devBearer)
         self.config = config
-        let store = WorkspaceStore(config: config)
-        workspace = store
-        store.start()
+        vaultStatus = nil
         startConnectivity()
         phase = .ready
+        // The vault decides the transport mode BEFORE any store dials: a
+        // profile with a vault never joins a plaintext room from this app.
+        refreshVault()
+    }
+
+    // MARK: Encrypted sync (vault)
+
+    /// Map the vault phase to what the stores may do. Anything that is not an
+    /// explicit "no vault" answer or an approved, key-holding membership
+    /// blocks sync entirely — never plaintext by default.
+    private static func syncAccess(for phase: MobileVaultPhase) -> AppConfig.SyncAccess {
+        switch phase {
+        case .legacy: return .legacy
+        case .ready: return .encrypted
+        default: return .blocked
+        }
+    }
+
+    /// Re-run the vault reconcile and (re)build the stores when the sync
+    /// mode changes. Safe to call repeatedly (foreground, pairing polls).
+    func refreshVault() {
+        guard let config, demo == nil, vaultTask == nil else { return }
+        vaultBusy = true
+        vaultTask = Task { [weak self] in
+            let status = await config.vault.refresh(client: config.vaultClient)
+            await MainActor.run { [weak self] in
+                self?.vaultTask = nil
+                self?.vaultBusy = false
+                self?.applyVault(status, config: config)
+            }
+        }
+    }
+
+    private func applyVault(_ status: MobileVaultStatus, config: AppConfig) {
+        guard self.config === config else { return }
+        vaultStatus = status
+        if status.phase == .revoked || status.phase == .pending || status.phase == .notEnrolled { requiresVaultApproval = true }
+        if status.phase == .ready || status.phase == .legacy { requiresVaultApproval = false }
+        let access = Self.syncAccess(for: status.phase)
+        let previous = config.syncAccess
+        config.setSyncAccess(access)
+        if access == .blocked || access != previous || workspace == nil {
+            // Mode changed (or first decision): every store was built for the
+            // old mode's rooms and codec. Rebuild from disk under the new one.
+            workspace?.stop()
+            workspace = nil
+            sessionStores.values.forEach { $0.stop() }
+            sessionStores.removeAll()
+            if access != .blocked {
+                let store = WorkspaceStore(config: config)
+                workspace = store
+                store.start()
+            }
+        }
+        if status.phase == .ready, let id = status.deviceId {
+            workspace?.publishDeviceIdentity(vaultId: id)
+        }
+    }
+
+    /// Ask an approved device to admit this phone. `fingerprint` is the vault
+    /// fingerprint shown on that device (Settings → Encryption / `zeron vault
+    /// status`); it pins the genesis so a relay cannot substitute a vault.
+    func enrollVault(fingerprintHex: String) async throws {
+        guard let config else { throw MobileVaultError.unavailable }
+        guard let fingerprint = Data(vaultHex: fingerprintHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), count: 32) else {
+            throw MobileVaultError.verification
+        }
+        try await config.vault.enroll(fingerprint: fingerprint, client: config.vaultClient)
+        refreshVault()
+    }
+
+    /// Rejoin with the recovery kit and the vault fingerprint from the
+    /// recovery file.
+    func recoverVault(kit: String, fingerprintHex: String) async throws {
+        guard let config else { throw MobileVaultError.unavailable }
+        guard let fingerprint = Data(vaultHex: fingerprintHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), count: 32) else {
+            throw MobileVaultError.verification
+        }
+        try await config.vault.recover(kit: kit, fingerprint: fingerprint, client: config.vaultClient)
+        refreshVault()
     }
 
     /// Wire the graced-connectivity recompute over the live stores (the
@@ -540,6 +632,8 @@ final class AppModel {
     func foregrounded() {
         kickAllRooms()
         probeEdgeHealth()
+        // Previously approved devices can be revoked while suspended, too.
+        refreshVault()
     }
 
     private func probeEdgeHealth() {

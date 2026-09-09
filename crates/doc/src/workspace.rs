@@ -103,6 +103,7 @@ impl WorkspaceDoc {
         row.insert("id", device.id.as_str())?;
         row.insert("name", device.name.as_str())?;
         row.insert("platform", device.platform.as_str())?;
+        set_opt_str(&row, "vaultDeviceId", device.vault_device_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
@@ -591,6 +592,8 @@ fn dt(ms: i64) -> DateTime<Utc> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawDevice {
     id: String,
+    #[serde(default)]
+    vault_device_id: Option<String>,
     name: String,
     platform: String,
     #[serde(default)]
@@ -606,6 +609,7 @@ pub(crate) struct RawDevice {
 impl From<RawDevice> for Device {
     fn from(raw: RawDevice) -> Self {
         Device {
+            vault_device_id: raw.vault_device_id,
             id: raw.id,
             name: raw.name,
             platform: raw.platform,
@@ -770,6 +774,7 @@ mod tests {
 
     fn device(id: &str, name: &str) -> Device {
         Device {
+            vault_device_id: None,
             id: id.into(),
             name: name.into(),
             platform: "linux".into(),

@@ -30,6 +30,7 @@ fn upsert(set: &[(&str, Value)], at: i64) -> RowOp {
         ),
         hlc: hlc(at),
         clocks: None,
+        proof: None,
     }
 }
 
@@ -45,6 +46,7 @@ fn update(set: &[(&str, Value)], hlc: String) -> RowOp {
         ),
         hlc,
         clocks: None,
+        proof: None,
     }
 }
 
@@ -56,6 +58,7 @@ fn delete(at: i64) -> RowOp {
         set: None,
         hlc: hlc(at),
         clocks: None,
+        proof: None,
     }
 }
 
@@ -239,6 +242,7 @@ fn wire_shapes_match_the_edge() {
 
 fn device(id: &str, name: &str) -> Device {
     Device {
+        vault_device_id: None,
         id: id.into(),
         name: name.into(),
         platform: "linux".into(),
@@ -412,6 +416,7 @@ fn broadcast_seq_gap_applies_rows_but_holds_the_cursor() {
         .into_iter()
         .collect(),
         clocks: Default::default(),
+        del_proof: None,
     };
     // Contiguous broadcast advances.
     assert!(ws.apply_rows(11, vec![row("chat-a", 11)]));
@@ -490,6 +495,7 @@ fn future_harness_chat_rows_stay_visible_without_their_config() {
             del_hlc: None,
             fields,
             clocks: Default::default(),
+            del_proof: None,
         }],
     );
 
@@ -769,6 +775,7 @@ fn state_frames_delta_replace_and_reseed() {
             ),
             hlc: hlc_by(50, "dev-b"),
             clocks: None,
+            proof: None,
         },
     );
     let outcome = doc.apply_state(seq + 1, false, 0, vec![remote.clone()]);
@@ -879,5 +886,54 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
     assert_eq!(
         doc.chat("chat-1").unwrap().unwrap().title.as_deref(),
         Some("live rename")
+    );
+}
+
+#[test]
+fn encryption_transition_resets_cursor_once_and_preserves_named_devices() {
+    let mut doc = RegistryDoc::new("laptop");
+    let mut laptop = device("laptop", "Work laptop");
+    laptop.vault_device_id = Some("aabbcc".into());
+    doc.upsert_device(&laptop).unwrap();
+    doc.apply_state(42, false, 10, vec![]);
+    assert!(doc.enter_encrypted_room());
+    assert_eq!(doc.cursor(), 0);
+    assert_eq!(doc.read_devices().unwrap(), vec![laptop]);
+    doc.apply_state(7, false, 0, vec![]);
+    let mut restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "laptop").unwrap();
+    assert!(!restored.enter_encrypted_room());
+    assert_eq!(restored.cursor(), 7);
+    assert_eq!(
+        restored.read_devices().unwrap()[0]
+            .vault_device_id
+            .as_deref(),
+        Some("aabbcc")
+    );
+}
+
+#[test]
+fn vault_device_names_survive_reapproval_and_rename() {
+    let mut doc = RegistryDoc::new("laptop");
+    let mut phone = device("phone", "iPhone");
+    phone.vault_device_id = Some("old-identity".into());
+    doc.upsert_device(&phone).unwrap();
+    phone.vault_device_id = Some("new-identity".into());
+    doc.upsert_device(&phone).unwrap();
+    assert_eq!(doc.vault_device_names()["old-identity"], "iPhone");
+    doc.rename_vault_device("new-identity", "Personal iPhone")
+        .unwrap();
+    assert_eq!(doc.read_devices().unwrap()[0].name, "Personal iPhone");
+    assert_eq!(doc.vault_device_names()["new-identity"], "Personal iPhone");
+    doc.rename_vault_device("unmapped-removed-identity", "Old phone")
+        .unwrap();
+    assert!(doc.rename_vault_device("new-identity", "  ").is_err());
+    let restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "laptop").unwrap();
+    assert_eq!(
+        restored.vault_device_names()["unmapped-removed-identity"],
+        "Old phone"
+    );
+    assert_eq!(
+        restored.vault_device_names()["new-identity"],
+        "Personal iPhone"
     );
 }

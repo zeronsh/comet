@@ -155,6 +155,10 @@ struct RegistryRow: Hashable, Codable, Sendable {
     var fields: [String: JSONValue]
     /// Per-field last-write clocks.
     var clocks: [String: Hlc]
+    /// Lifecycle proof for the tombstone (RFC 0001 §9): the sealed record a
+    /// member authored for exactly this row and `delHlc`. Encrypted readers
+    /// accept a tombstone only with a verified proof; cleared on revival.
+    var delProof: JSONValue? = nil
 }
 
 enum RegistryOpType: String, Codable, Sendable {
@@ -178,6 +182,9 @@ struct RegistryOp: Hashable, Codable, Sendable {
     /// Per-field clock overrides — re-seed pushes carry a row's ORIGINAL
     /// clocks so recovery never coarsens causality.
     var clocks: [String: Hlc]?
+    /// Lifecycle proof for a `delete` op (becomes the tombstone's
+    /// `delProof`). Only meaningful on deletes; required in encrypted rooms.
+    var proof: JSONValue? = nil
 }
 
 // MARK: - Validation (structural, mirrors validateOp in registry-core.ts)
@@ -202,6 +209,9 @@ func validateOp(_ op: RegistryOp) -> String? {
     if !matches(kindRe, op.kind) { return "bad kind" }
     if !matches(idRe, op.id) { return "bad id" }
     if !matches(hlcRe, op.hlc) { return "bad hlc" }
+    if let proof = op.proof, op.op != .delete || proof.objectValue == nil {
+        return "bad proof"
+    }
     if op.op == .delete {
         if op.set != nil { return "delete carries set" }
     } else {
@@ -247,13 +257,15 @@ func applyOp(_ row: RegistryRow?, _ op: RegistryOp) -> RegistryApplyResult {
             // Tombstone-on-missing guards against a late create racing the delete.
             return RegistryApplyResult(
                 row: RegistryRow(kind: op.kind, id: op.id, seq: 0, deleted: true,
-                                 delHlc: op.hlc, fields: [:], clocks: [:]),
+                                 delHlc: op.hlc, fields: [:], clocks: [:], delProof: op.proof),
                 changed: true)
         }
         let beats = gone.deleted ? hlcNewer(op.hlc, gone.delHlc) : hlcNewer(op.hlc, maxClock(gone))
         guard beats else { return RegistryApplyResult(row: row, changed: false) }
         gone.deleted = true
         gone.delHlc = op.hlc
+        // The proof travels with the tombstone it authorizes.
+        gone.delProof = op.proof
         gone.fields = [:]
         gone.clocks = [:]
         return RegistryApplyResult(row: gone, changed: true)
@@ -309,7 +321,7 @@ func rowToSeedOp(_ row: RegistryRow) -> RegistryOp {
     if row.deleted {
         return RegistryOp(kind: row.kind, id: row.id, op: .delete, set: nil,
                           hlc: row.delHlc ?? encodeHlc(ms: 0, counter: 0, device: "seed"),
-                          clocks: nil)
+                          clocks: nil, proof: row.delProof)
     }
     return RegistryOp(kind: row.kind, id: row.id, op: .upsert, set: row.fields,
                       hlc: maxClock(row) ?? encodeHlc(ms: 0, counter: 0, device: "seed"),

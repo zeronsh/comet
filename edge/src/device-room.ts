@@ -16,7 +16,8 @@
  */
 import { BytesReader, BytesWriter } from "loro-protocol";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
-import { AUTH_USER_HEADER, type Env } from "./env";
+import { AUTH_ORG_HEADER, AUTH_USER_HEADER, type Env } from "./env";
+import { profileRequiresEncryption } from "./vault-gate";
 
 export interface DeviceFrameHeader {
   /** Stream id, unique per (connId, logical stream). */
@@ -47,6 +48,7 @@ export const decodeDeviceFrame = (
 
 interface SocketState {
   userId: string;
+  orgId?: string;
   role: "host" | "client";
   connId: string;
   /** Accept time — the liveness floor until the socket's first auto-pong. */
@@ -74,6 +76,14 @@ const clientTag = (connId: string) => `client:${connId}`;
  * — 2.5 of their intervals — so upgrading engines is never a prerequisite. */
 const HOST_LIVENESS_MS = 75_000;
 
+/** The authenticated device channel (RFC 0001 §10, crates/rpc/src/device_channel.rs):
+ * Noise handshake and sealed RPC frames. For a profile that requires
+ * encryption these are the only application frames the relay carries — the
+ * relay sees ciphertext and routing, nothing else. */
+export const CHANNEL_KIND = "chan";
+/** App-level liveness echo (empty payload, bounced by the host). */
+const ECHO_KIND = "echo";
+
 /** Control frames the relay itself emits (kind " relay"). */
 // MUST byte-match packages/rpc device-frames.ts RELAY_KIND — clients compare
 // with ===; a mismatch makes host_offline/host_closed invisible to them.
@@ -90,10 +100,11 @@ const CHAT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly blobs: BlobStore;
+  private readonly env: Env;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
-    void env;
+    this.env = env;
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -173,7 +184,7 @@ export class DeviceRoom implements DurableObject {
       } else {
         this.ctx.acceptWebSocket(pair[1], [clientTag(connId)]);
       }
-      const state: SocketState = { userId, role, connId, joinedAt: Date.now() };
+      const state: SocketState = { userId, role, connId, joinedAt: Date.now(), orgId: request.headers.get(AUTH_ORG_HEADER) ?? undefined };
       pair[1].serializeAttachment(state);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
@@ -188,6 +199,9 @@ export class DeviceRoom implements DurableObject {
         return value === undefined ? json({ error: "not_found" }, 404) : json(value);
       }
       if (request.method === "POST") {
+        if (await profileRequiresEncryption(this.env, request.headers.get(AUTH_ORG_HEADER) ?? undefined, userId)) {
+          return json({ error: "encrypted_channel_required" }, 409);
+        }
         putJsonBlob(this.blobs, `sidecar:${name}`, await request.json());
         return json({ ok: true });
       }
@@ -250,7 +264,7 @@ export class DeviceRoom implements DurableObject {
     this.ctx.storage.sql.exec("DELETE FROM pending_nudges");
   }
 
-  webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): void {
+  async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     if (typeof message === "string") return; // ping/pong auto-response
     const state = ws.deserializeAttachment() as SocketState;
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
@@ -258,6 +272,14 @@ export class DeviceRoom implements DurableObject {
       frame = decodeDeviceFrame(new Uint8Array(message));
     } catch {
       ws.close(1002, "Frame error");
+      return;
+    }
+    // Encrypted profile: only channel frames (handshake + ciphertext) and
+    // payload-less liveness echoes cross the relay. A plaintext RPC frame is
+    // a protocol violation — the socket closes; nothing is forwarded.
+    const opaque = frame.header.k === CHANNEL_KIND || (frame.header.k === ECHO_KIND && frame.payload.length === 0);
+    if (!opaque && (await profileRequiresEncryption(this.env, state.orgId, state.userId))) {
+      ws.close(4403, "encrypted device channel required");
       return;
     }
     if (state.role === "client") {

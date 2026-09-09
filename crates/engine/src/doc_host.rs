@@ -41,6 +41,9 @@ use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
+mod migration;
+pub use migration::{EncryptionPreparation, MigrationStatus};
+
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
@@ -213,6 +216,10 @@ pub struct DocHostConfig {
 }
 
 struct DocHostInner {
+    migration_running: AtomicBool,
+    migration_lock: tokio::sync::Mutex<()>,
+    encryption_preparing: Arc<AtomicBool>,
+    migration_status: Mutex<MigrationStatus>,
     store: Arc<DocsStore>,
     config: DocHostConfig,
     /// Set-once (first wins), cleared by `shutdown_workers`: sessions and
@@ -264,6 +271,9 @@ struct DocHostInner {
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
+    /// Encrypted-sync vault (engine assembly, account-scoped runtimes): the
+    /// gate every chat2 content path consults before serializing.
+    vault: OnceLock<crate::vault::VaultService>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -310,6 +320,10 @@ impl Drop for TransferProgressGuard<'_> {
         self.host.transfer_progress_clear(self.upload_id);
     }
 }
+
+/// Sealed sidecar plaintext budget (tail JSON / blob bodies): under the
+/// edge's 4 MiB sidecar cap once the record overhead is added.
+const MAX_SIDECAR_PLAINTEXT: usize = 4 * 1024 * 1024 - 1024;
 
 /// How long raw degradation must persist before connectivity reports it.
 /// Room joins, idle-link wakes, and navigation dials resolve well under a
@@ -533,6 +547,16 @@ pub struct ChatDocHandle {
     chat2_pending_local: Mutex<Vec<Vec<u8>>>,
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
+    /// This handle was built for the ENCRYPTED room (RFC 0001 §8): local
+    /// updates go through the sealer/outbox, remote bytes through the codec,
+    /// and the plaintext room is never touched. Fixed at open; a change in
+    /// vault enrollment retires the handle (see `open`).
+    encrypted: bool,
+    /// The encrypted room's sink — created at open so the sealer can commit
+    /// batches before (and without) a live client.
+    chat2_sink: Mutex<Option<Arc<crate::chat2_host::EngineChatSink>>>,
+    /// Wakes the sealer when `chat2_pending_local` has plaintext to seal.
+    seal_wake: Arc<tokio::sync::Notify>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -700,6 +724,10 @@ impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
         Self {
             inner: Arc::new(DocHostInner {
+                migration_running: AtomicBool::new(false),
+                migration_lock: tokio::sync::Mutex::new(()),
+                encryption_preparing: Arc::new(AtomicBool::new(false)),
+                migration_status: Mutex::new(MigrationStatus::default()),
                 store,
                 config,
                 sessions: Mutex::new(None),
@@ -718,6 +746,7 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
+                vault: OnceLock::new(),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
@@ -859,6 +888,21 @@ impl DocHost {
         let _ = self.inner.links.set(links);
     }
 
+    /// Wire the encrypted-sync vault (engine assembly). Until set, chat2
+    /// transports run in the legacy plaintext mode.
+    pub fn set_vault(&self, vault: crate::vault::VaultService) {
+        let _ = self.inner.vault.set(vault);
+    }
+
+    fn plaintext_transport_allowed(&self) -> bool {
+        !self.inner.encryption_preparing.load(Ordering::Acquire)
+            && !self.vault().is_some_and(|v| v.is_enrolled())
+    }
+
+    pub fn vault(&self) -> Option<&crate::vault::VaultService> {
+        self.inner.vault.get()
+    }
+
     /// Re-evaluate every open chat's command queue NOW. Called after an
     /// upload commit lands bytes on this device: a Run deferred on those
     /// bytes (`pending://` refs not yet on disk) becomes executable the
@@ -868,7 +912,10 @@ impl DocHost {
             lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             let host = self.clone();
-            self.spawn_worker(async move { host.drain_commands(&handle).await });
+            self.spawn_worker(async move {
+                host.drain_commands(&handle).await;
+                host.drain_queue(&handle).await;
+            });
         }
     }
 
@@ -878,6 +925,7 @@ impl DocHost {
         if self.inner.workspace.set(workspace).is_ok() {
             self.spawn_cutover_watcher(chats);
             self.spawn_migration_sweep();
+            self.spawn_encrypted_history_migration();
         }
     }
 
@@ -898,6 +946,7 @@ impl DocHost {
             let mut attempted: HashMap<String, i64> = HashMap::new();
             loop {
                 tokio::time::sleep(TICK).await;
+                if !host.plaintext_transport_allowed() { continue; }
                 let Some(edge) = host.inner.config.edge.clone() else {
                     return; // edge-less engine: nothing to migrate onto
                 };
@@ -1061,10 +1110,21 @@ impl DocHost {
             Some(row) => row.room_gen.unwrap_or(1),
             None => 2,
         };
+        // Encrypted profile (RFC 0001 §8, §12): once this profile is enrolled
+        // in a vault, EVERY chat routes through its encrypted room — locked,
+        // pending-key, and revoked states pause rather than fall back.
+        let vault = self
+            .inner
+            .vault
+            .get()
+            .filter(|vault| vault.is_enrolled())
+            .cloned();
+        let encrypted = vault.is_some() && self.inner.config.edge.is_some();
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
-                let stale = registry_gen >= 2 && handle.room_gen < 2;
+                let stale =
+                    (registry_gen >= 2 && handle.room_gen < 2) || handle.encrypted != encrypted;
                 if (stale || handle.retired.load(Ordering::Relaxed)) && !self.pinned(handle) {
                     // A seed flipped this chat under a cached fat handle
                     // (review B1): drop it so this open converges onto the
@@ -1089,7 +1149,29 @@ impl DocHost {
         // duplicate every message. Local epoch >= 2 forces the chat2 branch
         // and best-effort completes the flip.
         let stored = self.inner.store.load_snapshot_with_cursor(chat_id)?;
+        let legacy_snapshot = stored
+            .as_ref()
+            .is_some_and(|(_, _, epoch)| *epoch < crate::chat2_host::CHAT2_ENCRYPTED_DOC_EPOCH);
         let stored_epoch = stored.as_ref().map(|(_, _, e)| *e).unwrap_or(0);
+        if encrypted && legacy_snapshot {
+            // Opening a chat may stamp subsequent local saves as encrypted.
+            // Retain its source and original room generation before that happens.
+            let source_key = format!("__encrypted_history_migration_v1:source:{chat_id}");
+            if !self.inner.store.has_snapshot(&source_key)? {
+                self.inner
+                    .store
+                    .save_snapshot(&source_key, &stored.as_ref().unwrap().0)?;
+                let source_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
+                    2
+                } else {
+                    registry_gen
+                };
+                self.inner.store.save_snapshot(
+                    &format!("{source_key}:generation"),
+                    &source_gen.to_le_bytes(),
+                )?;
+            }
+        }
         let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
             if registry_gen < 2
                 && let Some(ws) = self.workspace()
@@ -1105,7 +1187,39 @@ impl DocHost {
         let mut snapshot_len = 0usize;
         let mut chat2_cursor = 0u64;
         let mut requeue_commands: Vec<SessionCommandEntry> = Vec::new();
-        let doc = if room_gen >= 2 {
+        let room_gen = if encrypted { room_gen.max(2) } else { room_gen };
+        let doc = if encrypted {
+            // The encrypted room is a fresh storage generation: the local
+            // doc (whatever lineage it has) is kept — it is this device's
+            // copy and seeds the room through the host's checkpoint — but
+            // only a cursor stamped for THIS room carries over.
+            match stored {
+                Some((bytes, cursor, epoch)) => {
+                    snapshot_len = bytes.len();
+                    chat2_cursor = if epoch >= crate::chat2_host::CHAT2_ENCRYPTED_DOC_EPOCH {
+                        cursor
+                    } else {
+                        0
+                    };
+                    let raw = loro::LoroDoc::new();
+                    raw.import(&bytes)
+                        .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
+                    SessionDoc::from_doc(raw)
+                }
+                None => {
+                    let doc = SessionDoc::init(chat_id)?;
+                    if let Ok(snapshot) = doc.export_snapshot() {
+                        let _ = self.inner.store.save_snapshot_with_cursor(
+                            chat_id,
+                            &snapshot,
+                            0,
+                            crate::chat2_host::CHAT2_ENCRYPTED_DOC_EPOCH,
+                        );
+                    }
+                    doc
+                }
+            }
+        } else if room_gen >= 2 {
             match stored {
                 Some((bytes, cursor, epoch)) if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH => {
                     snapshot_len = bytes.len();
@@ -1230,6 +1344,17 @@ impl DocHost {
             chat2: Mutex::new(None),
             chat2_pending_local: Mutex::new(Vec::new()),
             chat2_local_sub: Mutex::new(None),
+            encrypted,
+            chat2_sink: Mutex::new(vault.as_ref().map(|vault| {
+                Arc::new(crate::chat2_host::EngineChatSink::encrypted(
+                    &doc,
+                    self.inner.store.clone(),
+                    chat_id,
+                    crate::chat2_host::ChatCodec::new(vault.clone(), chat_id),
+                    chat2_cursor,
+                ))
+            })),
+            seal_wake: Arc::new(tokio::sync::Notify::new()),
             _sub: sub,
         });
         {
@@ -1261,10 +1386,27 @@ impl DocHost {
                 // pending buffer the join drains — nothing composed during
                 // (or before) the dial is lost to the room.
                 let weak_push = Arc::downgrade(&handle);
+                let vault_gate = self.inner.vault.get().cloned();
+                let preparing = self.inner.encryption_preparing.clone();
                 let sub = doc
                     .doc()
                     .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
                         if let Some(handle) = weak_push.upgrade() {
+                            if handle.encrypted {
+                                // Encrypted room: plaintext never enters a
+                                // client. The sealer seals + commits to the
+                                // outbox, then enqueues the immutable bytes.
+                                lock(&handle.chat2_pending_local).push(bytes.clone());
+                                handle.seal_wake.notify_one();
+                                return true;
+                            }
+                            if preparing.load(Ordering::Acquire)
+                                || vault_gate.as_ref().is_some_and(|v| v.is_enrolled())
+                            {
+                                // Retain local edits while migration retires this old transport.
+                                lock(&handle.chat2).take();
+                                return true;
+                            }
                             // The buffer push happens WHILE HOLDING the client
                             // lock (verify pass: releasing it between the None
                             // check and the push let the join's store+drain
@@ -1299,7 +1441,12 @@ impl DocHost {
                 // transcript). Push the doc's full update log as the join's
                 // first batch; once acked the cursor moves and this never
                 // re-arms.
-                if chat2_cursor == 0 {
+                let checkpoint_seeded = self
+                    .inner
+                    .store
+                    .has_snapshot(&format!("__encrypted_history_seed:{chat_id}"))
+                    .unwrap_or(false);
+                if chat2_cursor == 0 && !(encrypted && (legacy_snapshot || checkpoint_seeded)) {
                     match doc
                         .doc()
                         .export(loro::ExportMode::updates(&loro::VersionVector::default()))
@@ -1313,6 +1460,9 @@ impl DocHost {
                                 "chat2 first-contact export failed; peers may stall on missing deps");
                         }
                     }
+                }
+                if encrypted {
+                    self.spawn_chat2_sealer(&handle);
                 }
                 self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
             } else {
@@ -1336,6 +1486,78 @@ impl DocHost {
         Ok(handle)
     }
 
+    /// Encrypted-room sealer (RFC 0001 §7.3, §8): drains plaintext local
+    /// updates into immutable sealed batches — each committed to the durable
+    /// outbox together with the snapshot and verified cursor BEFORE any
+    /// transport sees it — then hands the bytes to the live client (or
+    /// leaves them for the join's outbox replay). A vault that cannot seal
+    /// right now (keys pending) keeps the updates buffered and retries on
+    /// the next wake or vault status change; nothing is sent in the clear.
+    fn spawn_chat2_sealer(&self, handle: &Arc<ChatDocHandle>) {
+        let weak = Arc::downgrade(handle);
+        let wake = handle.seal_wake.clone();
+        let Some(vault) = self.inner.vault.get().cloned() else {
+            return;
+        };
+        let host = self.clone();
+        self.spawn_worker(async move {
+            let mut status = vault.watch_status();
+            loop {
+                tokio::select! {
+                    _ = wake.notified() => {}
+                    changed = status.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let Some(handle) = weak.upgrade() else { return };
+                let Some(sink) = lock(&handle.chat2_sink).clone() else { return };
+                loop {
+                    let pending: Vec<Vec<u8>> =
+                        std::mem::take(&mut *lock(&handle.chat2_pending_local));
+                    if pending.is_empty() {
+                        break;
+                    }
+                    let mut iter = pending.into_iter();
+                    let mut stalled: Option<Vec<u8>> = None;
+                    for update in iter.by_ref() {
+                        if update.len() > crate::chat2_host::MAX_SEALED_UPDATE_BYTES {
+                            // Over the sealed row budget: the ops stay in the
+                            // doc and reach peers through a checkpoint.
+                            tracing::warn!(chat = %handle.chat_id, bytes = update.len(),
+                                "chat2: local update exceeds the sealed row budget; checkpoint compensates");
+                            host.spawn_chat2_checkpoint(&handle, "oversized-update");
+                            continue;
+                        }
+                        match sink.seal_and_queue(&update).await {
+                            Ok((batch_id, bytes)) => {
+                                if let Some(client) = &*lock(&handle.chat2) {
+                                    client.enqueue_sealed(batch_id, bytes);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::info!(chat = %handle.chat_id, error = %err,
+                                    "chat2: sealing deferred until the vault is ready");
+                                stalled = Some(update);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(first) = stalled {
+                        // Put the unsealed tail back IN ORDER ahead of anything
+                        // that arrived meanwhile, then wait for a wake/status.
+                        let rest: Vec<Vec<u8>> = std::iter::once(first).chain(iter).collect();
+                        let mut buffer = lock(&handle.chat2_pending_local);
+                        let arrived = std::mem::take(&mut *buffer);
+                        *buffer = rest.into_iter().chain(arrived).collect();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     /// chat2 relay join (docs/chat2-sync.md C3): deadline on every dial,
     /// capped jittered backoff, wake redial — and the client resolves only
     /// after full catch-up (checkpoint + rows), so "joined" here means
@@ -1349,8 +1571,21 @@ impl DocHost {
         let weak = Arc::downgrade(handle);
         let host = self.clone();
         let mut token_changes = edge.token_changes();
+        let encrypted = handle.encrypted;
+        let encrypted_sink = lock(&handle.chat2_sink).clone();
+        let vault = self.inner.vault.get().cloned();
+        // The encrypted room is a separate namespace (RFC 0001 §12); the
+        // plaintext room keeps its (retained, never auto-deleted) copy.
+        let room = if encrypted {
+            crate::chat2_host::encrypted_room_id(&chat)
+        } else {
+            chat.clone()
+        };
         self.spawn_worker(async move {
-            let sink = Arc::new(crate::chat2_host::EngineChatSink::new(&doc, store, chat.clone()));
+            let sink: Arc<crate::chat2_host::EngineChatSink> = match encrypted_sink {
+                Some(sink) => sink,
+                None => Arc::new(crate::chat2_host::EngineChatSink::new(&doc, store, chat.clone())),
+            };
             // The sink holds only a Weak doc ref (a strong one made every
             // chat2 handle read as perma-pinned — LRU eviction dead); this
             // task's own strong ref dies when the join resolves.
@@ -1358,9 +1593,9 @@ impl DocHost {
             let fetcher = Arc::new(crate::chat2_host::EdgeCheckpointFetcher::new(
                 http,
                 edge.clone(),
-                chat.clone(),
+                room.clone(),
             ));
-            let url = edge.room_url(format!("/chat2/{chat}/ws"));
+            let url = edge.room_url(format!("/chat2/{room}/ws"));
             let mut wake = zeron_sync::wake::subscribe();
             // Sibling-dial successes end a backoff wait immediately, exactly
             // like the joined clients' own reconnect loops (chat_client.rs).
@@ -1372,8 +1607,31 @@ impl DocHost {
             let mut online = zeron_sync::wake::subscribe_online();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
+                if !encrypted && (host.inner.encryption_preparing.load(Ordering::Acquire) || vault.as_ref().is_some_and(|v| v.is_enrolled())) { return; }
                 if weak.upgrade().is_none() {
                     return; // evicted or purged while dialing
+                }
+                // Vault gate (RFC 0001 §4.3): an encrypted room is joined
+                // only with usable keys. Locked / key-update-required /
+                // revoked all WAIT here — no transport, no plaintext.
+                if encrypted {
+                    let Some(vault) = vault.as_ref() else { return };
+                    let mut status = vault.watch_status();
+                    let mut announced = false;
+                    while !vault.is_ready() {
+                        if !announced {
+                            tracing::info!(chat = %chat, status = ?vault.status().phase,
+                                "chat2: encrypted room join waiting for the vault");
+                            announced = true;
+                            let vault = vault.clone();
+                            tokio::spawn(async move {
+                                let _ = vault.refresh().await;
+                            });
+                        }
+                        if status.changed().await.is_err() || weak.upgrade().is_none() {
+                            return;
+                        }
+                    }
                 }
                 // Dual transport: WS dial + a plain-HTTPS pull/push seam
                 // (rows GET / POST on the same bearer auth as the checkpoint
@@ -1383,7 +1641,7 @@ impl DocHost {
                 let transport = Arc::new(crate::chat2_host::EdgeChatTransport::new(
                     host.inner.http.clone(),
                     edge.clone(),
-                    chat.clone(),
+                    room.clone(),
                     device.clone(),
                 ));
                 let dial = tokio::time::timeout(
@@ -1408,7 +1666,60 @@ impl DocHost {
                         };
                         let mut events = client.events();
                         let mut lifecycle_events = client.events();
-                        {
+                        if encrypted {
+                            // Keys arriving later resume the paused client
+                            // from its honest cursor.
+                            let weak_resume = weak.clone();
+                            sink.set_resume_hook(Arc::new(move || {
+                                if let Some(handle) = weak_resume.upgrade()
+                                    && let Some(client) = &*lock(&handle.chat2)
+                                {
+                                    client.resume();
+                                }
+                            }));
+                            // Durable outbox first (re-sealed under the
+                            // current policy where needed), then the live
+                            // sealer for anything buffered in memory.
+                            let replay = sink.replay_outbox().await;
+                            {
+                                let mut client_slot = lock(&handle.chat2);
+                                for (batch_id, bytes) in replay {
+                                    client.enqueue_sealed(batch_id, bytes);
+                                }
+                                *client_slot = Some(client);
+                            }
+                            handle.seal_wake.notify_one();
+                            // Vault status changes (keys fetched, membership
+                            // advanced, revocation) drive resume / leave.
+                            if let Some(vault) = vault.clone() {
+                                let weak_status = weak.clone();
+                                let sink_status = sink.clone();
+                                let chat_status = chat.clone();
+                                host.clone().spawn_worker(async move {
+                                    let mut status = vault.watch_status();
+                                    loop {
+                                        if status.changed().await.is_err() {
+                                            return;
+                                        }
+                                        let Some(handle) = weak_status.upgrade() else { return };
+                                        if vault.is_ready() {
+                                            sink_status.resume();
+                                        } else if !vault.is_enrolled()
+                                            || matches!(
+                                                vault.status().phase,
+                                                crate::vault::VaultPhase::Revoked
+                                            )
+                                        {
+                                            tracing::warn!(chat = %chat_status,
+                                                "chat2: vault membership ended; leaving encrypted room");
+                                            lock(&handle.chat2).take();
+                                            lock(&handle.chat2_local_sub).take();
+                                            return;
+                                        }
+                                    }
+                                });
+                            }
+                        } else {
                             // Store + drain under ONE client-lock critical
                             // section: the subscription pushes to the buffer
                             // while holding this same lock, so every commit
@@ -1422,7 +1733,7 @@ impl DocHost {
                             }
                             *client_slot = Some(client);
                         }
-                        tracing::info!(chat = %chat, "chat2 room joined (converged)");
+                        tracing::info!(chat = %chat, encrypted, "chat2 room joined (converged)");
                         // Bootstrap heal: a room with NO checkpoint can't
                         // cover its rows' causal deps for cold readers — a
                         // pre-0.1.34 first contact whose init batch never
@@ -1669,6 +1980,9 @@ impl DocHost {
             edge.url.trim_end_matches('/'),
             chat_id
         );
+        if !self.plaintext_transport_allowed() {
+            return Err("encryption transition stopped the legacy seed".into());
+        }
         let res = self
             .inner
             .http
@@ -1866,27 +2180,61 @@ impl DocHost {
             return;
         };
         let chat_id = handle.chat_id.clone();
-        // Tail publish: cheap, every quiesce tick.
+        let codec = lock(&handle.chat2_sink)
+            .as_ref()
+            .and_then(|sink| sink.codec().cloned());
+        let room = if handle.encrypted {
+            crate::chat2_host::encrypted_room_id(&chat_id)
+        } else {
+            chat_id.clone()
+        };
+        // Tail publish: cheap, every quiesce tick. Encrypted rooms seal it
+        // (purpose Tail) — the sidecar is content, not routing metadata.
         if let Ok(tail) =
             zeron_doc::materialize_tail(&handle.doc, now_ms(), zeron_doc::TAIL_MESSAGE_COUNT)
             && let Ok(body) = serde_json::to_vec(&tail)
         {
             let http = self.inner.http.clone();
             let edge_tail = edge.clone();
-            let chat = chat_id.clone();
+            let room_tail = room.clone();
+            let codec_tail = codec.clone();
+            let encrypted = handle.encrypted;
+            let gate = self.clone();
             self.spawn_worker(async move {
                 let Some(bearer) = edge_tail.bearer().await else {
                     return;
                 };
+                let (body, content_type) = if encrypted {
+                    let Some(codec) = codec_tail else { return };
+                    match codec
+                        .seal(
+                            zeron_crypto::content::ContentPurpose::Tail,
+                            &body,
+                            MAX_SIDECAR_PLAINTEXT,
+                        )
+                        .await
+                    {
+                        Ok(sealed) => (sealed.encoded().to_vec(), "application/octet-stream"),
+                        Err(err) => {
+                            tracing::debug!(error = %err, "chat2 tail: seal failed; not published");
+                            return;
+                        }
+                    }
+                } else {
+                    (body, "application/json")
+                };
                 let url = format!(
                     "{}/chat2/{}/tail",
                     edge_tail.url.trim_end_matches('/'),
-                    chat
+                    room_tail
                 );
+                if !encrypted && !gate.plaintext_transport_allowed() {
+                    return;
+                }
                 let _ = http
                     .put(&url)
                     .bearer_auth(&bearer)
-                    .header("content-type", "application/json")
+                    .header("content-type", content_type)
                     .body(body)
                     .send()
                     .await;
@@ -1931,18 +2279,68 @@ impl DocHost {
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
+        let codec = lock(&handle.chat2_sink)
+            .as_ref()
+            .and_then(|sink| sink.codec().cloned());
+        let encrypted = handle.encrypted;
+        let room = if encrypted {
+            crate::chat2_host::encrypted_room_id(&chat_id)
+        } else {
+            chat_id.clone()
+        };
+        let gate = self.clone();
         self.spawn_worker(async move {
             let Some(bearer) = edge.bearer().await else {
                 in_flight.store(false, Ordering::Release);
                 return;
             };
+            // Encrypted rooms: snapshot and frontier are sealed as two
+            // records (purposes Checkpoint / Frontier) under the same key;
+            // the frontier travels in the header as before (RFC 0001 §7.4).
+            let (snapshot, frontier) = if encrypted {
+                let Some(codec) = codec else {
+                    in_flight.store(false, Ordering::Release);
+                    return;
+                };
+                let sealed_snapshot = codec
+                    .seal(
+                        zeron_crypto::content::ContentPurpose::Checkpoint,
+                        &snapshot,
+                        zeron_crypto::content::MAX_PLAINTEXT_BYTES,
+                    )
+                    .await;
+                let sealed_frontier = codec
+                    .seal(
+                        zeron_crypto::content::ContentPurpose::Frontier,
+                        &frontier,
+                        64 * 1024,
+                    )
+                    .await;
+                match (sealed_snapshot, sealed_frontier) {
+                    (Ok(snapshot), Ok(frontier)) => {
+                        (snapshot.encoded().to_vec(), frontier.encoded().to_vec())
+                    }
+                    (Err(err), _) | (_, Err(err)) => {
+                        tracing::warn!(chat = %chat_id, error = %err,
+                            "chat2 checkpoint: seal failed; not posted");
+                        in_flight.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            } else {
+                (snapshot, frontier)
+            };
             let url = format!(
                 "{}/chat2/{}/checkpoint?seqCovered={}",
                 edge.url.trim_end_matches('/'),
-                chat_id,
+                room,
                 seq_covered
             );
             let size = snapshot.len() as u64;
+            if !encrypted && !gate.plaintext_transport_allowed() {
+                in_flight.store(false, Ordering::Release);
+                return;
+            }
             match http
                 .post(&url)
                 .bearer_auth(&bearer)
@@ -2914,6 +3312,12 @@ impl DocHost {
     ///
     /// One at a time by design: each send changes the status this reads.
     pub async fn drain_queue(&self, handle: &Arc<ChatDocHandle>) {
+        if !self.history_ready_for_commands(&handle.chat_id)
+            || self.inner.encryption_preparing.load(Ordering::Acquire)
+            || self.inner.migration_running.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
@@ -3018,6 +3422,12 @@ impl DocHost {
         item: &QueuedMessage,
         send: QueueSend,
     ) -> Result<(), EngineError> {
+        if !self.history_ready_for_commands(&handle.chat_id)
+            || self.inner.encryption_preparing.load(Ordering::Acquire)
+            || self.inner.migration_running.load(Ordering::Acquire)
+        {
+            return Err(EngineError::Other("Waiting for chat history encryption to finish".into()));
+        }
         let Some(sessions) = self.sessions() else {
             return Err(EngineError::Other("sessions engine not wired".into()));
         };
@@ -3629,12 +4039,26 @@ impl DocHost {
             return; // bare sync callers (unit tests) skip rather than panic
         };
         let http = self.inner.http.clone();
+        // Encrypted profile: blobs are content (RFC 0001 §10) — sealed under
+        // the chat's key, purpose Blob, or not published at all.
+        let codec = self
+            .inner
+            .vault
+            .get()
+            .filter(|vault| vault.is_enrolled())
+            .map(|vault| crate::chat2_host::ChatCodec::new(vault.clone(), chat_id));
+        let blob_room = if codec.is_some() {
+            crate::chat2_host::encrypted_room_id(chat_id)
+        } else {
+            chat_id.to_owned()
+        };
         let base = format!(
             "{}/blob/{}/{}",
             edge.url.trim_end_matches('/'),
-            chat_id,
+            blob_room,
             encode_part_segment(&payload.part_id)
         );
+        let gate = self.clone();
         self.spawn_worker_on(&runtime, async move {
             let Some(bearer) = edge.bearer().await else {
                 return; // signed out; summary-only until the next session
@@ -3652,6 +4076,25 @@ impl DocHost {
             {
                 puts.push((format!("{base}.diff"), "application/json", json));
             }
+            if let Some(codec) = &codec {
+                let mut sealed = Vec::with_capacity(puts.len());
+                for (url, _, body) in puts {
+                    match codec
+                        .seal(zeron_crypto::content::ContentPurpose::Blob, &body, MAX_SIDECAR_PLAINTEXT)
+                        .await
+                    {
+                        Ok(record) => {
+                            sealed.push((url, "application/octet-stream", record.encoded().to_vec()))
+                        }
+                        Err(err) => {
+                            tracing::debug!(error = %err, "tool sidecar: seal failed; not uploaded");
+                            return;
+                        }
+                    }
+                }
+                puts = sealed;
+            }
+            if codec.is_none() && !gate.plaintext_transport_allowed() { return; }
             for (url, content_type, body) in puts {
                 let sent = http
                     .put(&url)
@@ -3684,6 +4127,8 @@ impl DocHost {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                 && !part.is_empty()
+                && part != "."
+                && part != ".."
                 && part.len() <= 200
                 && part
                     .bytes()
@@ -3702,13 +4147,19 @@ impl DocHost {
         // segment for transport (PART_RE allows `#`, which a raw URL would
         // truncate as a fragment — the 2026-08-10 silent-collision bug).
         let (chat, part) = blob_ref.split_once('/').expect("validated above");
+        let encrypted = self.inner.vault.get().is_some_and(|v| v.is_enrolled());
+        let room = if encrypted {
+            crate::chat2_host::encrypted_room_id(chat)
+        } else {
+            chat.to_owned()
+        };
         let url = format!(
             "{}/blob/{}/{}",
             edge.url.trim_end_matches('/'),
-            chat,
+            room,
             encode_part_segment(part)
         );
-        let res = self
+        let mut res = self
             .inner
             .http
             .get(&url)
@@ -3716,15 +4167,50 @@ impl DocHost {
             .send()
             .await
             .map_err(|e| EngineError::Other(format!("sidecar fetch failed: {e}")))?;
+        if encrypted && res.status() == reqwest::StatusCode::NOT_FOUND {
+            res = self
+                .inner
+                .http
+                .get(format!(
+                    "{}/blob/{}/{}",
+                    edge.url.trim_end_matches('/'),
+                    chat,
+                    encode_part_segment(part)
+                ))
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
                 "sidecar fetch: HTTP {}",
                 res.status().as_u16()
             )));
         }
-        res.text()
+        let bytes = res
+            .bytes()
             .await
-            .map_err(|e| EngineError::Other(format!("sidecar body read failed: {e}")))
+            .map_err(|e| EngineError::Other(format!("sidecar body read failed: {e}")))?;
+        // Encrypted profile: the blob is a sealed record; an unopenable one
+        // is an error, never displayed as "the output" (no legacy fallback).
+        if let Some(vault) = self.inner.vault.get().filter(|vault| vault.is_enrolled()) {
+            let codec = crate::chat2_host::ChatCodec::new(vault.clone(), chat);
+            let plaintext = codec
+                .open_async(
+                    zeron_crypto::content::ContentPurpose::Blob,
+                    &bytes,
+                    MAX_SIDECAR_PLAINTEXT,
+                )
+                .await
+                .map_err(|outcome| {
+                    EngineError::Other(format!("sidecar could not be verified: {outcome:?}"))
+                })?;
+            return String::from_utf8(plaintext)
+                .map_err(|_| EngineError::Other("sidecar is not text".into()));
+        }
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| EngineError::Other("sidecar is not text".into()))
     }
 
     /// §2.2 writer discipline: we host a chat iff its workspace row's `deviceId` is
@@ -3757,6 +4243,14 @@ impl DocHost {
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
+        if !self.history_ready_for_commands(&handle.chat_id) {
+            return;
+        }
+        if self.inner.encryption_preparing.load(Ordering::Acquire)
+            || self.inner.migration_running.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
         };

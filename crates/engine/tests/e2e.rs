@@ -806,7 +806,8 @@ async fn rpc_surface_over_in_memory_transport() {
         .await
         .unwrap()
         .unwrap();
-    // Delta protocol: the stream opens with a full reset frame.
+    // Delta protocol: the stream opens with a full reset frame (plus the
+    // context-usage field every transcript update carries since #264).
     assert_eq!(
         initial,
         serde_json::json!({ "reset": [], "contextUsage": null })
@@ -1855,11 +1856,9 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| {
-                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
-                })
+            entries(&core).iter().any(|entry| {
+                entry.role == MessageRole::Assistant && entry.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )

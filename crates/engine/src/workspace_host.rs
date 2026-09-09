@@ -145,6 +145,10 @@ pub struct WorkspaceHostConfig {
     /// The signed-in user — registries are per-user (`reg1/{orgId}/{userId}`):
     /// spaces/sessions are private to their owner, never org-visible.
     pub user_id: String,
+    /// Encrypted-sync vault: when the profile is enrolled, the registry joins
+    /// its ENCRYPTED generation (`/registry/{orgId}/e1/ws`) with per-field
+    /// sealing and never the plaintext room (RFC 0001 §9).
+    pub vault: Option<crate::vault::VaultService>,
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
     pub edge: Option<EdgeConfig>,
@@ -159,6 +163,7 @@ struct WorkspaceHostInner {
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     room: Mutex<Option<Arc<RegistryClient>>>,
+    join_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Bumped on every registry change (local mutation or applied server
     /// frame) — drives republish + the snapshot debounce in `workspace_task`.
     changed_tx: watch::Sender<u64>,
@@ -243,6 +248,9 @@ impl WorkspaceHost {
                 doc
             }
         };
+        if config.vault.as_ref().is_some_and(|v| v.is_enrolled()) {
+            doc.enter_encrypted_room();
+        }
         // Destructive-break hygiene: the pre-spaces row stays unreachable.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
@@ -255,6 +263,7 @@ impl WorkspaceHost {
             .into_iter()
             .find(|d| d.id == config.device_id);
         doc.upsert_device(&Device {
+            vault_device_id: config.vault.as_ref().and_then(|v| v.status().device_id),
             id: config.device_id.clone(),
             name: device_name_on_boot(
                 existing.as_ref().map(|device| device.name.as_str()),
@@ -288,6 +297,7 @@ impl WorkspaceHost {
                 sessions_tx,
                 spaces_tx,
                 room: Mutex::new(None),
+                join_task: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
@@ -300,6 +310,42 @@ impl WorkspaceHost {
         // dies before the first debounced save.
         host.inner.save_snapshot();
         host.join_room();
+        if let Some(vault) = host.inner.config.vault.clone().filter(|v| !v.is_enrolled()) {
+            let weak = Arc::downgrade(&host.inner);
+            let mut status = vault.watch_status();
+            tokio::spawn(async move {
+                loop {
+                    if vault.is_enrolled() {
+                        let Some(inner) = weak.upgrade() else { return };
+                        // Stop the old generation before resetting its independent cursor.
+                        let previous = lock(&inner.join_task).take();
+                        if let Some(task) = previous {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        lock(&inner.room).take();
+                        {
+                            let mut doc = lock(&inner.reg);
+                            doc.enter_encrypted_room();
+                            if let Ok(Some(mut device)) = doc.read_devices().map(|devices| {
+                                devices.into_iter().find(|d| d.id == inner.config.device_id)
+                            }) {
+                                device.vault_device_id = vault.status().device_id;
+                                let _ = doc.upsert_device(&device);
+                            }
+                        }
+                        inner.save_snapshot();
+                        inner.publish();
+                        inner.bump_changed();
+                        WorkspaceHost { inner }.join_room();
+                        return;
+                    }
+                    if status.changed().await.is_err() || weak.upgrade().is_none() {
+                        return;
+                    }
+                }
+            });
+        }
         tokio::spawn(workspace_task(Arc::downgrade(&host.inner), changed_rx));
         if host.inner.config.edge.is_some() {
             tokio::spawn(relay_probe_task(Arc::downgrade(&host.inner)));
@@ -313,9 +359,26 @@ impl WorkspaceHost {
             return;
         };
         let org_id = self.inner.config.org_id.clone();
+        let vault = self
+            .inner
+            .config
+            .vault
+            .clone()
+            .filter(|vault| vault.is_enrolled());
         // Per-dial URL provider: the bearer is re-read on every (re)connect.
-        let url = edge.room_url(format!("/registry/{org_id}/ws"));
-        self.spawn_join(url, edge.token_changes(), Some(edge.token.clone()));
+        // Encrypted profiles address the encrypted registry generation and
+        // seal every value; the plaintext room is never joined again.
+        let (url, codec) = match vault {
+            Some(vault) => (
+                edge.room_url(format!("/registry/{org_id}/e1/ws")),
+                Some(Arc::new(crate::vault::VaultRegistryCodec::new(
+                    vault,
+                    &self.inner.config.user_id,
+                ))),
+            ),
+            None => (edge.room_url(format!("/registry/{org_id}/ws")), None),
+        };
+        self.spawn_join(url, edge.token_changes(), Some(edge.token.clone()), codec);
     }
 
     /// Test seam: join a registry room at a fixed WebSocket URL without an
@@ -323,7 +386,12 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(zeron_sync::StaticUrl(url.to_string())), None, None);
+        self.spawn_join(
+            Arc::new(zeron_sync::StaticUrl(url.to_string())),
+            None,
+            None,
+            None,
+        );
     }
 
     fn spawn_join(
@@ -331,12 +399,13 @@ impl WorkspaceHost {
         url: Arc<dyn zeron_sync::UrlProvider>,
         mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
         token: Option<Arc<dyn zeron_rpc::TokenSource>>,
+        codec: Option<Arc<crate::vault::VaultRegistryCodec>>,
     ) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut wake = zeron_sync::wake::subscribe();
             let mut online = zeron_sync::wake::subscribe_online();
             // `RegistryClient` only self-reconnects AFTER a first successful
@@ -352,12 +421,48 @@ impl WorkspaceHost {
                 let tuning = RegistryTuning {
                     probe_quiet: REGISTRY_PROBE_QUIET,
                 };
+                // Vault gate (RFC 0001 §4.3): an encrypted registry is joined
+                // only with usable keys — locked / key-update / revoked wait
+                // here, and sealing material is prepared before the first
+                // push so no batch ever leaves unsealed.
+                if let Some(codec) = &codec {
+                    let vault = codec.vault().clone();
+                    let mut status = vault.watch_status();
+                    let mut announced = false;
+                    loop {
+                        if vault.is_ready() && codec.prepare().await.is_ok() {
+                            break;
+                        }
+                        if !announced {
+                            tracing::info!(status = ?vault.status().phase,
+                                "registry: encrypted join waiting for the vault");
+                            announced = true;
+                            let vault = vault.clone();
+                            tokio::spawn(async move {
+                                let _ = vault.refresh().await;
+                            });
+                        }
+                        if status.changed().await.is_err() || weak.upgrade().is_none() {
+                            return;
+                        }
+                    }
+                }
                 // Production path (token present): dual transport — the WS
                 // dials as before, and a plain-HTTPS pull/push seam derived
                 // from the same URL provider bootstraps the doc in ~1 RTT
                 // and keeps syncing at backoff cadence when the socket can't
                 // connect (airplane-wifi networks strip WS upgrades).
-                let result = if token.is_some() {
+                let result = if let (Some(codec), true) = (&codec, token.is_some()) {
+                    RegistryClient::connect_via_transport_with_codec(
+                        url.clone(),
+                        reg.clone(),
+                        &device_id,
+                        tuning,
+                        Arc::new(WsDerivedRegistryTransport::new(url.clone())),
+                        codec.clone(),
+                    )
+                    .await
+                } else if token.is_some() {
                     RegistryClient::connect_via_transport(
                         url.clone(),
                         reg.clone(),
@@ -458,6 +563,9 @@ impl WorkspaceHost {
                 }
             }
         });
+        if let Some(previous) = lock(&self.inner.join_task).replace(task) {
+            previous.abort();
+        }
     }
 
     /// Close the current registry membership before account-scoped state is
@@ -1049,6 +1157,14 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.delete_chat(chat_id))?)
     }
 
+    pub fn vault_device_names(&self) -> std::collections::BTreeMap<String, String> {
+        lock(&self.inner.reg).vault_device_names()
+    }
+
+    pub fn rename_vault_device(&self, id: &str, name: &str) -> Result<(), EngineError> {
+        Ok(self.mutate(|doc| doc.rename_vault_device(id, name))?)
+    }
+
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.rename_device(device_id, name))?)
     }
@@ -1582,6 +1698,7 @@ mod tests {
                 org_id: "test-org".into(),
                 user_id: "test-user".into(),
                 edge: None,
+                vault: None,
             },
         )
         .unwrap();

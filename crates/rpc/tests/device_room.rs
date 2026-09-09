@@ -25,13 +25,14 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
 
+use zeron_crypto::channel::{ChannelIdentity, ChannelScope, PeerIdentity};
 use zeron_rpc::device_room::{
     CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, NUDGE_KIND, RELAY_KIND,
 };
 use zeron_rpc::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    RpcError, RpcReply, RpcService, StaticToken, TokenSource, decode_device_frame,
-    device_room_ws_url, encode_device_frame, methods,
+    ChannelAuthority, ChannelHost, ChannelLocal, DeviceFrameHeader, DeviceLink, HostRelay,
+    HostRelayConfig, LinkCache, LinkCacheConfig, RpcError, RpcReply, RpcService, StaticToken,
+    TokenSource, decode_device_frame, device_room_ws_url, encode_device_frame, methods,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,11 @@ struct RelayState {
     /// Zombie-path simulation: the host stays "connected" (no bounce) but
     /// client→host frames vanish — the 2026-08-19 dead edge↔host leg.
     blackhole_host_bound: bool,
+    /// Plaintext `rpc` frames the relay saw in either direction — the
+    /// leakage canary for the device-channel tests.
+    plaintext_rpc_frames: usize,
+    /// Every distinct frame kind the relay routed.
+    kinds_seen: Vec<String>,
 }
 
 struct FakeRelay {
@@ -97,6 +103,14 @@ impl FakeRelay {
     /// zombie relay path (client↔edge healthy, edge↔host dead).
     fn set_blackhole_host_bound(&self, on: bool) {
         self.state.lock().expect("lock").blackhole_host_bound = on;
+    }
+
+    fn plaintext_rpc_frames(&self) -> usize {
+        self.state.lock().expect("lock").plaintext_rpc_frames
+    }
+
+    fn kinds_seen(&self) -> Vec<String> {
+        self.state.lock().expect("lock").kinds_seen.clone()
     }
 
     /// Deliver a nudge frame to the connected host (the DO's /nudge live path).
@@ -186,7 +200,13 @@ async fn handle_socket(stream: tokio::net::TcpStream, state: Arc<Mutex<RelayStat
         let Ok((header, payload)) = decode_device_frame(&bytes) else {
             break;
         };
-        let st = state.lock().expect("lock");
+        let mut st = state.lock().expect("lock");
+        if header.k == "rpc" {
+            st.plaintext_rpc_frames += 1;
+        }
+        if !st.kinds_seen.contains(&header.k) {
+            st.kinds_seen.push(header.k.clone());
+        }
         if !is_host {
             if st.blackhole_host_bound {
                 continue; // zombie path: frame vanishes, no bounce
@@ -338,6 +358,92 @@ fn noop_nudge() -> zeron_rpc::NudgeHandler {
     Arc::new(|_| {})
 }
 
+// ---------------------------------------------------------------------------
+// Device-channel membership authority (the engine's vault, in miniature)
+// ---------------------------------------------------------------------------
+
+const SCOPE: ChannelScope = ChannelScope {
+    vault_id: [7; 16],
+    generation: [8; 16],
+};
+
+/// One device's channel identity plus the members it currently trusts.
+struct MemberAuthority {
+    device_id: [u8; 16],
+    secret: [u8; 32],
+    members: Mutex<Vec<PeerIdentity>>,
+    required: bool,
+}
+
+impl MemberAuthority {
+    fn new(tag: u8, required: bool) -> Arc<Self> {
+        Arc::new(Self {
+            device_id: [tag; 16],
+            secret: [tag ^ 0xa5; 32],
+            members: Mutex::new(Vec::new()),
+            required,
+        })
+    }
+
+    fn identity(&self) -> PeerIdentity {
+        PeerIdentity {
+            device_id: self.device_id,
+            static_key: ChannelIdentity::new(self.device_id, &self.secret)
+                .expect("identity")
+                .public_key(),
+        }
+    }
+
+    fn trust(&self, other: &MemberAuthority) {
+        self.members.lock().expect("lock").push(other.identity());
+    }
+
+    fn revoke(&self, other: &MemberAuthority) {
+        let gone = other.identity();
+        self.members.lock().expect("lock").retain(|m| *m != gone);
+    }
+}
+
+impl ChannelAuthority for MemberAuthority {
+    fn required(&self) -> bool {
+        self.required
+    }
+
+    fn local(&self) -> Result<ChannelLocal, String> {
+        Ok(ChannelLocal {
+            identity: ChannelIdentity::new(self.device_id, &self.secret)
+                .map_err(|e| e.to_string())?,
+            scope: SCOPE,
+        })
+    }
+
+    fn accept(&self, peer: &PeerIdentity) -> bool {
+        self.members.lock().expect("lock").contains(peer)
+    }
+}
+
+fn secured_host(
+    edge_url: &str,
+    authority: Arc<MemberAuthority>,
+    service: Arc<TestService>,
+) -> HostRelay {
+    let mut config = relay_config(edge_url, 100);
+    config.channel = Some(ChannelHost {
+        authority,
+        service: service.clone(),
+    });
+    HostRelay::spawn(config, service, noop_nudge())
+}
+
+fn secured_cache(edge_url: &str, authority: Arc<MemberAuthority>) -> Arc<LinkCache> {
+    let mut config = LinkCacheConfig::new(edge_url, Arc::new(StaticToken("test-user".into())));
+    config.cooldown_base = Duration::from_millis(100);
+    config.cooldown_max = Duration::from_millis(400);
+    config.probe_timeout = Duration::from_millis(1_500);
+    config.channel = Some(authority);
+    LinkCache::new(config)
+}
+
 struct RecoveringToken {
     value: Mutex<Option<String>>,
     changes: tokio::sync::watch::Sender<u64>,
@@ -452,6 +558,10 @@ async fn sign_out_closes_cached_peer_links() {
         .await
         .expect("link is live before sign-out");
 
+    for _ in 0..32 {
+        zeron_sync::wake::notify_online();
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
     token.clear();
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -687,6 +797,226 @@ async fn nudges_reach_the_host_callback() {
         .expect("nudge delivered")
         .expect("channel open");
     assert_eq!(got, "chat-42");
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated device channel (RFC 0001 §10)
+// ---------------------------------------------------------------------------
+
+/// Two mutually-trusting members: RPC and streams work end to end, and the
+/// relay never sees a plaintext `rpc` frame — only handshake/ciphertext
+/// (`chan`) and payload-less echoes.
+#[tokio::test]
+async fn device_channel_carries_rpc_with_no_plaintext_on_the_relay() {
+    let relay = FakeRelay::start().await;
+    let host_authority = MemberAuthority::new(0x11, true);
+    let client_authority = MemberAuthority::new(0x22, true);
+    host_authority.trust(&client_authority);
+    client_authority.trust(&host_authority);
+    let _host = secured_host(
+        &relay.edge_url(),
+        host_authority.clone(),
+        TestService::new("host-a"),
+    );
+    relay.wait_host_connected().await;
+
+    let links = secured_cache(&relay.edge_url(), client_authority.clone());
+    let client = links.client("dev-a").await.expect("secured dial");
+    let echoed = client
+        .call("Echo", serde_json::json!({ "secret": "plaintext canary" }))
+        .await
+        .expect("echo over the channel");
+    assert_eq!(echoed["host"], "host-a");
+    assert_eq!(echoed["params"]["secret"], "plaintext canary");
+
+    let mut items = client
+        .subscribe("Count", serde_json::json!({ "n": 3 }))
+        .await
+        .expect("stream over the channel");
+    let mut seen = Vec::new();
+    while let Some(v) = items.recv().await {
+        seen.push(v.as_u64().expect("number"));
+    }
+    assert_eq!(seen, vec![0, 1, 2]);
+
+    // A frame past Noise's 64 KiB message cap is chunked and reassembled.
+    let big = "x".repeat(200_000);
+    let echoed = client
+        .call("Echo", serde_json::json!({ "big": big }))
+        .await
+        .expect("large echo");
+    assert_eq!(
+        echoed["params"]["big"].as_str().map(str::len),
+        Some(200_000)
+    );
+
+    assert_eq!(
+        relay.plaintext_rpc_frames(),
+        0,
+        "no plaintext RPC crossed the relay"
+    );
+    let kinds = relay.kinds_seen();
+    assert!(kinds.contains(&"chan".to_string()), "kinds: {kinds:?}");
+    assert!(
+        kinds.iter().all(|k| k == "chan" || k == "echo"),
+        "unexpected frame kinds on the relay: {kinds:?}"
+    );
+
+    // The link authenticated the host's vault identity, not a relay id.
+    let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("c-peer"), "t");
+    let link = DeviceLink::connect_secured(&url, client_authority.as_ref())
+        .await
+        .expect("direct secured link");
+    assert_eq!(link.peer(), Some(host_authority.identity()));
+}
+
+/// An enrolled host refuses plaintext: a legacy client's very first RPC
+/// (the readiness probe) is answered with `encrypted_channel_required`
+/// and the dial fails — no downgrade, no cached link.
+#[tokio::test]
+async fn enrolled_host_refuses_plaintext_clients() {
+    let relay = FakeRelay::start().await;
+    let host_authority = MemberAuthority::new(0x11, true);
+    let _host = secured_host(
+        &relay.edge_url(),
+        host_authority,
+        TestService::new("host-a"),
+    );
+    relay.wait_host_connected().await;
+
+    let links = cache(&relay.edge_url());
+    let Err(err) = links.client("dev-a").await else {
+        panic!("plaintext dial must be refused");
+    };
+    assert!(
+        err.to_string().contains("encrypted_channel_required"),
+        "got: {err}"
+    );
+}
+
+/// Membership gates both directions: a host that does not list the caller
+/// refuses it after message 3, and a caller that does not list the host
+/// refuses BEFORE revealing its own identity (message 3 never leaves).
+#[tokio::test]
+async fn device_channel_refuses_non_members_on_either_side() {
+    let relay = FakeRelay::start().await;
+    let host_authority = MemberAuthority::new(0x11, true);
+    let member = MemberAuthority::new(0x22, true);
+    let stranger = MemberAuthority::new(0x33, true);
+    host_authority.trust(&member);
+    member.trust(&host_authority);
+    stranger.trust(&host_authority);
+    let _host = secured_host(
+        &relay.edge_url(),
+        host_authority.clone(),
+        TestService::new("host-a"),
+    );
+    relay.wait_host_connected().await;
+
+    // Stranger trusts the host, but the host does not list the stranger.
+    let url = device_room_ws_url(
+        &relay.edge_url(),
+        "dev-a",
+        "client",
+        Some("c-stranger"),
+        "t",
+    );
+    let link = DeviceLink::connect_secured(&url, stranger.as_ref()).await;
+    let refused = match link {
+        Err(err) => err.to_string(),
+        Ok(link) => {
+            // The handshake may complete on the client before the host's
+            // verdict arrives; the first call then surfaces the rejection.
+            let outcome = link.client().call("Echo", serde_json::json!({})).await;
+            outcome
+                .expect_err("stranger must not get an answer")
+                .to_string()
+        }
+    };
+    assert!(
+        refused.contains("channel_rejected")
+            || refused.contains("Closed")
+            || refused.contains("closed"),
+        "got: {refused}"
+    );
+
+    // A member that no longer trusts the host: refused locally, before message 3.
+    member.revoke(&host_authority);
+    let url = device_room_ws_url(&relay.edge_url(), "dev-a", "client", Some("c-member"), "t");
+    let Err(err) = DeviceLink::connect_secured(&url, member.as_ref()).await else {
+        panic!("an untrusted host must not get a channel");
+    };
+    assert!(err.to_string().contains("peer refused"), "got: {err}");
+
+    assert_eq!(relay.plaintext_rpc_frames(), 0);
+}
+
+/// A revocation that reaches the host mid-session ends it at the next
+/// sealed frame: the client's call fails and the link is down.
+#[tokio::test]
+async fn device_channel_ends_when_membership_is_revoked() {
+    let relay = FakeRelay::start().await;
+    let host_authority = MemberAuthority::new(0x11, true);
+    let client_authority = MemberAuthority::new(0x22, true);
+    host_authority.trust(&client_authority);
+    client_authority.trust(&host_authority);
+    let _host = secured_host(
+        &relay.edge_url(),
+        host_authority.clone(),
+        TestService::new("host-a"),
+    );
+    relay.wait_host_connected().await;
+
+    let links = secured_cache(&relay.edge_url(), client_authority.clone());
+    let client = links.client("dev-a").await.expect("secured dial");
+    client
+        .call("Echo", serde_json::json!({}))
+        .await
+        .expect("live before revocation");
+
+    host_authority.revoke(&client_authority);
+    let err = client
+        .call("Echo", serde_json::json!({}))
+        .await
+        .expect_err("revoked peer gets no answer");
+    assert!(
+        matches!(err, RpcError::Closed | RpcError::Transport(_)),
+        "got: {err}"
+    );
+    // The cache noticed the link drop; a redial is refused at the handshake.
+    let redial = loop {
+        match links.client("dev-a").await {
+            Err(err) if err.to_string().contains("backing off") => {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            other => break other,
+        }
+    };
+    assert!(
+        redial.is_err(),
+        "revoked member must not re-establish the channel"
+    );
+}
+
+/// A configured authority that is NOT yet enrolled keeps the plaintext
+/// path: the vault's "no compatibility layer" rule is about enrolled
+/// profiles, not about unenrolled ones losing remote control.
+#[tokio::test]
+async fn unenrolled_authority_keeps_plaintext_relay() {
+    let relay = FakeRelay::start().await;
+    let host_authority = MemberAuthority::new(0x11, false);
+    let client_authority = MemberAuthority::new(0x22, false);
+    let _host = secured_host(
+        &relay.edge_url(),
+        host_authority,
+        TestService::new("host-a"),
+    );
+    relay.wait_host_connected().await;
+
+    let links = secured_cache(&relay.edge_url(), client_authority);
+    let client = links.client("dev-a").await.expect("plaintext dial");
+    assert!(client.call("Echo", serde_json::json!({})).await.is_ok());
+    assert!(relay.plaintext_rpc_frames() > 0);
 }
 
 /// Live-edge variant: run the same host+client path through a real DeviceRoom DO.

@@ -31,6 +31,11 @@ export interface Row {
   deleted: boolean;
   /** Tombstone clock — an upsert newer than this revives the row. */
   delHlc?: Hlc;
+  /** Lifecycle proof for the tombstone (RFC 0001 §9): the sealed record a
+   * member authored for exactly this row and `delHlc`. Readers of an
+   * encrypted generation accept a tombstone only with a verified proof;
+   * cleared on revival. Opaque to the relay. */
+  delProof?: FieldValue;
   fields: Record<string, FieldValue>;
   /** Per-field last-write clocks. */
   clocks: Record<string, Hlc>;
@@ -50,6 +55,9 @@ export interface Op {
   /** Per-field clock overrides — used by re-seed pushes to carry a row's
    * ORIGINAL clocks so recovery never coarsens causality. */
   clocks?: Record<string, Hlc>;
+  /** Lifecycle proof for a `delete` op (stored as the tombstone's
+   * `delProof`). Only meaningful on deletes; required in encrypted rooms. */
+  proof?: FieldValue;
 }
 
 const ID_RE = /^[A-Za-z0-9_.:@\/-]{1,256}$/;
@@ -66,6 +74,9 @@ export const validateOp = (op: Op): string | null => {
   if (!ID_RE.test(op.id)) return "bad id";
   if (op.op !== "upsert" && op.op !== "update" && op.op !== "delete") return "bad op";
   if (!HLC_RE.test(op.hlc)) return "bad hlc";
+  if (op.proof !== undefined && (op.op !== "delete" || typeof op.proof !== "object" || op.proof === null)) {
+    return "bad proof";
+  }
   if (op.op === "delete") {
     if (op.set !== undefined) return "delete carries set";
   } else {
@@ -110,13 +121,24 @@ export const applyOp = (row: Row | undefined, op: Op): ApplyResult => {
     if (row === undefined) {
       // Tombstone-on-missing guards against a late create racing the delete.
       return {
-        row: { kind: op.kind, id: op.id, seq: 0, deleted: true, delHlc: op.hlc, fields: {}, clocks: {} },
+        row: {
+          kind: op.kind, id: op.id, seq: 0, deleted: true, delHlc: op.hlc,
+          ...(op.proof !== undefined ? { delProof: op.proof } : {}),
+          fields: {}, clocks: {}
+        },
         changed: true
       };
     }
     if (row.deleted ? hlcNewer(op.hlc, row.delHlc) : hlcNewer(op.hlc, maxClock(row))) {
+      // The proof travels with the tombstone it authorizes; an older proof
+      // never lingers on a newer tombstone.
+      const { delProof: _stale, ...rest } = row;
       return {
-        row: { ...row, deleted: true, delHlc: op.hlc, fields: {}, clocks: {} },
+        row: {
+          ...rest, deleted: true, delHlc: op.hlc,
+          ...(op.proof !== undefined ? { delProof: op.proof } : {}),
+          fields: {}, clocks: {}
+        },
         changed: true
       };
     }
@@ -169,7 +191,10 @@ export const maxClock = (row: Row): Hlc | undefined => {
  * the row's original per-field clocks, or a delete for tombstones. */
 export const rowToSeedOp = (row: Row): Op => {
   if (row.deleted) {
-    return { kind: row.kind, id: row.id, op: "delete", hlc: row.delHlc ?? encodeHlc(0, 0, "seed") };
+    return {
+      kind: row.kind, id: row.id, op: "delete", hlc: row.delHlc ?? encodeHlc(0, 0, "seed"),
+      ...(row.delProof !== undefined ? { proof: row.delProof } : {})
+    };
   }
   const max = maxClock(row) ?? encodeHlc(0, 0, "seed");
   return {

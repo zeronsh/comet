@@ -26,6 +26,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use zeron_crypto::channel::{Handshake, PeerIdentity};
+
+use crate::device_channel::{
+    CHANNEL_DATA, CHANNEL_ERROR, CHANNEL_HS1, CHANNEL_HS2, CHANNEL_HS3, CHANNEL_KIND,
+    CHANNEL_REJECTED, CHANNEL_REQUIRED, CHANNEL_UNSUPPORTED, ChannelAuthority, ChannelHost,
+    SharedChannel, error_code, error_payload, open, peer_of, seal, shared,
+};
 use crate::{RpcClient, RpcError, RpcService, serve_connection};
 
 /// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
@@ -270,6 +277,10 @@ pub struct HostRelayConfig {
     pub token: Arc<dyn TokenSource>,
     /// Reconnect delay after a session ends (a small jitter is added).
     pub retry: Duration,
+    /// The authenticated device channel (RFC 0001 §10). `None` = this build
+    /// cannot host one (no vault); an enrolled profile then refuses every
+    /// relay client rather than serving plaintext.
+    pub channel: Option<ChannelHost>,
 }
 
 impl HostRelayConfig {
@@ -283,6 +294,7 @@ impl HostRelayConfig {
             device_id: device_id.into(),
             token,
             retry: Duration::from_secs(5),
+            channel: None,
         }
     }
 }
@@ -324,7 +336,8 @@ impl HostRelay {
                     );
                     let started = tokio::time::Instant::now();
                     let outcome = {
-                        let session = host_session(&url, &service, &on_nudge);
+                        let session =
+                            host_session(&url, &service, &on_nudge, config.channel.as_ref());
                         tokio::pin!(session);
                         loop {
                             tokio::select! {
@@ -417,18 +430,54 @@ struct VirtualConn {
     in_tx: mpsc::Sender<String>,
 }
 
+/// Per-client host state. A conn id is plaintext OR channel — never both:
+/// a handshake on an id replaces whatever it was, and plaintext frames on a
+/// secured id are refused.
+enum HostConn {
+    Plain(VirtualConn),
+    Handshaking(Handshake),
+    Secured {
+        conn: VirtualConn,
+        channel: SharedChannel,
+    },
+}
+
+/// `channel` = seal every reply through the device channel (frames go out as
+/// [`CHANNEL_DATA`]); `None` = plaintext [`RPC_KIND`] frames.
 fn make_virtual_conn(
     service: Arc<dyn RpcService>,
     conn_id: String,
     host_out: mpsc::Sender<Vec<u8>>,
+    channel: Option<SharedChannel>,
 ) -> VirtualConn {
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
     let (srv_out_tx, mut srv_out_rx) = mpsc::channel::<String>(256);
     tokio::spawn(serve_connection(service, srv_out_tx, in_rx));
     tokio::spawn(async move {
         while let Some(text) = srv_out_rx.recv().await {
-            let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND).with_to(conn_id.clone());
-            match encode_device_frame(&header, text.as_bytes()) {
+            let (header, payload) = match &channel {
+                Some(channel) => match seal(channel, &text) {
+                    Ok(sealed) => (DeviceFrameHeader::new(CHANNEL_DATA, CHANNEL_KIND), sealed),
+                    Err(err) => {
+                        // Budget spent or a poisoned session: end the link
+                        // rather than ever sending the reply another way.
+                        tracing::warn!(error = %err, "device-room: channel seal failed; closing conn");
+                        let header =
+                            DeviceFrameHeader::new(CHANNEL_ERROR, CHANNEL_KIND).with_to(conn_id);
+                        if let Ok(frame) =
+                            encode_device_frame(&header, &error_payload(CHANNEL_REJECTED))
+                        {
+                            let _ = host_out.send(frame).await;
+                        }
+                        break;
+                    }
+                },
+                None => (
+                    DeviceFrameHeader::new(RPC_KIND, RPC_KIND),
+                    text.into_bytes(),
+                ),
+            };
+            match encode_device_frame(&header.with_to(conn_id.clone()), &payload) {
                 Ok(frame) => {
                     if host_out.send(frame).await.is_err() {
                         break; // relay socket gone
@@ -446,6 +495,7 @@ async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    channel: Option<&ChannelHost>,
 ) -> Result<(), RpcError> {
     let ws = zeron_sync::dial::connect_ws(url)
         .await
@@ -454,7 +504,7 @@ async fn host_session(
     let (mut sink, mut stream) = ws.split();
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
-    let mut conns: HashMap<String, VirtualConn> = HashMap::new();
+    let mut conns: HashMap<String, HostConn> = HashMap::new();
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
@@ -473,7 +523,8 @@ async fn host_session(
             message = stream.next() => match message {
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     last_rx = tokio::time::Instant::now();
-                    handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
+                    handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge, channel)
+                        .await;
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
                     if let Some(frame) = frame {
@@ -505,12 +556,122 @@ async fn host_session(
     Ok(())
 }
 
+async fn send_channel_error(out_tx: &mpsc::Sender<Vec<u8>>, to: &str, code: &str) {
+    let header = DeviceFrameHeader::new(CHANNEL_ERROR, CHANNEL_KIND).with_to(to);
+    match encode_device_frame(&header, &error_payload(code)) {
+        Ok(frame) => {
+            let _ = out_tx.send(frame).await;
+        }
+        Err(err) => tracing::error!(error = %err, "device-room: channel error encode failed"),
+    }
+}
+
+/// The channel state machine for one client conn (frames of kind
+/// [`CHANNEL_KIND`]). Any failure drops the conn's state and tells the
+/// client; nothing about the failure is ever answered in plaintext.
+async fn handle_channel_frame(
+    header: &DeviceFrameHeader,
+    payload: &[u8],
+    from: &str,
+    conns: &mut HashMap<String, HostConn>,
+    out_tx: &mpsc::Sender<Vec<u8>>,
+    host: &ChannelHost,
+) {
+    match header.s.as_str() {
+        CHANNEL_HS1 => {
+            // A fresh handshake on a known id replaces its state (a client
+            // that reconnected under the same conn id after a drop).
+            conns.remove(from);
+            let started = host.authority.local().map_err(|reason| {
+                RpcError::Transport(format!("device channel unavailable: {reason}"))
+            });
+            let started = started.and_then(|local| {
+                Handshake::respond(&local.identity, &local.scope, payload)
+                    .map_err(|e| RpcError::Transport(format!("device channel handshake: {e}")))
+            });
+            match started {
+                Ok((handshake, second)) => {
+                    conns.insert(from.to_string(), HostConn::Handshaking(handshake));
+                    let reply = DeviceFrameHeader::new(CHANNEL_HS2, CHANNEL_KIND).with_to(from);
+                    match encode_device_frame(&reply, &second) {
+                        Ok(frame) => {
+                            let _ = out_tx.send(frame).await;
+                        }
+                        Err(err) => {
+                            tracing::error!(error = %err, "device-room: handshake encode failed")
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(conn = %from, error = %err, "device-room: channel handshake refused");
+                    send_channel_error(out_tx, from, CHANNEL_REJECTED).await;
+                }
+            }
+        }
+        CHANNEL_HS3 => {
+            let Some(HostConn::Handshaking(mut handshake)) = conns.remove(from) else {
+                send_channel_error(out_tx, from, CHANNEL_REJECTED).await;
+                return;
+            };
+            let finished = handshake
+                .responder_step(payload)
+                .and_then(|_| handshake.finish(|peer| host.authority.accept(peer)));
+            match finished {
+                Ok(channel) => {
+                    let channel = shared(channel);
+                    let conn = make_virtual_conn(
+                        host.service.clone(),
+                        from.to_string(),
+                        out_tx.clone(),
+                        Some(channel.clone()),
+                    );
+                    tracing::info!(conn = %from, "device-room: device channel established");
+                    conns.insert(from.to_string(), HostConn::Secured { conn, channel });
+                }
+                Err(err) => {
+                    tracing::warn!(conn = %from, error = %err, "device-room: channel peer refused");
+                    send_channel_error(out_tx, from, CHANNEL_REJECTED).await;
+                }
+            }
+        }
+        CHANNEL_DATA => {
+            let Some(HostConn::Secured { conn, channel }) = conns.get(from) else {
+                send_channel_error(out_tx, from, CHANNEL_REJECTED).await;
+                return;
+            };
+            // Membership is re-checked per frame: a revocation that has
+            // reached this device ends the session at the next byte.
+            let opened = if host.authority.accept(&peer_of(channel)) {
+                open(channel, payload)
+            } else {
+                Err(RpcError::Transport(
+                    "peer is no longer an active member".into(),
+                ))
+            };
+            match opened {
+                Ok(text) => {
+                    if conn.in_tx.send(text).await.is_err() {
+                        tracing::warn!("device-room: virtual conn dispatch loop gone");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(conn = %from, error = %err, "device-room: sealed frame refused");
+                    conns.remove(from);
+                    send_channel_error(out_tx, from, CHANNEL_REJECTED).await;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn handle_host_frame(
     bytes: &[u8],
-    conns: &mut HashMap<String, VirtualConn>,
+    conns: &mut HashMap<String, HostConn>,
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
+    channel: Option<&ChannelHost>,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -559,15 +720,41 @@ async fn handle_host_frame(
         }
         return;
     }
+    if header.k == CHANNEL_KIND {
+        let Some(from) = header.from.clone() else {
+            return;
+        };
+        match channel {
+            Some(host) => handle_channel_frame(&header, &payload, &from, conns, out_tx, host).await,
+            None => send_channel_error(out_tx, &from, CHANNEL_UNSUPPORTED).await,
+        }
+        return;
+    }
     if header.k != RPC_KIND {
         return; // future stream kinds (term, tunnel)
     }
     let Some(from) = header.from else {
         return;
     };
-    let conn = conns
-        .entry(from.clone())
-        .or_insert_with(|| make_virtual_conn(service.clone(), from, out_tx.clone()));
+    // Enrolled profile: plaintext RPC is refused outright — the client is
+    // told why and its link ends. There is no downgrade path.
+    if channel.is_some_and(|host| host.authority.required()) {
+        tracing::warn!(conn = %from, "device-room: plaintext RPC refused (encrypted channel required)");
+        conns.remove(&from);
+        send_channel_error(out_tx, &from, CHANNEL_REQUIRED).await;
+        return;
+    }
+    let entry = conns.entry(from.clone()).or_insert_with(|| {
+        HostConn::Plain(make_virtual_conn(
+            service.clone(),
+            from,
+            out_tx.clone(),
+            None,
+        ))
+    });
+    let HostConn::Plain(conn) = entry else {
+        return; // plaintext on a channel conn id: dropped
+    };
     let text = String::from_utf8_lossy(&payload).into_owned();
     if conn.in_tx.send(text).await.is_err() {
         tracing::warn!("device-room: virtual conn dispatch loop gone");
@@ -586,14 +773,112 @@ pub struct DeviceLink {
     client: Arc<RpcClient>,
     closed_rx: watch::Receiver<Option<String>>,
     pump: tokio::task::JoinHandle<()>,
+    peer: Option<PeerIdentity>,
+}
+
+type WsSink = futures::stream::SplitSink<zeron_sync::dial::WsStream, WsMessage>;
+type WsSource = futures::stream::SplitStream<zeron_sync::dial::WsStream>;
+
+/// Run the initiator side of the Noise XX handshake over a fresh relay
+/// socket. The host's identity is checked against membership BEFORE this
+/// device sends its own (message 3), so a stranger holding the relay learns
+/// nothing but an ephemeral key.
+async fn client_handshake(
+    authority: &dyn ChannelAuthority,
+    sink: &mut WsSink,
+    stream: &mut WsSource,
+) -> Result<SharedChannel, RpcError> {
+    let transport = |m: String| RpcError::Transport(m);
+    let local = authority
+        .local()
+        .map_err(|reason| transport(format!("device channel unavailable: {reason}")))?;
+    let (mut handshake, first) = Handshake::initiate(&local.identity, &local.scope)
+        .map_err(|e| transport(format!("device channel handshake: {e}")))?;
+    let frame = encode_device_frame(&DeviceFrameHeader::new(CHANNEL_HS1, CHANNEL_KIND), &first)?;
+    sink.send(WsMessage::Binary(frame))
+        .await
+        .map_err(|_| transport("connection lost during handshake".into()))?;
+    loop {
+        match stream.next().await {
+            Some(Ok(WsMessage::Binary(bytes))) => {
+                let (header, payload) = decode_device_frame(&bytes)?;
+                if header.k == RELAY_KIND {
+                    let code = relay_error_code(&payload).unwrap_or_else(|| "relay error".into());
+                    return Err(transport(code));
+                }
+                if header.k == RPC_KIND {
+                    return Err(transport(
+                        "plaintext RPC frame during device channel handshake".into(),
+                    ));
+                }
+                if header.k != CHANNEL_KIND {
+                    continue; // echoes and future kinds
+                }
+                if header.s == CHANNEL_ERROR {
+                    return Err(transport(format!(
+                        "device channel refused: {}",
+                        error_code(&payload)
+                    )));
+                }
+                if header.s != CHANNEL_HS2 {
+                    return Err(transport("unexpected device channel frame".into()));
+                }
+                let (third, _) = handshake
+                    .initiator_step(&payload)
+                    .map_err(|e| transport(format!("device channel handshake: {e}")))?;
+                let channel = handshake
+                    .finish(|peer| authority.accept(peer))
+                    .map_err(|e| transport(format!("device channel peer refused: {e}")))?;
+                let frame = encode_device_frame(
+                    &DeviceFrameHeader::new(CHANNEL_HS3, CHANNEL_KIND),
+                    &third,
+                )?;
+                sink.send(WsMessage::Binary(frame))
+                    .await
+                    .map_err(|_| transport("connection lost during handshake".into()))?;
+                return Ok(shared(channel));
+            }
+            Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => {
+                return Err(transport("connection lost during handshake".into()));
+            }
+            Some(Ok(_)) => {}
+        }
+    }
 }
 
 impl DeviceLink {
+    /// Plaintext link (profiles with no vault).
     pub async fn connect(url: &str) -> Result<Self, RpcError> {
+        Self::connect_inner(url, None).await
+    }
+
+    /// Link through the authenticated device channel: the handshake completes
+    /// (and both memberships check out) before any RPC byte is accepted.
+    pub async fn connect_secured(
+        url: &str,
+        authority: &dyn ChannelAuthority,
+    ) -> Result<Self, RpcError> {
+        Self::connect_inner(url, Some(authority)).await
+    }
+
+    /// The channel peer this link authenticated (`None` on plaintext links).
+    pub fn peer(&self) -> Option<PeerIdentity> {
+        self.peer
+    }
+
+    async fn connect_inner(
+        url: &str,
+        authority: Option<&dyn ChannelAuthority>,
+    ) -> Result<Self, RpcError> {
         let ws = zeron_sync::dial::connect_ws(url)
             .await
             .map_err(|e| RpcError::Transport(format!("device room unreachable: {e}")))?;
         let (mut sink, mut stream) = ws.split();
+        let channel = match authority {
+            Some(authority) => Some(client_handshake(authority, &mut sink, &mut stream).await?),
+            None => None,
+        };
+        let peer = channel.as_ref().map(peer_of);
         let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
         let (in_tx, in_rx) = mpsc::channel::<String>(256);
         let (closed_tx, closed_rx) = watch::channel::<Option<String>>(None);
@@ -620,8 +905,17 @@ impl DeviceLink {
                 tokio::select! {
                     frame = out_rx.recv() => match frame {
                         Some(text) => {
-                            let header = DeviceFrameHeader::new(RPC_KIND, RPC_KIND);
-                            let encoded = match encode_device_frame(&header, text.as_bytes()) {
+                            let (header, payload) = match &channel {
+                                Some(channel) => match seal(channel, &text) {
+                                    Ok(sealed) => (DeviceFrameHeader::new(CHANNEL_DATA, CHANNEL_KIND), sealed),
+                                    Err(err) => {
+                                        tracing::warn!(error = %err, "device-room: channel seal failed; link down");
+                                        break "device channel exhausted".to_string();
+                                    }
+                                },
+                                None => (DeviceFrameHeader::new(RPC_KIND, RPC_KIND), text.into_bytes()),
+                            };
+                            let encoded = match encode_device_frame(&header, &payload) {
                                 Ok(bytes) => bytes,
                                 Err(err) => {
                                     tracing::error!(error = %err, "device-room: frame encode failed");
@@ -647,6 +941,36 @@ impl DeviceLink {
                                         .unwrap_or_else(|| "relay error".into());
                                     tracing::info!(%code, "device-room: link down");
                                     break code;
+                                }
+                                Ok((header, payload)) if header.k == CHANNEL_KIND => {
+                                    if header.s == CHANNEL_ERROR {
+                                        let code = error_code(&payload);
+                                        tracing::info!(%code, "device-room: link refused by host");
+                                        break code;
+                                    }
+                                    let Some(channel) = &channel else {
+                                        break "unexpected device channel frame".to_string();
+                                    };
+                                    if header.s != CHANNEL_DATA {
+                                        break "unexpected device channel frame".to_string();
+                                    }
+                                    let opened = match open(channel, &payload) {
+                                        Ok(text) => text,
+                                        Err(err) => {
+                                            tracing::warn!(error = %err, "device-room: sealed frame refused; link down");
+                                            break "device channel verification failed".to_string();
+                                        }
+                                    };
+                                    last_echo = tokio::time::Instant::now();
+                                    if in_tx.send(opened).await.is_err() {
+                                        break "client dropped".to_string();
+                                    }
+                                }
+                                Ok((header, _)) if header.k == RPC_KIND && channel.is_some() => {
+                                    // A secured link never accepts plaintext
+                                    // from the host: it is a downgrade attempt
+                                    // or a confused host — either way, down.
+                                    break "plaintext frame on secured link".to_string();
                                 }
                                 Ok((header, payload)) if header.k == RPC_KIND => {
                                     // An RPC frame from the host proves the
@@ -700,6 +1024,7 @@ impl DeviceLink {
             client: Arc::new(RpcClient::new(out_tx, in_rx)),
             closed_rx,
             pump,
+            peer,
         })
     }
 
@@ -756,6 +1081,10 @@ pub struct LinkCacheConfig {
     /// is presence-driven: the workspace's peer-alive hook fires the moment
     /// heartbeats return, and the next call passes the gate.
     pub liveness: Option<PeerLivenessProbe>,
+    /// The device channel authority. Once it reports `required()`, every
+    /// dial runs the authenticated handshake first and a host that cannot
+    /// complete it is unreachable — never dialed in plaintext.
+    pub channel: Option<Arc<dyn ChannelAuthority>>,
 }
 
 impl LinkCacheConfig {
@@ -773,6 +1102,7 @@ impl LinkCacheConfig {
             cooldown_max: Duration::from_secs(60),
             probe_timeout: Duration::from_secs(10),
             liveness: None,
+            channel: None,
         }
     }
 }
@@ -819,23 +1149,21 @@ impl LinkCache {
         // Skipped outside a runtime (sync unit tests).
         if tokio::runtime::Handle::try_current().is_ok() {
             let weak = Arc::downgrade(&cache);
+            let mut token_changes = cache.config.token.subscribe();
             tokio::spawn(async move {
                 let mut wake = zeron_sync::wake::subscribe();
                 let mut online = zeron_sync::wake::subscribe_online();
-                let mut token_changes = weak
-                    .upgrade()
-                    .and_then(|cache| cache.config.token.subscribe());
                 loop {
                     tokio::select! {
                         result = wake.recv() => {
-                            if result.is_err() { return; }
+                            if matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { return; }
                             let Some(cache) = weak.upgrade() else { return };
                             lock(&cache.links).clear();
                             lock(&cache.dial_state).clear();
                             tracing::info!("peer: links + cooldowns cleared after wake");
                         }
                         result = online.recv() => {
-                            if result.is_err() { return; }
+                            if matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { return; }
                             let Some(cache) = weak.upgrade() else { return };
                             lock(&cache.dial_state).clear();
                         }
@@ -1027,7 +1355,18 @@ impl LinkCache {
         // under `forward()` — a wedged edge socket hung callers indefinitely
         // and only the UI's own per-call timers saved them (silently).
         const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-        let link = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, DeviceLink::connect(&url))
+        let secured = self
+            .config
+            .channel
+            .as_ref()
+            .filter(|authority| authority.required());
+        let connect = async {
+            match secured {
+                Some(authority) => DeviceLink::connect_secured(&url, authority.as_ref()).await,
+                None => DeviceLink::connect(&url).await,
+            }
+        };
+        let link = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, connect)
             .await
             .map_err(|_| RpcError::Transport(format!("peer {device_id}: connect timed out")))?;
         let link = Arc::new(link?);
@@ -1041,7 +1380,14 @@ impl LinkCache {
                 RpcError::Transport(format!("peer {device_id}: readiness check timed out"))
             })?
             .map_err(|e| {
-                RpcError::Transport(format!("peer {device_id}: readiness check failed: {e}"))
+                // A link the host refused (plaintext on an enrolled profile,
+                // a rejected channel) closes with a reason worth more to the
+                // caller than the resulting `Closed` on the probe call.
+                let reason = link.closed().borrow().clone();
+                RpcError::Transport(match reason {
+                    Some(reason) => format!("peer {device_id}: readiness check failed: {reason}"),
+                    None => format!("peer {device_id}: readiness check failed: {e}"),
+                })
             })?;
         Ok(link)
     }

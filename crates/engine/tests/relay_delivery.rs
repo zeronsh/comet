@@ -218,6 +218,7 @@ async fn rows_dark_command_delivers_over_the_peer_relay_exactly_once() {
     // A knows the chat is hosted on B (local registry writes), and knows B's
     // stamped version passes the relay gate.
     core_a.workspace.upsert_device_row(&Device {
+        vault_device_id: None,
         id: "device-b".into(),
         name: "b".into(),
         platform: "linux".into(),

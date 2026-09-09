@@ -102,8 +102,7 @@ impl Render for NotificationsPage {
                                 vec![
                                     div()
                                         .child(SharedString::from(
-                                            "Show a system banner on the same events, so pings \
-                                             reach you while Zeron is in the background.",
+                                            "Show system banners for session updates and device approval requests.",
                                         ))
                                         .into_any_element(),
                                 ],
@@ -132,14 +131,13 @@ impl Render for NotificationsPage {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(&theme, "Only when in the background"))
+                            .child(widgets::row_title(&theme, "Session updates only in background"))
                             .child(widgets::meta_line(
                                 &theme,
                                 vec![
                                     div()
                                         .child(SharedString::from(
-                                            "Skip the banner while a Zeron window is focused — \
-                                             the chime already covers it.",
+                                            "Skip session banners while Zeron is focused. Device approval requests still notify.",
                                         ))
                                         .into_any_element(),
                                 ],

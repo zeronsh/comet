@@ -270,3 +270,38 @@ mod tests {
         assert_eq!(applescript_escape("two\nlines\r\n"), "two lines  ");
     }
 }
+
+/// Remember request IDs across polls, including temporary disappearance from
+/// the relay. A reapproval uses a new request ID and must notify again.
+#[derive(Default)]
+pub(crate) struct ApprovalRequests(std::collections::HashSet<String>);
+
+impl ApprovalRequests {
+    pub(crate) fn observe<'a>(
+        &mut self,
+        vault: &str,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let mut fresh = false;
+        for id in ids {
+            fresh |= self.0.insert(format!("{vault}/{id}"));
+        }
+        fresh
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::ApprovalRequests;
+    #[test]
+    fn approval_notifications_deduplicate_but_reapproval_notifies() {
+        let mut seen = ApprovalRequests::default();
+        assert!(seen.observe("vault", ["first"]));
+        assert!(!seen.observe("vault", ["first"]));
+        assert!(!seen.observe("vault", []));
+        assert!(!seen.observe("vault", ["first"]));
+        assert!(seen.observe("vault", ["reapproval"]));
+        assert!(!seen.observe("vault", ["reapproval"]));
+        assert!(seen.observe("another-vault", ["first"]));
+    }
+}

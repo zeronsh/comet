@@ -35,6 +35,7 @@ pub mod terminals;
 pub mod titles;
 pub mod uploads;
 pub mod workspace_files;
+pub mod vault;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -132,6 +133,8 @@ pub struct EngineCore {
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
+    /// Encrypted-sync vault for this profile (unavailable on local scope).
+    pub vault: vault::VaultService,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -220,6 +223,37 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         );
+        // Encrypted-sync vault: device identity + keyring under the profile
+        // store, edge control-plane client only for account-scoped runtimes
+        // with an edge. Opening never fails the boot: a locked secure store
+        // is a reported state, not an error.
+        let vault = {
+            let client = edge
+                .as_ref()
+                .filter(|_| profile.scope() != WorkspaceScope::Local)
+                .map(|edge| {
+                    vault::client::VaultClient::new(
+                        reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(30))
+                            .build()
+                            .unwrap_or_default(),
+                        edge.clone(),
+                        profile.org_id(),
+                    )
+                });
+            let protection: Box<dyn vault::ProtectionKeyProvider> = if client.is_some() {
+                vault::platform_protection()
+            } else {
+                Box::new(vault::LockedProtection("local profile".into()))
+            };
+            let store = vault::VaultStore::new(
+                profile.store_root(),
+                format!("{}/{}", profile.org_id(), profile.user_id()),
+                protection,
+            );
+            vault::VaultService::open(store, client, profile.org_id(), profile.user_id())
+        };
+        doc_host.set_vault(vault.clone());
         let workspace = WorkspaceHost::open(
             store,
             WorkspaceHostConfig {
@@ -228,6 +262,7 @@ impl EngineCore {
                 platform: std::env::consts::OS.to_string(),
                 org_id: profile.org_id().to_string(),
                 user_id: profile.user_id().to_string(),
+                vault: Some(vault.clone()),
                 edge: edge.clone(),
             },
         )?;
@@ -281,6 +316,7 @@ impl EngineCore {
             repos.clone(),
         ));
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
+        diff_sync.set_vault(vault.clone());
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();
         sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
@@ -302,6 +338,7 @@ impl EngineCore {
             agent_accounts,
             device_id,
             local_import,
+            vault,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -401,8 +438,19 @@ impl EngineCore {
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
     pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
         let auth = self.auth();
-        let config =
+        let mut config =
             zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+        // The authenticated device channel (RFC 0001 §10): peers that
+        // complete the Noise handshake against this vault's membership get
+        // the content surface even though the profile is enrolled; plaintext
+        // relay conns keep the gated service below.
+        config.channel = Some(zeron_rpc::ChannelHost {
+            authority: Arc::new(self.vault.clone()),
+            service: Arc::new(rpc::RelayRpc::secured(
+                self.rpc_service(),
+                self.vault.clone(),
+            )),
+        });
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
@@ -414,7 +462,11 @@ impl EngineCore {
                 }
             }
         });
-        zeron_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        zeron_rpc::HostRelay::spawn(
+            config,
+            Arc::new(rpc::RelayRpc::new(self.rpc_service(), self.vault.clone())),
+            on_nudge,
+        )
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {
@@ -442,6 +494,7 @@ impl EngineCore {
         if let Some(importer) = self.local_import.clone() {
             rpc = rpc.with_local_import(importer);
         }
+        rpc = rpc.with_vault(self.vault.clone());
         Arc::new(rpc)
     }
 
@@ -791,6 +844,9 @@ impl Engine {
             link_config.liveness = Some(Arc::new(move |device_id: &str| {
                 workspace_for_liveness.peer_liveness(device_id)
             }));
+            // Enrolled profiles dial peers through the authenticated device
+            // channel only (RFC 0001 §10); the authority is the vault itself.
+            link_config.channel = Some(Arc::new(core.vault.clone()));
             let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace

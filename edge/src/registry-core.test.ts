@@ -21,6 +21,14 @@ const upsert = (over: Partial<Op> = {}): Op => ({
   ...over
 });
 
+const del = (at: string, proof?: Op["proof"]): Op => ({
+  kind: "chats",
+  id: "chat-1",
+  op: "delete",
+  hlc: at,
+  ...(proof !== undefined ? { proof } : {})
+});
+
 const applied = (row: Row | undefined, op: Op): Row => {
   const result = applyOp(row, op);
   expect(result.changed).toBe(true);
@@ -172,6 +180,24 @@ describe("applyOp", () => {
     expect(stale.changed).toBe(false);
   });
 
+  it("carries the lifecycle proof on the tombstone and clears it on revival", () => {
+    const proof = { e1: "c2VhbGVk" };
+    const gone = applied(applied(undefined, upsert()), del(hlc(2000), proof));
+    expect(gone.deleted).toBe(true);
+    expect(gone.delProof).toEqual(proof);
+    // A newer delete replaces the proof; an older one leaves it untouched.
+    const again = applied(gone, del(hlc(3000), { e1: "bmV3ZXI=" }));
+    expect(again.delProof).toEqual({ e1: "bmV3ZXI=" });
+    expect(applyOp(again, del(hlc(2500), proof)).changed).toBe(false);
+    // Re-seeding a tombstone carries its proof back as the op's `proof`.
+    expect(rowToSeedOp(again)).toEqual({ kind: "chats", id: "chat-1", op: "delete", hlc: hlc(3000), proof: { e1: "bmV3ZXI=" } });
+    // Revival drops the proof with the tombstone it authorized.
+    const revived = applied(again, upsert({ hlc: hlc(4000) }));
+    expect(revived.deleted).toBe(false);
+    expect(revived.delProof).toBeUndefined();
+    expect(revived.delHlc).toBe(hlc(3000));
+  });
+
   it("rowToSeedOp round-trips tombstones", () => {
     const gone = applied(undefined, { kind: "spaces", id: "sp-1", op: "delete", hlc: hlc(7000) });
     const seeded = applied(undefined, rowToSeedOp(gone));
@@ -230,6 +256,13 @@ describe("applyOp", () => {
 });
 
 describe("validateOp", () => {
+  it("allows a proof only on delete ops, and only as an object", () => {
+    expect(validateOp({ ...upsert(), proof: { e1: "x" } })).toBe("bad proof");
+    expect(validateOp(del(hlc(1), "nope" as unknown as Op["proof"]))).toBe("bad proof");
+    expect(validateOp(del(hlc(1), { e1: "x" }))).toBeNull();
+    expect(validateOp(del(hlc(1)))).toBeNull();
+  });
+
   it("accepts well-formed ops and rejects malformed ones", () => {
     expect(validateOp(upsert())).toBeNull();
     expect(validateOp({ ...upsert(), kind: "Nope Kind" })).toMatch(/kind/);
