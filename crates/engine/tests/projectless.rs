@@ -110,15 +110,25 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn projectless_chat_runs_from_home_and_mints_no_space() {
+    exercise_projectless(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn projectless_command_before_metadata_survives_restart_and_resume() {
+    exercise_projectless(true).await;
+}
+
+async fn exercise_projectless(command_first: bool) {
     let tmp = tempfile::tempdir().unwrap();
     let requests: RequestLog = RequestLog::default();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(RecordingHarness {
         requests: requests.clone(),
     }));
+    let registry = Arc::new(registry);
     let core = EngineCore::assemble(
         &tmp.path().join("data"),
-        Arc::new(registry),
+        registry.clone(),
         HarnessId::Mock,
         None,
     )
@@ -127,60 +137,84 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
     // The composer's exact wire shape for "Don't work in a project": a
     // deviceId, no spaceId, no cwd.
     let client = zeron_rpc::memory_client(core.rpc_service());
-    client
-        .call(
-            zeron_rpc::methods::MUTATE,
-            serde_json::json!({
-                "op": "createChat",
-                "chatId": CHAT,
-                "deviceId": core.device_id,
-            }),
-        )
-        .await
-        .expect("createChat without a space");
-    // Pre-title so the auto-titler's own harness request stays out of the log.
-    core.workspace
-        .rename_chat(CHAT, "Pre-titled")
-        .expect("rename chat");
+    if !command_first {
+        client
+            .call(
+                zeron_rpc::methods::MUTATE,
+                serde_json::json!({
+                    "op": "createChat",
+                    "chatId": CHAT,
+                    "deviceId": core.device_id,
+                }),
+            )
+            .await
+            .expect("createChat without a space");
+    }
+    if !command_first {
+        // Pre-title so the auto-titler's own harness request stays out of the log.
+        core.workspace
+            .rename_chat(CHAT, "Pre-titled")
+            .expect("rename chat");
 
-    let chat = core
-        .workspace
-        .chat(CHAT)
-        .expect("read chat row")
-        .expect("chat row exists");
-    assert_eq!(chat.space_id, None, "project-less chat must carry no space");
-    assert_eq!(chat.cwd.as_deref(), Some("~"), "cwd defaults to `~`");
-    assert_eq!(chat.device_id, core.device_id);
-
+        let chat = core
+            .workspace
+            .chat(CHAT)
+            .expect("read chat row")
+            .expect("chat row exists");
+        assert_eq!(chat.space_id, None, "project-less chat must carry no space");
+        assert_eq!(chat.cwd.as_deref(), Some("~"), "cwd defaults to `~`");
+        assert_eq!(chat.device_id, core.device_id);
+    }
     // Run exactly as the composer sends it: the chat's stored cwd, `~`.
-    core.doc_host
-        .queue_command(
-            CHAT,
-            SessionCommandPayload::Run {
-                request: RunRequest {
-                    prompt: "hello from no project".into(),
-                    harness: None,
-                    model: None,
-                    reasoning: None,
-                    model_options: Default::default(),
-                    cwd: "~".into(),
-                    sandbox: SandboxLevel::WorkspaceWrite,
-                    auto_approve: true,
-                    attachments: Vec::new(),
-                    worktree: None,
-                    resume: None,
+    let queue_turn = |core: &EngineCore, message_id: &str| {
+        core.doc_host
+            .queue_command(
+                CHAT,
+                SessionCommandPayload::Run {
+                    request: RunRequest {
+                        prompt: "hello from no project".into(),
+                        harness: None,
+                        model: None,
+                        reasoning: None,
+                        model_options: Default::default(),
+                        cwd: "~".into(),
+                        sandbox: SandboxLevel::WorkspaceWrite,
+                        auto_approve: true,
+                        attachments: Vec::new(),
+                        worktree: None,
+                        resume: None,
+                    },
+                    message_id: message_id.into(),
                 },
-                message_id: "msg-np-1".into(),
-            },
-        )
-        .expect("queue run command");
+            )
+            .expect("queue run command");
+    };
+    queue_turn(&core, "msg-np-1");
     wait_for(|| complete_assistant_count(&core) == 1, "turn to complete").await;
+
+    let chat = core.workspace.chat(CHAT).unwrap().unwrap();
+    assert_eq!(chat.space_id, None);
+    assert_eq!(chat.cwd.as_deref(), Some("~"));
+    assert_eq!(chat.device_id, core.device_id);
+    // Simulate the metadata arriving after the command and a retry.
+    for _ in 0..2 {
+        client
+            .call(
+                zeron_rpc::methods::MUTATE,
+                serde_json::json!({
+                    "op": "createChat", "chatId": CHAT, "deviceId": core.device_id,
+                }),
+            )
+            .await
+            .unwrap();
+    }
 
     // The harness must see the host's real home dir, not the literal `~`.
     let cwds: Vec<String> = requests
         .lock()
         .expect("request log")
         .iter()
+        .filter(|r| r.prompt == "hello from no project")
         .map(|r| r.cwd.clone())
         .collect();
     let home = std::env::var("HOME").expect("HOME set in test env");
@@ -193,5 +227,33 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
         "project-less chat minted a space: {spaces:?}"
     );
 
+    core.shutdown().await;
+    drop(client);
+    drop(core);
+
+    let core = EngineCore::assemble(&tmp.path().join("data"), registry, HarnessId::Mock, None)
+        .expect("reopen persisted engine");
+    let chat = core.workspace.chat(CHAT).unwrap().unwrap();
+    assert_eq!(chat.space_id, None);
+    assert_eq!(chat.cwd.as_deref(), Some("~"));
+    assert_eq!(
+        complete_assistant_count(&core),
+        1,
+        "transcript survives restart"
+    );
+    queue_turn(&core, "msg-np-2");
+    wait_for(|| complete_assistant_count(&core) == 2, "resumed turn").await;
+    {
+        let log = requests.lock().unwrap();
+        let requests: Vec<_> = log
+            .iter()
+            .filter(|r| r.prompt == "hello from no project")
+            .collect();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].cwd, std::env::var("HOME").unwrap());
+        assert_eq!(requests[1].resume.as_deref(), Some("sess-np"));
+    }
+    assert!(core.workspace.read_spaces().unwrap().is_empty());
+    assert_eq!(core.workspace.read_chats().unwrap().len(), 1);
     core.shutdown().await;
 }

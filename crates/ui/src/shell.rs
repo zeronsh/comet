@@ -1786,6 +1786,14 @@ impl Shell {
                 }
             }
         }
+        // An explicit projectless canvas must be visible in the sidebar:
+        // retaining a project filter would hide the session on its first send.
+        if state.read(cx).no_project
+            && state.read(cx).selected_chat.is_none()
+            && self.settings.space_filter.take().is_some()
+        {
+            self.schedule_save(cx);
+        }
         // Boot: restore the last selected space once the first spaces frame
         // lands (a still-existing row wins over the auto-selected first one;
         // the boot-auto-selected chat's own space wins over both — selecting a
@@ -9711,6 +9719,84 @@ mod exit_regressions {
                 assert!(!shell.tween_active(tween));
                 assert_eq!(shell.active_tween_endpoints(tween), None);
                 assert_eq!(shell.eval_tween(tween, 0.), 0.);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn projectless_new_session_restores_opt_out_and_clears_sidebar_filter(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::settings::composer::ComposerDefaults {
+            device: Some("remote".into()),
+            no_project: true,
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_spaces(vec![zeron_proto::Space {
+                        id: "repo".into(),
+                        device_id: "local".into(),
+                        path: "/repo".into(),
+                        name: None,
+                        git_detected: false,
+                        git_checked_at: None,
+                        checkout_id: None,
+                        created_at: Utc::now(),
+                    }]);
+                    // Boot opened an existing project session after loading defaults.
+                    state.selected_chat = Some("existing-project-chat".into());
+                    state.no_project = false;
+                });
+                shell.settings.space_filter = None;
+                shell.open_new_session(cx);
+                assert!(shell.state.read(cx).no_project);
+                assert!(shell.state.read(cx).selected_space.is_none());
+                assert_eq!(
+                    shell.state.read(cx).effective_device_id().as_deref(),
+                    Some("remote")
+                );
+
+                // An explicit filter may select its project, but opting out again
+                // must remove that filter before the first send can hide the chat.
+                shell.set_space_filter(Some("repo".into()), cx);
+                shell
+                    .state
+                    .update(cx, |state, cx| state.select_space(None, cx));
+                shell.on_state_changed(&shell.state.clone(), cx);
+                assert!(shell.settings.space_filter.is_none());
+                assert!(shell.state.read(cx).no_project);
             })
             .unwrap();
     }

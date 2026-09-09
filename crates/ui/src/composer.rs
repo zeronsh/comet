@@ -5817,7 +5817,7 @@ impl Composer {
                 // it from the first frame (it read "Select ref" until the
                 // host's diff reconciler got around to stamping the branch).
                 let mut chat_branch: Option<String> = None;
-                if is_new {
+                if is_new && space_path.is_some() {
                     match &plan {
                         crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
                             chat_branch = branch.clone();

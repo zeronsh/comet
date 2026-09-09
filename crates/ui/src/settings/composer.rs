@@ -9,7 +9,7 @@
 //! rare); corrupt or missing files fall back to defaults.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -81,11 +81,27 @@ impl ComposerDefaults {
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = Self::path(data_dir);
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(self)
+        // Each writer owns its temporary file; overlapping windows must not
+        // truncate or rename one another's in-progress writes.
+        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        let json = serde_json::to_vec_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(data_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -190,6 +206,31 @@ mod tests {
             ComposerDefaults::load(dir.path()),
             ComposerDefaults::default()
         );
+    }
+
+    #[test]
+    fn concurrent_projectless_saves_leave_a_complete_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = dir.path();
+                scope.spawn(move || {
+                    let defaults = ComposerDefaults {
+                        device: Some(format!("device-{i}")),
+                        no_project: true,
+                        ..Default::default()
+                    };
+                    for _ in 0..10 {
+                        defaults.save(path).unwrap();
+                        let saved = ComposerDefaults::load(path);
+                        assert!(saved.no_project);
+                        assert!(saved.project.is_none());
+                        assert!(saved.device.is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

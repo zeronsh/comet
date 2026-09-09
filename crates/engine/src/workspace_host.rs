@@ -707,16 +707,15 @@ impl WorkspaceHost {
     /// older clocks — fields the claim never wrote (`config`, `title`) must
     /// still land then.
     ///
-    /// Spaces invariant: every chat belongs to a space, so the claim resolves an
-    /// own-device space matching `cwd` — or auto-creates one (gitDetected false;
-    /// SpacesSync corrects on its next pass). A cwd-less claim (e.g. note_message
-    /// racing ahead of the run command) leaves `spaceId` unset; the row is
-    /// invisible to the UI until a spaced claim/create lands.
+    /// Resolve project cwd claims to a space. The portable home marker `~`
+    /// is the composer's projectless target; preserve it without minting a
+    /// project when the run outruns createChat on the registry channel.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(());
         }
         let space_id = match cwd {
+            Some("~" | "~/") => None,
             Some(cwd) => Some(self.space_for_path(cwd)?),
             None => None,
         };

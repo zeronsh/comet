@@ -103,9 +103,17 @@ impl Shell {
                 .clone()
                 .filter(|id| state.space_row(id).is_some())
         };
+        let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);
         self.state.update(cx, |s, cx| {
             if target.is_some() {
                 s.select_space(target, cx);
+            } else if defaults.no_project {
+                // Opening an existing project session (including boot's last
+                // session) must not erase the saved new-session opt-out.
+                s.select_space(None, cx);
+                if let Some(device) = defaults.device {
+                    s.select_device(device, cx);
+                }
             }
             s.select_chat(None, cx);
         });

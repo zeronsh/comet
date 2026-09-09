@@ -372,6 +372,53 @@ async fn claim_on_first_command_creates_the_chat_row() {
     b.shutdown().await;
 }
 
+#[tokio::test]
+async fn projectless_claim_syncs_after_offline_creation_and_survives_viewer_restart() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = assemble(dir_a.path(), "dev-a");
+    let b = assemble(dir_b.path(), "dev-b");
+    let mut request = run_request("projectless while offline");
+    request.cwd = "~".into();
+    a.doc_host
+        .queue_command(
+            "projectless-offline",
+            SessionCommandPayload::Run {
+                request,
+                message_id: "projectless-msg".into(),
+            },
+        )
+        .unwrap();
+    wait_for(
+        || a.workspace.chat("projectless-offline").unwrap().is_some(),
+        "offline claim",
+    )
+    .await;
+    let link = bridge(&a, &b).await;
+    wait_for(
+        || b.workspace.chat("projectless-offline").unwrap().is_some(),
+        "projectless sync",
+    )
+    .await;
+    let row = b.workspace.chat("projectless-offline").unwrap().unwrap();
+    assert_eq!(row.device_id, "dev-a");
+    assert_eq!(row.space_id, None);
+    assert_eq!(row.cwd.as_deref(), Some("~"));
+    assert!(a.workspace.read_spaces().unwrap().is_empty());
+    assert!(b.workspace.read_spaces().unwrap().is_empty());
+    b.shutdown().await;
+    drop(b);
+    let b = assemble(dir_b.path(), "dev-b");
+    let row = b.workspace.chat("projectless-offline").unwrap().unwrap();
+    assert_eq!(row.space_id, None);
+    assert_eq!(row.device_id, "dev-a");
+    assert_eq!(b.workspace.read_chats().unwrap().len(), 1);
+    assert!(b.workspace.read_spaces().unwrap().is_empty());
+    drop(link);
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
 /// A first command whose cwd is a linked WORKTREE must attribute the chat to
 /// the parent checkout's space — claiming at the worktree path minted a
 /// phantom sidebar space named after the worktree folder.
