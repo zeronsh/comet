@@ -158,12 +158,6 @@ impl BrowserSurface {
                             }))
                     })
                     .child(
-                        icons::icon(icons::GLOBE)
-                            .size(px(15.0))
-                            .flex_none()
-                            .text_color(theme.text_muted),
-                    )
-                    .child(
                         div()
                             .flex_1()
                             .min_w_0()
