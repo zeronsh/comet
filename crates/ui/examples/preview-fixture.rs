@@ -184,8 +184,8 @@ fn main() -> anyhow::Result<()> {
                 std::fs::write(output.join("ready.txt"),&stable)?;
                 if std::env::var_os("ZERON_PREVIEW_AUTO_OPEN").is_some() {
                     // CI sends a real GPUI pointer sequence through hit testing.
+                    let position = browser.read_with(cx,|b,_|b.fixture_preview_open_position()).ok_or_else(||anyhow::anyhow!("Open button was not laid out"))?;
                     window.update(cx,|_,w,cx| {
-                        let position = gpui::point(px(985.),px(207.));
                         w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position,button:gpui::MouseButton::Left,click_count:1,..Default::default() }),cx);
                         w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position,button:gpui::MouseButton::Left,click_count:1,..Default::default() }),cx);
                     })?;
@@ -193,7 +193,8 @@ fn main() -> anyhow::Result<()> {
                 // A native mouse click on Open drives navigation; the runner can
                 // inspect the initial screenshot before choosing its coordinates.
                 for _ in 0..1200 { if browser.read_with(cx,|b,_|b.page.title=="Fieldnotes" && !b.page.loading) { break; } pause(cx,100).await; }
-                anyhow::ensure!(browser.read_with(cx,|b,_|b.page.title=="Fieldnotes"),"Open did not load the preview");
+                if !browser.read_with(cx,|b,_|b.page.title=="Fieldnotes") { capture(&output,"preview-open-failed")?; }
+                anyhow::ensure!(browser.read_with(cx,|b,_|b.page.title=="Fieldnotes"),"Open did not load the preview: {:?}",browser.read_with(cx,|b,_|b.page.clone()));
                 pause(cx,1000).await; capture(&output,"preview-open-stable-url")?;
                 std::fs::write(project.join("index.html"),html.replace("Fieldnotes</title>","Fieldnotes · Live update</title>").replace("Room for your next idea.","Ideas come to life."))?;
                 for _ in 0..150 { if browser.read_with(cx,|b,_|b.page.title=="Fieldnotes · Live update") {break;} pause(cx,100).await; }

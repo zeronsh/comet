@@ -87,6 +87,8 @@ pub struct BrowserSurface {
     previews: zeron_proto::PreviewSnapshot,
     previews_loading: bool,
     previews_task: Option<gpui::Task<()>>,
+    #[cfg(feature = "browser-fixture")]
+    fixture_preview_open: std::rc::Rc<std::cell::Cell<Option<gpui::Point<gpui::Pixels>>>>,
     presentation: Presentation,
     _input_sub: Subscription,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -158,6 +160,8 @@ impl BrowserSurface {
             previews: zeron_proto::PreviewSnapshot::default(),
             previews_loading: true,
             previews_task: None,
+            #[cfg(feature = "browser-fixture")]
+            fixture_preview_open: Default::default(),
             presentation: Presentation::Hidden,
             _input_sub: input_sub,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -218,6 +222,10 @@ impl BrowserSurface {
     #[cfg(feature = "browser-fixture")]
     pub fn fixture_previews(&self) -> zeron_proto::PreviewSnapshot {
         self.previews.clone()
+    }
+    #[cfg(feature = "browser-fixture")]
+    pub fn fixture_preview_open_position(&self) -> Option<gpui::Point<gpui::Pixels>> {
+        self.fixture_preview_open.get()
     }
 
     /// The daemon resolves the session's current cwd for every update, so a

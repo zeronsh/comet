@@ -196,6 +196,20 @@ impl BrowserSurface {
                     )
                     .child(
                         div()
+                            .map(|el| {
+                                #[cfg(feature = "browser-fixture")]
+                                if snapshot
+                                    .services
+                                    .first()
+                                    .is_some_and(|first| first.id == service.id)
+                                {
+                                    let position = self.fixture_preview_open.clone();
+                                    return el.on_children_prepainted(move |bounds, _, _| {
+                                        position.set(bounds.first().map(|bounds| bounds.center()));
+                                    });
+                                }
+                                el
+                            })
                             .id(gpui::SharedString::from(format!(
                                 "open-preview-{}",
                                 service.id
