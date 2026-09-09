@@ -56,6 +56,7 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
 objc = "0.2"
 wry = { version = "0.56", default-features = false, features = ["os-webview"] }
 raw-window-handle = "0.6"

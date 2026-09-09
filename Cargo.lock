@@ -11813,6 +11813,7 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "image",
+ "libc",
  "mimalloc",
  "objc",
  "objc2 0.6.4",
