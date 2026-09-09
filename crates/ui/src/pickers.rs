@@ -757,17 +757,46 @@ impl Pickers {
     }
 
     /// The explicit (non-default) option picks: the chat's persisted
-    /// selections for existing chats, the draft's for the new-chat canvas.
+    /// selections for existing chats; for the new-chat canvas the remembered
+    /// last-used picks (clamped to what the selected model offers) overlaid
+    /// with this canvas's draft picks.
     fn explicit_options(&self, cx: &App) -> serde_json::Map<String, serde_json::Value> {
-        match self
+        if let Some(config) = self
             .state
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.config.as_ref())
         {
-            Some(config) => config.model_options.clone(),
-            None => self.config.model_options.clone(),
+            return config.model_options.clone();
         }
+        let mut options = match self.selected_model(cx) {
+            Some(model) => {
+                let mut clamped = serde_json::Map::new();
+                for option in &model.options {
+                    if let Some(choice) = self
+                        .defaults
+                        .model_options
+                        .get(&option.id)
+                        .and_then(|v| v.as_str())
+                        && choice != option.default_choice
+                        && option.choices.iter().any(|c| c.id == choice)
+                    {
+                        clamped.insert(
+                            option.id.clone(),
+                            serde_json::Value::String(choice.to_string()),
+                        );
+                    }
+                }
+                clamped
+            }
+            // Catalog not loaded yet: trust the memory as-is (same stance as
+            // the offline model id in `resolved`).
+            None => self.defaults.model_options.clone(),
+        };
+        for (id, choice) in &self.config.model_options {
+            options.insert(id.clone(), choice.clone());
+        }
+        options
     }
 
     /// The catalog is loaded and offers nothing runnable — the no-agents
@@ -1337,36 +1366,38 @@ impl Pickers {
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
         // a model is the expected flow. Esc, click-out, or the chip close it.
+        // Every pick becomes the sticky new-session default for its harness,
+        // whether made on the new-chat canvas or inside an existing chat.
+        if let Some(harness) = self.effective_harness(cx) {
+            let label = self
+                .models
+                .get(&harness)
+                .and_then(|l| l.ready())
+                .and_then(|models| models.iter().find(|m| m.id == model_id))
+                .map(|m| m.label.clone())
+                .unwrap_or_else(|| model_id.clone());
+            self.defaults.remember_model(harness, model_id.clone(), label);
+            self.save_defaults();
+        }
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
         } else {
-            // New chat: draft pick + sticky last-used memory for this harness.
-            self.config.model = Some(model_id.clone());
-            if let Some(harness) = self.effective_harness(cx) {
-                let label = self
-                    .models
-                    .get(&harness)
-                    .and_then(|l| l.ready())
-                    .and_then(|models| models.iter().find(|m| m.id == model_id))
-                    .map(|m| m.label.clone())
-                    .unwrap_or_else(|| model_id.clone());
-                self.defaults.remember_model(harness, model_id, label);
-                self.save_defaults();
-            }
+            self.config.model = Some(model_id);
         }
         cx.notify();
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
-        // Always a concrete selection (no toggle-back-to-default).
+        // Always a concrete selection (no toggle-back-to-default); remembered
+        // as the new-session default regardless of where it was picked.
+        self.defaults.reasoning = Some(level);
+        self.save_defaults();
         if self.state.read(cx).selected_chat.is_some() {
             self.update_chat_config(cx, move |config| config.reasoning = Some(level));
         } else {
             self.config.reasoning = Some(level);
-            self.defaults.reasoning = Some(level);
-            self.save_defaults();
         }
         cx.notify();
     }
@@ -1378,6 +1409,17 @@ impl Pickers {
         default: bool,
         cx: &mut Context<Self>,
     ) {
+        // Remember the pick for new sessions; a default pick clears the
+        // memory (absence already resolves to the option's default).
+        if default {
+            self.defaults.model_options.remove(&option_id);
+        } else {
+            self.defaults.model_options.insert(
+                option_id.clone(),
+                serde_json::Value::String(choice_id.clone()),
+            );
+        }
+        self.save_defaults();
         if self.state.read(cx).selected_chat.is_some() {
             self.update_chat_config(cx, move |config| {
                 if default {

@@ -60,6 +60,10 @@ pub struct ComposerDefaults {
     pub no_project: bool,
     /// Starred models (the picker's favorites rail), in starring order.
     pub favorites: Vec<FavoriteModel>,
+    /// Last non-default model-option picks (option id → choice id), e.g.
+    /// context window or fast mode. Applied to new sessions when the selected
+    /// model offers the option; absence means the option's default.
+    pub model_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ComposerDefaults {
@@ -185,6 +189,10 @@ mod tests {
             "Fable 5".into(),
         );
         defaults.remember_model(HarnessId::Codex, "gpt-5.2-codex".into(), "GPT-5.2".into());
+        defaults.model_options.insert(
+            "contextWindow".into(),
+            serde_json::Value::String("1m".into()),
+        );
         defaults.save(dir.path()).unwrap();
         let loaded = ComposerDefaults::load(dir.path());
         assert_eq!(loaded, defaults);
