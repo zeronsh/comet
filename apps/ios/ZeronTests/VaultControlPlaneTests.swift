@@ -17,6 +17,7 @@ final class VaultControlPlaneTests: XCTestCase {
         let epochsAfter: [UInt64]
         let keyringEnvelopeB, keyringEpoch1, objectId, objectKeyEnvelope, objectKeyId, objectKey: String
         let chatRecord, chatPlaintext: String
+        let registryLifecycleRecord, registryLifecyclePlaintext: String
         let enrollment: Enrollment
     }
 
@@ -121,6 +122,17 @@ final class VaultControlPlaneTests: XCTestCase {
         XCTAssertThrowsError(try VaultContentCrypto.open(
             b64(fixture.chatRecord), expected: states[2].contentBinding(objectId: objectId, authorId: aId),
             purpose: .chatUpdate, key: objectKey, trustedPublicKey: aPublic, maxPlaintextBytes: 1024
+        ))
+        // A registry row lifecycle proof (purpose 9) opens as such and never
+        // as a field value: the purpose is bound into the record.
+        let lifecycle = try VaultContentCrypto.open(
+            b64(fixture.registryLifecycleRecord), expected: added.contentBinding(objectId: objectId, authorId: aId),
+            purpose: .registryLifecycle, key: objectKey, trustedPublicKey: aPublic, maxPlaintextBytes: 1024
+        )
+        XCTAssertEqual(String(decoding: lifecycle.plaintext, as: UTF8.self), fixture.registryLifecyclePlaintext)
+        XCTAssertThrowsError(try VaultContentCrypto.open(
+            b64(fixture.registryLifecycleRecord), expected: added.contentBinding(objectId: objectId, authorId: aId),
+            purpose: .registryField, key: objectKey, trustedPublicKey: aPublic, maxPlaintextBytes: 1024
         ))
     }
 

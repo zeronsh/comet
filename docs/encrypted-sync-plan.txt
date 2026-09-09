@@ -1874,5 +1874,47 @@ ES-16  Release controls, support, and staged activation
    refusing relay RPC until a Rust bridge exists), and per-session audit of
    which member issued which command.
 
+17.13. Authenticated registry row tombstones (ES-10, G4 first half; 2026-09-09)
+
+   Deletes in the encrypted registry generation now carry a row lifecycle
+   proof: a content record with purpose 9 (RegistryLifecycle) whose
+   authenticated plaintext is {kind, id, op: "delete", hlc}. The room
+   refuses a bare delete for an encrypted generation (plaintext_rejected),
+   stores the proof as the tombstone's delProof (new column, added in
+   place for existing rooms), serves it with the row, and drops it on
+   revival. Readers in all three languages accept a tombstone only with a
+   verified proof for exactly that row and clock that is causally newer
+   than the verified baseline, and accept a live row over a verified
+   tombstone only with a verified field newer than it; a proof whose key
+   is not held withholds the row (cursor holds). The relay can therefore
+   neither delete nor resurrect a row. iOS previously paused on any
+   tombstone in an encrypted room; it now verifies them.
+
+   Files: crates/crypto/src/content.rs (purpose 9), crates/doc/src/
+   registry.rs (proof/del_proof on ops and rows, seed round-trip),
+   crates/sync/src/registry.rs (codec seal/open_lifecycle, tombstone and
+   revival rules in open_rows), crates/engine/src/vault/registry_codec.rs,
+   edge/src/{registry-core,registry-room,vault-records}.ts, apps/ios/
+   Zeron/Sync/{RegistryCore,VaultRegistryCodec,VaultContent}.swift; the
+   shared fixture gained registryLifecycleRecord/Plaintext.
+
+   Verification: doc 89; sync 39 + 9 + 14 (incl. a forged tombstone from a
+   keyless writer that the server merges and the encrypted peer ignores,
+   while the member's proven delete lands); crypto fixture round-trip
+   (opens as purpose 9, refused as purpose 4); edge 53 Node + 19 workerd
+   (bare delete and wrong-purpose proof refused, proven delete stored and
+   served byte for byte); Swift RegistryCoreTests lifecycle cases. Still
+   open in ES-10: GC/full-sync rules with proofs beyond the gcFloor
+   resync, the reviewed rekey/cutover design, and per-row creation
+   evidence (field records already bind their clocks).
+
+   On immutable retry records: the Rust registry outbox re-seals a pending
+   batch on every push attempt. That is safe by construction here — each
+   seal draws a fresh 32-byte salt (a fresh per-record key, so the zero
+   nonce is never reused) and Rust's Ed25519 signing is deterministic —
+   so the RFC §7.3 concern applies to Swift, whose CryptoKit signatures
+   are not byte-deterministic; iOS already persists sealed batches and
+   resends the stored bytes.
+
 
                           -- End of Project Plan --

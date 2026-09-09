@@ -30,6 +30,7 @@ fn upsert(set: &[(&str, Value)], at: i64) -> RowOp {
         ),
         hlc: hlc(at),
         clocks: None,
+        proof: None,
     }
 }
 
@@ -45,6 +46,7 @@ fn update(set: &[(&str, Value)], hlc: String) -> RowOp {
         ),
         hlc,
         clocks: None,
+        proof: None,
     }
 }
 
@@ -56,6 +58,7 @@ fn delete(at: i64) -> RowOp {
         set: None,
         hlc: hlc(at),
         clocks: None,
+        proof: None,
     }
 }
 
@@ -412,6 +415,7 @@ fn broadcast_seq_gap_applies_rows_but_holds_the_cursor() {
         .into_iter()
         .collect(),
         clocks: Default::default(),
+        del_proof: None,
     };
     // Contiguous broadcast advances.
     assert!(ws.apply_rows(11, vec![row("chat-a", 11)]));
@@ -490,6 +494,7 @@ fn future_harness_chat_rows_stay_visible_without_their_config() {
             del_hlc: None,
             fields,
             clocks: Default::default(),
+            del_proof: None,
         }],
     );
 
@@ -769,6 +774,7 @@ fn state_frames_delta_replace_and_reseed() {
             ),
             hlc: hlc_by(50, "dev-b"),
             clocks: None,
+            proof: None,
         },
     );
     let outcome = doc.apply_state(seq + 1, false, 0, vec![remote.clone()]);

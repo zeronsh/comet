@@ -44,7 +44,7 @@ pub fn encode_hlc(ms: i64, counter: u32, device: &str) -> String {
 }
 
 /// `a` strictly newer than `b` (`None` = never written, loses to any).
-fn hlc_newer(a: &str, b: Option<&str>) -> bool {
+pub fn hlc_newer(a: &str, b: Option<&str>) -> bool {
     match b {
         None => true,
         Some(b) => a > b,
@@ -95,10 +95,16 @@ pub struct RegistryRow {
     /// Per-field last-write clocks.
     #[serde(default)]
     pub clocks: BTreeMap<String, String>,
+    /// Lifecycle proof for the tombstone (RFC 0001 §9): the sealed record a
+    /// member authored for exactly this row and `del_hlc`. Encrypted
+    /// readers accept a tombstone only with a verified proof; cleared on
+    /// revival. Opaque to the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub del_proof: Option<Value>,
 }
 
 impl RegistryRow {
-    fn tombstone(kind: &str, id: &str, hlc: String) -> Self {
+    fn tombstone(kind: &str, id: &str, hlc: String, proof: Option<Value>) -> Self {
         Self {
             kind: kind.to_string(),
             id: id.to_string(),
@@ -107,11 +113,12 @@ impl RegistryRow {
             del_hlc: Some(hlc),
             fields: BTreeMap::new(),
             clocks: BTreeMap::new(),
+            del_proof: proof,
         }
     }
 
     /// The newest clock anywhere on the row (delete-vs-live comparison base).
-    fn max_clock(&self) -> Option<&str> {
+    pub fn max_clock(&self) -> Option<&str> {
         let mut max = self.del_hlc.as_deref();
         for clock in self.clocks.values() {
             if max.is_none_or(|m| clock.as_str() > m) {
@@ -149,6 +156,10 @@ pub struct RowOp {
     /// clocks so recovery never coarsens causality.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clocks: Option<BTreeMap<String, String>>,
+    /// Lifecycle proof for a `delete` op (becomes the tombstone's
+    /// `del_proof`). Only meaningful on deletes; required in encrypted rooms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Value>,
 }
 
 impl RowOp {
@@ -168,7 +179,12 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
         return match row {
             // Tombstone-on-missing guards against a late create racing the delete.
             None => (
-                Some(RegistryRow::tombstone(&op.kind, &op.id, op.hlc.clone())),
+                Some(RegistryRow::tombstone(
+                    &op.kind,
+                    &op.id,
+                    op.hlc.clone(),
+                    op.proof.clone(),
+                )),
                 true,
             ),
             Some(row) => {
@@ -181,6 +197,8 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
                     let mut gone = row.clone();
                     gone.deleted = true;
                     gone.del_hlc = Some(op.hlc.clone());
+                    // The proof travels with the tombstone it authorizes.
+                    gone.del_proof = op.proof.clone();
                     gone.fields.clear();
                     gone.clocks.clear();
                     (Some(gone), true)
@@ -204,6 +222,7 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
                 del_hlc: None,
                 fields: BTreeMap::new(),
                 clocks: BTreeMap::new(),
+                del_proof: None,
             }
         }
         Some(row) if row.deleted => {
@@ -220,6 +239,7 @@ pub fn apply_op(row: Option<&RegistryRow>, op: &RowOp) -> (Option<RegistryRow>, 
                 del_hlc: row.del_hlc.clone(),
                 fields: BTreeMap::new(),
                 clocks: BTreeMap::new(),
+                del_proof: None,
             }
         }
         Some(row) => row.clone(),
@@ -263,6 +283,7 @@ pub fn row_to_seed_op(row: &RegistryRow) -> RowOp {
                 .clone()
                 .unwrap_or_else(|| encode_hlc(0, 0, "seed")),
             clocks: None,
+            proof: row.del_proof.clone(),
         };
     }
     RowOp {
@@ -280,6 +301,7 @@ pub fn row_to_seed_op(row: &RegistryRow) -> RowOp {
             .map(str::to_string)
             .unwrap_or_else(|| encode_hlc(0, 0, "seed")),
         clocks: Some(row.clocks.clone()),
+        proof: None,
     }
 }
 
@@ -638,6 +660,7 @@ impl RegistryDoc {
             set: Some(set),
             hlc,
             clocks: None,
+            proof: None,
         }]);
     }
 
@@ -652,6 +675,7 @@ impl RegistryDoc {
                 set: None,
                 hlc: hlc.clone(),
                 clocks: None,
+                proof: None,
             })
             .collect();
         self.enqueue_ops(ops);
@@ -1219,6 +1243,7 @@ impl RegistryDoc {
                 set: Some(set),
                 hlc: encode_hlc(ms.max(1), 0, "migration"),
                 clocks: None,
+                proof: None,
             });
         };
         for device in &state.devices {

@@ -637,6 +637,45 @@ impl zeron_sync::RegistryCodec for TestCodec {
             Some(inner["value"].clone())
         })
     }
+
+    fn seal_lifecycle(&self, kind: &str, id: &str, hlc: &str) -> Result<serde_json::Value, String> {
+        if !self.has_keys.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("no keys".into());
+        }
+        let inner =
+            serde_json::json!({ "kind": kind, "id": id, "op": "delete", "hlc": hlc }).to_string();
+        let wire: String = inner.bytes().rev().map(|b| format!("{b:02x}")).collect();
+        Ok(serde_json::json!({ "sealed": wire }))
+    }
+
+    fn open_lifecycle(
+        &self,
+        kind: &str,
+        id: &str,
+        hlc: &str,
+        wire: &serde_json::Value,
+    ) -> Result<(), zeron_sync::FieldOpenFailure> {
+        if !self.has_keys.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(zeron_sync::FieldOpenFailure::KeyUnavailable);
+        }
+        let Some(text) = wire.get("sealed").and_then(|v| v.as_str()) else {
+            return Err(zeron_sync::FieldOpenFailure::Rejected);
+        };
+        let bytes: Vec<u8> = (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .rev()
+            .collect();
+        let inner: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if inner["kind"] != kind
+            || inner["id"] != id
+            || inner["op"] != "delete"
+            || inner["hlc"] != hlc
+        {
+            return Err(zeron_sync::FieldOpenFailure::Rejected);
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -712,6 +751,92 @@ async fn codec_seals_every_value_and_opens_it_on_the_peer() {
     );
     client_a.shutdown().await;
     client_b.shutdown().await;
+}
+
+/// Row lifecycle proofs (RFC 0001 §9): a member's delete carries a sealed
+/// proof and tombstones the row on every peer; a tombstone the relay makes
+/// up (no proof) is dropped and the verified row survives.
+#[tokio::test]
+async fn authenticated_tombstones_delete_on_peers_and_forged_ones_do_not() {
+    let server = MockRegistryServer::start().await;
+    let doc_a = new_doc("dev-a");
+    let doc_b = new_doc("dev-b");
+    {
+        let mut doc = doc_a.lock().unwrap();
+        doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        doc.upsert_chat(&chat("chat-2", "dev-a")).unwrap();
+    }
+    let client_a = RegistryClient::connect_via_codec(
+        Arc::new(zeron_sync::StaticUrl(server.url())),
+        doc_a.clone(),
+        "dev-a",
+        Arc::new(TestCodec::new(true)),
+    )
+    .await
+    .expect("A joins");
+    let client_b = RegistryClient::connect_via_codec(
+        Arc::new(zeron_sync::StaticUrl(server.url())),
+        doc_b.clone(),
+        "dev-b",
+        Arc::new(TestCodec::new(true)),
+    )
+    .await
+    .expect("B joins");
+    let b_has = |id: &'static str| {
+        let doc_b = doc_b.clone();
+        move || {
+            doc_b
+                .lock()
+                .unwrap()
+                .read_chats()
+                .map(|c| c.iter().any(|c| c.id == id))
+                .unwrap_or(false)
+        }
+    };
+    wait_until(b_has("chat-2")).await;
+    wait_until(b_has("chat-1")).await;
+
+    // A deletes chat-1: the tombstone on the relay carries the sealed proof
+    // and B's row goes away.
+    {
+        let mut doc = doc_a.lock().unwrap();
+        doc.delete_chat("chat-1").unwrap();
+    }
+    client_a.nudge();
+    wait_until(|| server.row("chats", "chat-1").is_some_and(|r| r.deleted)).await;
+    let stored = server.row("chats", "chat-1").unwrap();
+    assert!(
+        stored
+            .del_proof
+            .as_ref()
+            .is_some_and(|p| p.get("sealed").is_some()),
+        "tombstone carries the sealed proof: {stored:?}"
+    );
+    wait_until(|| !b_has("chat-1")()).await;
+
+    // A forger with no keys (a compromised relay, in effect) tombstones
+    // chat-2 with a bare delete: the server merges it, B keeps its row.
+    let doc_f = new_doc("dev-f");
+    {
+        let mut doc = doc_f.lock().unwrap();
+        doc.upsert_chat(&chat("chat-2", "dev-f")).unwrap();
+        doc.delete_chat("chat-2").unwrap();
+    }
+    let client_f = RegistryClient::connect(&server.url(), doc_f.clone(), "dev-f")
+        .await
+        .expect("forger joins");
+    wait_until(|| server.row("chats", "chat-2").is_some_and(|r| r.deleted)).await;
+    assert!(server.row("chats", "chat-2").unwrap().del_proof.is_none());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        b_has("chat-2")(),
+        "a tombstone without a proof must not delete B's row"
+    );
+    assert!(!b_has("chat-1")(), "the proven tombstone stays applied");
+
+    client_a.shutdown().await;
+    client_b.shutdown().await;
+    client_f.shutdown().await;
 }
 
 #[tokio::test]

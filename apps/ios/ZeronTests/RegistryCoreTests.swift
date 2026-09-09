@@ -243,3 +243,35 @@ final class RegistryMaxClockTests: XCTestCase {
         XCTAssertEqual(maxClock(tomb), hlc(9))
     }
 }
+
+final class RegistryLifecycleProofTests: XCTestCase {
+    func testProofRidesTheTombstoneAndClearsOnRevival() {
+        let proof = JSONValue.object(["e1": .string("c2VhbGVk")])
+        var del = deleteOp(hlc: hlc(2000))
+        del.proof = proof
+        let gone = applied(applied(nil, upsert()), del)
+        XCTAssertTrue(gone.deleted)
+        XCTAssertEqual(gone.delProof, proof)
+        var newer = deleteOp(hlc: hlc(3000))
+        newer.proof = .object(["e1": .string("bmV3ZXI=")])
+        let again = applied(gone, newer)
+        XCTAssertEqual(again.delProof, newer.proof)
+        XCTAssertFalse(applyOp(again, del).changed)
+        XCTAssertEqual(rowToSeedOp(again).proof, newer.proof)
+        let revived = applied(again, upsert(hlc: hlc(4000)))
+        XCTAssertFalse(revived.deleted)
+        XCTAssertNil(revived.delProof)
+        XCTAssertEqual(revived.delHlc, hlc(3000))
+    }
+
+    func testValidateOpRefusesProofsOutsideDeletes() {
+        var op = upsert()
+        op.proof = .object(["e1": .string("x")])
+        XCTAssertEqual(validateOp(op), "bad proof")
+        var del = deleteOp(hlc: hlc(1))
+        del.proof = .string("not an envelope")
+        XCTAssertEqual(validateOp(del), "bad proof")
+        del.proof = .object(["e1": .string("x")])
+        XCTAssertNil(validateOp(del))
+    }
+}

@@ -691,7 +691,7 @@ Table of Contents
       1  suite                unsigned, exactly 1 (AES-256-GCM/HKDF-SHA256)
       2  purpose              unsigned: 1 update, 2 checkpoint, 3 frontier,
                               4 registry field, 5 tail, 6 diff, 7 blob,
-                              8 device sidecar
+                              8 device sidecar, 9 registry lifecycle
       3  content-key ID       byte string, 16 bytes
       4  per-record salt      byte string, 32 bytes
       5  ciphertext and tag   byte string; final 16 bytes are the GCM tag
@@ -780,6 +780,21 @@ Table of Contents
    filed the value under. value = null is an authenticated field deletion.
    The wire value is {"e1": base64(record)}. Encrypted profiles use the
    registry generation /registry/{org}/e1 (room reg1e1/{org}/{user}).
+
+   Row lifecycle proofs are content records with purpose 9 under the same
+   object; the authenticated plaintext is {kind, id, op: "delete", hlc}.
+   A delete op in an encrypted generation MUST carry one as `proof`; the
+   room stores it as the tombstone's `delProof`, serves it with the row,
+   replaces it only with a causally newer delete, and drops it on
+   revival. Readers accept a tombstone only with a verified proof whose
+   row and clock equal the slot the server filed it under and whose clock
+   is newer than the verified baseline (max field clock, or the previous
+   tombstone's clock); a live row over a verified tombstone is accepted
+   only with a verified field newer than the tombstone. Anything else is
+   dropped, never applied: a relay can neither delete nor resurrect a
+   row. Tombstone compaction (30 days) keeps the server-side gcFloor rule;
+   a reader that missed a compacted tombstone resyncs and sees absence,
+   never a fabricated deletion.
 
    Object IDs are the first 16 bytes of SHA-256("zeron/object-id/v1" 00 ||
    kind || 00 || id). Encrypted profiles publish chats to a separate room

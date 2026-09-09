@@ -25,6 +25,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use zeron_doc::registry::{OpKind, hlc_newer};
 use zeron_doc::{PendingBatch, RegistryDoc, RegistryRow, RowOp, StateOutcome};
 
 use crate::types::{RoomStatsSnapshot, StaticUrl, SyncError, UrlProvider};
@@ -198,6 +199,19 @@ pub trait RegistryCodec: Send + Sync + 'static {
         hlc: &str,
         wire: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, FieldOpenFailure>;
+    /// Seal the lifecycle proof for a row deletion at `hlc` (RFC 0001 §9):
+    /// the authenticated plaintext names the row and its tombstone clock,
+    /// so a relay can neither invent a tombstone nor move one between rows.
+    fn seal_lifecycle(&self, kind: &str, id: &str, hlc: &str)
+    -> Result<serde_json::Value, String>;
+    /// Verify a tombstone's proof against the slot the server filed it under.
+    fn open_lifecycle(
+        &self,
+        kind: &str,
+        id: &str,
+        hlc: &str,
+        wire: &serde_json::Value,
+    ) -> Result<(), FieldOpenFailure>;
 }
 
 /// Seal every write in `ops` for the wire. `None` when any field cannot be
@@ -226,6 +240,15 @@ pub fn seal_ops(codec: &dyn RegistryCodec, ops: &[RowOp]) -> Option<Vec<RowOp>> 
             }
             sealed.set = Some(wire);
         }
+        if op.op == OpKind::Delete {
+            match codec.seal_lifecycle(&op.kind, &op.id, &op.hlc) {
+                Ok(proof) => sealed.proof = Some(proof),
+                Err(reason) => {
+                    tracing::info!(reason, "registry: lifecycle sealing deferred");
+                    return None;
+                }
+            }
+        }
         out.push(sealed);
     }
     Some(out)
@@ -233,6 +256,12 @@ pub fn seal_ops(codec: &dyn RegistryCodec, ops: &[RowOp]) -> Option<Vec<RowOp>> 
 
 /// Open every field of `rows`. Rows with a field whose key is not held are
 /// withheld (returned count); rejected fields are dropped from their row.
+///
+/// Row lifecycle (RFC 0001 §9): a tombstone is accepted only with a verified
+/// proof for exactly this row and clock, and only if it is causally newer
+/// than the verified baseline; a live row over a verified tombstone must
+/// carry at least one verified field newer than the tombstone. Anything
+/// else is dropped — a relay can neither delete nor resurrect a row.
 pub fn open_rows(
     codec: &dyn RegistryCodec,
     rows: Vec<RegistryRow>,
@@ -242,6 +271,37 @@ pub fn open_rows(
     let mut withheld = 0;
     'rows: for mut row in rows {
         let previous = baseline.authoritative_row(&row.kind, &row.id);
+        if row.deleted {
+            let (Some(hlc), Some(proof)) = (row.del_hlc.as_deref(), row.del_proof.as_ref()) else {
+                tracing::warn!(kind = %row.kind, "registry: tombstone without proof; dropped");
+                continue;
+            };
+            match codec.open_lifecycle(&row.kind, &row.id, hlc, proof) {
+                Ok(()) => {}
+                Err(FieldOpenFailure::KeyUnavailable) => {
+                    withheld += 1;
+                    continue;
+                }
+                Err(FieldOpenFailure::Rejected) => {
+                    tracing::warn!(kind = %row.kind, "registry: tombstone proof rejected; dropped");
+                    continue;
+                }
+            }
+            let newer = match previous {
+                None => true,
+                Some(previous) if previous.deleted => hlc_newer(hlc, previous.del_hlc.as_deref()),
+                Some(previous) => hlc_newer(hlc, previous.max_clock()),
+            };
+            if !newer {
+                tracing::warn!(kind = %row.kind, "registry: stale tombstone; dropped");
+                continue;
+            }
+            row.fields.clear();
+            row.clocks.clear();
+            out.push(row);
+            continue;
+        }
+        let revives = previous.filter(|p| p.deleted).and_then(|p| p.del_hlc.clone());
         let mut fields = previous.map(|r| r.fields.clone()).unwrap_or_default();
         let mut clocks = previous.map(|r| r.clocks.clone()).unwrap_or_default();
         for (field, wire) in &row.fields {
@@ -270,8 +330,15 @@ pub fn open_rows(
                 }
             }
         }
+        if let Some(del_hlc) = &revives
+            && !clocks.values().any(|clock| clock > del_hlc)
+        {
+            tracing::warn!(kind = %row.kind, "registry: revival without newer evidence; dropped");
+            continue;
+        }
         row.fields = fields;
         row.clocks = clocks;
+        row.del_proof = None;
         out.push(row);
     }
     (out, withheld)
@@ -1304,6 +1371,78 @@ mod encryption_tests {
                 _ => Ok(Some(value.clone())),
             }
         }
+
+        fn seal_lifecycle(
+            &self,
+            kind: &str,
+            id: &str,
+            hlc: &str,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({ "proof": format!("{kind}/{id}/{hlc}") }))
+        }
+
+        fn open_lifecycle(
+            &self,
+            kind: &str,
+            id: &str,
+            hlc: &str,
+            wire: &serde_json::Value,
+        ) -> Result<(), FieldOpenFailure> {
+            match wire.get("proof").and_then(|p| p.as_str()) {
+                Some("missing") => Err(FieldOpenFailure::KeyUnavailable),
+                Some(proof) if proof == format!("{kind}/{id}/{hlc}") => Ok(()),
+                _ => Err(FieldOpenFailure::Rejected),
+            }
+        }
+    }
+
+    fn tombstone(hlc: &str, proof: Option<serde_json::Value>) -> RegistryRow {
+        let mut row: RegistryRow = serde_json::from_value(serde_json::json!({
+            "kind": "chats", "id": "chat", "seq": 3, "deleted": true, "delHlc": hlc,
+        }))
+        .unwrap();
+        row.del_proof = proof;
+        row
+    }
+
+    #[test]
+    fn tombstones_need_a_verified_proof_newer_than_the_baseline() {
+        let mut baseline = RegistryDoc::new("device");
+        baseline.apply_state(1, true, 0, vec![row("trusted", "old", "2")]);
+        // No proof, a proof for another row, and a stale proof: all dropped.
+        let forged = tombstone("5", None);
+        let moved = tombstone("5", Some(serde_json::json!({ "proof": "chats/other/5" })));
+        let stale = tombstone("1", Some(serde_json::json!({ "proof": "chats/chat/1" })));
+        let (opened, withheld) = open_rows(&Codec, vec![forged, moved, stale], &baseline);
+        assert_eq!((opened.len(), withheld), (0, 0));
+        // A missing key withholds (cursor holds); a good proof applies.
+        let waiting = tombstone("5", Some(serde_json::json!({ "proof": "missing" })));
+        let (opened, withheld) = open_rows(&Codec, vec![waiting], &baseline);
+        assert_eq!((opened.len(), withheld), (0, 1));
+        let good = tombstone("5", Some(serde_json::json!({ "proof": "chats/chat/5" })));
+        let (opened, withheld) = open_rows(&Codec, vec![good], &baseline);
+        assert_eq!(withheld, 0);
+        assert!(opened[0].deleted && opened[0].fields.is_empty());
+        assert_eq!(opened[0].del_hlc.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn revival_over_a_verified_tombstone_needs_newer_evidence() {
+        let mut baseline = RegistryDoc::new("device");
+        baseline.apply_state(
+            1,
+            true,
+            0,
+            vec![tombstone("5", Some(serde_json::json!({ "proof": "chats/chat/5" })))],
+        );
+        // A relay replaying pre-deletion fields cannot resurrect the row.
+        let (opened, _) = open_rows(&Codec, vec![row("old", "old", "3")], &baseline);
+        assert!(opened.is_empty());
+        // A member's write newer than the tombstone revives it.
+        let (opened, _) = open_rows(&Codec, vec![row("new", "new", "6")], &baseline);
+        assert_eq!(opened.len(), 1);
+        assert!(!opened[0].deleted);
+        assert_eq!(opened[0].fields["title"], "new");
     }
 
     fn row(title: &str, cwd: &str, clock: &str) -> RegistryRow {

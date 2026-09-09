@@ -19,10 +19,10 @@
  * Hibernation discipline: ZERO wall-clock timers; ping/pong rides the
  * auto-response pair; the daily alarm does tombstone GC + the R2 backup.
  */
-import { applyOp, validateOp, type Op, type Row } from "./registry-core";
+import { applyOp, validateOp, type FieldValue, type Op, type Row } from "./registry-core";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ENCRYPTED_ROOM_HEADER, type Env } from "./env";
 import { profileRequiresEncryption } from "./vault-gate";
-import { looksLikeSealedField } from "./vault-records";
+import { looksLikeSealedField, looksLikeSealedLifecycle } from "./vault-records";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Tombstones older than this are purged; cursors from before the purge
@@ -64,6 +64,13 @@ export class RegistryRoom implements DurableObject {
       "CREATE TABLE IF NOT EXISTS rows (kind TEXT NOT NULL, id TEXT NOT NULL, seq INTEGER NOT NULL, deleted INTEGER NOT NULL, del_hlc TEXT, fields TEXT NOT NULL, clocks TEXT NOT NULL, PRIMARY KEY (kind, id))"
     );
     ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS rows_seq ON rows (seq)");
+    // Lifecycle proofs (RFC 0001 §9) ride tombstones; rooms created before
+    // the column existed gain it here (SQLite has no ADD COLUMN IF NOT EXISTS).
+    try {
+      ctx.storage.sql.exec("ALTER TABLE rows ADD COLUMN del_proof TEXT");
+    } catch {
+      /* column exists */
+    }
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     );
@@ -101,32 +108,25 @@ export class RegistryRoom implements DurableObject {
   private loadRow(kind: string, id: string): Row | undefined {
     const rows = [
       ...this.ctx.storage.sql.exec(
-        "SELECT seq, deleted, del_hlc, fields, clocks FROM rows WHERE kind = ? AND id = ?",
+        "SELECT seq, deleted, del_hlc, del_proof, fields, clocks FROM rows WHERE kind = ? AND id = ?",
         kind,
         id
       )
     ];
     const raw = rows[0];
     if (!raw) return undefined;
-    return {
-      kind,
-      id,
-      seq: raw.seq as number,
-      deleted: (raw.deleted as number) === 1,
-      ...(raw.del_hlc ? { delHlc: raw.del_hlc as string } : {}),
-      fields: JSON.parse(raw.fields as string) as Row["fields"],
-      clocks: JSON.parse(raw.clocks as string) as Row["clocks"]
-    };
+    return rowFromRaw(kind, id, raw);
   }
 
   private saveRow(row: Row): void {
     this.ctx.storage.sql.exec(
-      "INSERT INTO rows (kind, id, seq, deleted, del_hlc, fields, clocks) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, id) DO UPDATE SET seq = excluded.seq, deleted = excluded.deleted, del_hlc = excluded.del_hlc, fields = excluded.fields, clocks = excluded.clocks",
+      "INSERT INTO rows (kind, id, seq, deleted, del_hlc, del_proof, fields, clocks) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, id) DO UPDATE SET seq = excluded.seq, deleted = excluded.deleted, del_hlc = excluded.del_hlc, del_proof = excluded.del_proof, fields = excluded.fields, clocks = excluded.clocks",
       row.kind,
       row.id,
       row.seq,
       row.deleted ? 1 : 0,
       row.delHlc ?? null,
+      row.delProof === undefined ? null : JSON.stringify(row.delProof),
       JSON.stringify(row.fields),
       JSON.stringify(row.clocks)
     );
@@ -135,18 +135,10 @@ export class RegistryRoom implements DurableObject {
   private rowsSince(cursor: number): Row[] {
     const out: Row[] = [];
     for (const raw of this.ctx.storage.sql.exec(
-      "SELECT kind, id, seq, deleted, del_hlc, fields, clocks FROM rows WHERE seq > ? ORDER BY seq",
+      "SELECT kind, id, seq, deleted, del_hlc, del_proof, fields, clocks FROM rows WHERE seq > ? ORDER BY seq",
       cursor
     )) {
-      out.push({
-        kind: raw.kind as string,
-        id: raw.id as string,
-        seq: raw.seq as number,
-        deleted: (raw.deleted as number) === 1,
-        ...(raw.del_hlc ? { delHlc: raw.del_hlc as string } : {}),
-        fields: JSON.parse(raw.fields as string) as Row["fields"],
-        clocks: JSON.parse(raw.clocks as string) as Row["clocks"]
-      });
+      out.push(rowFromRaw(raw.kind as string, raw.id as string, raw));
     }
     return out;
   }
@@ -385,6 +377,12 @@ export class RegistryRoom implements DurableObject {
         this.recordPush(device, false);
         return { ok: false, code: "plaintext_rejected", message: "encrypted field records required" };
       }
+      // An encrypted generation never tombstones on a bare delete: the row
+      // lifecycle proof (RFC 0001 §9) must be present and framed as such.
+      if (encrypted && op.op === "delete" && !looksLikeSealedLifecycle(op.proof, 1024)) {
+        this.recordPush(device, false);
+        return { ok: false, code: "plaintext_rejected", message: "encrypted lifecycle proof required" };
+      }
     }
 
     // Apply atomically: DO events are single-threaded and SQLite writes in an
@@ -506,3 +504,15 @@ const json = (value: unknown, status = 200): Response =>
     status,
     headers: { "content-type": "application/json" }
   });
+
+/** A stored row → wire row; `del_proof` is JSON text or NULL. */
+const rowFromRaw = (kind: string, id: string, raw: Record<string, SqlStorageValue>): Row => ({
+  kind,
+  id,
+  seq: raw.seq as number,
+  deleted: (raw.deleted as number) === 1,
+  ...(raw.del_hlc ? { delHlc: raw.del_hlc as string } : {}),
+  ...(raw.del_proof ? { delProof: JSON.parse(raw.del_proof as string) as FieldValue } : {}),
+  fields: JSON.parse(raw.fields as string) as Row["fields"],
+  clocks: JSON.parse(raw.clocks as string) as Row["clocks"]
+});

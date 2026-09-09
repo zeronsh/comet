@@ -113,6 +113,30 @@ describe("vault fences on actual Durable Objects", () => {
     expect((await stats.json<{ rowCount: number }>()).rowCount).toBe(0);
   });
 
+  it("tombstones an encrypted registry row only with a lifecycle proof", async () => {
+    const { org, headers } = profile();
+    const room = env.TEST_REGISTRY.get(env.TEST_REGISTRY.idFromName(org));
+    const push = (op: Record<string, unknown>) => room.fetch("https://room/push", {
+      method: "POST", headers: { ...headers, [ENCRYPTED_ROOM_HEADER]: "1" },
+      body: JSON.stringify({ batch: `b-${Math.random()}`, ops: [op] })
+    });
+    // A bare delete (a relay-shaped forgery) never lands.
+    const bare = await push({ kind: "chats", id: "chat-1", op: "delete", hlc: "0000000000002-000000-dev-a" });
+    expect(bare.status).toBe(400);
+    expect((await bare.json<{ error: string }>()).error).toBe("plaintext_rejected");
+    // A field record in the proof slot is the wrong purpose: refused too.
+    const wrongPurpose = await push({ kind: "chats", id: "chat-1", op: "delete", hlc: "0000000000002-000000-dev-a", proof: { e1: fixture.chatRecord } });
+    expect(wrongPurpose.status).toBe(400);
+    // The member's sealed lifecycle proof tombstones the row and is served
+    // back with it, byte for byte, for readers to verify.
+    const proven = await push({ kind: "chats", id: "chat-1", op: "delete", hlc: "0000000000002-000000-dev-a", proof: { e1: fixture.registryLifecycleRecord } });
+    expect(proven.status).toBe(200);
+    const rows = await room.fetch("https://room/rows?since=0", { headers });
+    const body = await rows.json<{ rows: Array<{ id: string; deleted: boolean; delHlc?: string; delProof?: { e1: string } }> }>();
+    expect(body.rows).toHaveLength(1);
+    expect(body.rows[0]).toMatchObject({ id: "chat-1", deleted: true, delHlc: "0000000000002-000000-dev-a", delProof: { e1: fixture.registryLifecycleRecord } });
+  });
+
   it("rejects plaintext over HTTPS in an encrypted chat generation", async () => {
     const { org, headers } = profile();
     const room = env.TEST_CHAT.get(env.TEST_CHAT.idFromName(org));

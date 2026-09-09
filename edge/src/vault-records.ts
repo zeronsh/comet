@@ -332,7 +332,7 @@ export const looksLikeSealedContent = (bytes: Uint8Array, maxPayloadBytes: numbe
     const reader = new Reader(record.payload);
     if (reader.argument(5) !== 6n || reader.uintField(0) !== 1n || reader.uintField(1) !== 1n) return false;
     const purpose = reader.uintField(2);
-    if (purpose < 1n || purpose > 8n || (expectedPurpose !== undefined && purpose !== expectedPurpose)) return false;
+    if (purpose < 1n || purpose > 9n || (expectedPurpose !== undefined && purpose !== expectedPurpose)) return false;
     reader.fixedField(3, 16);
     reader.fixedField(4, 32);
     const ciphertext = reader.bytesField(5, maxPayloadBytes);
@@ -343,12 +343,21 @@ export const looksLikeSealedContent = (bytes: Uint8Array, maxPayloadBytes: numbe
   }
 };
 
-export const looksLikeSealedField = (value: unknown, maxPayloadBytes: number): boolean => {
+const looksLikeSealedValue = (value: unknown, maxPayloadBytes: number, purpose: bigint): boolean => {
   if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).length !== 1) return false;
   if (!("e1" in value) || typeof value.e1 !== "string" || value.e1.length > (maxPayloadBytes + MAX_RECORD_OVERHEAD) * 2) return false;
   const bytes = decodeBase64(value.e1);
-  return bytes !== undefined && looksLikeSealedContent(bytes, maxPayloadBytes, 4n);
+  return bytes !== undefined && looksLikeSealedContent(bytes, maxPayloadBytes, purpose);
 };
+
+/** A registry field value `{"e1": base64(record)}` framed as purpose 4. */
+export const looksLikeSealedField = (value: unknown, maxPayloadBytes: number): boolean =>
+  looksLikeSealedValue(value, maxPayloadBytes, 4n);
+
+/** A registry row lifecycle proof `{"e1": base64(record)}` framed as purpose 9
+ * (RFC 0001 §9): a delete in an encrypted generation must carry one. */
+export const looksLikeSealedLifecycle = (value: unknown, maxPayloadBytes: number): boolean =>
+  looksLikeSealedValue(value, maxPayloadBytes, 9n);
 
 // ── digests and signatures ──────────────────────────────────────────────────
 

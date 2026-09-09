@@ -22,7 +22,7 @@ enum VaultContentError: Error, Equatable {
 
 enum VaultContentPurpose: UInt64 {
     case chatUpdate = 1, checkpoint = 2, frontier = 3, registryField = 4
-    case tail = 5, diff = 6, blob = 7, deviceSidecar = 8
+    case tail = 5, diff = 6, blob = 7, deviceSidecar = 8, registryLifecycle = 9
 }
 
 struct VaultKeyScope: Equatable {

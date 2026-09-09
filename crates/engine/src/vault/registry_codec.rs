@@ -23,7 +23,10 @@ use crate::EngineError;
 /// Registry field plaintext cap: the edge's 16 KiB per-op budget minus the
 /// record overhead and base64 expansion, spread over a row's fields.
 const MAX_FIELD_PLAINTEXT: usize = 8 * 1024;
+/// A lifecycle proof names a row and a clock — small by construction.
+const MAX_LIFECYCLE_PLAINTEXT: usize = 1024;
 const WIRE_KEY: &str = "e1";
+const LIFECYCLE_DELETE: &str = "delete";
 
 #[derive(Serialize, Deserialize)]
 struct FieldPlaintext<'a> {
@@ -32,6 +35,16 @@ struct FieldPlaintext<'a> {
     field: &'a str,
     hlc: &'a str,
     value: serde_json::Value,
+}
+
+/// Row lifecycle proof (purpose RegistryLifecycle): a member's signed,
+/// sealed statement that row `kind/id` was deleted at tombstone clock `hlc`.
+#[derive(Serialize, Deserialize)]
+struct LifecyclePlaintext<'a> {
+    kind: &'a str,
+    id: &'a str,
+    op: &'a str,
+    hlc: &'a str,
 }
 
 pub struct VaultRegistryCodec {
@@ -167,5 +180,79 @@ impl RegistryCodec for VaultRegistryCodec {
         } else {
             Some(plaintext.value)
         })
+    }
+
+    fn seal_lifecycle(&self, kind: &str, id: &str, hlc: &str) -> Result<serde_json::Value, String> {
+        let material = lock(&self.material)
+            .clone()
+            .ok_or_else(|| "vault keys not ready".to_string())?;
+        if self.vault.current_content_binding(self.object_id) != Some(material.binding) {
+            return Err("vault epoch changed; re-preparing".into());
+        }
+        let plaintext = serde_json::to_vec(&LifecyclePlaintext {
+            kind,
+            id,
+            op: LIFECYCLE_DELETE,
+            hlc,
+        })
+        .map_err(|e| e.to_string())?;
+        let sealed = content::seal(
+            &material.binding,
+            ContentPurpose::RegistryLifecycle,
+            &material.key,
+            &material.signer,
+            &plaintext,
+            MAX_LIFECYCLE_PLAINTEXT,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ WIRE_KEY: super::client::encode_base64(sealed.encoded()) }))
+    }
+
+    fn open_lifecycle(
+        &self,
+        kind: &str,
+        id: &str,
+        hlc: &str,
+        wire: &serde_json::Value,
+    ) -> Result<(), FieldOpenFailure> {
+        let Some(encoded) = wire
+            .get(WIRE_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(super::client::decode_base64)
+        else {
+            return Err(FieldOpenFailure::Rejected);
+        };
+        let parsed = UnverifiedRecord::parse(&encoded, MAX_LIFECYCLE_PLAINTEXT + 144)
+            .map_err(|_| FieldOpenFailure::Rejected)?;
+        let binding = *parsed.untrusted_binding();
+        let context = self
+            .vault
+            .open_material_cached(self.object_id, &binding)
+            .map_err(|failure| match failure {
+                OpenFailure::Unavailable | OpenFailure::KeyUnavailable => {
+                    self.vault.spawn_key_refresh(self.object_id);
+                    FieldOpenFailure::KeyUnavailable
+                }
+                OpenFailure::NotAuthorized => FieldOpenFailure::Rejected,
+            })?;
+        let opened = content::open(
+            &encoded,
+            &context.binding,
+            ContentPurpose::RegistryLifecycle,
+            &context.key,
+            &context.author_public_key,
+            MAX_LIFECYCLE_PLAINTEXT,
+        )
+        .map_err(|_| FieldOpenFailure::Rejected)?;
+        let plaintext: LifecyclePlaintext = serde_json::from_slice(opened.plaintext().as_bytes())
+            .map_err(|_| FieldOpenFailure::Rejected)?;
+        if plaintext.kind != kind
+            || plaintext.id != id
+            || plaintext.op != LIFECYCLE_DELETE
+            || plaintext.hlc != hlc
+        {
+            return Err(FieldOpenFailure::Rejected);
+        }
+        Ok(())
     }
 }

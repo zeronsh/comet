@@ -56,6 +56,9 @@ pub enum ContentPurpose {
     Diff = 6,
     Blob = 7,
     DeviceSidecar = 8,
+    /// A registry row lifecycle proof (RFC 0001 §9): the authenticated
+    /// plaintext names the row and its tombstone clock.
+    RegistryLifecycle = 9,
 }
 
 impl TryFrom<u64> for ContentPurpose {
@@ -70,6 +73,7 @@ impl TryFrom<u64> for ContentPurpose {
             6 => Ok(Self::Diff),
             7 => Ok(Self::Blob),
             8 => Ok(Self::DeviceSidecar),
+            9 => Ok(Self::RegistryLifecycle),
             _ => Err(ContentError::UnsupportedPurpose),
         }
     }

@@ -58,6 +58,10 @@ struct Fixture {
     object_key: String,
     chat_record: String,
     chat_plaintext: String,
+    /// A registry row lifecycle proof (purpose 9) for a delete of
+    /// chats/chat-1 at the clock inside `registry_lifecycle_plaintext`.
+    registry_lifecycle_record: String,
+    registry_lifecycle_plaintext: String,
     enrollment: EnrollmentFixture,
 }
 
@@ -227,6 +231,18 @@ fn generate() -> Fixture {
     )
     .unwrap();
 
+    let lifecycle_plaintext =
+        br#"{"kind":"chats","id":"chat-1","op":"delete","hlc":"0000000000002-000000-dev-a"}"#;
+    let lifecycle_record = content::seal(
+        &added.content_binding(object_id, a.id),
+        ContentPurpose::RegistryLifecycle,
+        &object_key,
+        &a.signer,
+        lifecycle_plaintext,
+        1024,
+    )
+    .unwrap();
+
     let mut revoke = added.next_payload(Operation::RevokeDevice);
     revoke.devices[1].status = DeviceStatus::Revoked;
     let revoke_record = policy::encode_policy(
@@ -271,6 +287,8 @@ fn generate() -> Fixture {
         object_key: hex(object_key.expose_secret()),
         chat_record: b64(chat_record.encoded()),
         chat_plaintext: String::from_utf8(chat_plaintext.to_vec()).unwrap(),
+        registry_lifecycle_record: b64(lifecycle_record.encoded()),
+        registry_lifecycle_plaintext: String::from_utf8(lifecycle_plaintext.to_vec()).unwrap(),
         enrollment: EnrollmentFixture {
             request_id: hex(&request.request_id),
             device_id: hex(&request.device_id),
@@ -367,6 +385,31 @@ fn vault_fixture_round_trips_across_the_control_plane() {
         fixture.chat_plaintext.as_bytes()
     );
     // After the revocation the head epoch moved: an old-epoch record no
+    let lifecycle = content::open(
+        &unb64(&fixture.registry_lifecycle_record),
+        &added.content_binding(object_id, a_id),
+        ContentPurpose::RegistryLifecycle,
+        &object_key,
+        &a_public,
+        1024,
+    )
+    .unwrap();
+    assert_eq!(
+        lifecycle.plaintext().as_bytes(),
+        fixture.registry_lifecycle_plaintext.as_bytes()
+    );
+    // A lifecycle proof never opens as a field value (purpose is bound).
+    assert!(
+        content::open(
+            &unb64(&fixture.registry_lifecycle_record),
+            &added.content_binding(object_id, a_id),
+            ContentPurpose::RegistryField,
+            &object_key,
+            &a_public,
+            1024,
+        )
+        .is_err()
+    );
     // longer matches the current content binding.
     assert!(
         content::open(
