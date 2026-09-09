@@ -185,7 +185,7 @@ fn main() -> anyhow::Result<()> {
                 if std::env::var_os("ZERON_PREVIEW_AUTO_OPEN").is_some() {
                     // CI sends a real GPUI pointer sequence through hit testing.
                     let position = browser.read_with(cx,|b,_|b.fixture_preview_open_position()).ok_or_else(||anyhow::anyhow!("Open button was not laid out"))?;
-                    window.update(cx,|_,w,cx| {
+                    gpui::AnyWindowHandle::from(window).update(cx,|_,w,cx| {
                         w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position,button:gpui::MouseButton::Left,click_count:1,..Default::default() }),cx);
                         w.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position,button:gpui::MouseButton::Left,click_count:1,..Default::default() }),cx);
                     })?;
