@@ -4,7 +4,7 @@ import fixture from "../../../crates/crypto/tests/fixtures/vault.json";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ENCRYPTED_ROOM_HEADER } from "../../src/env";
 import { decodeBase64 } from "../../src/vault-records";
 import { decodeFrame, encodeFrame, FRAME } from "../../src/chat-frames";
-import { encodeDeviceFrame } from "../../src/device-room";
+import { decodeDeviceFrame, encodeDeviceFrame } from "../../src/device-room";
 
 function profile() {
   const org = `org-${crypto.randomUUID()}`;
@@ -136,6 +136,16 @@ describe("vault fences on actual Durable Objects", () => {
     expect(response.status).toBe(409);
     const stored = await room.fetch("https://room/sidecar/repos", { headers });
     expect(stored.status).toBe(404);
+    // Device-channel frames (handshake + ciphertext) still cross the relay:
+    // with no client "peer" attached the relay bounces client_gone instead
+    // of closing the socket.
+    const relayed = new Promise<Uint8Array>((resolve) =>
+      socket.addEventListener("message", (event) => resolve(new Uint8Array(event.data as ArrayBuffer)), { once: true })
+    );
+    socket.send(encodeDeviceFrame({ s: "hs2", k: "chan", to: "peer" }, new Uint8Array([1, 2, 3])));
+    const bounce = decodeDeviceFrame(await relayed);
+    expect(bounce.header.k).toBe(" relay");
+    expect(JSON.parse(new TextDecoder().decode(bounce.payload))).toEqual({ error: "client_gone" });
     const closed = new Promise<number>((resolve) => socket.addEventListener("close", (event) => resolve(event.code), { once: true }));
     socket.send(encodeDeviceFrame({ s: "rpc", k: "rpc", to: "peer" }, new TextEncoder().encode("plaintext canary")));
     expect(await closed).toBe(4403);

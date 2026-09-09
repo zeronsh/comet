@@ -701,9 +701,9 @@ impl EngineRpc {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcReply, RpcError> {
-        if self.vault.as_ref().is_some_and(|vault| vault.is_enrolled()) {
-            return Err(RpcError::Failed("encrypted device channel required".into()));
-        }
+        // An enrolled profile's link cache dials through the authenticated
+        // device channel or not at all (`LinkCacheConfig::channel`), so no
+        // plaintext gate is needed here.
         let Some(links) = &self.links else {
             return Err(RpcError::Failed(format!(
                 "cannot reach device {target}: remote routing unavailable (offline)"
@@ -1172,9 +1172,15 @@ impl RpcService for AuthRpc {
     }
 }
 
+/// The RPC surface served to relay clients. Two instances exist per engine:
+/// the PLAINTEXT one (served on ordinary relay frames) refuses everything
+/// the moment the profile is enrolled, and the SECURED one (served only on
+/// conns that completed the authenticated device channel) carries content
+/// for enrolled profiles. Both refuse vault management: that stays local.
 pub(crate) struct RelayRpc {
     service: std::sync::Arc<dyn RpcService>,
     vault: crate::vault::VaultService,
+    secured: bool,
 }
 
 impl RelayRpc {
@@ -1182,7 +1188,26 @@ impl RelayRpc {
         service: std::sync::Arc<dyn RpcService>,
         vault: crate::vault::VaultService,
     ) -> Self {
-        Self { service, vault }
+        Self {
+            service,
+            vault,
+            secured: false,
+        }
+    }
+
+    pub(crate) fn secured(
+        service: std::sync::Arc<dyn RpcService>,
+        vault: crate::vault::VaultService,
+    ) -> Self {
+        Self {
+            service,
+            vault,
+            secured: true,
+        }
+    }
+
+    fn plaintext_refused(&self) -> bool {
+        !self.secured && self.vault.is_enrolled()
     }
 }
 
@@ -1198,7 +1223,7 @@ impl RpcService for RelayRpc {
         let request = self.service.handle(method, params);
         tokio::pin!(request);
         let reply = loop {
-            if self.vault.is_enrolled() {
+            if self.plaintext_refused() {
                 return Err(RpcError::Failed("encrypted device channel required".into()));
             }
             tokio::select! {
@@ -1211,18 +1236,19 @@ impl RpcService for RelayRpc {
                 reply = &mut request => break reply?,
             }
         };
-        if self.vault.is_enrolled() {
+        if self.plaintext_refused() {
             return Err(RpcError::Failed("encrypted device channel required".into()));
         }
         match reply {
             RpcReply::Value(value) => Ok(RpcReply::Value(value)),
             RpcReply::Stream(stream) => {
                 let vault = self.vault.clone();
+                let secured = self.secured;
                 let stream = futures::stream::unfold(
                     (stream, vault, status),
-                    |(mut stream, vault, mut status)| async move {
+                    move |(mut stream, vault, mut status)| async move {
                         loop {
-                            if vault.is_enrolled() {
+                            if !secured && vault.is_enrolled() {
                                 return None;
                             }
                             tokio::select! {

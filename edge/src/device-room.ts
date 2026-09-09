@@ -76,6 +76,14 @@ const clientTag = (connId: string) => `client:${connId}`;
  * — 2.5 of their intervals — so upgrading engines is never a prerequisite. */
 const HOST_LIVENESS_MS = 75_000;
 
+/** The authenticated device channel (RFC 0001 §10, crates/rpc/src/device_channel.rs):
+ * Noise handshake and sealed RPC frames. For a profile that requires
+ * encryption these are the only application frames the relay carries — the
+ * relay sees ciphertext and routing, nothing else. */
+export const CHANNEL_KIND = "chan";
+/** App-level liveness echo (empty payload, bounced by the host). */
+const ECHO_KIND = "echo";
+
 /** Control frames the relay itself emits (kind " relay"). */
 // MUST byte-match packages/rpc device-frames.ts RELAY_KIND — clients compare
 // with ===; a mismatch makes host_offline/host_closed invisible to them.
@@ -259,15 +267,19 @@ export class DeviceRoom implements DurableObject {
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     if (typeof message === "string") return; // ping/pong auto-response
     const state = ws.deserializeAttachment() as SocketState;
-    if (await profileRequiresEncryption(this.env, state.orgId, state.userId)) {
-      ws.close(4403, "encrypted device channel required");
-      return;
-    }
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
     try {
       frame = decodeDeviceFrame(new Uint8Array(message));
     } catch {
       ws.close(1002, "Frame error");
+      return;
+    }
+    // Encrypted profile: only channel frames (handshake + ciphertext) and
+    // payload-less liveness echoes cross the relay. A plaintext RPC frame is
+    // a protocol violation — the socket closes; nothing is forwarded.
+    const opaque = frame.header.k === CHANNEL_KIND || (frame.header.k === ECHO_KIND && frame.payload.length === 0);
+    if (!opaque && (await profileRequiresEncryption(this.env, state.orgId, state.userId))) {
+      ws.close(4403, "encrypted device channel required");
       return;
     }
     if (state.role === "client") {

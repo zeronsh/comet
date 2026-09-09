@@ -1835,5 +1835,44 @@ ES-16  Release controls, support, and staged activation
    pairing on hardware, background/lock lifecycle, and the iOS readers for
    sealed tails/blobs (the app reads transcripts from the sealed rows).
 
+17.12. Authenticated device channel (ES-11, 2026-09-09)
+
+   Device RPC for enrolled profiles now rides a Noise XX session between
+   the two devices' vault identities (RFC §10, profile
+   Noise_XX_25519_AESGCM_SHA256 via the `snow` crate, statics = the
+   membership-published X25519 encryption keys, prologue bound to vault id
+   and generation, device ids inside the encrypted handshake payloads).
+   crates/crypto/src/channel.rs wraps the handshake and the transport
+   (chunking, frame cap, per-direction budget); crates/rpc/src/
+   device_channel.rs defines the frame shape (kind "chan", stream ids
+   hs1/hs2/hs3/rpc/err) and the ChannelAuthority seam; crates/rpc/src/
+   device_room.rs runs the responder in the host relay and the initiator
+   in DeviceLink/LinkCache. The engine implements ChannelAuthority on
+   VaultService (identity from the local store, scope and membership from
+   the pinned head, self-connections refused) and serves a second
+   RelayRpc instance to channel-authenticated conns; the plaintext
+   instance keeps refusing everything once enrolled, and both refuse
+   Vault* methods. Membership is re-checked on every inbound sealed frame;
+   a revocation that has reached either side ends the session.
+
+   The edge DeviceRoom relays "chan" frames (and payload-less liveness
+   echoes) for encrypted profiles and closes the socket (4403) on any
+   plaintext RPC frame, so the relay never carries application plaintext
+   for an enrolled profile. The former blanket refusals in dial_device and
+   EngineRpc::forward are gone: the link cache enforces the channel.
+
+   Verification: 3 crypto tests (mutual authentication, chunking/replay/
+   tamper, membership + prologue gating); 5 relay tests over the in-memory
+   fake DO (RPC + streams + 200 KB frames with zero plaintext frames on the
+   relay, plaintext client refused by an enrolled host, non-members refused
+   on either side, mid-session revocation, unenrolled profiles keep
+   plaintext); the workerd gate test now proves "chan" frames cross the
+   relay while plaintext closes; a live scenario in
+   crates/engine/tests/vault_e2e.rs (device_channel_over_the_live_relay)
+   pairs two VaultServices through a real DeviceRoom and checks the same
+   properties. Not yet covered: the iOS relay client (the phone keeps
+   refusing relay RPC until a Rust bridge exists), and per-session audit of
+   which member issued which command.
+
 
                           -- End of Project Plan --

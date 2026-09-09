@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod channel;
 pub mod content;
 pub mod envelope;
 pub mod hpke;

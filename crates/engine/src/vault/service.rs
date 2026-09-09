@@ -307,6 +307,62 @@ impl VaultService {
             .map(|t| t.device_id)
     }
 
+    /// This device's identity for the authenticated device channel (RFC
+    /// 0001 §10): its vault device id, X25519 static, and the vault scope
+    /// at the pinned membership head. Refused unless the head is trusted
+    /// and this device is active in it.
+    fn channel_local(&self) -> Result<zeron_rpc::ChannelLocal, String> {
+        let guarded = lock(&self.inner.guarded);
+        if let Some(reason) = &guarded.locked {
+            return Err(format!("vault locked: {reason}"));
+        }
+        if let Some(reason) = &guarded.verification_failure {
+            return Err(format!("vault verification failed: {reason}"));
+        }
+        let trust = guarded
+            .trust
+            .as_ref()
+            .ok_or("device is not an approved vault member")?;
+        let head = trust.head();
+        head.active_device(&trust.device_id)
+            .ok_or("device is not an active vault member")?;
+        let secret = guarded
+            .state
+            .device
+            .as_ref()
+            .and_then(|device| device.encryption_secret.decode::<32>())
+            .ok_or("device encryption secret unavailable")?;
+        let identity = zeron_crypto::channel::ChannelIdentity::new(trust.device_id, &secret)
+            .map_err(|e| e.to_string())?;
+        Ok(zeron_rpc::ChannelLocal {
+            identity,
+            scope: zeron_crypto::channel::ChannelScope {
+                vault_id: *head.vault_id(),
+                generation: *head.generation(),
+            },
+        })
+    }
+
+    /// The channel membership check: an ACTIVE device at the pinned head
+    /// whose published encryption key is the peer's Noise static, and which
+    /// is not this device. A clone presenting our own identity is refused.
+    fn channel_accepts(&self, peer: &zeron_crypto::channel::PeerIdentity) -> bool {
+        let guarded = lock(&self.inner.guarded);
+        if guarded.locked.is_some() || guarded.verification_failure.is_some() {
+            return false;
+        }
+        let Some(trust) = guarded.trust.as_ref() else {
+            return false;
+        };
+        if peer.device_id == trust.device_id {
+            return false;
+        }
+        trust
+            .head()
+            .active_device(&peer.device_id)
+            .is_some_and(|device| device.encryption_key == peer.static_key)
+    }
+
     fn publish_status(&self) {
         let status = {
             let guarded = lock(&self.inner.guarded);
@@ -326,7 +382,10 @@ impl VaultService {
         let base = |phase: VaultPhase| VaultStatus {
             phase,
             vault_id: guarded.state.vault.as_ref().map(|v| v.vault_id.0.clone()),
-            genesis_hash: guarded.trust.as_ref().map(|t| Hex::of(t.head().genesis_hash()).0),
+            genesis_hash: guarded
+                .trust
+                .as_ref()
+                .map(|t| Hex::of(t.head().genesis_hash()).0),
             device_id: device_id.clone(),
             epoch: None,
             devices: Vec::new(),
@@ -1673,6 +1732,20 @@ impl VaultService {
             key,
             author_public_key,
         })
+    }
+}
+
+impl zeron_rpc::ChannelAuthority for VaultService {
+    fn required(&self) -> bool {
+        self.is_enrolled()
+    }
+
+    fn local(&self) -> Result<zeron_rpc::ChannelLocal, String> {
+        self.channel_local()
+    }
+
+    fn accept(&self, peer: &zeron_crypto::channel::PeerIdentity) -> bool {
+        self.channel_accepts(peer)
     }
 }
 

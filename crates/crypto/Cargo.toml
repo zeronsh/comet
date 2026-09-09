@@ -13,6 +13,14 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 # needs a curve library. Reviewed 4.1.3 archive (checksum 97fb8b7c…b2be):
 # cfg-only build script, no process/network/filesystem access.
 curve25519-dalek = { version = "=4.1.3", default-features = false, features = ["zeroize"] }
+# Noise XX device channel (RFC 0001 §10, plan G1): the reviewed handshake
+# framework rather than a hand-rolled key exchange. ring supplies AES-GCM +
+# SHA-256, curve25519-dalek the X25519 DH (the same crate the HPKE path
+# uses). Archive 599b506c…d82 matches crates.io (2025-07-19, mcginty);
+# build script only detects the nightly channel. The RustCrypto sha2 /
+# chacha20poly1305 features only satisfy snow's compile-time resolver
+# check; the fallback resolver takes ring's SHA-256 and AES-GCM first.
+snow = { version = "=0.10.0", default-features = false, features = ["ring-accelerated", "use-curve25519", "use-getrandom", "use-sha2", "use-chacha20poly1305"] }
 
 [dev-dependencies]
 serde.workspace = true

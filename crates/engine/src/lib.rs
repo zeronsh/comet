@@ -424,11 +424,6 @@ impl EngineCore {
         &self,
         device_id: &str,
     ) -> Result<Arc<zeron_rpc::RpcClient>, EngineError> {
-        if self.vault.is_enrolled() {
-            return Err(EngineError::Other(
-                "encrypted device channel required".into(),
-            ));
-        }
         let links = self
             .links()
             .ok_or_else(|| EngineError::Other("peer links unavailable (offline)".into()))?;
@@ -443,8 +438,19 @@ impl EngineCore {
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
     pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
         let auth = self.auth();
-        let config =
+        let mut config =
             zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+        // The authenticated device channel (RFC 0001 §10): peers that
+        // complete the Noise handshake against this vault's membership get
+        // the content surface even though the profile is enrolled; plaintext
+        // relay conns keep the gated service below.
+        config.channel = Some(zeron_rpc::ChannelHost {
+            authority: Arc::new(self.vault.clone()),
+            service: Arc::new(rpc::RelayRpc::secured(
+                self.rpc_service(),
+                self.vault.clone(),
+            )),
+        });
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
@@ -838,6 +844,9 @@ impl Engine {
             link_config.liveness = Some(Arc::new(move |device_id: &str| {
                 workspace_for_liveness.peer_liveness(device_id)
             }));
+            // Enrolled profiles dial peers through the authenticated device
+            // channel only (RFC 0001 §10); the authority is the vault itself.
+            link_config.channel = Some(Arc::new(core.vault.clone()));
             let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace

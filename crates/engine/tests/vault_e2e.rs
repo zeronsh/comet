@@ -217,6 +217,140 @@ async fn two_devices_pair_seal_open_revoke_and_recover() {
     drop(Arc::new(()));
 }
 
+/// The authenticated device channel (RFC 0001 §10) through a REAL DeviceRoom
+/// DO: two paired members speak RPC over Noise XX; the relay refuses a
+/// plaintext frame for the encrypted profile; a stranger (its own vault,
+/// same user) cannot complete the handshake; a revoked member is cut off.
+#[tokio::test]
+async fn device_channel_over_the_live_relay() {
+    use zeron_rpc::{
+        ChannelHost, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig, RpcError, RpcReply,
+        RpcService, StaticToken, methods,
+    };
+
+    struct Probe;
+    #[async_trait::async_trait]
+    impl RpcService for Probe {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::LIST_HARNESSES => Ok(RpcReply::Value(serde_json::json!([]))),
+                "Echo" => Ok(RpcReply::Value(params)),
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    let Some(edge) = edge_url() else {
+        eprintln!("ZERON_VAULT_EDGE_URL unset; skipping live vault e2e");
+        return;
+    };
+    let (org, user) = fresh_profile();
+    let bearer = format!("{user}@{org}");
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = device(dir_a.path(), &edge, &org, &user);
+    a.refresh().await.unwrap();
+    let _kit = a.setup().await.unwrap();
+    a.confirm_recovery_kit().await.unwrap();
+    let b = device(dir_b.path(), &edge, &org, &user);
+    b.refresh().await.unwrap();
+    let (request_id, code) = b.request_enrollment().await.unwrap();
+    a.approve(&request_id, &code).await.unwrap();
+    b.refresh().await.unwrap();
+    assert!(b.is_ready());
+    // A learns B is a member (its head advanced on approval).
+    a.refresh().await.unwrap();
+
+    // A hosts its device room with the vault as channel authority.
+    let relay_device = format!("chan-live-{}", uuid::Uuid::new_v4().simple());
+    let mut host_config = HostRelayConfig::new(
+        edge.clone(),
+        relay_device.clone(),
+        Arc::new(StaticToken(bearer.clone())),
+    );
+    host_config.retry = std::time::Duration::from_millis(500);
+    host_config.channel = Some(ChannelHost {
+        authority: Arc::new(a.clone()),
+        service: Arc::new(Probe),
+    });
+    let _host = HostRelay::spawn(host_config, Arc::new(Probe), Arc::new(|_| {}));
+
+    // B dials through the channel and gets an answer.
+    let mut link_config = LinkCacheConfig::new(edge.clone(), Arc::new(StaticToken(bearer.clone())));
+    link_config.probe_timeout = std::time::Duration::from_secs(5);
+    link_config.cooldown_base = std::time::Duration::from_millis(200);
+    link_config.cooldown_max = std::time::Duration::from_millis(200);
+    link_config.channel = Some(Arc::new(b.clone()));
+    let links = LinkCache::new(link_config);
+    let client = loop {
+        match links.client(&relay_device).await {
+            Ok(client) => break client,
+            Err(err) => {
+                eprintln!("dial retry: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+    };
+    let echoed = client
+        .call(
+            "Echo",
+            serde_json::json!({ "private": "canary over the relay" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(echoed["private"], "canary over the relay");
+
+    // A plaintext client for the same profile: the relay closes the socket
+    // (4403) before the host ever sees the frame — the dial fails.
+    let mut plain_config =
+        LinkCacheConfig::new(edge.clone(), Arc::new(StaticToken(bearer.clone())));
+    plain_config.probe_timeout = std::time::Duration::from_secs(5);
+    let plain = LinkCache::new(plain_config);
+    let err = match plain.client(&relay_device).await {
+        Ok(_) => panic!("plaintext relay client must be refused"),
+        Err(err) => err.to_string(),
+    };
+    eprintln!("plaintext dial refused: {err}");
+
+    // A stranger: same user at the relay, but its own vault (another org)
+    // — the handshake prologue and membership both refuse it.
+    let dir_s = tempfile::tempdir().unwrap();
+    let (other_org, _) = fresh_profile();
+    let stranger = device(dir_s.path(), &edge, &other_org, &user);
+    stranger.refresh().await.unwrap();
+    stranger.setup().await.unwrap();
+    stranger.confirm_recovery_kit().await.unwrap();
+    let mut stranger_config =
+        LinkCacheConfig::new(edge.clone(), Arc::new(StaticToken(bearer.clone())));
+    stranger_config.probe_timeout = std::time::Duration::from_secs(5);
+    stranger_config.channel = Some(Arc::new(stranger.clone()));
+    let stranger_links = LinkCache::new(stranger_config);
+    assert!(
+        stranger_links.client(&relay_device).await.is_err(),
+        "a device from another vault must not get a channel"
+    );
+
+    // Revocation ends B's session: A's next refresh sees B gone and the
+    // established channel is cut at the next frame; a redial is refused.
+    let b_id = b.status().device_id.clone().unwrap();
+    a.revoke(&b_id).await.unwrap();
+    let err = client
+        .call("Echo", serde_json::json!({}))
+        .await
+        .expect_err("revoked member gets no answer");
+    eprintln!("post-revocation call: {err}");
+    links.invalidate(&relay_device);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        links.client(&relay_device).await.is_err(),
+        "revoked member must not re-establish the channel"
+    );
+}
+
 /// Registry field envelopes (RFC 0001 §9) through the live control plane:
 /// one object key per epoch for the whole registry, values bound to their
 /// row/field/clock, deletion markers, and key-unavailable withholding.

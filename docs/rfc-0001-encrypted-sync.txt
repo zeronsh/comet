@@ -898,6 +898,28 @@ Table of Contents
    Use a reviewed authenticated channel with ephemeral session keys,
    directional keys, replay protection, and explicit rekey limits.
 
+   The implemented profile is Noise_XX_25519_AESGCM_SHA256 (Noise revision
+   34), one fixed profile, no negotiation. Each device's Noise static is
+   the X25519 encryption key its membership entry publishes, so the
+   transcript authenticates the same identity the policy chain vouches
+   for. The prologue is "zeron/device-channel/v1\0" || vault id ||
+   storage generation; message 2 and message 3 carry the sender's device
+   id inside the encrypted handshake payload. A side accepts its peer
+   only when the pinned membership head lists an ACTIVE device with that
+   id AND that static key, and the peer is not itself. The initiator
+   checks the responder before sending message 3 (it reveals nothing but
+   an ephemeral key to a host it does not trust). After the handshake the
+   session uses Noise transport mode: per-direction keys and nonces
+   (replay-rejecting), application frames chunked below Noise's 64 KiB
+   limit with a continuation flag, an 8 MiB frame cap, and a budget of
+   2^32 messages per direction after which the session is retired.
+   Membership is re-checked on every inbound frame, so a revocation that
+   has reached a device ends the session at the next byte. The relay
+   carries kind "chan" frames only; for an enrolled profile it closes any
+   socket that sends a plaintext RPC frame, and the host refuses such a
+   frame independently. There is no plaintext fallback in either
+   direction.
+
    A relay-assigned connection ID is not a cryptographic device identity.
    Authenticate the peer and membership before exposing serve_connection
    or executing RPC. Scope each channel to one profile; the current
