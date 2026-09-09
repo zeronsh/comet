@@ -10675,7 +10675,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-crypto"
-version = "0.2.46"
+version = "0.2.54"
 dependencies = [
  "curve25519-dalek",
  "ring",

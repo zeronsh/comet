@@ -268,6 +268,7 @@ final class SessionStore {
             let status = try doc.importWith(bytes: plaintext, origin: "remote")
             if status.pending != nil { return .pendingDependencies }
             try persist(cursor: max(cursor, seq))
+            showingTail = false
             project()
             syncError = nil
             return .applied
@@ -355,6 +356,7 @@ final class SessionStore {
 
     private func connectIfReady() {
         guard started, !offline, !holdDial, chatRoom == nil, roomGen >= 2, config.permitsSync(encrypted: encrypted) else { return }
+        loadTail()
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
@@ -501,6 +503,10 @@ final class SessionStore {
     func stop() {
         started = false
         sealer?.cancel()
+        tailTask?.cancel()
+        tailTask = nil
+        if let hostRelay { Task { await hostRelay.client.close() } }
+        hostRelay = nil
         subscriptions.removeAll()
         saver?.flush()
         if let chatRoom {
@@ -521,6 +527,42 @@ final class SessionStore {
         case .disconnected:
             connected = false
         }
+    }
+
+    @ObservationIgnored private var tailTask: Task<Void, Never>?
+    private var showingTail = false
+
+    private func loadTail() {
+        guard tailTask == nil, entries.isEmpty, started, roomGen >= 2, !holdDial else { return }
+        let sidecars = SessionSidecars(config: config, chatId: chatId, encrypted: encrypted)
+        tailTask = Task { [weak self] in
+            defer { self?.tailTask = nil }
+            do {
+                let bytes = try await sidecars.tail()
+                guard let self, self.started, !Task.isCancelled, self.entries.isEmpty,
+                      self.config.permitsSync(encrypted: self.encrypted) else { return }
+                let entries = try Self.decodeTail(bytes, chatId: self.chatId)
+                self.showingTail = true
+                self.apply(entries)
+            } catch {
+                // Missing/unavailable sidecars do not prevent authoritative room sync.
+            }
+        }
+    }
+
+    func fetchToolBlob(ref: String) async throws -> String {
+        try await SessionSidecars(config: config, chatId: chatId, encrypted: encrypted).blob(ref: ref)
+    }
+
+    nonisolated static func decodeTail(_ bytes: Data, chatId: String) throws -> [MessageEntry] {
+        guard let json = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              json["chatId"] as? String == chatId, json["schemaVersion"] as? Int == 1,
+              let messages = json["messages"] as? [[String: Any]], messages.count <= 64 else {
+            throw MobileVaultError.verification
+        }
+        let entries = messages.compactMap { entryFrom(.fromJSON($0)) }
+        guard entries.count == messages.count else { throw MobileVaultError.verification }
+        return joinContinuations(entries)
     }
 
     // MARK: Projection
@@ -554,7 +596,7 @@ final class SessionStore {
             }.value
             guard let self else { return }
             self.projecting = false
-            if let decoded {
+            if let decoded, !self.showingTail {
                 self.apply(decoded.entries, queue: decoded.queue)
             }
             if self.projectPending {
@@ -620,10 +662,13 @@ final class SessionStore {
                     fields[k] = list.map { "\($0.jsonObject)" }
                 }
             }
+            for key in ["output", "outputRef", "diffRef"] {
+                if let value = m[key]?.stringValue { fields[key] = value }
+            }
             // isError presence IS the resolution marker (schema.rs:96).
             let isError = m["isError"]?.boolValue
             return .tool(id: id, call: RenderToolCall(tag: tag, fields: fields),
-                         isError: isError ?? false, resolved: isError != nil)
+                         isError: isError ?? false, resolved: m["resolved"]?.boolValue ?? (isError != nil))
         case "input":
             var questions: [UserInputQuestion] = []
             if let list = m["questions"]?.listValue,
@@ -631,7 +676,7 @@ final class SessionStore {
                let decoded = try? JSONDecoder().decode([UserInputQuestion].self, from: data) {
                 questions = decoded
             }
-            return .input(id: id, requestId: id, questions: questions,
+            return .input(id: id, requestId: m["requestId"]?.stringValue ?? id, questions: questions,
                           resolved: m["resolved"]?.boolValue ?? false)
         case "error":
             return .error(id: id, message: m["message"]?.stringValue ?? "")

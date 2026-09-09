@@ -136,3 +136,9 @@ queued row when the composer is empty. It never skips a blocked head or stops
 the agent merely because the draft is empty.
 
 Queue editing on iOS changes text only and preserves queued attachments, including when the text is cleared. Draft photos are hidden and the attachment picker is unavailable during editing. If the row disappears or its lease is superseded, **Copy edit and stop editing** saves the edited text to the clipboard and restores the original draft and photos.
+### Encrypted physical-device testing
+
+The phone supports encrypted relay RPC, sealed recent-message tails, and
+full tool output/diff sidecars. Follow the [Mac + iPhone test guide](../../docs/ios-encrypted-device-test.md)
+for a separate local profile, installation, comparison-code pairing, and the
+repeatable simulator-to-Rust live test.

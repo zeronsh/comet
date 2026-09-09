@@ -626,6 +626,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
         let now = chrono::Utc::now();
         legacy
             .upsert_device(&Device {
+                vault_device_id: None,
                 id: "dev-a".into(),
                 name: "old laptop".into(),
                 platform: "linux".into(),

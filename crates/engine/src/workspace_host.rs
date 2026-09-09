@@ -163,6 +163,7 @@ struct WorkspaceHostInner {
     sessions_tx: watch::Sender<Vec<Session>>,
     spaces_tx: watch::Sender<Vec<Space>>,
     room: Mutex<Option<Arc<RegistryClient>>>,
+    join_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Bumped on every registry change (local mutation or applied server
     /// frame) — drives republish + the snapshot debounce in `workspace_task`.
     changed_tx: watch::Sender<u64>,
@@ -247,6 +248,9 @@ impl WorkspaceHost {
                 doc
             }
         };
+        if config.vault.as_ref().is_some_and(|v| v.is_enrolled()) {
+            doc.enter_encrypted_room();
+        }
         // Destructive-break hygiene: the pre-spaces row stays unreachable.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
@@ -259,6 +263,7 @@ impl WorkspaceHost {
             .into_iter()
             .find(|d| d.id == config.device_id);
         doc.upsert_device(&Device {
+            vault_device_id: config.vault.as_ref().and_then(|v| v.status().device_id),
             id: config.device_id.clone(),
             name: device_name_on_boot(
                 existing.as_ref().map(|device| device.name.as_str()),
@@ -292,6 +297,7 @@ impl WorkspaceHost {
                 sessions_tx,
                 spaces_tx,
                 room: Mutex::new(None),
+                join_task: Mutex::new(None),
                 changed_tx,
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
@@ -304,6 +310,42 @@ impl WorkspaceHost {
         // dies before the first debounced save.
         host.inner.save_snapshot();
         host.join_room();
+        if let Some(vault) = host.inner.config.vault.clone().filter(|v| !v.is_enrolled()) {
+            let weak = Arc::downgrade(&host.inner);
+            let mut status = vault.watch_status();
+            tokio::spawn(async move {
+                loop {
+                    if vault.is_enrolled() {
+                        let Some(inner) = weak.upgrade() else { return };
+                        // Stop the old generation before resetting its independent cursor.
+                        let previous = lock(&inner.join_task).take();
+                        if let Some(task) = previous {
+                            task.abort();
+                            let _ = task.await;
+                        }
+                        lock(&inner.room).take();
+                        {
+                            let mut doc = lock(&inner.reg);
+                            doc.enter_encrypted_room();
+                            if let Ok(Some(mut device)) = doc.read_devices().map(|devices| {
+                                devices.into_iter().find(|d| d.id == inner.config.device_id)
+                            }) {
+                                device.vault_device_id = vault.status().device_id;
+                                let _ = doc.upsert_device(&device);
+                            }
+                        }
+                        inner.save_snapshot();
+                        inner.publish();
+                        inner.bump_changed();
+                        WorkspaceHost { inner }.join_room();
+                        return;
+                    }
+                    if status.changed().await.is_err() || weak.upgrade().is_none() {
+                        return;
+                    }
+                }
+            });
+        }
         tokio::spawn(workspace_task(Arc::downgrade(&host.inner), changed_rx));
         if host.inner.config.edge.is_some() {
             tokio::spawn(relay_probe_task(Arc::downgrade(&host.inner)));
@@ -363,7 +405,7 @@ impl WorkspaceHost {
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut wake = zeron_sync::wake::subscribe();
             let mut online = zeron_sync::wake::subscribe_online();
             // `RegistryClient` only self-reconnects AFTER a first successful
@@ -521,6 +563,9 @@ impl WorkspaceHost {
                 }
             }
         });
+        if let Some(previous) = lock(&self.inner.join_task).replace(task) {
+            previous.abort();
+        }
     }
 
     /// Close the current registry membership before account-scoped state is
@@ -1110,6 +1155,14 @@ impl WorkspaceHost {
     /// doc remains untouched.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.delete_chat(chat_id))?)
+    }
+
+    pub fn vault_device_names(&self) -> std::collections::BTreeMap<String, String> {
+        lock(&self.inner.reg).vault_device_names()
+    }
+
+    pub fn rename_vault_device(&self, id: &str, name: &str) -> Result<(), EngineError> {
+        Ok(self.mutate(|doc| doc.rename_vault_device(id, name))?)
     }
 
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {

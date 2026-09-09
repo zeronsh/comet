@@ -2,8 +2,8 @@
 // the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
 // The zeron mark on black, one white button — the old mobile app's Gate.
 //
-// Endpoints are fixed to production (the old app's rule: mobile always talks
-// to prod; a stale override once broke sign-in in the worst ghost way).
+// OAuth always uses production endpoints. Debug builds expose a separate,
+// explicit Dev sign-in for a local AUTH_MODE=dev worker.
 
 import AuthenticationServices
 import SwiftUI
@@ -33,6 +33,9 @@ struct SignInView: View {
     @State private var busy = false
     @State private var error: String?
     @State private var authSession = AuthSessionCoordinator()
+    #if DEBUG
+    @State private var showDevSignIn = false
+    #endif
 
     var body: some View {
         ZStack {
@@ -77,6 +80,15 @@ struct SignInView: View {
                     .disabled(busy)
                     .opacity(busy ? 0.6 : 1)
 
+                    #if DEBUG
+                    Button("Dev sign in") { showDevSignIn = true }
+                        .font(Theme.sans(13))
+                        .foregroundStyle(Theme.textMuted)
+                        .frame(minHeight: 44)
+                        .disabled(busy)
+                        .accessibilityIdentifier("dev-sign-in")
+                    #endif
+
                     if let error {
                         Text(error)
                             .font(Theme.sans(13))
@@ -90,6 +102,9 @@ struct SignInView: View {
             .padding(.horizontal, 32)
             .frame(maxWidth: 480)
         }
+        #if DEBUG
+        .sheet(isPresented: $showDevSignIn) { DevSignInView() }
+        #endif
     }
 
     /// The AuthKit code flow: system browser session → zeron://callback with
@@ -128,6 +143,60 @@ struct SignInView: View {
         }
     }
 }
+
+#if DEBUG
+private struct DevSignInView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("devSignInEdgeURL") private var edge = ""
+    @AppStorage("devSignInUser") private var user = "mobile-test"
+    @AppStorage("devSignInOrg") private var org = "mobile-test"
+
+    private var edgeURL: URL? {
+        guard let parts = URLComponents(string: edge.trimmingCharacters(in: .whitespacesAndNewlines)),
+              parts.scheme == "http" || parts.scheme == "https",
+              let host = parts.host, !host.isEmpty,
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil else { return nil }
+        return parts.url
+    }
+    private var userId: String { user.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var orgId: String { org.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var validIdentity: Bool {
+        !userId.isEmpty && !orgId.isEmpty && !userId.contains("@") && !orgId.contains("@")
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("http://your-mac.local:27640", text: $edge)
+                        .keyboardType(.URL)
+                        .accessibilityLabel("Edge URL")
+                    TextField("User ID", text: $user)
+                    TextField("Organization ID", text: $org)
+                } header: { Text("Local development server") } footer: {
+                    Text("Use your Mac's .local hostname. On a phone, localhost points to the phone itself. The server must run with AUTH_MODE=dev.")
+                }
+                Section {
+                    Button("Connect") {
+                        guard let edgeURL, validIdentity else { return }
+                        model.signInDev(edgeURL: edgeURL, userId: userId, orgId: orgId)
+                        dismiss()
+                    }
+                    .disabled(edgeURL == nil || !validIdentity)
+                }
+            }
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .navigationTitle("Dev sign in")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            }
+        }
+    }
+}
+#endif
 
 // MARK: - Auth session plumbing
 

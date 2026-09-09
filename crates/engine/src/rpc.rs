@@ -2322,21 +2322,54 @@ impl RpcService for EngineRpc {
                     .refresh()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&status)
+                let mut value =
+                    serde_json::to_value(status).map_err(|e| RpcError::Failed(e.to_string()))?;
+                value["migration"] = serde_json::json!(self.doc_host.history_migration_status());
+                value["deviceNames"] = serde_json::json!(self.workspace.vault_device_names());
+                RpcReply::value(&value)
+            }
+            methods::VAULT_RENAME_DEVICE => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    device_id: String,
+                    name: String,
+                }
+                let p: Params = parse_params(params)?;
+                if !self.vault()?.is_ready() {
+                    return Err(RpcError::Failed(
+                        "Approve this device before renaming devices".into(),
+                    ));
+                }
+                let status = self.vault()?.status();
+                if !status.devices.iter().any(|d| d.device_id == p.device_id) {
+                    return Err(RpcError::Failed("Device is not part of this vault".into()));
+                }
+                self.workspace
+                    .rename_vault_device(&p.device_id, &p.name)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({"ok": true}))
             }
             methods::VAULT_CONFIRM_RECOVERY => {
                 self.vault()?
                     .confirm_recovery_kit()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.doc_host.start_history_migration();
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::VAULT_MIGRATE_HISTORY => {
+                self.doc_host.start_history_migration();
+                RpcReply::value(&self.doc_host.history_migration_status())
+            }
             methods::VAULT_SETUP => {
-                let kit = self
-                    .vault()?
-                    .setup()
-                    .await
+                let preparation = self
+                    .doc_host
+                    .prepare_encryption()
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let result = self.vault()?.setup().await;
+                drop(preparation);
+                let kit = result.map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&kit)
             }
             methods::VAULT_REQUEST_ENROLLMENT => {

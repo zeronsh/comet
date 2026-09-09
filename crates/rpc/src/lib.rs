@@ -114,6 +114,7 @@ pub mod methods {
     // operations; none of them exports private keys.
     pub const VAULT_STATUS: &str = "VaultStatus";
     pub const VAULT_REFRESH: &str = "VaultRefresh";
+    pub const VAULT_MIGRATE_HISTORY: &str = "VaultMigrateHistory";
     pub const VAULT_SETUP: &str = "VaultSetup";
     pub const VAULT_CONFIRM_RECOVERY: &str = "VaultConfirmRecovery";
     pub const VAULT_REQUEST_ENROLLMENT: &str = "VaultRequestEnrollment";
@@ -121,6 +122,7 @@ pub mod methods {
     pub const VAULT_PENDING_REQUESTS: &str = "VaultPendingRequests";
     pub const VAULT_APPROVE: &str = "VaultApprove";
     pub const VAULT_REJECT: &str = "VaultReject";
+    pub const VAULT_RENAME_DEVICE: &str = "VaultRenameDevice";
     pub const VAULT_REVOKE: &str = "VaultRevoke";
     pub const VAULT_RECOVER: &str = "VaultRecover";
     /// Ask a headless IPC owner to drain its runtime and exit successfully.

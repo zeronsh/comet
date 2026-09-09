@@ -37,6 +37,7 @@ struct ZeronApp: App {
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -46,9 +47,22 @@ struct RootView: View {
             case .pickingOrg(let tokens, let orgs):
                 OrgPickerView(tokens: tokens, orgs: orgs)
             case .ready:
-                HomeView()
+                if model.requiresVaultApproval {
+                    DeviceApprovalView()
+                } else {
+                    HomeView()
+                }
             }
         }
         .task { model.restore() }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            // Membership changes are independent of socket connectivity.
+            // Stop polling in the background; foregrounding checks immediately.
+            while !Task.isCancelled {
+                model.refreshVault()
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            }
+        }
     }
 }

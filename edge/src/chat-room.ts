@@ -148,9 +148,20 @@ export class ChatRoom implements DurableObject {
       ) {
         return json({ error: "plaintext_rejected" }, 400);
       }
+      const expectedFrontier = request.headers.get("x-chat2-expected-frontier");
+      if (expectedFrontier !== null && expectedFrontier !== encodeBase64(this.blobs.get(FRONTIER_BLOB) ?? new Uint8Array(0))) {
+        return json({ error: "checkpoint_changed" }, 409);
+      }
       const outcome = commitCheckpoint(sql, this.blobs, seqCovered, frontier, body, Date.now());
       if (!outcome.ok) return json({ error: outcome.error }, 409);
       this.markBackupDirty();
+      // A history import can add state without appending a row. Reconnect
+      // existing readers so their normal catch-up loads the new checkpoint.
+      if (sealedOnly && url.searchParams.get("refreshReaders") === "1") {
+        for (const socket of this.ctx.getWebSockets()) {
+          try { socket.close(4411, "encrypted history updated"); } catch { /* already closed */ }
+        }
+      }
       return json({ ok: true, seqFloor: outcome.seqFloor, pruned: outcome.pruned });
     }
 

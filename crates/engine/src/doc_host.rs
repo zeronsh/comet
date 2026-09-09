@@ -41,6 +41,9 @@ use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
 
+mod migration;
+pub use migration::{EncryptionPreparation, MigrationStatus};
+
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 
@@ -213,6 +216,10 @@ pub struct DocHostConfig {
 }
 
 struct DocHostInner {
+    migration_running: AtomicBool,
+    migration_lock: tokio::sync::Mutex<()>,
+    encryption_preparing: Arc<AtomicBool>,
+    migration_status: Mutex<MigrationStatus>,
     store: Arc<DocsStore>,
     config: DocHostConfig,
     /// Set-once (first wins), cleared by `shutdown_workers`: sessions and
@@ -717,6 +724,10 @@ impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
         Self {
             inner: Arc::new(DocHostInner {
+                migration_running: AtomicBool::new(false),
+                migration_lock: tokio::sync::Mutex::new(()),
+                encryption_preparing: Arc::new(AtomicBool::new(false)),
+                migration_status: Mutex::new(MigrationStatus::default()),
                 store,
                 config,
                 sessions: Mutex::new(None),
@@ -883,6 +894,11 @@ impl DocHost {
         let _ = self.inner.vault.set(vault);
     }
 
+    fn plaintext_transport_allowed(&self) -> bool {
+        !self.inner.encryption_preparing.load(Ordering::Acquire)
+            && !self.vault().is_some_and(|v| v.is_enrolled())
+    }
+
     pub fn vault(&self) -> Option<&crate::vault::VaultService> {
         self.inner.vault.get()
     }
@@ -896,7 +912,10 @@ impl DocHost {
             lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             let host = self.clone();
-            self.spawn_worker(async move { host.drain_commands(&handle).await });
+            self.spawn_worker(async move {
+                host.drain_commands(&handle).await;
+                host.drain_queue(&handle).await;
+            });
         }
     }
 
@@ -906,6 +925,7 @@ impl DocHost {
         if self.inner.workspace.set(workspace).is_ok() {
             self.spawn_cutover_watcher(chats);
             self.spawn_migration_sweep();
+            self.spawn_encrypted_history_migration();
         }
     }
 
@@ -926,6 +946,7 @@ impl DocHost {
             let mut attempted: HashMap<String, i64> = HashMap::new();
             loop {
                 tokio::time::sleep(TICK).await;
+                if !host.plaintext_transport_allowed() { continue; }
                 let Some(edge) = host.inner.config.edge.clone() else {
                     return; // edge-less engine: nothing to migrate onto
                 };
@@ -1128,7 +1149,29 @@ impl DocHost {
         // duplicate every message. Local epoch >= 2 forces the chat2 branch
         // and best-effort completes the flip.
         let stored = self.inner.store.load_snapshot_with_cursor(chat_id)?;
+        let legacy_snapshot = stored
+            .as_ref()
+            .is_some_and(|(_, _, epoch)| *epoch < crate::chat2_host::CHAT2_ENCRYPTED_DOC_EPOCH);
         let stored_epoch = stored.as_ref().map(|(_, _, e)| *e).unwrap_or(0);
+        if encrypted && legacy_snapshot {
+            // Opening a chat may stamp subsequent local saves as encrypted.
+            // Retain its source and original room generation before that happens.
+            let source_key = format!("__encrypted_history_migration_v1:source:{chat_id}");
+            if !self.inner.store.has_snapshot(&source_key)? {
+                self.inner
+                    .store
+                    .save_snapshot(&source_key, &stored.as_ref().unwrap().0)?;
+                let source_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
+                    2
+                } else {
+                    registry_gen
+                };
+                self.inner.store.save_snapshot(
+                    &format!("{source_key}:generation"),
+                    &source_gen.to_le_bytes(),
+                )?;
+            }
+        }
         let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
             if registry_gen < 2
                 && let Some(ws) = self.workspace()
@@ -1343,6 +1386,8 @@ impl DocHost {
                 // pending buffer the join drains — nothing composed during
                 // (or before) the dial is lost to the room.
                 let weak_push = Arc::downgrade(&handle);
+                let vault_gate = self.inner.vault.get().cloned();
+                let preparing = self.inner.encryption_preparing.clone();
                 let sub = doc
                     .doc()
                     .subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
@@ -1353,6 +1398,13 @@ impl DocHost {
                                 // outbox, then enqueues the immutable bytes.
                                 lock(&handle.chat2_pending_local).push(bytes.clone());
                                 handle.seal_wake.notify_one();
+                                return true;
+                            }
+                            if preparing.load(Ordering::Acquire)
+                                || vault_gate.as_ref().is_some_and(|v| v.is_enrolled())
+                            {
+                                // Retain local edits while migration retires this old transport.
+                                lock(&handle.chat2).take();
                                 return true;
                             }
                             // The buffer push happens WHILE HOLDING the client
@@ -1389,7 +1441,12 @@ impl DocHost {
                 // transcript). Push the doc's full update log as the join's
                 // first batch; once acked the cursor moves and this never
                 // re-arms.
-                if chat2_cursor == 0 {
+                let checkpoint_seeded = self
+                    .inner
+                    .store
+                    .has_snapshot(&format!("__encrypted_history_seed:{chat_id}"))
+                    .unwrap_or(false);
+                if chat2_cursor == 0 && !(encrypted && (legacy_snapshot || checkpoint_seeded)) {
                     match doc
                         .doc()
                         .export(loro::ExportMode::updates(&loro::VersionVector::default()))
@@ -1550,6 +1607,7 @@ impl DocHost {
             let mut online = zeron_sync::wake::subscribe_online();
             let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
             loop {
+                if !encrypted && (host.inner.encryption_preparing.load(Ordering::Acquire) || vault.as_ref().is_some_and(|v| v.is_enrolled())) { return; }
                 if weak.upgrade().is_none() {
                     return; // evicted or purged while dialing
                 }
@@ -1922,6 +1980,9 @@ impl DocHost {
             edge.url.trim_end_matches('/'),
             chat_id
         );
+        if !self.plaintext_transport_allowed() {
+            return Err("encryption transition stopped the legacy seed".into());
+        }
         let res = self
             .inner
             .http
@@ -2138,6 +2199,7 @@ impl DocHost {
             let room_tail = room.clone();
             let codec_tail = codec.clone();
             let encrypted = handle.encrypted;
+            let gate = self.clone();
             self.spawn_worker(async move {
                 let Some(bearer) = edge_tail.bearer().await else {
                     return;
@@ -2166,6 +2228,9 @@ impl DocHost {
                     edge_tail.url.trim_end_matches('/'),
                     room_tail
                 );
+                if !encrypted && !gate.plaintext_transport_allowed() {
+                    return;
+                }
                 let _ = http
                     .put(&url)
                     .bearer_auth(&bearer)
@@ -2223,6 +2288,7 @@ impl DocHost {
         } else {
             chat_id.clone()
         };
+        let gate = self.clone();
         self.spawn_worker(async move {
             let Some(bearer) = edge.bearer().await else {
                 in_flight.store(false, Ordering::Release);
@@ -2271,6 +2337,10 @@ impl DocHost {
                 seq_covered
             );
             let size = snapshot.len() as u64;
+            if !encrypted && !gate.plaintext_transport_allowed() {
+                in_flight.store(false, Ordering::Release);
+                return;
+            }
             match http
                 .post(&url)
                 .bearer_auth(&bearer)
@@ -3242,6 +3312,12 @@ impl DocHost {
     ///
     /// One at a time by design: each send changes the status this reads.
     pub async fn drain_queue(&self, handle: &Arc<ChatDocHandle>) {
+        if !self.history_ready_for_commands(&handle.chat_id)
+            || self.inner.encryption_preparing.load(Ordering::Acquire)
+            || self.inner.migration_running.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
@@ -3346,6 +3422,12 @@ impl DocHost {
         item: &QueuedMessage,
         send: QueueSend,
     ) -> Result<(), EngineError> {
+        if !self.history_ready_for_commands(&handle.chat_id)
+            || self.inner.encryption_preparing.load(Ordering::Acquire)
+            || self.inner.migration_running.load(Ordering::Acquire)
+        {
+            return Err(EngineError::Other("Waiting for chat history encryption to finish".into()));
+        }
         let Some(sessions) = self.sessions() else {
             return Err(EngineError::Other("sessions engine not wired".into()));
         };
@@ -3965,12 +4047,18 @@ impl DocHost {
             .get()
             .filter(|vault| vault.is_enrolled())
             .map(|vault| crate::chat2_host::ChatCodec::new(vault.clone(), chat_id));
+        let blob_room = if codec.is_some() {
+            crate::chat2_host::encrypted_room_id(chat_id)
+        } else {
+            chat_id.to_owned()
+        };
         let base = format!(
             "{}/blob/{}/{}",
             edge.url.trim_end_matches('/'),
-            chat_id,
+            blob_room,
             encode_part_segment(&payload.part_id)
         );
+        let gate = self.clone();
         self.spawn_worker_on(&runtime, async move {
             let Some(bearer) = edge.bearer().await else {
                 return; // signed out; summary-only until the next session
@@ -4006,6 +4094,7 @@ impl DocHost {
                 }
                 puts = sealed;
             }
+            if codec.is_none() && !gate.plaintext_transport_allowed() { return; }
             for (url, content_type, body) in puts {
                 let sent = http
                     .put(&url)
@@ -4038,6 +4127,8 @@ impl DocHost {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                 && !part.is_empty()
+                && part != "."
+                && part != ".."
                 && part.len() <= 200
                 && part
                     .bytes()
@@ -4056,13 +4147,19 @@ impl DocHost {
         // segment for transport (PART_RE allows `#`, which a raw URL would
         // truncate as a fragment — the 2026-08-10 silent-collision bug).
         let (chat, part) = blob_ref.split_once('/').expect("validated above");
+        let encrypted = self.inner.vault.get().is_some_and(|v| v.is_enrolled());
+        let room = if encrypted {
+            crate::chat2_host::encrypted_room_id(chat)
+        } else {
+            chat.to_owned()
+        };
         let url = format!(
             "{}/blob/{}/{}",
             edge.url.trim_end_matches('/'),
-            chat,
+            room,
             encode_part_segment(part)
         );
-        let res = self
+        let mut res = self
             .inner
             .http
             .get(&url)
@@ -4070,6 +4167,21 @@ impl DocHost {
             .send()
             .await
             .map_err(|e| EngineError::Other(format!("sidecar fetch failed: {e}")))?;
+        if encrypted && res.status() == reqwest::StatusCode::NOT_FOUND {
+            res = self
+                .inner
+                .http
+                .get(format!(
+                    "{}/blob/{}/{}",
+                    edge.url.trim_end_matches('/'),
+                    chat,
+                    encode_part_segment(part)
+                ))
+                .bearer_auth(&bearer)
+                .send()
+                .await
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
                 "sidecar fetch: HTTP {}",
@@ -4131,6 +4243,14 @@ impl DocHost {
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
+        if !self.history_ready_for_commands(&handle.chat_id) {
+            return;
+        }
+        if self.inner.encryption_preparing.load(Ordering::Acquire)
+            || self.inner.migration_running.load(Ordering::Acquire)
+        {
+            return;
+        }
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
         };

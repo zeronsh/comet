@@ -387,7 +387,7 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Encryption,
         SettingsSection::Harnesses,
@@ -1227,6 +1227,9 @@ pub struct Shell {
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    vault_requests_task: Option<Task<()>>,
+    vault_requests_seen: crate::notify::ApprovalRequests,
+    vault_requests_pending: usize,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
     /// UpdateStatus stream says WHETHER one exists; this says how far the
     /// download/stage of it has come in this process.
@@ -1391,12 +1394,17 @@ impl Shell {
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
             let mut displayed_minute = Utc::now().timestamp().div_euclid(60);
+            let mut vault_tick = 0u8;
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let minute = Utc::now().timestamp().div_euclid(60);
                 let minute_changed = minute != displayed_minute;
                 displayed_minute = minute;
                 let alive = this.update(cx, |shell: &mut Shell, cx| {
+                    if vault_tick == 0 {
+                        shell.poll_vault_requests(cx);
+                    }
+                    vault_tick = (vault_tick + 1) % 5;
                     let live = {
                         let s = shell.state.read(cx);
                         s.selected_chat
@@ -1551,6 +1559,9 @@ impl Shell {
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
+            vault_requests_task: None,
+            vault_requests_seen: Default::default(),
+            vault_requests_pending: 0,
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
@@ -3082,6 +3093,52 @@ impl Shell {
         }
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// Approval requests are app-wide: settings need not be open to discover them.
+    fn poll_vault_requests(&mut self, cx: &mut Context<Self>) {
+        if self.vault_requests_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if self.vault_requests_pending != 0 {
+                self.vault_requests_pending = 0;
+                cx.notify();
+            }
+            return;
+        };
+        let scope = self.state.read(cx).workspace_scope.clone();
+        self.vault_requests_task = Some(cx.spawn(async move |this, cx| {
+            let result = async {
+                let status = engine.client().call(methods::VAULT_REFRESH, serde_json::json!({})).await?;
+                if status.get("phase").and_then(serde_json::Value::as_str) != Some("ready") {
+                    return Ok::<_, zeron_rpc::RpcError>((String::new(), Vec::new()));
+                }
+                let vault = status.get("genesisHash").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+                let response = engine.client().call(methods::VAULT_PENDING_REQUESTS, serde_json::json!({})).await?;
+                let requests = response.get("requests").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+                Ok((vault, requests))
+            }.await;
+            this.update(cx, |shell, cx| {
+                shell.vault_requests_task = None;
+                if shell.state.read(cx).workspace_scope != scope || shell.state.read(cx).engine().is_none() {
+                    shell.vault_requests_pending = 0;
+                    cx.notify();
+                    return;
+                }
+                if let Ok((vault, requests)) = result {
+                    shell.vault_requests_pending = requests.len();
+                    let new = shell.vault_requests_seen.observe(&vault, requests.iter().filter_map(|request|
+                        request.get("requestId").and_then(serde_json::Value::as_str)));
+                    if new && shell.settings.notifications_enabled {
+                        // Approval prompts remain useful while the app is focused;
+                        // the background-only preference applies to session updates.
+                        crate::notify::post("Device approval requested", "A device wants access to your encrypted vault. Open Settings → Encryption to compare its code and review the request.");
+                    }
+                    cx.notify();
+                }
+            }).ok();
+        }));
     }
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
@@ -5288,6 +5345,35 @@ impl Shell {
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
+            })
+            .when(self.vault_requests_pending > 0, |el| {
+                el.child(
+                    div()
+                        .id("vault-approval-notice")
+                        .mx(px(Theme::SPACE_SM))
+                        .mt(px(4.0))
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(6.0))
+                        .rounded(px(Theme::CONTROL_RADIUS))
+                        .bg(theme.accent_wash)
+                        .hover(move |s| s.bg(theme.accent.opacity(0.16)))
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.accent)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_settings(SettingsSection::Encryption, cx)
+                        }))
+                        .child(format!(
+                            "{} device approval request{} · Review",
+                            self.vault_requests_pending,
+                            if self.vault_requests_pending == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )),
+                )
             })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {

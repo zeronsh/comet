@@ -26,6 +26,9 @@ use crate::theme::Theme;
 enum Prompt {
     /// Recovery: the user types the kit text.
     Recover,
+    Rename {
+        device_id: String,
+    },
 }
 
 struct PromptDialog {
@@ -47,6 +50,7 @@ pub struct EncryptionPage {
     load_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
+    poll_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -59,7 +63,7 @@ pub fn phase_copy(status: &Value) -> (&'static str, String) {
         .unwrap_or("")
         .to_string();
     match phase {
-        "ready" => ("Vault ready", "This device holds vault keys. Encrypted sync is a preview; migration, device channels and iOS integration are incomplete.".into()),
+        "ready" => ("Vault ready", "Synced content is encrypted on your approved devices.".into()),
         "notEnrolled" => {
             if status.get("remoteVault").and_then(Value::as_bool) == Some(true) {
                 ("Approve this device", "This account already has an encrypted vault. Approve this device from another device, or use your recovery key.".into())
@@ -70,7 +74,7 @@ pub fn phase_copy(status: &Value) -> (&'static str, String) {
         "pending" => ("Waiting for approval", "Open Settings → Encryption on an approved device and compare the code below before approving.".into()),
         "locked" => ("Unlock this device", format!("Secure key storage is unavailable: {reason}")),
         "recoveryConfirmationRequired" => ("Save recovery kit", "Save the recovery key and file, then confirm. Encrypted writes remain paused until confirmation.".into()),
-        "keyUpdateRequired" => ("Waiting for encryption keys", "A vault update or key delivery is pending. Refresh to retry safely.".into()),
+        "keyUpdateRequired" => ("Waiting for encryption keys", "A vault update or key delivery is pending. This page checks automatically.".into()),
         "verificationFailed" => ("Sync paused", format!("Data could not be verified: {reason}")),
         "revoked" => ("Removed", "This device was removed from the vault. Approve it again from another device to resume.".into()),
         "unavailable" => ("Not available", reason),
@@ -93,15 +97,36 @@ impl EncryptionPage {
             load_task: None,
             action_task: None,
             copy_task: None,
+            poll_task: None,
             _observe: observe,
         };
         page.load(cx);
+        page.poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                if this
+                    .update(cx, |page, cx| {
+                        if !page.busy {
+                            page.load(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
         page
     }
 
     /// `VaultRefresh` (network reconcile + status) and, when this device is
     /// an approved member, the pending enrollment requests.
     fn load(&mut self, cx: &mut Context<Self>) {
+        if self.load_task.is_some() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -130,6 +155,7 @@ impl EncryptionPage {
                 Vec::new()
             };
             this.update(cx, |page, cx| {
+                page.load_task = None;
                 page.status = match status {
                     Ok(value) => Loadable::Ready(value),
                     Err(err) => Loadable::Error(err.to_string()),
@@ -236,6 +262,22 @@ impl EncryptionPage {
         );
     }
 
+    fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| ComposerInput::new("Device name", cx));
+        input.update(cx, |input, cx| input.set_text(current, cx));
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_prompt(cx);
+            }
+        });
+        self.prompt = Some(PromptDialog {
+            kind: Prompt::Rename { device_id },
+            input,
+            _events: events,
+        });
+        cx.notify();
+    }
+
     fn open_recover(&mut self, cx: &mut Context<Self>) {
         let input = cx.new(|cx| ComposerInput::new("Recovery key (XXXXX-XXXXX-…)", cx));
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
@@ -261,6 +303,12 @@ impl EncryptionPage {
             return;
         }
         match dialog.kind {
+            Prompt::Rename { device_id } => self.action(
+                methods::VAULT_RENAME_DEVICE,
+                serde_json::json!({"deviceId": device_id, "name": text}),
+                |_, _| {},
+                cx,
+            ),
             Prompt::Recover => self.action(
                 methods::VAULT_RECOVER,
                 serde_json::json!({ "kit": text }),
@@ -299,18 +347,26 @@ impl EncryptionPage {
         let theme = Theme::of(cx).clone();
         let dialog = self.prompt.as_ref()?;
         let input = dialog.input.clone();
+        let (title, description, submit) = match &dialog.kind {
+            Prompt::Recover => (
+                "Use recovery key",
+                "Enter the recovery key you saved when you set up encryption. This adds this device under a fresh key epoch; other devices catch up automatically.",
+                "Recover",
+            ),
+            Prompt::Rename { .. } => (
+                "Rename device",
+                "Choose a recognizable name, like Laptop or iPhone. Names sync across your approved devices.",
+                "Save",
+            ),
+        };
         let card = popover::dialog_card(&theme)
-            .child(popover::dialog_title(&theme, "Use recovery key"))
+            .child(popover::dialog_title(&theme, title))
             .child(
                 div()
                     .mt(px(8.0))
                     .text_size(crate::typography::ui_rems(12.5))
                     .text_color(theme.text_muted)
-                    .child(SharedString::from(
-                        "Enter the recovery key you saved when you set up encryption. This \
-                         adds this device under a fresh key epoch; other devices catch up \
-                         automatically.",
-                    )),
+                    .child(SharedString::from(description)),
             )
             .child(
                 div()
@@ -333,7 +389,7 @@ impl EncryptionPage {
                             })),
                     )
                     .child(
-                        popover::btn_primary(&theme, "Recover")
+                        popover::btn_primary(&theme, submit)
                             .id("vault-prompt-submit")
                             .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
                     ),
@@ -393,8 +449,14 @@ impl EncryptionPage {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let mut meta: Vec<AnyElement> =
-            vec![div().child(SharedString::from(copy)).into_any_element()];
+        let mut meta: Vec<AnyElement> = vec![
+            div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .child(SharedString::from(copy))
+                .into_any_element(),
+        ];
         if let Some(epoch) = epoch {
             meta.push(
                 div()
@@ -506,7 +568,17 @@ impl EncryptionPage {
                         .flex()
                         .flex_col()
                         .child(widgets::row_title(theme, "End-to-end encryption"))
-                        .child(widgets::meta_line(theme, meta)),
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.text_muted)
+                                .children(meta),
+                        ),
                 )
                 .child(badge),
         );
@@ -531,6 +603,7 @@ impl EncryptionPage {
                         .child(widgets::meta_line(
                             theme,
                             vec![div()
+                                .w_full().min_w_0().whitespace_normal()
                                 .child(SharedString::from(
                                     "Approve only if the approving device shows exactly this code.",
                                 ))
@@ -551,6 +624,61 @@ impl EncryptionPage {
             ),
         );
         card.into_any_element()
+    }
+
+    fn render_migration(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Loadable::Ready(status) = &self.status else {
+            return None;
+        };
+        if status.get("phase").and_then(Value::as_str) != Some("ready") {
+            return None;
+        }
+        let migration = status.get("migration")?;
+        let phase = migration.get("phase").and_then(Value::as_str).unwrap_or("");
+        let done = migration
+            .get("completed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total = migration.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let title = match phase {
+            "copying" => format!("Encrypting existing chats · {done} of {total}"),
+            "complete" => "Chat history is up to date".into(),
+            "paused" => format!("History migration paused · {done} of {total}"),
+            _ => "Preparing existing chat history".into(),
+        };
+        let mut content = div().flex().flex_col().gap(px(8.0)).min_w_0().flex_1()
+            .child(widgets::row_title(theme, title))
+            .child(div().w_full().whitespace_normal().text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_muted).child("Original plaintext copies are retained. Unsynced history on another device is copied when that device reconnects and joins encryption."));
+        if let Some(error) = migration.get("error").and_then(Value::as_str) {
+            content = content.child(
+                div()
+                    .w_full()
+                    .whitespace_normal()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.danger)
+                    .child(error.to_owned()),
+            );
+        }
+        let mut row = widgets::card_row(theme, true).child(content);
+        if phase != "copying" {
+            row = row.child(self.action_button(
+                theme,
+                "vault-migrate",
+                "Retry / check history",
+                false,
+                cx,
+                |page, cx| {
+                    page.action(
+                        methods::VAULT_MIGRATE_HISTORY,
+                        serde_json::json!({}),
+                        |_, _| {},
+                        cx,
+                    )
+                },
+            ));
+        }
+        Some(widgets::section_card(theme).child(row).into_any_element())
     }
 
     fn render_kit(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -669,6 +797,9 @@ impl EncryptionPage {
                                 theme,
                                 vec![
                                     div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .whitespace_normal()
                                         .child(SharedString::from(
                                             "Compare with the code on the new device. An approved \
                                          device can read all synced content and manage devices.",
@@ -701,8 +832,9 @@ impl EncryptionPage {
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
+                .mt(px(24.0))
                 .child(widgets::field_label(theme, "Devices waiting for approval"))
-                .child(widgets::section_card(theme).children(rows))
+                .child(widgets::section_card(theme).mt(px(0.0)).children(rows))
                 .into_any_element(),
         )
     }
@@ -726,21 +858,43 @@ impl EncryptionPage {
                     .to_string();
                 let active = device.get("status").and_then(Value::as_str) == Some("active");
                 let this_device = device.get("thisDevice").and_then(Value::as_bool) == Some(true);
+                let state = self.state.read(cx);
+                let named = state.devices.iter().find(|d| {
+                    d.vault_device_id.as_deref() == Some(id.as_str())
+                        || (this_device && state.local_device_id.as_deref() == Some(d.id.as_str()))
+                });
+                let label = status
+                    .get("deviceNames")
+                    .and_then(|names| names.get(&id))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| named.map(|d| d.name.clone()))
+                    .unwrap_or_else(|| {
+                        if this_device {
+                            "This computer".into()
+                        } else {
+                            format!("Device {}", crate::settings::devices::short_id(&id))
+                        }
+                    });
+                let icon = if named.is_some_and(|d| d.platform == "ios") {
+                    crate::icons::SMARTPHONE
+                } else {
+                    crate::icons::MONITOR
+                };
                 let revoke_id = id.clone();
+                let rename_id = id.clone();
+                let rename_name = label.clone();
                 let mut row = widgets::card_row(theme, ix == 0)
                     .id(("vault-device", ix))
                     .when(!active, |el| el.opacity(0.55))
-                    .child(widgets::row_tile(theme, crate::icons::MONITOR))
+                    .child(widgets::row_tile(theme, icon))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(widgets::row_title(
-                                theme,
-                                format!("Vault member {}", crate::settings::devices::short_id(&id)),
-                            ))
+                            .child(widgets::row_title(theme, label))
                             .child(widgets::meta_line(
                                 theme,
                                 vec![
@@ -754,6 +908,18 @@ impl EncryptionPage {
                                 ],
                             )),
                     );
+                if status.get("phase").and_then(Value::as_str) == Some("ready") {
+                    row = row.child(self.action_button(
+                        theme,
+                        "vault-rename",
+                        "Rename",
+                        false,
+                        cx,
+                        move |this, cx| {
+                            this.open_rename(rename_id.clone(), rename_name.clone(), cx)
+                        },
+                    ));
+                }
                 if this_device {
                     row = row.child(widgets::badge_active(theme, "This device"));
                 } else if active {
@@ -774,12 +940,16 @@ impl EncryptionPage {
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
+                .mt(px(24.0))
                 .child(widgets::field_label(theme, "Approved devices"))
-                .child(widgets::section_card(theme).children(rows))
+                .child(widgets::section_card(theme).mt(px(0.0)).children(rows))
                 .child(widgets::meta_line(
                     theme,
                     vec![
                         div()
+                            .w_full()
+                            .min_w_0()
+                            .whitespace_normal()
                             .child(SharedString::from(
                                 "Removing a device stops its future sync access after the change \
                              takes effect. It cannot erase information the device already \
@@ -809,11 +979,11 @@ impl Render for EncryptionPage {
             Some(WorkspaceScope::Local) => {
                 "This workspace is local-only; nothing is sent to a sync backend.".to_string()
             }
-            _ => "Encrypted-sync preview. Key management and selected sync paths are implemented, \
-                  but complete content coverage and migration are not ready for production use."
+            _ => "Manage the devices that can read your encrypted sessions and files. Existing history is copied into encryption after setup; original plaintext copies are retained."
                 .to_string(),
         };
         let status = self.render_status(&theme, cx);
+        let migration = self.render_migration(&theme, cx);
         let kit = self.render_kit(&theme, cx);
         let pending = self.render_pending(&theme, cx);
         let devices = self.render_devices(&theme, cx);
@@ -837,6 +1007,7 @@ impl Render for EncryptionPage {
                     })
                     .children(kit)
                     .child(status)
+                    .children(migration)
                     .children(pending)
                     .children(devices),
             )

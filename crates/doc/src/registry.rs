@@ -348,6 +348,8 @@ struct PersistedState {
     /// pre-epoch snapshots default to 0.
     #[serde(default)]
     resync_epoch: u32,
+    #[serde(default)]
+    encrypted: bool,
     device_id: String,
     server_seq: u64,
     gc_floor: u64,
@@ -359,6 +361,7 @@ struct PersistedState {
 /// The local registry replica. Pure data — no I/O, no async; the transport
 /// (`zeron_sync::RegistryClient`) and the engine host drive it under a lock.
 pub struct RegistryDoc {
+    encrypted: bool,
     device_id: String,
     /// kind → id → row (server truth).
     authoritative: HashMap<String, HashMap<String, RegistryRow>>,
@@ -374,6 +377,7 @@ pub struct RegistryDoc {
 impl RegistryDoc {
     pub fn new(device_id: impl Into<String>) -> Self {
         Self {
+            encrypted: false,
             device_id: device_id.into(),
             authoritative: HashMap::new(),
             server_seq: 0,
@@ -402,6 +406,29 @@ impl RegistryDoc {
         self.pending.len()
     }
 
+    /// Registry generations have independent cursors. Preserve local metadata
+    /// and clocks, but resubmit it through the encrypted codec on first entry.
+    /// Transcript/history migration is deliberately separate.
+    pub fn enter_encrypted_room(&mut self) -> bool {
+        if self.encrypted {
+            return false;
+        }
+        self.encrypted = true;
+        self.server_seq = 0;
+        self.gc_floor = 0;
+        let seeds: Vec<RowOp> = self
+            .authoritative
+            .values()
+            .flat_map(|rows| rows.values())
+            .map(row_to_seed_op)
+            .collect();
+        if !seeds.is_empty() {
+            self.enqueue_ops(seeds);
+        }
+        self.generation += 1;
+        true
+    }
+
     // ── persistence ─────────────────────────────────────────────────────────
 
     // (see PersistedState::resync_epoch)
@@ -415,6 +442,7 @@ impl RegistryDoc {
         let state = PersistedState {
             v: 1,
             resync_epoch: CURRENT_RESYNC_EPOCH,
+            encrypted: self.encrypted,
             device_id: self.device_id.clone(),
             server_seq: self.server_seq,
             gc_floor: self.gc_floor,
@@ -434,6 +462,7 @@ impl RegistryDoc {
             )));
         }
         let mut doc = Self::new(device_id);
+        doc.encrypted = state.encrypted;
         // One-shot healing resync: snapshots from before a cursor-integrity
         // fix may have a cursor that JUMPED past rows this replica never
         // applied (the ack/gap bugs above) — those rows are invisible and no
@@ -748,12 +777,65 @@ impl RegistryDoc {
             ("id", json!(device.id)),
             ("name", json!(device.name)),
             ("platform", json!(device.platform)),
+            ("vaultDeviceId", opt_str(device.vault_device_id.as_deref())),
             ("lastSeenAt", opt_ms(device.last_seen_at)),
             ("createdAt", opt_ms(device.created_at)),
             ("version", opt_str(device.version.as_deref())),
             ("capabilities", json!(device.capabilities)),
         ]);
         self.write(KIND_DEVICES, &device.id.clone(), OpKind::Upsert, set);
+        if let Some(id) = &device.vault_device_id {
+            if !self.row_exists("vaultDevices", id) {
+                self.write(
+                    "vaultDevices",
+                    id,
+                    OpKind::Upsert,
+                    fields([
+                        ("name", json!(device.name)),
+                        ("deviceId", json!(device.id)),
+                        ("platform", json!(device.platform)),
+                    ]),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Display labels are encrypted registry metadata, separate from membership.
+    pub fn vault_device_names(&self) -> BTreeMap<String, String> {
+        let mut names = BTreeMap::new();
+        for device in self.read_devices().unwrap_or_default() {
+            if let Some(id) = device.vault_device_id {
+                names.insert(id, device.name);
+            }
+        }
+        for row in self.overlay_rows("vaultDevices") {
+            if let Some(name) = row.fields.get("name").and_then(Value::as_str) {
+                names.insert(row.id, name.to_owned());
+            }
+        }
+        names
+    }
+
+    pub fn rename_vault_device(&mut self, id: &str, name: &str) -> Result<(), DocError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 80 {
+            return Err(DocError::Schema(
+                "Device names must contain 1–80 characters".into(),
+            ));
+        }
+        self.write(
+            "vaultDevices",
+            id,
+            OpKind::Upsert,
+            fields([("name", json!(name))]),
+        );
+        let devices = self.read_devices()?;
+        for device in devices {
+            if device.vault_device_id.as_deref() == Some(id) {
+                self.rename_device(&device.id, name)?;
+            }
+        }
         Ok(())
     }
 
@@ -768,6 +850,16 @@ impl RegistryDoc {
             OpKind::Update,
             fields([("name", json!(name))]),
         );
+        for alias in self.overlay_rows("vaultDevices") {
+            if alias.fields.get("deviceId").and_then(Value::as_str) == Some(device_id) {
+                self.write(
+                    "vaultDevices",
+                    &alias.id,
+                    OpKind::Update,
+                    fields([("name", json!(name))]),
+                );
+            }
+        }
         Ok(true)
     }
 
@@ -1256,6 +1348,7 @@ impl RegistryDoc {
                     ("id", json!(device.id)),
                     ("name", json!(device.name)),
                     ("platform", json!(device.platform)),
+                    ("vaultDeviceId", opt_str(device.vault_device_id.as_deref())),
                     ("lastSeenAt", opt_ms(device.last_seen_at)),
                     ("createdAt", opt_ms(device.created_at)),
                     ("version", opt_str(device.version.as_deref())),

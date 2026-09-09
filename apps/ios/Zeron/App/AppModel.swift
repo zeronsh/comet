@@ -29,6 +29,8 @@ final class AppModel {
     /// at all (a vault exists but this device is not yet approved).
     private(set) var vaultStatus: MobileVaultStatus?
     private(set) var vaultBusy = false
+    /// Keep the reapproval flow visible through pending/key-delivery states.
+    private(set) var requiresVaultApproval = false
     @ObservationIgnored private var vaultTask: Task<Void, Never>?
     private var sessionStores: [String: SessionStore] = [:]
     private var config: AppConfig?
@@ -246,6 +248,7 @@ final class AppModel {
         sessionStores.removeAll()
         config = nil
         vaultStatus = nil
+        requiresVaultApproval = false
         demo = nil
         Keychain.delete(key: "accessToken")
         Keychain.delete(key: "refreshToken")
@@ -304,6 +307,8 @@ final class AppModel {
     private func applyVault(_ status: MobileVaultStatus, config: AppConfig) {
         guard self.config === config else { return }
         vaultStatus = status
+        if status.phase == .revoked || status.phase == .pending || status.phase == .notEnrolled { requiresVaultApproval = true }
+        if status.phase == .ready || status.phase == .legacy { requiresVaultApproval = false }
         let access = Self.syncAccess(for: status.phase)
         let previous = config.syncAccess
         config.setSyncAccess(access)
@@ -319,6 +324,9 @@ final class AppModel {
                 workspace = store
                 store.start()
             }
+        }
+        if status.phase == .ready, let id = status.deviceId {
+            workspace?.publishDeviceIdentity(vaultId: id)
         }
     }
 
@@ -624,11 +632,8 @@ final class AppModel {
     func foregrounded() {
         kickAllRooms()
         probeEdgeHealth()
-        // A pending approval / key update resolves on another device; the
-        // foreground is the natural moment to learn about it.
-        if let vaultStatus, vaultStatus.phase != .legacy, vaultStatus.phase != .ready {
-            refreshVault()
-        }
+        // Previously approved devices can be revoked while suspended, too.
+        refreshVault()
     }
 
     private func probeEdgeHealth() {

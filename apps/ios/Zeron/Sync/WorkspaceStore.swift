@@ -2,9 +2,9 @@
 // host (crates/doc/src/registry.rs + crates/engine WorkspaceHost). Joins the
 // per-user `/registry/{orgId}/ws` room, projects the row table into typed
 // rows, and performs the writes the writer discipline allows a viewer device:
-// chat creates, archives, renames and seen marks. iOS is a viewport, not an
-// engine device, so it owns no device row; it does publish a presence beat
-// (registry presence replaced the old ws room's ephemeral store).
+// chat creates, archives, renames and seen marks. An enrolled phone also
+// publishes its own device row so approved devices have recognizable names.
+// Liveness is published separately through registry presence beats.
 //
 // Reads are OVERLAY reads: the server's authoritative rows plus the pending
 // op-batch queue replayed on top (optimistic local writes, retired on ack).
@@ -143,6 +143,40 @@ final class WorkspaceStore {
         guard bytes.count <= VaultChatDisk.maxBytes else { throw VaultStorageError.tooLarge }
         try FileManager.default.createDirectory(at: registryURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try VaultPersistence.writeDurably(bytes, to: registryURL)
+    }
+
+    /// Reconcile display metadata after every vault refresh. Reapproval gives
+    /// this installation a new identity; retain the previous identity's label.
+    func publishDeviceIdentity(vaultId: String) {
+        guard encrypted, !stopped, config.permitsSync(encrypted: true) else { return }
+        let row = doc.overlayRow(kind: "devices", id: config.deviceId)
+        let name = doc.overlayRow(kind: "vaultDevices", id: vaultId)?.fields["name"]?.stringValue
+            ?? row?.fields["name"]?.stringValue ?? config.deviceName
+        let previous = row?.fields["vaultDeviceId"]?.stringValue
+        var changed = false
+        for id in Set([previous, vaultId].compactMap { $0 }) {
+            if doc.overlayRow(kind: "vaultDevices", id: id) == nil {
+                doc.write(kind: "vaultDevices", id: id, op: .upsert, set: [
+                    "name": .string(name), "deviceId": .string(config.deviceId), "platform": .string("ios")
+                ])
+                changed = true
+            }
+        }
+        if let alias = doc.overlayRow(kind: "vaultDevices", id: vaultId),
+           alias.fields["deviceId"]?.stringValue != config.deviceId {
+            doc.write(kind: "vaultDevices", id: vaultId, op: .update, set: [
+                "deviceId": .string(config.deviceId), "platform": .string("ios")
+            ])
+            changed = true
+        }
+        if previous != vaultId || row?.fields["name"]?.stringValue != name {
+            doc.write(kind: "devices", id: config.deviceId, op: .upsert, set: [
+                "id": .string(config.deviceId), "name": .string(name),
+                "platform": .string("ios"), "vaultDeviceId": .string(vaultId)
+            ])
+            changed = true
+        }
+        if changed { afterLocalWrite() }
     }
 
     @ObservationIgnored private var sealingBatches = false

@@ -287,6 +287,30 @@ actor MobileVault {
         return status()
     }
 
+    struct ChannelCredentials: Sendable {
+        let deviceId: Data
+        let staticKey: Data
+        let membership: VaultMembershipState
+    }
+
+    func channelCredentials(client: MobileVaultClient) async throws -> ChannelCredentials {
+        try await acquire()
+        defer { release() }
+        try load()
+        try await fetchHistory(client)
+        try updatePhase()
+        guard phase == .ready, let identity = state.identity, let head = history.last else {
+            throw MobileVaultError.notApproved
+        }
+        return ChannelCredentials(deviceId: identity.id, staticKey: identity.agreementSeed, membership: head)
+    }
+
+    func acceptsChannel(peerId: Data, peerKey: Data) -> Bool {
+        guard phase == .ready, let head = history.last, let identity = state.identity,
+              head.activeDevice(identity.id) != nil else { return false }
+        return peerId != identity.id && head.activeDevice(peerId)?.encryptionKey == peerKey
+    }
+
     private func freshIdentity() throws -> Identity {
         Identity(id: try VaultContentCrypto.randomBytes(16), signingSeed: Curve25519.Signing.PrivateKey().rawRepresentation,
                  agreementSeed: Curve25519.KeyAgreement.PrivateKey().rawRepresentation)
@@ -296,7 +320,14 @@ actor MobileVault {
         try await acquire()
         defer { release() }
         try load()
-        guard fingerprint.count == 32, state.identity == nil || phase == .pending || phase == .notEnrolled else { throw MobileVaultError.notApproved }
+        guard fingerprint.count == 32, state.identity == nil || phase == .pending || phase == .notEnrolled || phase == .revoked else { throw MobileVaultError.notApproved }
+        if let pinned = state.fingerprint, pinned != fingerprint { throw MobileVaultError.verification }
+        if phase == .revoked {
+            // A removed identity stays revoked; reapproval admits a fresh one.
+            state.identity = try freshIdentity()
+            state.enrollment = nil
+            state.keyring = nil
+        }
         phase = .pending
         required = true
         if let pinned = state.fingerprint, pinned != fingerprint { throw MobileVaultError.verification }

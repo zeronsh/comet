@@ -18,6 +18,7 @@ fn ts(ms: i64) -> DateTime<Utc> {
 
 fn device(id: &str) -> Device {
     Device {
+        vault_device_id: None,
         id: id.into(),
         name: format!("{id}-name"),
         platform: "linux".into(),

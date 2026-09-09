@@ -465,3 +465,439 @@ async fn registry_fields_seal_open_and_bind_their_slot() {
         Err(FieldOpenFailure::Rejected)
     );
 }
+
+/// Opt-in companion for iOS MobileVaultLiveTests. Approval is automatic ONLY
+/// inside this fresh, disposable test profile; never run with a real account.
+#[tokio::test]
+async fn mobile_test_host() {
+    use zeron_rpc::{
+        ChannelHost, HostRelay, HostRelayConfig, RpcError, RpcReply, RpcService, StaticToken,
+    };
+    let Ok(directory) = std::env::var("ZERON_MOBILE_E2E_DIR") else {
+        return;
+    };
+    let edge = edge_url().expect("ZERON_VAULT_EDGE_URL is required");
+    let directory = std::path::PathBuf::from(directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let (org, user) = fresh_profile();
+    let dir = tempfile::tempdir().unwrap();
+    let host = device(dir.path(), &edge, &org, &user);
+    host.refresh().await.unwrap();
+    host.setup().await.unwrap();
+    host.confirm_recovery_kit().await.unwrap();
+    struct Echo;
+    #[async_trait::async_trait]
+    impl RpcService for Echo {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                "Echo" => Ok(RpcReply::Value(params)),
+                "EchoStream" => Ok(RpcReply::Stream(Box::pin(futures::stream::iter(
+                    (0..3).map(|i| serde_json::json!({ "text": format!("stream {i}") })),
+                )))),
+                _ => Err(RpcError::UnknownMethod(method.into())),
+            }
+        }
+    }
+    let relay_id = format!("ios-live-{}", uuid::Uuid::new_v4().simple());
+    let mut config = HostRelayConfig::new(
+        edge.clone(),
+        relay_id.clone(),
+        Arc::new(StaticToken(format!("{user}@{org}"))),
+    );
+    config.channel = Some(ChannelHost {
+        authority: Arc::new(host.clone()),
+        service: Arc::new(Echo),
+    });
+    let _relay = HostRelay::spawn(config, Arc::new(Echo), Arc::new(|_| {}));
+    let chat = &format!("mobile-sidecar-{}", uuid::Uuid::new_v4().simple());
+    let material = host
+        .seal_material(object_id_for("chat", chat))
+        .await
+        .unwrap();
+    let tail = serde_json::json!({"chatId":chat,"schemaVersion":1,"totalMessages":1,"updatedAt":1000,
+        "messages":[{"id":"message-1","role":"assistant","createdAt":1000,"deviceId":"host","parts":[
+            {"id":"text-1","kind":"text","text":"Encrypted recent messages"},
+            {"id":"tool-1","kind":"tool","call":{"kind":"exec","command":"echo hello"},"isError":false,
+             "resolved":true,"output":"hello","outputRef":format!("{chat}/tool-1")}]}]});
+    for (path, purpose, plaintext) in [
+        (
+            format!("chat2/{chat}-e1/tail"),
+            ContentPurpose::Tail,
+            serde_json::to_vec(&tail).unwrap(),
+        ),
+        (
+            format!("blob/{chat}/tool-1"),
+            ContentPurpose::Blob,
+            b"Full encrypted tool output".to_vec(),
+        ),
+    ] {
+        let sealed = content::seal(
+            &material.binding,
+            purpose,
+            &material.key,
+            &material.signer,
+            &plaintext,
+            4 * 1024 * 1024 - 1024,
+        )
+        .unwrap();
+        let response = reqwest::Client::new()
+            .put(format!("{edge}/{path}"))
+            .bearer_auth(format!("{user}@{org}"))
+            .header("content-type", "application/octet-stream")
+            .body(sealed.encoded().to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "sidecar {path}: {}",
+            response.status()
+        );
+    }
+    let connection = serde_json::json!({"edge":edge,"org":org,"user":user,"relay":relay_id,
+        "fingerprint":host.status().genesis_hash,"chat":chat});
+    std::fs::write(
+        directory.join("connection.json"),
+        serde_json::to_vec(&connection).unwrap(),
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut approved = None;
+    while tokio::time::Instant::now() < deadline {
+        if directory.join("done").exists() {
+            return;
+        }
+        for request in host.pending_requests().await.unwrap() {
+            host.approve(&request.request_id, &request.pairing_code)
+                .await
+                .unwrap();
+            approved = Some(request.device_id);
+        }
+        if directory.join("revoke").exists()
+            && let Some(id) = approved.take()
+        {
+            host.revoke(&id).await.unwrap();
+            std::fs::write(directory.join("revoked"), b"ok").unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("iOS test did not finish before deadline");
+}
+
+#[tokio::test]
+async fn running_workspace_switches_to_encrypted_registry_after_setup() {
+    use zeron_engine::workspace_host::{WorkspaceHost, WorkspaceHostConfig};
+    let Some(edge) = edge_url() else { return };
+    let (org, user) = fresh_profile();
+    let dir = tempfile::tempdir().unwrap();
+    let vault = device(dir.path(), &edge, &org, &user);
+    vault.refresh().await.unwrap();
+    let workspace = WorkspaceHost::open(
+        Arc::new(zeron_sync::DocsStore::open(&dir.path().join("docs")).unwrap()),
+        WorkspaceHostConfig {
+            device_id: "laptop".into(),
+            device_name: "Work laptop".into(),
+            platform: "macos".into(),
+            org_id: org.clone(),
+            user_id: user.clone(),
+            vault: Some(vault.clone()),
+            edge: Some(EdgeConfig::with_static_token(
+                &edge,
+                format!("{user}@{org}"),
+            )),
+        },
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !workspace.connected() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    vault.setup().await.unwrap();
+    vault.confirm_recovery_kit().await.unwrap();
+    let client = reqwest::Client::new();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let response = client
+                .get(format!("{edge}/registry/{org}/e1/rows"))
+                .bearer_auth(format!("{user}@{org}"))
+                .send()
+                .await
+                .unwrap();
+            let body: serde_json::Value = response.json().await.unwrap();
+            if workspace.connected() && body.to_string().contains("vaultDeviceId") {
+                assert!(!body.to_string().contains("Work laptop"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        workspace.read_devices().unwrap()[0].vault_device_id,
+        vault.status().device_id
+    );
+    workspace.shutdown();
+}
+
+#[tokio::test]
+async fn plaintext_history_migrates_resumably_with_sidecars_and_lineage() {
+    use base64::Engine as _;
+    use zeron_engine::doc_host::{DocHost, DocHostConfig};
+    use zeron_engine::workspace_host::{WorkspaceHost, WorkspaceHostConfig};
+    let Some(edge) = edge_url() else { return };
+    let (org, user) = fresh_profile();
+    let dir = tempfile::tempdir().unwrap();
+    let vault = device(dir.path(), &edge, &org, &user);
+    let config = EdgeConfig::with_static_token(&edge, format!("{user}@{org}"));
+    let store = Arc::new(zeron_sync::DocsStore::open(dir.path().join("docs")).unwrap());
+    let workspace = WorkspaceHost::open(
+        store.clone(),
+        WorkspaceHostConfig {
+            device_id: "laptop".into(),
+            device_name: "Laptop".into(),
+            platform: "macos".into(),
+            org_id: org.clone(),
+            user_id: user.clone(),
+            vault: Some(vault.clone()),
+            edge: Some(config.clone()),
+        },
+    )
+    .unwrap();
+    let chat = format!("migrate-{}", uuid::Uuid::new_v4().simple());
+    workspace
+        .create_chat(&chat, None, Some("laptop"), None, None)
+        .unwrap();
+    let source = zeron_doc::SessionDoc::init(&chat).unwrap();
+    let message = |id: &str, text: &str| {
+        serde_json::from_value::<zeron_doc::SessionMessageEntry>(serde_json::json!({
+            "id":id,"role":"user","parts":[{"id":format!("{id}-text"),"kind":"text","text":text}],
+            "createdAt":1234,"deviceId":"laptop"
+        }))
+        .unwrap()
+    };
+    source
+        .push_message(&message("before", "Existing private history"))
+        .unwrap();
+    // A real >1 MiB checkpoint must not be shoved into the relay's row path.
+    use sha2::{Digest, Sha256};
+    let mut large = String::new();
+    for n in 0..50_000u64 {
+        for byte in Sha256::digest(n.to_le_bytes()) {
+            large.push_str(&format!("{byte:02x}"));
+        }
+    }
+    source
+        .doc()
+        .get_map("migrationFixture")
+        .insert("largeHistory", large)
+        .unwrap();
+    source.doc().commit();
+    store
+        .save_snapshot_with_cursor(&chat, &source.export_snapshot().unwrap(), 0, 2)
+        .unwrap();
+    store.mark_processed("already-run").unwrap();
+    source
+        .push_message(&message("remote", "Only present on the relay"))
+        .unwrap();
+    source
+        .doc()
+        .get_map("migrationFixture")
+        .insert("outputRef", format!("{chat}/tool-output"))
+        .unwrap();
+    source.doc().commit();
+    let plaintext_checkpoint = source.export_snapshot().unwrap();
+    assert!(plaintext_checkpoint.len() > 1024 * 1024);
+    let frontier = source.doc().oplog_vv();
+    let http = reqwest::Client::new();
+    let auth = format!("{user}@{org}");
+    let response = http
+        .post(format!("{edge}/chat2/{chat}/checkpoint?seqCovered=0"))
+        .bearer_auth(&auth)
+        .header(
+            "x-chat2-frontier",
+            base64::engine::general_purpose::STANDARD.encode(frontier.encode()),
+        )
+        .body(plaintext_checkpoint.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+    source
+        .push_message(&message("last-row", "Final plaintext row"))
+        .unwrap();
+    let update = source
+        .doc()
+        .export(loro::ExportMode::updates(&frontier))
+        .unwrap();
+    let response = http
+        .post(format!(
+            "{edge}/chat2/{chat}/rows?batchId=source-final-row&device=laptop"
+        ))
+        .bearer_auth(&auth)
+        .body(update)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "{}", response.status());
+    let kit = vault.setup().await.unwrap();
+    vault.confirm_recovery_kit().await.unwrap();
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig {
+            device_id: "laptop".into(),
+            default_harness: zeron_proto::HarnessId::ClaudeCode,
+            edge: Some(config.clone()),
+        },
+    );
+    host.set_vault(vault.clone());
+    host.set_workspace(workspace.clone());
+    // Missing referenced output must pause migration, not silently drop it.
+    host.migrate_history().await.unwrap_err();
+    assert_eq!(host.history_migration_status().phase, "paused");
+    assert_eq!(host.history_migration_status().completed, 0);
+    host.shutdown_workers().await;
+    // A reader already waiting in the encrypted room must reconnect when
+    // migration seeds a checkpoint without adding any log rows.
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let ws_url = format!("{}/chat2/{chat}-e1/ws", edge.replacen("http", "ws", 1));
+    let mut request = ws_url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {auth}").parse().unwrap());
+    let (mut reader, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig {
+            device_id: "laptop".into(),
+            default_harness: zeron_proto::HarnessId::ClaudeCode,
+            edge: Some(config.clone()),
+        },
+    );
+    host.set_vault(vault.clone());
+    host.set_workspace(workspace.clone());
+    let codec = zeron_engine::chat2_host::ChatCodec::new(vault.clone(), &chat);
+    let restored_blob = codec
+        .seal(ContentPurpose::Blob, b"Recovered full tool output", 1024)
+        .await
+        .unwrap();
+    assert!(
+        http.put(format!("{edge}/blob/{chat}/tool-output"))
+            .bearer_auth(&auth)
+            .body(restored_blob.encoded().to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    host.migrate_history().await.unwrap();
+    assert_eq!(host.history_migration_status().phase, "complete");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(frame) = reader.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(Some(close)) = frame.unwrap() {
+                assert_eq!(u16::from(close.code), 4411);
+                return;
+            }
+        }
+        panic!("migration did not refresh the existing reader");
+    })
+    .await
+    .unwrap();
+    assert_eq!(host.history_migration_status().completed, 1);
+    let sealed = http
+        .get(format!("{edge}/chat2/{chat}-e1/checkpoint"))
+        .bearer_auth(&auth)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert!(!sealed.windows(24).any(|w| w == b"Existing private history"));
+    let stale_frontier = codec
+        .seal(ContentPurpose::Frontier, b"stale", 1024)
+        .await
+        .unwrap();
+    let conflict = http
+        .post(format!(
+            "{edge}/chat2/{chat}-e1/checkpoint?seqCovered=0&refreshReaders=1"
+        ))
+        .bearer_auth(&auth)
+        .header(
+            "x-chat2-frontier",
+            base64::engine::general_purpose::STANDARD.encode(stale_frontier.encoded()),
+        )
+        .header("x-chat2-expected-frontier", "")
+        .body(sealed.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    let opened = codec
+        .open_async(
+            ContentPurpose::Checkpoint,
+            &sealed,
+            content::MAX_PLAINTEXT_BYTES,
+        )
+        .await
+        .unwrap();
+    let restored = loro::LoroDoc::new();
+    restored.import(&opened).unwrap();
+    assert!(restored.oplog_vv().includes_vv(&source.doc().oplog_vv()));
+    let restored = zeron_doc::SessionDoc::from_doc(restored);
+    assert_eq!(restored.read_entries().unwrap().len(), 3);
+    assert!(store.is_processed("already-run").unwrap());
+    assert_eq!(
+        host.fetch_tool_blob(&format!("{chat}/tool-output"))
+            .await
+            .unwrap(),
+        "Recovered full tool output"
+    );
+    let retained = http
+        .get(format!("{edge}/chat2/{chat}/checkpoint"))
+        .bearer_auth(&auth)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(retained.as_ref(), plaintext_checkpoint.as_slice());
+    host.migrate_history().await.unwrap();
+    assert_eq!(
+        host.open(&chat)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .len(),
+        3
+    );
+    let recovered_dir = tempfile::tempdir().unwrap();
+    let recovered = device(recovered_dir.path(), &edge, &org, &user);
+    let genesis =
+        zeron_engine::vault::store::Hex(kit.recovery_file["genesisHash"].as_str().unwrap().into())
+            .decode::<32>()
+            .unwrap();
+    recovered.recover(&kit.kit, Some(genesis)).await.unwrap();
+    let recovery_codec = zeron_engine::chat2_host::ChatCodec::new(recovered, &chat);
+    let recovered_bytes = recovery_codec
+        .open_async(
+            ContentPurpose::Checkpoint,
+            &sealed,
+            content::MAX_PLAINTEXT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered_bytes, opened);
+    host.shutdown_workers().await;
+}

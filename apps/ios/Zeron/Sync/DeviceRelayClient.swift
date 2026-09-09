@@ -196,6 +196,9 @@ actor DeviceRelayClient {
     private var nextId: UInt64 = 1
     private let pending = DeviceRpcPending()
     private var connected = false
+    private var channel: VaultChannel?
+    private var connectionTask: Task<Void, Error>?
+    private var connectionGeneration: UInt64 = 0
     /// Transport clock — any inbound (the DO's auto-pong included) counts.
     private var lastInbound = DispatchTime.now()
     /// Host-proof clock — echo replies and inbound RPC frames only.
@@ -214,7 +217,25 @@ actor DeviceRelayClient {
     // MARK: Lifecycle
 
     private func connect() async throws {
+        guard config.syncAccess != .blocked else { throw RelayError.notConnected }
         if connected, socket != nil { return }
+        if let connectionTask { return try await connectionTask.value }
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        let task = Task { try await self.establish(generation: generation) }
+        connectionTask = task
+        do {
+            try await task.value
+            if connectionGeneration == generation { connectionTask = nil }
+        } catch {
+            if connectionGeneration == generation { teardown(error: .notConnected) }
+            throw error
+        }
+    }
+
+    private func establish(generation: UInt64) async throws {
+        let encrypted = config.syncAccess == .encrypted
+        let credentials = encrypted ? try await config.vault.channelCredentials(client: config.vaultClient) : nil
         // Registry-dark dial parking: a device with positive stale-presence
         // evidence fails fast with zero dials (it was 3-dial bursts every
         // ~60s to a device offline for days). A live cached link above wins;
@@ -237,9 +258,47 @@ actor DeviceRelayClient {
             URLQueryItem(name: "connId", value: UUID().uuidString.lowercased()),
             URLQueryItem(name: "token", value: token),
         ]
+        guard generation == connectionGeneration, config.permitsSync(encrypted: encrypted) else {
+            throw RelayError.notConnected
+        }
         let task = URLSession.shared.webSocketTask(with: components.url!)
+        task.maximumMessageSize = VaultChannel.maximum + 4096
         socket = task
         task.resume()
+        if let credentials {
+            let handshake = try VaultChannelHandshake(deviceId: credentials.deviceId, staticKey: credentials.staticKey,
+                vaultId: credentials.membership.vaultId, generation: credentials.membership.generation)
+            // Cancel the socket to interrupt receive even when the relay never answers.
+            let deadline = Task {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                if !Task.isCancelled { task.cancel(with: .goingAway, reason: nil) }
+            }
+            defer { deadline.cancel() }
+            try await task.send(.data(Self.encodeFrame(header: #"{"s":"hs1","k":"chan"}"#, payload: handshake.first)))
+            while true {
+                let message = try await task.receive()
+                guard case .data(let bytes) = message else { continue }
+                guard let (header, payload) = Self.decodeFrame(bytes) else { throw MobileVaultError.verification }
+                if header.k == Self.relayKind { throw RelayError.hostOffline }
+                if header.k == Self.rpcKind { throw MobileVaultError.verification }
+                guard header.k == "chan" else { continue }
+                guard header.s == "hs2" else { throw MobileVaultError.verification }
+                let (third, secured) = try handshake.finish(payload) { id, key in
+                    id != credentials.deviceId && credentials.membership.activeDevice(id)?.encryptionKey == key
+                }
+                guard await config.vault.acceptsChannel(peerId: secured.peerId, peerKey: secured.peerKey),
+                      generation == connectionGeneration, config.permitsSync(encrypted: true) else {
+                    throw MobileVaultError.verification
+                }
+                try await task.send(.data(Self.encodeFrame(header: #"{"s":"hs3","k":"chan"}"#, payload: third)))
+                guard generation == connectionGeneration else { throw RelayError.notConnected }
+                channel = secured
+                break
+            }
+        }
+        guard generation == connectionGeneration, config.permitsSync(encrypted: encrypted) else {
+            throw RelayError.notConnected
+        }
         connected = true
         lastInbound = .now()
         lastHostProof = .now()
@@ -248,12 +307,11 @@ actor DeviceRelayClient {
         receiveTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                guard let sock = await self.socket else { return }
                 do {
-                    let message = try await sock.receive()
-                    await self.handleInbound(message)
+                    let message = try await task.receive()
+                    await self.handleInbound(message, generation: generation)
                 } catch {
-                    await self.teardown(error: .hostOffline)
+                    await self.connectionFailed(generation: generation)
                     return
                 }
             }
@@ -262,7 +320,7 @@ actor DeviceRelayClient {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: DeviceRelayClient.pingIntervalNs)
                 guard let self else { return }
-                await self.keepaliveTick()
+                await self.keepaliveTick(generation: generation)
             }
         }
         // One echo immediately on connect: feature detection + instant proof
@@ -275,6 +333,10 @@ actor DeviceRelayClient {
     }
 
     private func teardown(error: RelayError) {
+        connectionGeneration &+= 1
+        connectionTask?.cancel()
+        connectionTask = nil
+        channel = nil
         receiveTask?.cancel()
         pingTask?.cancel()
         socket?.cancel(with: .goingAway, reason: nil)
@@ -283,11 +345,28 @@ actor DeviceRelayClient {
         pending.failAll(error: error)
     }
 
+    private func connectionFailed(generation: UInt64) {
+        if generation == connectionGeneration { teardown(error: .hostOffline) }
+    }
+
+    private func channelAllowed() async -> Bool {
+        if let channel {
+            guard config.permitsSync(encrypted: true) else { return false }
+            let accepted = await config.vault.acceptsChannel(peerId: channel.peerId, peerKey: channel.peerKey)
+            return accepted && config.permitsSync(encrypted: true) && self.channel === channel
+        }
+        return config.permitsSync(encrypted: false)
+    }
+
     /// Keepalive + liveness in one 10s tick: judge the transport lease and
     /// the host-echo deadline, then ride a text ping (DO transport lease) and
     /// an echo frame (host proof) out together.
-    private func keepaliveTick() async {
-        guard socket != nil else { return }
+    private func keepaliveTick(generation: UInt64) async {
+        guard generation == connectionGeneration, socket != nil else { return }
+        guard await channelAllowed(), generation == connectionGeneration else {
+            connectionFailed(generation: generation)
+            return
+        }
         let now = DispatchTime.now().uptimeNanoseconds
         if now - lastInbound.uptimeNanoseconds > Self.silenceLeaseNs {
             roomLog.warning("relay \(self.deviceId, privacy: .public): socket silent past lease; dropping link")
@@ -376,15 +455,23 @@ actor DeviceRelayClient {
     }
 
     private func send(_ data: Data, for id: UInt64) async {
+        guard pending.owns(id: id) else { return }
+        let generation = connectionGeneration
         guard let socket else {
             failRequest(id: id, error: .notConnected)
             return
         }
         do {
-            try await socket.send(.data(data))
+            guard await channelAllowed(), self.socket === socket else { throw RelayError.notConnected }
+            let outgoing: Data
+            if let channel {
+                guard let (_, payload) = Self.decodeFrame(data) else { throw MobileVaultError.verification }
+                outgoing = Self.encodeFrame(header: #"{"s":"rpc","k":"chan"}"#, payload: try channel.seal(payload))
+            } else { outgoing = data }
+            try await socket.send(.data(outgoing))
         } catch {
             failRequest(id: id, error: .notConnected)
-            teardown(error: .notConnected)
+            connectionFailed(generation: generation)
         }
     }
 
@@ -426,19 +513,31 @@ actor DeviceRelayClient {
 
     private func cancelStream(id: UInt64) async {
         guard pending.removeStreamForCancellation(id: id), let socket else { return }
+        let generation = connectionGeneration
         let frame: [String: Any] = ["id": id, "cancel": true]
         guard let payload = try? JSONSerialization.data(withJSONObject: frame) else { return }
         let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
         do {
-            try await socket.send(.data(data))
+            guard await channelAllowed(), self.socket === socket else { throw RelayError.notConnected }
+            let outgoing: Data
+            if let channel {
+                guard let (_, payload) = Self.decodeFrame(data) else { throw MobileVaultError.verification }
+                outgoing = Self.encodeFrame(header: #"{"s":"rpc","k":"chan"}"#, payload: try channel.seal(payload))
+            } else { outgoing = data }
+            try await socket.send(.data(outgoing))
         } catch {
-            teardown(error: .notConnected)
+            connectionFailed(generation: generation)
         }
     }
 
     // MARK: Inbound
 
-    private func handleInbound(_ message: URLSessionWebSocketTask.Message) {
+    private func handleInbound(_ message: URLSessionWebSocketTask.Message, generation: UInt64) async {
+        guard generation == connectionGeneration else { return }
+        guard await channelAllowed(), generation == connectionGeneration else {
+            connectionFailed(generation: generation)
+            return
+        }
         lastInbound = .now()
         switch message {
         case .string:
@@ -446,7 +545,16 @@ actor DeviceRelayClient {
         case .data(let data):
             guard let (header, payload) = Self.decodeFrame(data) else { return }
             switch header.k {
+            case "chan":
+                guard let channel, header.s == "rpc" else { teardown(error: .notConnected); return }
+                do {
+                    let opened = try channel.open(payload)
+                    lastHostProof = .now()
+                    echoSeen = true
+                    handleRpcPayload(opened)
+                } catch { teardown(error: .notConnected) }
             case Self.rpcKind:
+                guard channel == nil else { teardown(error: .notConnected); return }
                 // An inbound RPC frame comes from the host — proof enough.
                 lastHostProof = .now()
                 echoSeen = true

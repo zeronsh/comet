@@ -14,6 +14,9 @@ pub struct Device {
     pub id: String,
     pub name: String,
     pub platform: String,
+    /// Vault identity associated with this device row (display metadata only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_device_id: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
     /// First registration time (zeron devices.created_at — the Devices page
     /// "Added …" fragment). Optional so pre-existing docs stay readable.

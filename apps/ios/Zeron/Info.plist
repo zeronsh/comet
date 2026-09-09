@@ -65,6 +65,8 @@
 	</array>
 	<key>UIUserInterfaceStyle</key>
 	<string>Dark</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect to your desktop and local sync server to test encrypted sync.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

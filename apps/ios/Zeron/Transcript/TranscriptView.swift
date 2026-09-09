@@ -32,7 +32,8 @@ struct TranscriptView: View {
                         isTail: row.id == rows.last?.id || (row.entryId == runway && row.turnStart),
                         chatId: chatId))
                     .environment(\.dynamicTypeSize, dynamicTypeSize)
-                    .environment(\.colorScheme, .dark))
+                    .environment(\.colorScheme, .dark)
+                    .environment(\.toolBlobLoader, { ref in try await store.fetchToolBlob(ref: ref) }))
             }
             .modifier(TranscriptViewportProbe(chatId: chatId))
             .background(Theme.bg)
@@ -499,9 +500,12 @@ struct ToolChipRow: View {
     var continues = false
     var onResize: () -> Void = {}
     @State private var expanded = false
+    @State private var selectedBlob: ToolBlobSelection?
+    @Environment(\.toolBlobLoader) private var loadBlob
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
         Button {
             withAnimation(reduceMotion ? nil : Motion.resize) { expanded.toggle() }
             onResize()
@@ -551,6 +555,29 @@ struct ToolChipRow: View {
             Button("Copy details", systemImage: "doc.on.doc") {
                 UIPasteboard.general.string = tool.call.expandedDetail
             }
+        }
+        if expanded {
+            if let output = tool.call.string("output"), !output.isEmpty {
+                Text(output).font(Theme.mono(12)).foregroundStyle(Theme.textMuted)
+                    .textSelection(.enabled).padding(.leading, 36)
+            }
+            if loadBlob != nil {
+                ForEach(blobSelections) { selection in
+                    Button(selection.title) { selectedBlob = selection }
+                        .font(Theme.sans(13)).padding(.leading, 36).frame(minHeight: 44)
+                }
+            }
+        }
+        }
+        .sheet(item: $selectedBlob) { selection in
+            if let loadBlob { ToolBlobView(selection: selection, load: loadBlob) }
+        }
+        .onChange(of: expanded) { _, _ in onResize() }
+    }
+
+    private var blobSelections: [ToolBlobSelection] {
+        [("outputRef", "Show full output"), ("diffRef", "Show full diff")].compactMap { key, title in
+            tool.call.string(key).map { ToolBlobSelection(id: $0, title: title) }
         }
     }
 }
