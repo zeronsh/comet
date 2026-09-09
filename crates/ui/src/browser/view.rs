@@ -104,10 +104,6 @@ impl BrowserSurface {
     fn preview_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let snapshot = &self.previews;
         let available = snapshot.error.is_none();
-        let title = snapshot
-            .project_name
-            .clone()
-            .unwrap_or_else(|| "Local previews".into());
         let subtitle = if snapshot.remote {
             "Running on your device"
         } else {
@@ -115,39 +111,23 @@ impl BrowserSurface {
         };
         let mut content = div()
             .w_full()
-            .max_w(px(380.0))
+            .max_w(px(280.0))
+            .flex_shrink_0()
+            .my_auto()
             .flex()
             .flex_col()
-            .gap(px(16.0))
-            .child(
-                div().flex().flex_col().gap(px(6.0)).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            icons::icon(icons::GLOBE)
-                                .size(px(18.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::typography::ui_rems(15.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text)
-                                .truncate()
-                                .child(title),
-                        ),
-                ),
-            )
+            .gap(px(8.0))
             .child(
                 div()
-                    .text_size(crate::typography::ui_rems(11.0))
+                    .mb(px(4.0))
+                    .text_size(crate::typography::ui_rems(12.0))
                     .text_color(theme.text_muted)
                     .child(subtitle),
             );
         for service in &snapshot.services {
             let url = service.url(snapshot.proxy_port);
+            let row_url = url.clone();
+            let border_strong = theme.border_strong;
             let label = if snapshot.remote {
                 format!("{} · localhost:{}", service.device_name, service.port)
             } else {
@@ -155,21 +135,33 @@ impl BrowserSurface {
             };
             content = content.child(
                 div()
+                    .id(gpui::SharedString::from(format!("preview-row-{}", service.id)))
                     .w_full()
-                    .p(px(12.0))
-                    .rounded(px(8.0))
+                    .h(px(56.0))
+                    .px(px(14.0))
+                    .rounded(px(10.0))
                     .border_1()
                     .border_color(theme.border)
-                    .bg(theme.surface_raised.opacity(0.5))
+                    .bg(crate::theme::ink(0.02))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(px(10.0))
+                    .when(available, |el| {
+                        el.cursor_pointer()
+                            .hover(move |style| {
+                                style
+                                    .bg(crate::theme::ink(0.05))
+                                    .border_color(border_strong)
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.navigate(&row_url, window, cx)
+                            }))
+                    })
                     .child(
-                        div()
-                            .size(px(6.0))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(theme.success),
+                        icons::icon(icons::GLOBE)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
                     )
                     .child(
                         div()
@@ -177,10 +169,10 @@ impl BrowserSurface {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(4.0))
+                            .gap(px(2.0))
                             .child(
                                 div()
-                                    .text_size(crate::typography::ui_rems(12.0))
+                                    .text_size(crate::typography::ui_rems(13.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(theme.text)
                                     .truncate()
@@ -215,23 +207,21 @@ impl BrowserSurface {
                                 service.id
                             )))
                             .h(px(28.0))
-                            .px(px(12.0))
+                            .px(px(6.0))
                             .flex_shrink_0()
                             .rounded(px(6.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface_raised)
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(crate::typography::ui_rems(12.0))
-                            .text_color(theme.text)
+                            .text_color(theme.text_muted)
                             .role(gpui::Role::Button)
                             .aria_label(format!("Open {} preview", service.name))
                             .when(available, |el| {
                                 el.cursor_pointer()
-                                    .hover(|style| style.bg(crate::theme::wash(0.10)))
+                                    .hover(|style| style.bg(crate::theme::ink(0.05)))
                                     .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
                                         this.navigate(&url, window, cx)
                                     }))
                             })
@@ -272,20 +262,20 @@ impl BrowserSurface {
         content = content.child(
             div()
                 .id("preview-enter-address")
-                .mt(px(4.0))
+                .mt(px(8.0))
                 .text_size(crate::typography::ui_rems(11.0))
                 .text_color(theme.text_muted)
                 .cursor_pointer()
                 .role(gpui::Role::Button)
                 .aria_label("Enter a website address")
                 .on_click(cx.listener(|this, _, window, cx| this.focus_address(window, cx)))
-                .child("Or enter a website address above"),
+                .child("Or enter a website address"),
         );
         div()
             .id("browser-previews")
             .size_full()
             .overflow_y_scroll()
-            .p(px(24.0))
+            .p(px(16.0))
             .flex()
             .flex_col()
             .items_center()
