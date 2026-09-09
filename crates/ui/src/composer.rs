@@ -7931,6 +7931,7 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn layout_cache_reuses_resize_frames_and_invalidates_text_inputs() {
         gpui_platform::headless().run(|cx| {
