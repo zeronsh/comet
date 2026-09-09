@@ -5335,10 +5335,8 @@ impl Composer {
         )
     }
 
-    /// New-chat sends need a project: with none picked (empty device, or a
-    /// selection healed away) the send button dims and submit is a no-op —
-    /// project-less `~`-cwd sessions are no longer mintable from the canvas.
-    /// Existing chats carry their own project, so they always send.
+    /// New chats need a runnable agent, but may target the device's home
+    /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
         if self.queue_edit_finishing {
             return true;
@@ -5350,11 +5348,11 @@ impl Composer {
         if state.selected_chat.is_some() {
             return false;
         }
-        // New-chat canvas: needs a project AND a runnable agent. The
+        // New-chat canvas: needs a runnable agent. The
         // no-agents check only fires once the catalog is loaded — offline
         // and still-loading states must not block (the harness resolves from
         // the remembered default and the engine reports real failures).
-        state.selected_space_row().is_none() || self.pickers.read(cx).no_agents_available()
+        self.pickers.read(cx).no_agents_available()
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
@@ -6488,9 +6486,8 @@ impl Composer {
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Queue => {
-                // Dimmed and inert while no project is picked or no agent is
-                // runnable (`send_blocked` also gates `on_submit`, so Enter
-                // is a no-op too).
+                // Share the submission guard with Enter, including pending
+                // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
                 div()
                     .id("composer-send")
@@ -7185,6 +7182,36 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn projectless_composer_allows_send_and_enter_submission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        // A device with no projects is a valid home-directory target too.
+        composer.update(cx, |composer, cx| assert!(!composer.send_blocked(cx)));
+        state.update(cx, |state, cx| state.select_space(None, cx));
+        composer.update(cx, |composer, cx| {
+            composer.input.update(cx, |input, cx| {
+                input.set_text("Hello without a project", cx);
+            });
+            assert_eq!(composer.button_mode(cx), SendButtonMode::Send);
+            assert!(
+                !composer.send_blocked(cx),
+                "The Send button must be enabled without a project"
+            );
+            composer.on_submit(cx);
+            // With no engine attached, reaching the normal send error proves
+            // Enter dispatched instead of silently stopping at the UI gate.
+            assert_eq!(composer.failure.as_deref(), Some("Engine not connected"));
+            composer.queue_edit_finishing = true;
+            assert!(
+                composer.send_blocked(cx),
+                "Pending edits must still block submission"
+            );
+        });
+    }
 
     /// The press intent is judged by eye everywhere except here: that a
     /// multi-click leaves the drag disarmed is invisible until a selection
