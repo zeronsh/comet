@@ -29,3 +29,6 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.11"

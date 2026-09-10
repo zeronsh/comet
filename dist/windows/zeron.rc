@@ -1,0 +1,2 @@
+// GPUI's Windows platform loads the application icon from resource ID 1.
+1 ICON "zeron.ico"

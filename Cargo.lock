@@ -11583,6 +11583,7 @@ version = "0.2.59"
 dependencies = [
  "anyhow",
  "clap",
+ "embed-resource",
  "libc",
  "mimalloc",
  "serde_json",
