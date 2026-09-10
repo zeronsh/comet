@@ -77,7 +77,7 @@ jobs:
       - name: Build native rendering regression fixture
         run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
       - name: Windows CPU and shader layout regressions
-        run: cargo test --release --locked -p gpui_windows --lib layout_tests
+        run: cargo test --release --locked -p gpui_windows --lib layout
       - name: Application and updater regressions
         run: cargo test --release --locked -p zeron -p zeron-update
       - name: Harness discovery and managed-adapter regressions

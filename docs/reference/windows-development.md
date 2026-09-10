@@ -108,7 +108,7 @@ Run on an interactive Windows desktop:
 
 ```powershell
 cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
-cargo test --release --locked -p gpui_windows --lib
+cargo test --release --locked -p gpui_windows --lib layout
 ./scripts/test-windows-lifecycle.ps1 -Runs 5
 ./scripts/test-windows-rendering.ps1
 ```
