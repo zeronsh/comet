@@ -122,12 +122,10 @@ Evidence stays in unique ignored `target/windows-render-*` and
 
 The pinned Zui revision includes the [upstream DirectX fix](https://github.com/zeronsh/zui/pull/7)
 for CPU/HLSL buffer layouts and quad/image edge fades. All GPUI crates use that
-revision directly; no local renderer patch is needed. In-app backdrop blur
-remains unsupported on Windows.
+revision. In-app backdrop blur remains unsupported on Windows.
 
 Layout tests check CPU offsets and HLSL source declarations, not compiled-shader
-reflection. Native pixel checks complement them. Historical before/after images
-and test results are in the [verification archive](../research/windows-verification-history.md).
+reflection. Native pixel checks complement them.
 
 ## Remaining limitations
 
@@ -137,5 +135,4 @@ and test results are in the [verification archive](../research/windows-verificat
 - Windows backdrop blur, cross-device acceptance, and shutdown during live runs.
 - Concurrent-launch log rotation and invalid-window teardown diagnostics.
 
-Use isolated data roots for lifecycle and migration probes. See the
-[original investigation](../research/windows-support.md) for historical context.
+Use isolated data roots for lifecycle and migration probes.
