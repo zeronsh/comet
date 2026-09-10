@@ -61,7 +61,10 @@ pub(crate) fn resolve_workspace_file_link(
     let line = fragment_line.or(suffix_line);
 
     let root = Path::new(workspace_root);
-    let relative = if Path::new(target).is_absolute() {
+    // A remote engine may supply POSIX paths to a Windows viewport. A leading
+    // slash has a root on Windows, but is_absolute() also requires a drive;
+    // classify the link by its root instead of the viewer's absolute-path rules.
+    let relative = if Path::new(target).has_root() {
         Path::new(target).strip_prefix(root).ok()?
     } else {
         Path::new(target)

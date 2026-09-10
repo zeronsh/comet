@@ -1,0 +1,133 @@
+name: Windows foundation
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'apps/zeron/**'
+      - 'crates/**'
+      - 'scripts/test-windows-*.ps1'
+      - 'edge/src/install.sh'
+      - '.github/workflows/windows.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'apps/zeron/**'
+      - 'crates/**'
+      - 'scripts/test-windows-*.ps1'
+      - 'edge/src/install.sh'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+    inputs:
+      native_gui:
+        description: 'Run native GUI/pixel probes (requires a usable desktop and Direct3D)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-foundation-${{ github.ref }}
+  cancel-in-progress: true
+
+# Build and regression coverage, not a Windows release/support declaration.
+# Native rendering, agent lifecycle, and packaging remain separate gates.
+jobs:
+  shared-regressions:
+    name: Shared regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Shared agent, terminal, ownership, and updater regressions
+        run: cargo test --locked -p zeron-harness -p zeron-engine -p zeron-update --lib
+
+  windows-foundation:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+      - name: Link release application and compile DirectX shaders
+        run: cargo build --release --locked -p zeron
+      - name: Build native rendering regression fixture
+        run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
+      - name: Windows CPU and shader layout regressions
+        run: cargo test --release --locked -p gpui_windows --lib layout_tests
+      - name: Application and updater regressions
+        run: cargo test --release --locked -p zeron -p zeron-update
+      - name: Harness discovery and managed-adapter regressions
+        run: cargo test --release --locked -p zeron-harness --lib
+      - name: Codex native executable availability
+        run: cargo test --release --locked -p zeron-harness --test codex_availability
+      - name: Native ACP stdio, resume, and protocol cancellation
+        run: cargo test --release --locked -p zeron-harness --features native-fixture --test windows_native
+
+      - name: Engine regressions including ownership and source control
+        run: cargo test --release --locked -p zeron-engine --lib
+      - name: Codex production harness catalog
+        run: cargo test --release --locked -p zeron-engine --test codex_catalog
+      - name: UI regressions including bootstrap cleanup and remote paths
+        run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
+      - name: CLI startup without HOME
+        run: |
+          # Exercise real path resolution without touching the runner's account.
+          # Port zero cannot connect to another running engine.
+          $env:HOME = $null
+          $env:ZERON_DATA_DIR = $null
+          $env:ZERON_EDGE_TOKEN = $null
+          $env:ZERON_IPC_PORT = '0'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "zeron smoke O'Brien 日本語"
+          $expected = Join-Path $env:LOCALAPPDATA 'Zeron'
+          $output = & ./target/release/zeron.exe status
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $output
+          if (-not ($output -contains "Data dir: $expected")) {
+            throw 'Windows startup did not select LOCALAPPDATA/Zeron'
+          }
+          if (-not ($output -match '^Mode:\s+local only$')) {
+            throw 'An isolated Windows startup must select local-only mode'
+          }
+      - name: Native GUI lifecycle regression
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+        run: ./scripts/test-windows-lifecycle.ps1
+      - name: Native renderer pixel regression
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+        run: ./scripts/test-windows-rendering.ps1
+      - name: Upload synthetic native probe evidence
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-probes
+          path: |
+            target/windows-render-*/capture.png
+            target/windows-render-*/measurements.json
+            target/windows-render-*/stdout.txt
+            target/windows-render-*/stderr.txt
+            target/windows-lifecycle-*/result.txt
+            target/windows-lifecycle-*/run-*.txt
+          if-no-files-found: warn

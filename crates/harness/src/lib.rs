@@ -116,51 +116,11 @@ pub(crate) mod adapter_install;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub(crate) mod executable;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
 pub mod shell_env;
-
-/// Bin directories where npm-installed CLIs land under Node version managers.
-/// GUI launches never see these on PATH — the managers shape PATH in shell
-/// init (fnm's per-shell multishells, nvm's shell function), which a
-/// Dock/Finder-launched app never runs.
-pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    // fnm: `aliases/default` is a stable symlink to the active default
-    // installation (the multishell PATH entries are ephemeral, per-shell).
-    let mut fnm_roots: Vec<PathBuf> = std::env::var_os("FNM_DIR")
-        .map(PathBuf::from)
-        .into_iter()
-        .collect();
-    if let Some(home) = &home {
-        fnm_roots.push(home.join(".local").join("share").join("fnm"));
-        fnm_roots.push(home.join("Library").join("Application Support").join("fnm"));
-        fnm_roots.push(home.join(".fnm"));
-    }
-    for root in fnm_roots {
-        dirs.push(root.join("aliases").join("default").join("bin"));
-    }
-    if let Some(home) = &home {
-        // volta / bun keep real shims in a fixed bin dir; pnpm has a global bin.
-        dirs.push(home.join(".volta").join("bin"));
-        dirs.push(home.join(".bun").join("bin"));
-        dirs.push(home.join("Library").join("pnpm"));
-        dirs.push(home.join(".local").join("share").join("pnpm"));
-        // nvm: every installed version's bin, newest first.
-        let nvm = home.join(".nvm").join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(&nvm) {
-            let mut versions: Vec<PathBuf> =
-                entries.flatten().map(|e| e.path().join("bin")).collect();
-            versions.sort();
-            versions.reverse();
-            dirs.append(&mut versions);
-        }
-    }
-    dirs
-}
 
 /// Add the login shell's PATH to a child process while preserving the PATH of
 /// the current process. This lets GUI/service launches find user-installed

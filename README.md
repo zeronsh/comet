@@ -53,6 +53,8 @@ zeron daemon start
 
 On macOS: use the desktop release, or build `zeron` from source and run `zeron daemon install` to install the launchd service.
 
+On Windows: see the [source-build development notes](docs/reference/windows-development.md). Windows release support is still in progress.
+
 ---
 
 Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/comet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).

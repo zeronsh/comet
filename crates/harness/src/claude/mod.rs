@@ -64,43 +64,14 @@ use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 /// [`crate::shell_env`]), then known install locations as a last resort.
 /// Resolved per call — cheap after the snapshot is cached.
 fn resolve_claude_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+    let mut extra = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        extra.push(home.join(".claude").join("local").join("claude"));
+        extra.push(home.join(".local").join("bin").join("claude"));
     }
-    let exe = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    extra.push(PathBuf::from("/usr/local/bin/claude"));
+    crate::executable::find_on_paths("claude", extra)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -155,14 +126,20 @@ impl ClaudeHarness {
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
-            return Ok(p.clone());
+            return crate::executable::validate_native_override(p);
+        }
+        if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
+            && !p.is_empty()
+        {
+            return crate::executable::validate_native_override(&PathBuf::from(p));
         }
         resolve_claude_executable().ok_or_else(|| {
             HarnessError::NotInstalled(
                 "claude (searched PATH, the login shell's PATH, ~/.claude/local, \
                  ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and \
-                 fnm/nvm/volta/pnpm/bun install dirs; set CLAUDE_CODE_EXECUTABLE \
-                 to override)"
+                 fnm/nvm/volta/pnpm/bun install dirs; Windows also checks USERPROFILE \
+                 and explicit NVM_SYMLINK/VOLTA_HOME/PNPM_HOME; set \
+                 CLAUDE_CODE_EXECUTABLE to override)"
                     .into(),
             )
         })

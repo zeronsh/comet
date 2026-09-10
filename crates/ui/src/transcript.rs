@@ -4355,6 +4355,7 @@ impl Transcript {
         let hold_selection: Arc<str> = format!("{row_id}:u").into();
         let body = div()
             .id(SharedString::from(format!("{row_id}-body")))
+            .cursor(gpui::CursorStyle::IBeam)
             // A long press toggles instead of double-click. A normal release
             // remains available for text selection, and pointer movement
             // cancels the pending toggle before a drag can select text.

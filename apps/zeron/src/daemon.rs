@@ -403,7 +403,9 @@ mod tests {
 
     #[test]
     fn curl_installer_always_starts_the_local_capable_service() {
-        let installer = include_str!("../../../edge/src/install.sh");
+        // Git for Windows can check out this source fixture with CRLF. These
+        // assertions cover the installer directives, not checkout line endings.
+        let installer = include_str!("../../../edge/src/install.sh").replace("\r\n", "\n");
         assert!(!installer.contains("session.json"));
         assert!(installer.contains("StartLimitIntervalSec=60\n"));
         assert!(installer.contains("StartLimitBurst=5\n"));

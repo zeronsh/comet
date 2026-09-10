@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod paths;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -202,9 +203,7 @@ fn main() -> anyhow::Result<()> {
             // Headed: the UI probes ZERON_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: std::env::var_os("ZERON_DATA_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(dirs_data_dir),
+                data_dir: paths::data_dir(),
                 ipc_port: std::env::var("ZERON_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
@@ -228,9 +227,7 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
     // Dev-mode bearer (no WorkOS): an explicit token enables sync.
     let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
     zeron_engine::EngineConfig {
-        data_dir: std::env::var_os("ZERON_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(dirs_data_dir),
+        data_dir: paths::data_dir(),
         edge_url: edge_url_from_env(),
         ipc_port: std::env::var("ZERON_IPC_PORT")
             .ok()
@@ -260,20 +257,6 @@ fn harness_from_env() -> zeron_engine::HarnessId {
         Ok("pi") => zeron_engine::HarnessId::Pi,
         _ => zeron_engine::HarnessId::ClaudeCode,
     }
-}
-
-fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let dir = home.join(".zeron");
-    // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
-    // device identity, prefs) instead of starting fresh.
-    if !dir.exists() {
-        let old = home.join(".comet-native");
-        if old.exists() && std::fs::rename(&old, &dir).is_ok() {
-            eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
-        }
-    }
-    dir
 }
 
 /// `zeron sync`: dial the running engine's IPC and print per-room sync state.
@@ -413,10 +396,7 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 /// locked logs to `zeron-{mode}.{pid}.log` instead; the next lock-holding
 /// launch sweeps pid-suffixed files older than a week.
 fn open_log_file(mode: &str) -> Option<std::fs::File> {
-    let dir = std::env::var_os("ZERON_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(dirs_data_dir)
-        .join("logs");
+    let dir = paths::data_dir().join("logs");
     open_log_file_in(&dir, mode)
 }
 

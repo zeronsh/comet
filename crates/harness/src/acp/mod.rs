@@ -125,28 +125,7 @@ fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String 
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
 pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    candidates.extend(extra);
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    crate::executable::find_on_paths(exe, extra)
 }
 
 /// Generic effort ladder for agents without their own clamping rules.
@@ -182,7 +161,7 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
 
 fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join(exe));
         dirs.push(home.join(".npm-global").join("bin").join(exe));
     }
@@ -193,7 +172,7 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
 
 fn grok_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("grok"));
         dirs.push(home.join(".grok").join("bin").join("grok"));
         dirs.push(home.join(".npm-global").join("bin").join("grok"));
@@ -263,7 +242,7 @@ fn grok_spec() -> AcpAgentSpec {
 
 fn devin_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::executable::home_dir() {
         // The official installer's launcher symlink (the binary lives below
         // ~/.local/share/devin/cli/_versions).
         dirs.push(home.join(".local").join("bin").join("devin"));
@@ -334,7 +313,7 @@ fn devin_spec() -> AcpAgentSpec {
 
 fn hermes_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("hermes"));
         dirs.push(home.join(".hermes").join("bin").join("hermes"));
     }
@@ -631,12 +610,14 @@ impl AcpHarness {
     fn resolve_launch(&self) -> Result<Launch, HarnessError> {
         let spec_args: Vec<String> = self.spec.args.iter().map(|a| a.to_string()).collect();
         if let Some(p) = &self.executable {
-            return Ok(Launch::Program(p.clone(), spec_args));
+            return crate::executable::validate_native_override(p)
+                .map(|program| Launch::Program(program, spec_args));
         }
         if let Some(p) = std::env::var_os(self.spec.env_override)
             && !p.is_empty()
         {
-            return Ok(Launch::Program(PathBuf::from(p), spec_args));
+            return crate::executable::validate_native_override(&PathBuf::from(p))
+                .map(|program| Launch::Program(program, spec_args));
         }
         if let Some(found) = find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
             return Ok(Launch::Program(found, spec_args));
@@ -770,7 +751,7 @@ impl AcpHarness {
                 .await?;
             let mut commands = scan_available_commands(&init);
             if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let cwd = crate::executable::home_or_current_dir();
                 let session = client
                     .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                     .await;
@@ -832,7 +813,7 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let cwd = crate::executable::home_or_current_dir();
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;

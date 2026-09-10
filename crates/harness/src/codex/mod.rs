@@ -72,40 +72,15 @@ use normalize::{
 /// then known install locations as a last resort. Resolved per call — cheap
 /// after the snapshot is cached.
 fn resolve_codex_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+    let mut extra = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        extra.push(home.join(".local").join("bin").join("codex"));
+        extra.push(home.join(".codex").join("bin").join("codex"));
+        extra.push(home.join(".npm-global").join("bin").join("codex"));
     }
-    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local").join("bin").join("codex"));
-        candidates.push(home.join(".codex").join("bin").join("codex"));
-        candidates.push(home.join(".npm-global").join("bin").join("codex"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
-    candidates.push(PathBuf::from("/usr/local/bin/codex"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/codex"));
+    extra.push(PathBuf::from("/usr/local/bin/codex"));
+    crate::executable::find_on_paths("codex", extra)
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -152,14 +127,20 @@ impl CodexHarness {
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
-            return Ok(p.clone());
+            return crate::executable::validate_native_override(p);
+        }
+        if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
+            && !p.is_empty()
+        {
+            return crate::executable::validate_native_override(&PathBuf::from(p));
         }
         resolve_codex_executable().ok_or_else(|| {
             HarnessError::NotInstalled(
                 "codex (searched PATH, the login shell's PATH, ~/.local/bin, \
                  ~/.codex/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, \
-                 and fnm/nvm/volta/pnpm/bun install dirs; set CODEX_EXECUTABLE to \
-                 override)"
+                 and fnm/nvm/volta/pnpm/bun install dirs; Windows also checks USERPROFILE \
+                 and explicit NVM_SYMLINK/VOLTA_HOME/PNPM_HOME; set CODEX_EXECUTABLE \
+                 to override)"
                     .into(),
             )
         })
@@ -540,7 +521,7 @@ impl Harness for CodexHarness {
         REASONING_LEVELS
     }
     fn installed(&self) -> bool {
-        self.executable.is_some() || resolve_codex_executable().is_some()
+        self.resolve_executable().is_ok()
     }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {

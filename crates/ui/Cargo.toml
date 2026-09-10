@@ -7,6 +7,7 @@ publish.workspace = true
 
 [features]
 browser-fixture = []
+windows-render-fixture = []
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
 [[example]]
@@ -20,6 +21,10 @@ required-features = ["browser-fixture"]
 [[example]]
 name = "browser-fixture"
 required-features = ["browser-fixture"]
+
+[[example]]
+name = "windows-render-fixture"
+required-features = ["windows-render-fixture"]
 
 [dependencies]
 url = "2"

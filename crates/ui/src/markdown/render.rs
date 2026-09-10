@@ -15,9 +15,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, Context, FontStyle, FontWeight, Hsla, InteractiveText, Render,
-    SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point,
-    prelude::*, px, quad, size,
+    AnyElement, BorderStyle, Bounds, Context, CursorStyle, FontStyle, FontWeight, Hsla,
+    InteractiveText, Render, SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas,
+    div, font, point, prelude::*, px, quad, size,
 };
 use zeron_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
@@ -861,6 +861,7 @@ fn flat_text_element(
     .size_full();
     div()
         .relative()
+        .cursor(CursorStyle::IBeam)
         .child(underlay)
         .child(text_el)
         .into_any_element()
