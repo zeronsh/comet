@@ -245,6 +245,7 @@ impl Observer {
 struct ClipState {
     dragging: Cell<bool>,
     region: Cell<objc2_foundation::NSRect>,
+    resize_inset: Cell<f64>,
 }
 
 // Clips native content to GPUI's current paint mask. During app drags the
@@ -260,7 +261,7 @@ define_class!(
         fn hit_test(&self, point: objc2_foundation::NSPoint) -> *mut NSView {
             let region = self.ivars().region.get();
             if self.ivars().dragging.get()
-                || point.x < region.origin.x || point.x >= region.origin.x + region.size.width
+                || point.x < region.origin.x + self.ivars().resize_inset.get() || point.x >= region.origin.x + region.size.width
                 || point.y < region.origin.y || point.y >= region.origin.y + region.size.height
             { std::ptr::null_mut() }
             else { unsafe { msg_send![super(self), hitTest: point] } }
@@ -316,6 +317,7 @@ impl NativePage {
             let object = mtm.alloc().set_ivars(ClipState {
                 dragging: Cell::new(false),
                 region: Cell::new(objc2_foundation::NSRect::ZERO),
+                resize_inset: Cell::new(0.0),
             });
             msg_send![super(object), initWithFrame: objc2_foundation::NSRect::ZERO]
         };
@@ -528,7 +530,13 @@ fn has_focus(view: &NSView) -> bool {
 }
 
 impl Host {
-    pub fn sync(&mut self, bounds: Bounds<Pixels>, mask: Bounds<Pixels>, dragging: bool) {
+    pub fn sync(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        mask: Bounds<Pixels>,
+        dragging: bool,
+        resize_inset: Pixels,
+    ) {
         // WebKit may fill newly exposed tiles a frame after a viewport change.
         // Match its page background beneath those tiles instead of exposing
         // the application's dark window background at the resize edge.
@@ -551,6 +559,10 @@ impl Host {
         }
         let visible = bounds.intersect(&mask);
         self.clip.ivars().dragging.set(dragging);
+        self.clip
+            .ivars()
+            .resize_inset
+            .set(f64::from(f32::from(resize_inset)));
         if self.bounds != Some(bounds) || self.visible_bounds != Some(visible) {
             self.bounds = Some(bounds);
             self.visible_bounds = Some(visible);
@@ -579,19 +591,23 @@ impl Host {
             unsafe {
                 let _: () = msg_send![&*self.clip_mask, setFrame: region];
             }
-            let rect = wry::Rect {
-                position: wry::dpi::LogicalPosition::new(
-                    f64::from(f32::from(bounds.origin.x)),
-                    f64::from(f32::from(bounds.origin.y)),
-                )
-                .into(),
-                size: wry::dpi::LogicalSize::new(
-                    f64::from(f32::from(bounds.size.width)),
-                    f64::from(f32::from(bounds.size.height)),
-                )
-                .into(),
+            // Wry's set_bounds rounds logical origins and sizes to whole points. GPUI
+            // uses fractional points, so that leaves uncovered background
+            // strips between the WKWebView and its clip after a resize.
+            let web_height = f64::from(f32::from(bounds.size.height)).max(0.);
+            let web_y = f64::from(f32::from(bounds.origin.y));
+            let web_y = if self.parent.isFlipped() {
+                web_y
+            } else {
+                self.parent.bounds().size.height - web_y - web_height
             };
-            let _ = self.web.set_bounds(rect);
+            self.view.setFrame(objc2_foundation::NSRect::new(
+                objc2_foundation::NSPoint::new(f64::from(f32::from(bounds.origin.x)), web_y),
+                objc2_foundation::NSSize::new(
+                    f64::from(f32::from(bounds.size.width)).max(0.),
+                    web_height,
+                ),
+            ));
             unsafe {
                 // Leave the implicit transaction open for the matching Metal
                 // presentation. Committing here would expose native geometry early.

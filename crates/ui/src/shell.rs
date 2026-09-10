@@ -170,6 +170,7 @@ impl SidebarDisclosureMotion {
 /// Vertical pane resize hitboxes yield the global titlebar. Keeping this in
 /// the shared constructor makes left/right seams mirror each other and avoids
 /// relying on paint order when chrome crosses an animated pane boundary.
+const PANE_RESIZE_HITBOX_HALF_WIDTH: f32 = 6.0;
 const PANE_RESIZE_HITBOX_TOP: f32 = Theme::TITLEBAR_HEIGHT;
 
 fn stable_panel_content_width(target: f32, transition: Option<(f32, f32)>) -> f32 {
@@ -6348,8 +6349,9 @@ impl Shell {
             .absolute()
             .top(px(PANE_RESIZE_HITBOX_TOP))
             .bottom_0()
-            .w(px(12.0))
+            .w(px(PANE_RESIZE_HITBOX_HALF_WIDTH * 2.0))
             .flex_none()
+            .occlude()
             .cursor_col_resize()
             .on_hover(motion::hover_listener(fade_key))
             // Codex-style seam feedback: the existing 1px panel border stays
@@ -8457,6 +8459,16 @@ impl Render for Shell {
         // Native clipping follows the animated GPUI mask. Drags only transfer
         // pointer ownership; the browser continues rendering and reflowing.
         let browser_dragging = cx.has_active_drag();
+        #[cfg(target_os = "macos")]
+        let browser_resize_inset = if self.right_pane_open(cx)
+            && !self.right_pane_expanded
+            && !self.tween_active(self.right_tween)
+        {
+            // The browser starts inside the panel's one-point left border.
+            px(PANE_RESIZE_HITBOX_HALF_WIDTH - 1.0)
+        } else {
+            px(0.0)
+        };
         let selected_surface = self.resolved_right_active(cx);
         for (id, browser) in &self.browsers {
             let presentation = crate::browser::model::presentation(
@@ -8464,6 +8476,8 @@ impl Render for Shell {
                 browser_dragging,
             );
             browser.update(cx, |browser, cx| {
+                #[cfg(target_os = "macos")]
+                browser.set_resize_inset(browser_resize_inset, cx);
                 browser.set_shortcuts(&self.settings.keymap);
                 browser.set_presentation(presentation, cx);
             });
@@ -8724,7 +8738,7 @@ impl Render for Shell {
                     )
                     // A forgiving transparent hit target centered on the
                     // seam; the panel's 1px border remains the visual divider.
-                    .left(px(-6.0))
+                    .left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
                 });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
@@ -8774,12 +8788,16 @@ impl Render for Shell {
                 // Keep the right resize target outside the pane's
                 // overflow-hidden width container. This mirrors the sidebar
                 // seam and lets the target straddle both adjacent panes.
+                // Paint it after the page so page input cannot occlude the
+                // inner half. A deferred draw would capture all native input.
                 let right_seam: AnyElement = if let Some(handle) = right_handle {
                     div()
                         .w(px(0.0))
                         .h_full()
                         .flex_none()
-                        .relative()
+                        .absolute()
+                        .left_0()
+                        .top_0()
                         .child(handle)
                         .into_any_element()
                 } else {
@@ -8819,8 +8837,14 @@ impl Render for Shell {
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
-                            .child(right_seam)
-                            .child(right),
+                            .child(
+                                div()
+                                    .h_full()
+                                    .flex_none()
+                                    .relative()
+                                    .child(right)
+                                    .child(right_seam),
+                            ),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))

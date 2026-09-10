@@ -353,11 +353,16 @@ fn main() -> anyhow::Result<()> {
                     let (left,top)=first.read_with(cx,|b,_|b.fixture_origin());
                     // Real resize-handle drag, including crossing into the native page.
                     eprintln!("Browser fixture: starting resize drag");
-                    let start=gpui::point(px(left-2.),px(top+120.));
+                    // Both halves must reach GPUI before a drag exists.
+                    for offset in [-6., -2., 0., 3., 4.5] {
+                        anyhow::ensure!(!first.read_with(cx,|b,_|b.fixture_page_hit((left+offset) as f64,(top+120.) as f64)),"native page stole the resize target at offset {offset}");
+                    }
+                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((left+6.) as f64,(top+120.) as f64)),"resize target blocked adjacent page content");
+                    let start=gpui::point(px(left+3.),px(top+120.));
                     gpui::AnyWindowHandle::from(window).update(cx,|_,w,cx| {w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent{position:start,button:gpui::MouseButton::Left,click_count:1,..Default::default()}),cx);})?;
                     let mut widths=Vec::new();
                     for delta in [10.,30.,60.,100.,140.,180.,140.,100.,60.,20.,-20.,-60.,-100.,-140.,-180.,-140.,-100.,-60.,-20.,0.] {
-                        let pos=gpui::point(px(left-2.+delta),start.y);
+                        let pos=gpui::point(px(left+3.+delta),start.y);
                         first.read_with(cx,|b,_|b.fixture_move_cursor(f32::from(pos.x) as f64,f32::from(pos.y) as f64));
                         gpui::AnyWindowHandle::from(window).update(cx,|_,w,cx| {w.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent{position:pos,pressed_button:Some(gpui::MouseButton::Left),modifiers:Default::default()}),cx);})?;
                         pause(cx,100).await;
@@ -443,9 +448,14 @@ fn main() -> anyhow::Result<()> {
                     anyhow::ensure!(std::fs::metadata(output.join("browser-layout.mov"))?.len()>10000,"layout recording is empty");
                     validate_blur(&output,regions[0],window_width)?;
                 }
-                for width in [380., 640., 520.] {
+                for width in [380.25, 640.5, 520.75] {
                     window.update(cx, |shell, _, cx| shell.fixture_resize_browser(width, cx))?;
                     pause(cx, 150).await;
+                    #[cfg(target_os = "macos")]
+                    {
+                        let (layout,native,clip)=first.read_with(cx,|b,_|b.fixture_geometry());
+                        anyhow::ensure!((layout-native).abs()<0.01 && (clip-native).abs()<0.01,"fractional resize left a gap between the page and clip: {layout}/{native}/{clip}");
+                    }
                 }
                 window.update(cx, |shell, _, cx| shell.fixture_expand_browser(cx))?;
                 pause(cx, 400).await;

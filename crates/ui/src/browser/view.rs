@@ -519,6 +519,7 @@ impl Render for BrowserSurface {
                 body.child(self.empty_body(&theme, cx))
             } else {
                 let native = native.handle();
+                let resize_inset = self.resize_inset;
                 body.child(
                     gpui::canvas(
                         |_, _, _| (),
@@ -528,7 +529,9 @@ impl Render for BrowserSurface {
                             let dragging = cx.has_active_drag();
                             window.on_present(move || {
                                 if let Some(native) = native.upgrade() {
-                                    native.borrow_mut().sync(bounds, mask, dragging);
+                                    native
+                                        .borrow_mut()
+                                        .sync(bounds, mask, dragging, resize_inset);
                                 }
                             });
                         },
