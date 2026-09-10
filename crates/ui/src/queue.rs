@@ -1020,7 +1020,7 @@ impl Composer {
                             composer.attachments.remove(&composer.current_key).unwrap_or_default(),
                         ));
                         composer.attachments.insert(composer.current_key.clone(), loaded_attachments);
-                        composer.queue_edit_focus_pending = true;
+                        composer.focus_pending = true;
                         composer.input.update(cx, |input, cx| input.set_text(text, cx));
                         composer.start_queue_edit_renewal(engine.clone(), cx);
                     }
@@ -1095,7 +1095,7 @@ impl Composer {
             self.attachments
                 .insert(self.current_key.clone(), attachments);
         }
-        self.queue_edit_focus_pending = true;
+        self.focus_pending = true;
         cx.notify();
     }
 

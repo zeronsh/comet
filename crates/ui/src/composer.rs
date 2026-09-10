@@ -3975,8 +3975,8 @@ pub struct Composer {
     pub(crate) queue_edit_finishing: bool,
     pub(crate) queue_edit_task: Option<Task<()>>,
     pub(crate) queue_edit_renew_task: Option<Task<()>>,
-    /// Apply focus on the next render after opening or closing an edit.
-    pub(crate) queue_edit_focus_pending: bool,
+    /// Focus once on mount, navigation, or after opening/closing a queue edit.
+    pub(crate) focus_pending: bool,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
     pub(crate) queue_scroll: gpui::ScrollHandle,
@@ -4155,7 +4155,7 @@ impl Composer {
             queue_edit_finishing: false,
             queue_edit_task: None,
             queue_edit_renew_task: None,
-            queue_edit_focus_pending: false,
+            focus_pending: true,
             queue_drag: None,
             queue_scroll: gpui::ScrollHandle::new(),
             queue_removing: HashSet::new(),
@@ -6592,8 +6592,8 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.queue_edit_focus_pending {
-            self.queue_edit_focus_pending = false;
+        if self.focus_pending {
+            self.focus_pending = false;
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);
         }

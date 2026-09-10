@@ -3116,6 +3116,7 @@ impl Shell {
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
     }
@@ -3141,6 +3142,7 @@ impl Shell {
         match entry {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
+                self.focus_composer(cx);
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
@@ -9740,6 +9742,77 @@ mod exit_regressions {
                 assert_eq!(shell.eval_tween(tween, 0.), 0.);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn session_navigation_focuses_composer_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        // Render the real composer in its own window to exercise mounting
+        // without the shell's boot/connection gate hiding the destination.
+        let composer_window = cx.update(|cx| {
+            let composer = window.read(cx).unwrap().composer.clone();
+            cx.open_window(gpui::WindowOptions::default(), |_, _| composer)
+                .unwrap()
+        });
+        for destination in ["initial", "chat", "chat", "new", "new", "back", "settings"] {
+            window
+                .update(cx, |shell, _, cx| match destination {
+                    "chat" => shell.open_chat("existing-session".into(), cx),
+                    "new" => shell.open_new_session(cx),
+                    "back" => shell.apply_nav(NavEntry::Chat("existing-session".into()), cx),
+                    "settings" => {
+                        shell.open_settings(SettingsSection::Devices, cx);
+                        shell.close_settings(cx);
+                    }
+                    _ => {}
+                })
+                .unwrap();
+            cx.update_window(composer_window.into(), |composer, window, cx| {
+                window.draw(cx).clear();
+                assert!(
+                    composer
+                        .downcast::<Composer>()
+                        .unwrap()
+                        .focus_handle(cx)
+                        .is_focused(window),
+                    "{destination}"
+                );
+                // Subsequent renders after a click-away must not reclaim it.
+                window.blur();
+                window.draw(cx).clear();
+                assert!(window.focused(cx).is_none(), "{destination}");
+            })
+            .unwrap();
+        }
     }
 
     #[gpui::test]
