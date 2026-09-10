@@ -33,6 +33,7 @@
 
 pub mod catalog;
 mod normalize;
+mod settings;
 mod wire;
 
 use std::path::PathBuf;
@@ -56,6 +57,7 @@ use zeron_proto::{
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
+use settings::ClaudeSettings;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
 /// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
@@ -169,6 +171,17 @@ impl ClaudeHarness {
     }
 
     fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+        self.build_command_with_settings(exe, request, &ClaudeSettings::load())
+    }
+
+    /// [`Self::build_command`] with the Claude settings injected, so tests can
+    /// exercise the model resolution without touching `~/.claude`.
+    fn build_command_with_settings(
+        &self,
+        exe: &PathBuf,
+        request: &RunRequest,
+        claude_settings: &ClaudeSettings,
+    ) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
@@ -194,17 +207,27 @@ impl ClaudeHarness {
         // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
         // always-on thinking are settings overrides.
         if let Some(model) = &request.model {
-            let one_m = request
-                .model_options
-                .get("contextWindow")
-                .and_then(Value::as_str)
-                == Some("1m");
-            cmd.arg("--model");
-            cmd.arg(if one_m {
-                format!("{model}[1m]")
+            // cc-switch / gateways map the Claude *families* to provider models
+            // through `ANTHROPIC_DEFAULT_*_MODEL`, but the CLI applies that
+            // mapping only to family aliases — never to the full ids this
+            // catalog hands out (issue #305). Resolve through the mapping when
+            // one is configured; otherwise keep the id exactly as before.
+            if let Some(resolved) = claude_settings.resolve_request_model(model) {
+                cmd.arg("--model");
+                cmd.arg(resolved);
             } else {
-                model.clone()
-            });
+                let one_m = request
+                    .model_options
+                    .get("contextWindow")
+                    .and_then(Value::as_str)
+                    == Some("1m");
+                cmd.arg("--model");
+                cmd.arg(if one_m {
+                    format!("{model}[1m]")
+                } else {
+                    model.clone()
+                });
+            }
         }
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
@@ -394,7 +417,12 @@ impl Harness for ClaudeHarness {
     /// like the discovery call would.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        let catalog = static_models();
+        // cc-switch / gateways: name the provider models that actually run
+        // instead of the Claude ids they are mapped from (issue #305).
+        Ok(ClaudeSettings::load()
+            .provider_rows(&catalog)
+            .unwrap_or(catalog))
     }
 
     /// Slash commands from the CLI's `initialize` control-request handshake —
@@ -449,8 +477,13 @@ impl ClaudeHarness {
                 "--strict-mcp-config",
                 "--mcp-config",
                 "{\"mcpServers\":{}}",
+                // Keep USER settings (the `env` block carries a third-party
+                // provider's base URL / token / model — cc-switch) but skip
+                // project/local settings for a scratch title run. `""` here
+                // dropped the user env too, so titles failed with "Not
+                // logged in" for anyone on a third-party provider.
                 "--setting-sources",
-                "",
+                "user",
             ]);
         }
         let mut child = cmd.spawn().map_err(|e| {
@@ -951,5 +984,65 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+
+    fn request_with_model(model: &str) -> RunRequest {
+        RunRequest {
+            prompt: "hi".into(),
+            harness: None,
+            model: Some(model.into()),
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: zeron_proto::SandboxLevel::DangerFullAccess,
+            auto_approve: true,
+            attachments: Vec::new(),
+            worktree: None,
+            resume: None,
+        }
+    }
+
+    /// The value that follows `--model` in the spawned argv.
+    fn model_arg(request: &RunRequest, settings: &ClaudeSettings) -> Option<String> {
+        let command = ClaudeHarness::new().build_command_with_settings(
+            &PathBuf::from("/bin/true"),
+            request,
+            settings,
+        );
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let index = args.iter().position(|arg| arg == "--model")?;
+        args.get(index + 1).cloned()
+    }
+
+    #[test]
+    fn provider_mapping_rewrites_the_model_flag() {
+        // A full Claude id is remapped to the family's provider model in the
+        // `ANTHROPIC_DEFAULT_*_MODEL` settings cc-switch writes (issue #305).
+        let mapped = ClaudeSettings::from_json(&json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-flash[1M]",
+            }
+        }));
+        assert_eq!(
+            model_arg(&request_with_model("claude-opus-5"), &mapped).as_deref(),
+            Some("deepseek-v4-flash[1M]")
+        );
+
+        // Native settings leave the id — and the `[1m]` context suffix — as
+        // they were.
+        let native = ClaudeSettings::from_json(&json!({ "env": {} }));
+        let mut one_m = request_with_model("claude-opus-5");
+        one_m
+            .model_options
+            .insert("contextWindow".into(), json!("1m"));
+        assert_eq!(
+            model_arg(&one_m, &native).as_deref(),
+            Some("claude-opus-5[1m]")
+        );
     }
 }

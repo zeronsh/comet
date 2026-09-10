@@ -17,16 +17,20 @@ case "$first" in
   tools_off=false
   system_set=false
   mcp_off=false
+  # `user` (not "") keeps the user settings.json env cc-switch writes; ""
+  # dropped third-party provider auth and broke every title run (issue #305).
+  settings_user=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --tools) shift; [ "$1" = "" ] && tools_off=true ;;
       --system-prompt) shift; case "$1" in "You generate session titles."*) system_set=true ;; esac ;;
       --strict-mcp-config) mcp_off=true ;;
+      --setting-sources) shift; [ "$1" = "user" ] && settings_user=true ;;
       --dangerously-skip-permissions) exit 1 ;;
     esac
     shift
   done
-  [ "$tools_off" = true ] && [ "$system_set" = true ] && [ "$mcp_off" = true ] || exit 1
+  [ "$tools_off" = true ] && [ "$system_set" = true ] && [ "$mcp_off" = true ] && [ "$settings_user" = true ] || exit 1
   emit '{"type":"control_request","request_id":"title-tool","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch should-not-exist"}}}'
   read -r response || exit 1
   case "$response" in *'"behavior":"deny"'*) ;; *) exit 1 ;; esac
