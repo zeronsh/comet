@@ -43,6 +43,7 @@ use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::source_control::{SourceControlEvent, SourceControlPage};
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -389,18 +390,21 @@ pub enum SettingsSection {
     Agents,
     Appearance,
     Files,
+    /// Pull request link preferences for checkouts.
+    SourceControl,
     Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
+        SettingsSection::SourceControl,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -415,6 +419,7 @@ impl SettingsSection {
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
+            SettingsSection::SourceControl => "Source control",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -1192,6 +1197,7 @@ pub struct Shell {
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
     files_settings_page: Option<Entity<FilesSettingsPage>>,
+    source_control_page: Option<Entity<SourceControlPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -1199,6 +1205,7 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
+    source_control_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1445,6 +1452,7 @@ impl Shell {
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
+            Some("settings/source-control") => Route::Settings(SettingsSection::SourceControl),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -1533,6 +1541,7 @@ impl Shell {
             archived_page: None,
             appearance_page: None,
             files_settings_page: None,
+            source_control_page: None,
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1540,6 +1549,7 @@ impl Shell {
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
+            source_control_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -3271,6 +3281,29 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::SourceControl => {
+                if self.source_control_page.is_none() {
+                    let page = cx.new(|cx| {
+                        SourceControlPage::new(self.settings.pull_request_link_target, cx)
+                    });
+                    // Persist the target whenever the page flips it; badges
+                    // read it from the settings store at click time.
+                    self.source_control_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &SourceControlEvent, cx| {
+                            let SourceControlEvent::PullRequestLinkTargetChanged(target) = *event;
+                            this.settings.pull_request_link_target = target;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.source_control_page = Some(page);
+                }
+                match &self.source_control_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Notifications => {
                 if self.notifications_page.is_none() {
                     let page = cx.new(|cx| {
@@ -4604,6 +4637,7 @@ impl Shell {
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
+            SettingsSection::SourceControl => icons::PULL_REQUEST,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
