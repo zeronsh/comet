@@ -2187,7 +2187,12 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+                self.composer
+                    .update(cx, |composer, _| composer.focus_pending = false);
+                panel.update(cx, |panel, cx| {
+                    panel.select_tab_by_key(tab, cx);
+                    panel.request_focus(cx);
+                });
             }
             RightSurface::Diff(id) => {
                 if let Some(changes) = self.diffs.get(&id).cloned() {
@@ -2923,6 +2928,9 @@ impl Shell {
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
+            self.composer
+                .update(cx, |composer, _| composer.focus_pending = false);
+            panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
             // to the prompt, no click needed (zeron terminal-panel.tsx: the
             // visible+active effect calls `terminal.focus()` on every open).
@@ -9742,6 +9750,91 @@ mod exit_regressions {
                 assert_eq!(shell.eval_tween(tween, 0.), 0.);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn opening_terminals_focuses_the_terminal_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let mut drawer_window = None;
+        for embedded in [false, false, true] {
+            let panel = window
+                .update(cx, |shell, window, cx| {
+                    shell.open_chat("terminal-session".into(), cx);
+                    shell.active_chat = "terminal-session".into();
+                    let panel = if embedded {
+                        shell.add_terminal_surface(cx);
+                        shell.right_terminal.clone().unwrap()
+                    } else {
+                        shell.toggle_terminal(window, cx);
+                        shell.terminal.clone().unwrap()
+                    };
+                    assert!(!shell.composer.read(cx).focus_pending);
+                    panel
+                })
+                .unwrap();
+            let terminal_window = if !embedded && drawer_window.is_some() {
+                drawer_window.unwrap()
+            } else {
+                let handle = cx.update(|cx| {
+                    cx.open_window(gpui::WindowOptions::default(), |_, _| panel.clone())
+                        .unwrap()
+                });
+                if !embedded {
+                    drawer_window = Some(handle);
+                }
+                handle
+            };
+            cx.update_window(terminal_window.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert!(
+                    panel.read(cx).focus_handle().is_focused(window),
+                    "embedded: {embedded}"
+                );
+                // Ordinary redraws must not steal focus from another control.
+                let other_input = cx.focus_handle();
+                window.focus(&other_input, cx);
+                window.draw(cx).clear();
+                assert!(other_input.is_focused(window));
+            })
+            .unwrap();
+            if !embedded {
+                window
+                    .update(cx, |shell, window, cx| {
+                        shell.toggle_terminal(window, cx);
+                        assert!(shell.composer.focus_handle(cx).is_focused(window));
+                    })
+                    .unwrap();
+            }
+        }
     }
 
     #[gpui::test]
