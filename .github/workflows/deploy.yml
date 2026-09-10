@@ -11,11 +11,6 @@ name: deploy
 on:
   push:
     branches: [main]
-    paths:
-      - 'edge/**'
-      - 'apps/landing/**'
-      - 'apps/www-redirect/**'
-      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
 concurrency:
