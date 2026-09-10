@@ -21,7 +21,8 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath}`, `GetCheckoutIsolation`, `SetCheckoutIsolation
+//!   {isolation}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
@@ -224,6 +225,12 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetCheckoutIsolationParams {
+    isolation: zeron_proto::CheckoutIsolation,
 }
 
 #[derive(Debug, Deserialize)]
@@ -932,7 +939,7 @@ fn forwardable(method: &str) -> bool {
             | methods::REMOVE_QUEUED_MESSAGE
             | methods::SEND_QUEUED_MESSAGE_NOW
             | methods::STEER_QUEUED_MESSAGE_NOW
-            // Repos/worktrees/folders are device-local filesystem state.
+            // Repos/worktrees/folders/isolation are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
             | methods::CLONE_REPO
@@ -954,6 +961,8 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            | methods::GET_CHECKOUT_ISOLATION
+            | methods::SET_CHECKOUT_ISOLATION
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
@@ -2123,6 +2132,15 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::GET_CHECKOUT_ISOLATION => RpcReply::value(&self.repos.isolation_status()),
+            methods::SET_CHECKOUT_ISOLATION => {
+                let p: SetCheckoutIsolationParams = parse_params(params)?;
+                let status = self
+                    .repos
+                    .set_isolation(p.isolation)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&status)
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;

@@ -111,6 +111,59 @@ async fn drain_until(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn checkout_isolation_rpc_defaults_to_git() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let core = assemble(&tmp.path().join("data"));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    let isolation = client
+        .call(methods::GET_CHECKOUT_ISOLATION, serde_json::json!({}))
+        .await
+        .expect("GetCheckoutIsolation");
+    assert_eq!(isolation["isolation"], "git");
+    assert!(isolation["riftSupported"].is_boolean());
+
+    let isolation = client
+        .call(
+            methods::SET_CHECKOUT_ISOLATION,
+            serde_json::json!({ "isolation": "git" }),
+        )
+        .await
+        .expect("SetCheckoutIsolation git");
+    assert_eq!(isolation["isolation"], "git");
+
+    if isolation["riftSupported"] == true {
+        let rift = client
+            .call(
+                methods::SET_CHECKOUT_ISOLATION,
+                serde_json::json!({ "isolation": "rift" }),
+            )
+            .await
+            .expect("SetCheckoutIsolation rift");
+        assert_eq!(rift["isolation"], "rift");
+        let git = client
+            .call(
+                methods::SET_CHECKOUT_ISOLATION,
+                serde_json::json!({ "isolation": "git" }),
+            )
+            .await
+            .expect("restore git");
+        assert_eq!(git["isolation"], "git");
+    } else {
+        assert!(
+            client
+                .call(
+                    methods::SET_CHECKOUT_ISOLATION,
+                    serde_json::json!({ "isolation": "rift" }),
+                )
+                .await
+                .is_err(),
+            "rift without the CLI must fail"
+        );
+    }
+}
+
+#[tokio::test]
 async fn repos_round_trip_add_branches_worktrees() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("myrepo");
@@ -195,6 +248,11 @@ async fn repos_round_trip_add_branches_worktrees() {
     );
     let plain_ref = by_name("feature/x");
     assert!(!plain_ref.current && plain_ref.worktree_path.is_none());
+    assert_eq!(worktree.isolation, zeron_proto::CheckoutIsolation::Git);
+    assert_eq!(
+        by_name(&worktree.branch).isolation,
+        zeron_proto::CheckoutIsolation::Git
+    );
 
     // Worktree checkout identity differs from the main checkout's.
     let main_identity = repos

@@ -252,6 +252,10 @@ pub struct RepoRef {
     /// Path of the linked worktree this branch is checked out in, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
+    /// How this checkout was created. Meaningful when [`Self::worktree_path`]
+    /// is set; omitted by older engines.
+    #[serde(default, skip_serializing_if = "CheckoutIsolation::is_git")]
+    pub isolation: CheckoutIsolation,
 }
 
 /// Public Git reference attached to a commit in the history graph.
@@ -331,6 +335,39 @@ pub struct Worktree {
     /// Canonical checkout identity (device-scoped hash of the git dir).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
+    /// Git worktree (default) or a Rift copy-on-write clone.
+    #[serde(default, skip_serializing_if = "CheckoutIsolation::is_git")]
+    pub isolation: CheckoutIsolation,
+}
+
+/// How this device materializes an isolated session checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckoutIsolation {
+    /// `git worktree add` under `~/.zeron/worktrees` (the default).
+    #[default]
+    Git,
+    /// [Rift](https://github.com/anomalyco/rift) copy-on-write clone. Needs
+    /// btrfs, a reflink-capable Linux filesystem, or APFS.
+    Rift,
+}
+
+impl CheckoutIsolation {
+    pub fn is_git(&self) -> bool {
+        matches!(self, Self::Git)
+    }
+}
+
+/// This device's isolated-checkout setting, plus whether Rift can even be
+/// attempted on the platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutIsolationStatus {
+    pub isolation: CheckoutIsolation,
+    /// The `rift` CLI is present on this device. Does not mean the current
+    /// disk can actually clone; create still fails with a filesystem error
+    /// if it cannot.
+    pub rift_supported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

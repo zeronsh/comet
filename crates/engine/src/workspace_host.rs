@@ -738,7 +738,7 @@ impl WorkspaceHost {
         {
             return Ok(space.id.clone());
         }
-        let root = linked_worktree_root(std::path::Path::new(path));
+        let root = isolated_checkout_root(std::path::Path::new(path));
         if let Some(root) = root.as_deref()
             && let Some(space) = spaces
                 .iter()
@@ -1254,6 +1254,18 @@ impl WorkspaceHostInner {
     }
 }
 
+/// Parent checkout root of an isolated session directory: a linked git
+/// worktree, or a Rift clone stamped with `.zeron-checkout.json`. `None` for a
+/// primary checkout (`.git` is a directory), a non-repo folder, or any other
+/// layout (bare-repo worktrees have no `<root>` working copy to attribute to).
+/// Pure fs reads — no git subprocess; this runs on the synchronous claim path.
+pub(crate) fn isolated_checkout_root(path: &std::path::Path) -> Option<String> {
+    if let Some(root) = crate::rift::source_root(path) {
+        return Some(root);
+    }
+    linked_worktree_root(path)
+}
+
 /// The parent checkout root of a linked git worktree: `<path>/.git` is a FILE
 /// containing `gitdir: <root>/.git/worktrees/<name>`. `None` for a primary
 /// checkout (`.git` is a directory), a non-repo folder, or any other layout
@@ -1565,7 +1577,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_name_on_boot, linked_worktree_root};
+    use super::{device_name_on_boot, isolated_checkout_root, linked_worktree_root};
 
     #[tokio::test]
     async fn presence_publish_keeps_unchanged_lists_quiet_and_late_subscribers_current() {
@@ -1636,6 +1648,27 @@ mod tests {
         assert_eq!(
             device_name_on_boot(Some("Work laptop"), "MacBook Pro"),
             "Work laptop"
+        );
+    }
+
+    #[test]
+    fn rift_clone_resolves_to_the_source_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let clone = dir.path().join("keen-raven");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::write(
+            clone.join(crate::rift::MARKER_FILE),
+            format!(
+                "{{\n  \"repoPath\": \"{}\",\n  \"isolation\": \"rift\"\n}}\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            isolated_checkout_root(&clone).as_deref(),
+            Some(root.to_str().unwrap())
         );
     }
 

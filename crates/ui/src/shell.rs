@@ -43,6 +43,7 @@ use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::worktrees::WorktreesPage;
 use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
@@ -391,11 +392,12 @@ pub enum SettingsSection {
     Files,
     Notifications,
     Shortcuts,
+    Worktrees,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
@@ -403,6 +405,7 @@ impl SettingsSection {
         SettingsSection::Files,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
+        SettingsSection::Worktrees,
         SettingsSection::Archived,
     ];
 
@@ -417,6 +420,7 @@ impl SettingsSection {
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
+            SettingsSection::Worktrees => "Worktrees",
             SettingsSection::Archived => "Archived sessions",
         }
     }
@@ -1196,6 +1200,7 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    worktrees_page: Option<Entity<WorktreesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -1447,6 +1452,7 @@ impl Shell {
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
+            Some("settings/worktrees") => Route::Settings(SettingsSection::Worktrees),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
@@ -1537,6 +1543,7 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            worktrees_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -3318,6 +3325,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Worktrees => {
+                if self.worktrees_page.is_none() {
+                    let state = self.state.clone();
+                    self.worktrees_page = Some(cx.new(|cx| WorktreesPage::new(state, cx)));
+                }
+                match &self.worktrees_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Archived => {
                 if self.archived_page.is_none() {
                     let state = self.state.clone();
@@ -4585,6 +4602,7 @@ impl Shell {
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Worktrees => icons::FOLDER_WITH_FILES,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to

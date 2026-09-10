@@ -2281,6 +2281,7 @@ impl DocHost {
         }
     }
 
+
     /// Composer path: append an immutable pending command entry (rule 1). Durable by
     /// construction — the change subscription kicks the drain, so a local host executes
     /// immediately and an offline doc simply holds the entry until it syncs.
@@ -4347,7 +4348,7 @@ impl DocHost {
             && let Ok(Some(chat)) = ws.chat(chat_id)
             && let Some(cwd) = chat.cwd
             && cwd != spec.repo_path
-            && crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)).as_deref()
+            && crate::workspace_host::isolated_checkout_root(std::path::Path::new(&cwd)).as_deref()
                 == Some(spec.repo_path.as_str())
         {
             tracing::info!(chat = %chat_id, cwd = %cwd, "worktree spec: reusing the chat's existing worktree");

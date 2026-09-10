@@ -7,6 +7,8 @@
 //! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
 //! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
+//! Isolated checkouts default to git worktrees; Settings can opt a device into
+//! [Rift](https://github.com/anomalyco/rift) copy-on-write clones instead.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
@@ -19,9 +21,9 @@ use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 
 use zeron_proto::{
-    DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit,
-    GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind, Repo, RepoRef,
-    Worktree,
+    CheckoutIsolation, CheckoutIsolationStatus, DriveEntry, FileSearchMatch, FolderEntry,
+    FolderListing, GitHistoryCommit, GitHistoryComparison, GitHistoryPage, GitHistoryRef,
+    GitHistoryRefKind, Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -91,10 +93,32 @@ fn default_worktrees_root() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".zeron").join("worktrees"))
 }
 
+const ISOLATION_FILE: &str = "checkout-isolation.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct IsolationFile {
+    #[serde(default)]
+    isolation: CheckoutIsolation,
+}
+
+fn isolation_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(ISOLATION_FILE)
+}
+
+fn load_isolation(data_dir: &Path) -> CheckoutIsolation {
+    std::fs::read_to_string(isolation_path(data_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<IsolationFile>(&raw).ok())
+        .map(|file| file.isolation)
+        .unwrap_or_default()
+}
+
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    isolation: std::sync::Mutex<CheckoutIsolation>,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     http: reqwest::Client,
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
@@ -134,6 +158,7 @@ impl Repos {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                isolation: std::sync::Mutex::new(load_isolation(data_dir)),
                 file_searches: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::builder()
                     .timeout(GITHUB_AVATAR_TIMEOUT)
@@ -145,6 +170,46 @@ impl Repos {
                 file_index: std::sync::Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn isolation(&self) -> CheckoutIsolation {
+        *self
+            .inner
+            .isolation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn isolation_status(&self) -> CheckoutIsolationStatus {
+        CheckoutIsolationStatus {
+            isolation: self.isolation(),
+            rift_supported: crate::rift::available(),
+        }
+    }
+
+    pub fn set_isolation(
+        &self,
+        isolation: CheckoutIsolation,
+    ) -> Result<CheckoutIsolationStatus, EngineError> {
+        if isolation == CheckoutIsolation::Rift && !crate::rift::available() {
+            return Err(EngineError::Other(
+                "Install the rift CLI to use Rift checkouts (https://github.com/anomalyco/rift). Needs btrfs, a Linux filesystem with reflinks, or APFS.".into(),
+            ));
+        }
+        let file = IsolationFile { isolation };
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|e| EngineError::Other(format!("checkout isolation serialize: {e}")))?;
+        std::fs::create_dir_all(&self.inner.data_dir)?;
+        let path = isolation_path(&self.inner.data_dir);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, &path)?;
+        *self
+            .inner
+            .isolation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = isolation;
+        Ok(self.isolation_status())
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -466,6 +531,7 @@ impl Repos {
         // main checkout — excluded (it's `current`, not a linked worktree).
         let mut worktrees: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut isolation_by_path: HashMap<String, CheckoutIsolation> = HashMap::new();
         if let Ok(out) = self
             .git(&["worktree", "list", "--porcelain"], Some(repo_path))
             .await
@@ -480,18 +546,48 @@ impl Repos {
                 } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
                     && let Some(path) = path.take()
                 {
+                    isolation_by_path.insert(path.clone(), CheckoutIsolation::Git);
                     worktrees.insert(branch.to_string(), path);
                 }
             }
         }
-        Ok(names
+        let mut extra: Vec<RepoRef> = Vec::new();
+        for rift in self.list_rift_checkouts(repo_path).await {
+            let branch = self
+                .current_branch(&rift)
+                .await
+                .unwrap_or_else(|_| "HEAD".into());
+            let path = rift.to_string_lossy().into_owned();
+            isolation_by_path.insert(path.clone(), CheckoutIsolation::Rift);
+            if names.iter().any(|name| name == &branch) {
+                worktrees.entry(branch).or_insert(path);
+            } else {
+                extra.push(RepoRef {
+                    current: false,
+                    worktree_path: Some(path),
+                    isolation: CheckoutIsolation::Rift,
+                    name: branch,
+                });
+            }
+        }
+        let mut refs: Vec<RepoRef> = names
             .into_iter()
-            .map(|name| RepoRef {
-                current: current.as_deref() == Some(name.as_str()),
-                worktree_path: worktrees.get(&name).cloned(),
-                name,
+            .map(|name| {
+                let worktree_path = worktrees.get(&name).cloned();
+                let isolation = worktree_path
+                    .as_ref()
+                    .and_then(|path| isolation_by_path.get(path).copied())
+                    .unwrap_or_default();
+                RepoRef {
+                    current: current.as_deref() == Some(name.as_str()),
+                    worktree_path,
+                    isolation,
+                    name,
+                }
             })
-            .collect())
+            .collect();
+        refs.extend(extra);
+        Ok(refs)
     }
 
     /// Public commit history in topological order. Only user-facing branches,
@@ -1042,20 +1138,26 @@ impl Repos {
 
     // ── worktrees ───────────────────────────────────────────────────────────
 
-    /// `git worktree add` an isolated checkout under
-    /// `{worktrees_root}/<repoName>/<generatedName>`, on a fresh `zeron/<name>`
-    /// branch off `branch`.
+    /// Isolated checkout under `{worktrees_root}/<repoName>/<generatedName>`.
+    /// Git worktrees mint a fresh `zeron/<name>` branch off `branch`. Rift
+    /// clones the source workspace, then creates that same branch in the copy.
     pub async fn create_worktree(
         &self,
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
-        let repo_name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
-        std::fs::create_dir_all(&base)?;
+        match self.isolation() {
+            CheckoutIsolation::Git => self.create_git_worktree(repo_path, branch).await,
+            CheckoutIsolation::Rift => self.create_rift_checkout(repo_path, branch).await,
+        }
+    }
+
+    async fn allocate_checkout_name(
+        &self,
+        repo_path: &Path,
+        base: &Path,
+    ) -> Result<String, EngineError> {
+        std::fs::create_dir_all(base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self
             .branches(repo_path)
@@ -1081,8 +1183,20 @@ impl Repos {
                 break;
             }
         }
-        let name =
-            name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
+        name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))
+    }
+
+    async fn create_git_worktree(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+    ) -> Result<Worktree, EngineError> {
+        let repo_name = repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string());
+        let base = self.inner.worktrees_root.join(&repo_name);
+        let name = self.allocate_checkout_name(repo_path, &base).await?;
         let path = base.join(&name);
         let branch_name = format!("zeron/{name}");
         self.git(
@@ -1097,6 +1211,60 @@ impl Repos {
             Some(repo_path),
         )
         .await?;
+        self.finish_worktree(repo_path, path, branch_name, name, CheckoutIsolation::Git)
+            .await
+    }
+
+    async fn create_rift_checkout(
+        &self,
+        repo_path: &Path,
+        branch: &str,
+    ) -> Result<Worktree, EngineError> {
+        if !crate::rift::available() {
+            return Err(EngineError::Other(
+                "Install the rift CLI to use Rift checkouts (https://github.com/anomalyco/rift). Needs btrfs, a Linux filesystem with reflinks, or APFS.".into(),
+            ));
+        }
+        let repo_name = repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string());
+        let base = self.inner.worktrees_root.join(&repo_name);
+        let name = self.allocate_checkout_name(repo_path, &base).await?;
+        let repo_path_owned = repo_path.to_path_buf();
+        let into = base.clone();
+        let clone_name = name.clone();
+        let path = tokio::task::spawn_blocking(move || {
+            crate::rift::create(&repo_path_owned, &clone_name, &into)
+        })
+        .await
+        .map_err(|e| EngineError::Other(format!("rift create join: {e}")))??;
+        let cleanup =
+            |path: PathBuf| tokio::task::spawn_blocking(move || crate::rift::remove(&path));
+        if let Err(err) = crate::rift::write_marker(&path, repo_path) {
+            let _ = cleanup(path).await;
+            return Err(err);
+        }
+        let branch_name = format!("zeron/{name}");
+        if let Err(err) = self
+            .git(&["checkout", "-B", &branch_name, branch], Some(&path))
+            .await
+        {
+            let _ = cleanup(path).await;
+            return Err(err);
+        }
+        self.finish_worktree(repo_path, path, branch_name, name, CheckoutIsolation::Rift)
+            .await
+    }
+
+    async fn finish_worktree(
+        &self,
+        repo_path: &Path,
+        path: PathBuf,
+        branch_name: String,
+        name: String,
+        isolation: CheckoutIsolation,
+    ) -> Result<Worktree, EngineError> {
         let checkout = self.checkout_identity(&path).await?;
         Ok(Worktree {
             repo_path: repo_path.to_string_lossy().to_string(),
@@ -1104,7 +1272,26 @@ impl Repos {
             branch: branch_name,
             name,
             checkout_id: Some(checkout.id),
+            isolation,
         })
+    }
+
+    async fn list_rift_checkouts(&self, repo_path: &Path) -> Vec<PathBuf> {
+        let repo_name = repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "repo".to_string());
+        let base = self.inner.worktrees_root.join(repo_name);
+        let mut paths = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if crate::rift::source_root_matches(&path, repo_path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
@@ -1177,12 +1364,22 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
+        let is_rift = crate::rift::is_checkout(worktree_path)
+            || crate::rift::source_root(worktree_path).is_some();
         let branch = if worktree_path.exists() {
             self.current_branch(worktree_path).await.unwrap_or_default()
         } else {
             String::new()
         };
-        if worktree_path.exists() {
+        if is_rift {
+            let path = worktree_path.to_path_buf();
+            let removed = tokio::task::spawn_blocking(move || crate::rift::remove(&path))
+                .await
+                .map_err(|e| EngineError::Other(format!("rift remove join: {e}")))?;
+            if removed.is_err() && worktree_path.exists() {
+                let _ = std::fs::remove_dir_all(worktree_path);
+            }
+        } else if worktree_path.exists() {
             let removed = self
                 .git(
                     &[
@@ -1198,8 +1395,8 @@ impl Repos {
                 // git refused (or the dir is half-gone) — delete the folder directly.
                 let _ = std::fs::remove_dir_all(worktree_path);
             }
+            let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
         }
-        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
         if branch.starts_with("zeron/") {
             let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
@@ -2478,5 +2675,60 @@ tmpfs /run tmpfs rw 0 0
 
         assert_eq!(alpha.unwrap()[0].path, "alpha.rs");
         assert_eq!(beta.unwrap()[0].path, "beta.rs");
+    }
+
+    #[test]
+    fn checkout_isolation_defaults_to_git_and_persists() {
+        let data = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        assert_eq!(repos.isolation(), CheckoutIsolation::Git);
+        assert_eq!(repos.isolation_status().isolation, CheckoutIsolation::Git);
+
+        if crate::rift::available() {
+            let status = repos.set_isolation(CheckoutIsolation::Rift).unwrap();
+            assert_eq!(status.isolation, CheckoutIsolation::Rift);
+            let reloaded =
+                Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+            assert_eq!(reloaded.isolation(), CheckoutIsolation::Rift);
+            reloaded
+                .set_isolation(CheckoutIsolation::Git)
+                .expect("back to git");
+            assert_eq!(reloaded.isolation(), CheckoutIsolation::Git);
+        } else {
+            assert!(repos.set_isolation(CheckoutIsolation::Rift).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn git_worktree_create_stays_the_default() {
+        let data = tempfile::tempdir().unwrap();
+        let repo = data.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        let worktree = repos.create_worktree(&repo, "main").await.unwrap();
+        assert_eq!(worktree.isolation, CheckoutIsolation::Git);
+        assert!(PathBuf::from(&worktree.path).join(".git").is_file());
+        assert!(!crate::rift::is_checkout(Path::new(&worktree.path)));
     }
 }

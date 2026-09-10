@@ -157,6 +157,10 @@ pub mod methods {
     pub const WATCH_WORKSPACE_FILES: &str = "WatchWorkspaceFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    /// This device's isolated-checkout backend (git worktrees or Rift).
+    pub const GET_CHECKOUT_ISOLATION: &str = "GetCheckoutIsolation";
+    /// Persist the isolated-checkout backend. `{ isolation: "git" | "rift" }`.
+    pub const SET_CHECKOUT_ISOLATION: &str = "SetCheckoutIsolation";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
