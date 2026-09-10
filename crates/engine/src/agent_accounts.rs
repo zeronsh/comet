@@ -31,8 +31,10 @@
 //!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
 //!    until its loopback callback lands.
 //!
-//! Usage probes: both providers expose the rate-limit view their own CLIs render
-//! (`/usage` in Claude Code, `/status` in Codex). Unlike zeron (fetch on every
+//! Usage probes: all three providers expose the rate-limit view their own CLIs render
+//! (`/usage` in Claude Code, `/status` in Codex; Cursor's key has no quota view,
+//! so the probe exchanges it for a dashboard session and reads the
+//! `GetCurrentPeriodUsage` call the Cursor app itself makes). Unlike zeron (fetch on every
 //! list, 60s cache), native only hits the network when `force_usage` is set —
 //! the default list stays offline-fast and deterministic; the UI passes
 //! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
@@ -67,6 +69,9 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// The Cursor dashboard's current-period usage RPC (Connect-style POST).
+const CURSOR_CURRENT_PERIOD_USAGE: &str = "aiserver.v1.DashboardService/GetCurrentPeriodUsage";
+const CURSOR_DEFAULT_BACKEND: &str = "https://api2.cursor.sh";
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -1174,60 +1179,55 @@ impl AgentAccounts {
         let usage = match harness {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot).await,
+            HarnessId::Cursor => self.cursor_usage(slot).await,
             _ => None,
         };
         lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
         usage
     }
 
-    async fn claude_usage(
-        &self,
-        slot: &Slot,
-        is_active: bool,
-    ) -> Option<UsageSnapshot> {
+    async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<UsageSnapshot> {
         let oauth = slot.credentials.get("claudeAiOauth")?;
-        let mut access_token = str_field(oauth, "accessToken")?;
-        let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
-        if let Some(expires_at) = expires_at
-            && expires_at < now_ms() + 30_000
-        {
-            if is_active {
-                // The CLI owns this token pair — rotating its refresh token out
-                // from under a running Claude Code could force a re-login.
-                return None;
+        let access_token = str_field(oauth, "accessToken")?;
+        match self.claude_usage_request(&access_token).await {
+            Ok(usage) => usage,
+            // The stored expiry metadata can lie (a Claude Code regression
+            // wrote `expiresAt: 0` for fresh logins), so probe with the
+            // stored token first and rotate the slot-owned pair only after
+            // the endpoint actually rejected it. The active login is never
+            // rotated: the running CLI may hold its single-use refresh token.
+            Err(_) if !is_active => {
+                let fresh = self.refresh_claude_slot(slot).await?;
+                self.claude_usage_request(&fresh).await.ok().flatten()
             }
-            access_token = self.refresh_claude_slot(slot).await?;
+            Err(_) => None,
         }
-        let body: serde_json::Value = self
+    }
+
+    /// One usage probe: GET the endpoint and parse windows. `Err` means the
+    /// token was rejected (401/403) — the only case worth a refresh.
+    async fn claude_usage_request(&self, access_token: &str) -> Result<Option<UsageSnapshot>, ()> {
+        let response = self
             .inner
             .http
             .get(CLAUDE_USAGE_URL)
-            .bearer_auth(&access_token)
+            .bearer_auth(access_token)
             .header("anthropic-beta", "oauth-2025-04-20")
             .send()
             .await
-            .ok()?
+            .map_err(|_| ())?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(());
+        }
+        let body: serde_json::Value = response
             .error_for_status()
-            .ok()?
+            .map_err(|_| ())?
             .json()
             .await
-            .ok()?;
-        let mut windows = Vec::new();
-        for (key, label) in [("five_hour", "Session"), ("seven_day", "Week")] {
-            if let Some(w) = body.get(key)
-                && let Some(utilization) = w.get("utilization").and_then(|v| v.as_f64())
-            {
-                windows.push(AgentUsageWindow {
-                    label: label.to_string(),
-                    used_fraction: (utilization / 100.0) as f32,
-                    resets_at: parse_when(w.get("resets_at")),
-                });
-            }
-        }
-        (!windows.is_empty()).then_some(UsageSnapshot {
-            windows,
-            plan_label: None,
-        })
+            .map_err(|_| ())?;
+        Ok(claude_usage_windows(&body))
     }
 
     async fn codex_usage(&self, slot: &Slot) -> Option<UsageSnapshot> {
@@ -1275,7 +1275,55 @@ impl AgentAccounts {
         // so a plan change shows up on the next forced refresh without a
         // re-login.
         let plan_label = codex_plan(str_field(&body, "plan_type").as_deref());
-        Some(UsageSnapshot { windows, plan_label })
+        Some(UsageSnapshot {
+            windows,
+            plan_label,
+        })
+    }
+
+    async fn cursor_usage(&self, slot: &Slot) -> Option<UsageSnapshot> {
+        // The SDK key tracks identity/expiry but has no quota view — the
+        // account numbers live on the dashboard API the Cursor app itself
+        // calls, reachable with a session minted from the key.
+        let api_key = str_field(&slot.credentials, "apiKey")?;
+        let backend = str_field(&slot.credentials, "backendUrl")
+            .unwrap_or_else(|| CURSOR_DEFAULT_BACKEND.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let session: serde_json::Value = self
+            .inner
+            .http
+            .post(format!("{backend}/auth/exchange_user_api_key"))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let access_token = str_field(&session, "accessToken")?;
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .post(format!("{backend}/{CURSOR_CURRENT_PERIOD_USAGE}"))
+            .bearer_auth(&access_token)
+            .header("Connect-Protocol-Version", "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        cursor_usage_window(&body).map(|window| UsageSnapshot {
+            windows: vec![window],
+            plan_label: None,
+        })
     }
 
     /// Refresh a saved Claude slot's expired access token so its usage stays
@@ -1713,6 +1761,61 @@ fn parse_when(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
     }
 }
 
+/// Windows from Claude's `/api/oauth/usage`: the 5-hour session and weekly
+/// buckets, each a 0-100 `utilization` with an RFC3339 `resets_at`.
+fn claude_usage_windows(body: &serde_json::Value) -> Option<UsageSnapshot> {
+    let mut windows = Vec::new();
+    for (key, label) in [("five_hour", "Session"), ("seven_day", "Week")] {
+        if let Some(w) = body.get(key)
+            && let Some(utilization) = w.get("utilization").and_then(|v| v.as_f64())
+        {
+            windows.push(AgentUsageWindow {
+                label: label.to_string(),
+                used_fraction: (utilization / 100.0) as f32,
+                resets_at: parse_when(w.get("resets_at")),
+            });
+        }
+    }
+    (!windows.is_empty()).then_some(UsageSnapshot {
+        windows,
+        plan_label: None,
+    })
+}
+
+/// The billing-cycle window from Cursor's `GetCurrentPeriodUsage`. The blended
+/// percent is derived from spend/limit in cents: the payload's own
+/// `totalPercentUsed` disagrees with the number Cursor's UI narrates ("You've
+/// used 72% of your included usage" against `totalSpend`/`limit`, not the
+/// precomputed 11.5). proto3 JSON omits zero-valued fields, so an absent
+/// `limit` means unusable, not 0% — a synthetic 0% would render a healthy bar
+/// for an account whose usage nobody knows.
+fn cursor_usage_window(body: &serde_json::Value) -> Option<AgentUsageWindow> {
+    let plan = body.get("planUsage")?;
+    let limit = plan.get("limit").and_then(|v| v.as_f64())?;
+    if limit <= 0.0 {
+        return None;
+    }
+    let used = plan
+        .get("totalSpend")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    Some(AgentUsageWindow {
+        label: "Month".to_string(),
+        used_fraction: (used / limit) as f32,
+        resets_at: json_ms(body.get("billingCycleEnd")),
+    })
+}
+
+/// Unix-millis timestamp arriving as a JSON number or proto3 int64 string.
+fn json_ms(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    let ms = match value? {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    DateTime::<Utc>::from_timestamp_millis(ms)
+}
+
 fn scan_openai_url(output: &str) -> Option<String> {
     let start = output.find("https://auth.openai.com/")?;
     let rest = &output[start..];
@@ -1920,6 +2023,82 @@ mod tests {
         assert_eq!(codex_window_label(604_800), "Week");
         // Unknown/absent span falls back to the shortest label.
         assert_eq!(codex_window_label(0), "Session");
+    }
+
+    #[test]
+    fn claude_usage_windows_map_buckets_and_percent() {
+        let body = serde_json::json!({
+            "five_hour": { "utilization": 6.0, "resets_at": "2026-04-08T18:59:59Z" },
+            "seven_day": { "utilization": 35.0, "resets_at": "2026-04-14T16:59:59Z" },
+            "extra_usage": { "is_enabled": true },
+        });
+        let snapshot = claude_usage_windows(&body).expect("windows");
+        assert_eq!(snapshot.plan_label, None);
+        let labels: Vec<_> = snapshot.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["Session", "Week"]);
+        assert!((snapshot.windows[0].used_fraction - 0.06).abs() < 1e-6);
+        assert!((snapshot.windows[1].used_fraction - 0.35).abs() < 1e-6);
+        assert_eq!(
+            snapshot.windows[1].resets_at,
+            Some(
+                "2026-04-14T16:59:59Z"
+                    .parse::<chrono::DateTime<Utc>>()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn claude_usage_windows_none_without_any_bucket() {
+        // A 200 with only `extra_usage` (no rate windows) is not a snapshot —
+        // the UI then says "Usage unavailable" instead of showing nothing.
+        assert!(claude_usage_windows(&serde_json::json!({ "extra_usage": {} })).is_none());
+        assert!(claude_usage_windows(&serde_json::json!({ "five_hour": {} })).is_none());
+    }
+
+    #[test]
+    fn cursor_usage_window_derives_percent_from_spend_not_total_percent() {
+        // Real payload flavor (observed shape): proto3 JSON with string int64
+        // cycle bounds. `totalPercentUsed` (11.53) contradicts the derived
+        // 28846/40000 = 72.1% that Cursor's own UI narrates — derive.
+        let body = serde_json::json!({
+            "billingCycleStart": "1768399334000",
+            "billingCycleEnd": "1771077734000",
+            "planUsage": {
+                "totalSpend": 28846,
+                "includedSpend": 23222,
+                "bonusSpend": 5624,
+                "remaining": 11154,
+                "limit": 40000,
+                "totalPercentUsed": 11.5384,
+            },
+            "displayMessage": "You've used 72% of your included usage",
+        });
+        let window = cursor_usage_window(&body).expect("window");
+        assert_eq!(window.label, "Month");
+        assert!((window.used_fraction - 0.72115).abs() < 1e-5);
+        assert_eq!(
+            window.resets_at,
+            Some(chrono::DateTime::<Utc>::from_timestamp_millis(1_771_077_734_000).unwrap())
+        );
+    }
+
+    #[test]
+    fn cursor_usage_window_absent_limit_is_unusable_not_zero() {
+        // proto3 JSON omits zero-valued fields: an account with no usage-based
+        // spend simply lacks `limit` — never render a synthetic 0% bar.
+        assert!(cursor_usage_window(&serde_json::json!({ "planUsage": {} })).is_none());
+        assert!(cursor_usage_window(&serde_json::json!({ "planUsage": { "limit": 0 } })).is_none());
+    }
+
+    #[test]
+    fn cursor_usage_window_no_spend_is_zero_percent() {
+        let window = cursor_usage_window(&serde_json::json!({
+            "billingCycleEnd": 1771077734000i64,
+            "planUsage": { "limit": 40000 },
+        }))
+        .expect("window");
+        assert_eq!(window.used_fraction, 0.0);
     }
 
     #[test]
