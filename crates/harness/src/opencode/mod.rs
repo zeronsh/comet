@@ -37,7 +37,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +45,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -54,6 +52,7 @@ use zeron_proto::{
     SteeringMode, TodoItem, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, shutdown_child};
 
 /// opencode loads plugins and MCP config before the server answers; cold

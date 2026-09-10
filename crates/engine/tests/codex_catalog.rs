@@ -55,6 +55,8 @@ fn npm_codex_is_offered_by_production_catalog() {
         "HOME",
         "USERPROFILE",
         "FNM_DIR",
+        "FNM_MULTISHELL_PATH",
+        "LOCALAPPDATA",
         "VOLTA_HOME",
         "PNPM_HOME",
         "APPDATA",

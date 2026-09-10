@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::HarnessError;
+use crate::process::{ChildStdin, ChildStdout};
 
 /// A non-response line from the app server, in stdout order.
 #[derive(Debug)]

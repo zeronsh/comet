@@ -23,6 +23,8 @@ fn probe(
         "HOME",
         "USERPROFILE",
         "FNM_DIR",
+        "FNM_MULTISHELL_PATH",
+        "LOCALAPPDATA",
         "NVM_SYMLINK",
         "VOLTA_HOME",
         "PNPM_HOME",

@@ -21,10 +21,10 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use crate::HarnessError;
+use crate::process::Stdio;
 
 /// A pinned npm package: `"@scope/name@1.2.3"` → name + version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,7 +513,7 @@ async fn install_into(
     );
     let (program, args) =
         npm_install_plan(npm, pin, cache_dir, crate::executable::Platform::current())?;
-    let mut cmd = tokio::process::Command::new(&program);
+    let mut cmd = crate::process::Command::new(&program);
     cmd.args(args)
         .current_dir(tmp_dir)
         .stdin(Stdio::null())
@@ -718,6 +718,32 @@ mod tests {
                     .join("adapters")
             )
         );
+    }
+
+    #[test]
+    fn windows_npm_discovery_falls_back_to_fnm_default_with_complete_node_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let roaming = temp.path().join("Roaming with spaces");
+        let active = temp.path().join("active");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("node.exe"), b"MZ").unwrap();
+        let root = roaming.join("fnm/aliases/default");
+        let npm = root.join("node_modules/npm/bin/npm-cli.js");
+        std::fs::create_dir_all(npm.parent().unwrap()).unwrap();
+        std::fs::write(root.join("node.exe"), b"MZ").unwrap();
+        std::fs::write(&npm, b"// fixture").unwrap();
+        let lookup = env(&[
+            ("APPDATA", roaming.into_os_string()),
+            ("FNM_MULTISHELL_PATH", active.into_os_string()),
+        ]);
+        let platform = crate::executable::Platform::Windows;
+        assert_eq!(find_npm_with(&lookup, None, platform), Some(npm.clone()));
+        assert_eq!(
+            node_sibling_for_npm(&npm, platform),
+            Some(root.join("node.exe"))
+        );
+        std::fs::remove_file(root.join("node.exe")).unwrap();
+        assert_eq!(find_npm_with(&lookup, None, platform), None);
     }
 
     #[test]

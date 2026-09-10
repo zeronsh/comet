@@ -11639,6 +11639,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "zeron-doc",
  "zeron-harness",
  "zeron-preview",
@@ -11666,6 +11667,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
  "zeron-proto",
 ]
 

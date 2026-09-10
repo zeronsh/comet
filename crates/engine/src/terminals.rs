@@ -19,7 +19,11 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::PtySize;
+#[cfg(not(windows))]
+use portable_pty::{CommandBuilder, native_pty_system};
+#[cfg(windows)]
+mod windows;
 use tokio::sync::mpsc;
 
 use zeron_doc::TERMINAL_OUTPUT_BATCH_MS;
@@ -37,6 +41,10 @@ struct LiveTerminal {
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    #[cfg(windows)]
+    reader_thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(windows)]
+    cleanup: Option<Arc<windows::Cleanup>>,
     subscribers: Vec<mpsc::UnboundedSender<TerminalEvent>>,
     replay: VecDeque<TerminalEvent>,
     replay_bytes: usize,
@@ -181,38 +189,47 @@ impl Terminals {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| shell.clone());
 
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(clamp_size(cols, rows))
-            .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
-        let mut cmd = CommandBuilder::new(&shell);
-        if !cfg!(windows) {
-            cmd.arg("-l"); // login shell — the user's real PATH/profile
-        }
-        cmd.cwd(cwd);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "Zeron");
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| EngineError::Other(format!("could not spawn {shell_name}: {e}")))?;
-        drop(pair.slave);
+        #[cfg(windows)]
+        let (master, mut child) = windows::open(&shell, cwd, clamp_size(cols, rows))
+            .map_err(|e| EngineError::Other(format!("could not open Windows terminal: {e}")))?;
+        #[cfg(not(windows))]
+        let (master, mut child) = {
+            let pty = native_pty_system();
+            let pair = pty
+                .openpty(clamp_size(cols, rows))
+                .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
+            let mut cmd = CommandBuilder::new(&shell);
+            if !cfg!(windows) {
+                cmd.arg("-l"); // login shell — the user's real PATH/profile
+            }
+            cmd.cwd(cwd);
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            cmd.env("TERM_PROGRAM", "Zeron");
+            let child = pair
+                .slave
+                .spawn_command(cmd)
+                .map_err(|e| EngineError::Other(format!("could not spawn {shell_name}: {e}")))?;
+            drop(pair.slave);
+            (pair.master, child)
+        };
         let killer = child.clone_killer();
-        let reader = pair
-            .master
+        let reader = master
             .try_clone_reader()
             .map_err(|e| EngineError::Other(format!("pty reader: {e}")))?;
-        let writer = pair
-            .master
+        let writer = master
             .take_writer()
             .map_err(|e| EngineError::Other(format!("pty writer: {e}")))?;
 
         let id = new_id();
         let session = Arc::new(Mutex::new(LiveTerminal {
-            master: Some(pair.master),
+            master: Some(master),
             writer: Some(writer),
             killer,
+            #[cfg(windows)]
+            reader_thread: None,
+            #[cfg(windows)]
+            cleanup: None,
             subscribers: Vec::new(),
             replay: VecDeque::new(),
             replay_bytes: 0,
@@ -224,11 +241,42 @@ impl Terminals {
 
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        std::thread::Builder::new()
+        let reader_thread = std::thread::Builder::new()
             .name(format!("pty-read-{id}"))
             .spawn(move || read_pty(reader, raw_tx))
-            .map_err(|e| EngineError::Other(format!("pty reader thread: {e}")))?;
+            .map_err(|e| {
+                #[cfg(windows)]
+                {
+                    lock(&self.inner.sessions).remove(&id);
+                    dispose(&session, true);
+                }
+                EngineError::Other(format!("pty reader thread: {e}"))
+            })?;
+        #[cfg(windows)]
+        {
+            lock(&session).reader_thread = Some(reader_thread);
+        }
+        #[cfg(not(windows))]
+        drop(reader_thread);
+        #[cfg(not(windows))]
         let wait = tokio::task::spawn_blocking(move || child.wait());
+        #[cfg(windows)]
+        let wait = {
+            // Shell lifetime must not consume workers needed by other Windows
+            // process pipes, nor delay resuming a new terminal behind them.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name(format!("pty-wait-{id}"))
+                .spawn(move || {
+                    let _ = tx.send(child.wait());
+                })
+                .map_err(|e| {
+                    lock(&self.inner.sessions).remove(&id);
+                    dispose(&session, true);
+                    EngineError::Other(format!("pty wait thread: {e}"))
+                })?;
+            tokio::spawn(async move { rx.await.map_err(std::io::Error::other)? })
+        };
         tokio::spawn(pump_output(Arc::downgrade(&session), raw_rx, wait));
 
         Ok(TerminalSession {
@@ -317,8 +365,13 @@ impl Terminals {
         let session = lock(&self.inner.sessions)
             .remove(terminal_id)
             .ok_or_else(|| EngineError::Other("Terminal not found".into()))?;
-        dispose(&session, true);
-        Ok(())
+        if dispose(&session, true) {
+            Ok(())
+        } else {
+            Err(EngineError::Other(
+                "Windows terminal reader did not finish cleanup".into(),
+            ))
+        }
     }
 
     /// Any live PTY (the reaper prunes exited ones) — restarts kill shells, so
@@ -336,7 +389,7 @@ impl Terminals {
     }
 }
 
-fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) {
+fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
     let mut session = lock(session);
     session.subscribers.clear();
     if kill
@@ -345,6 +398,16 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) {
     {
         tracing::debug!(error = %err, "terminal kill failed (already exited?)");
     }
+    #[cfg(windows)]
+    {
+        let cleanup = windows::Cleanup::start(&mut session);
+        drop(session);
+        if !cleanup.wait(Duration::from_secs(5)) {
+            tracing::warn!("Windows terminal cleanup did not acknowledge completion");
+            return false;
+        }
+    }
+    true
 }
 
 /// Blocking PTY reader: forwards raw chunks until EOF. A closed PTY reads as an
@@ -356,6 +419,9 @@ fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<Vec<u8>>
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 if tx.send(buf[..n].to_vec()).is_err() {
+                    // ConPTY must finish writing even when the output pump is
+                    // gone; stopping this reader can deadlock ClosePseudoConsole.
+                    #[cfg(not(windows))]
                     break;
                 }
             }
@@ -387,9 +453,9 @@ async fn pump_output(
         true
     };
 
-    let mut tick = tokio::time::interval(batch);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick.tick().await; // consume the immediate first tick
+    // Start a batch only when output arrives; idle terminals need no timer.
+    let flush = tokio::time::sleep(batch);
+    tokio::pin!(flush);
     let mut buffer = Vec::new();
     let mut raw_open = true;
     let mut exit_code = None;
@@ -397,7 +463,12 @@ async fn pump_output(
     while raw_open || exit_code.is_none() {
         tokio::select! {
             chunk = raw_rx.recv(), if raw_open => match chunk {
-                Some(chunk) => buffer.extend_from_slice(&chunk),
+                Some(chunk) => {
+                    if buffer.is_empty() {
+                        flush.as_mut().reset(tokio::time::Instant::now() + batch);
+                    }
+                    buffer.extend_from_slice(&chunk);
+                },
                 None => raw_open = false,
             },
             result = &mut wait, if exit_code.is_none() => {
@@ -416,20 +487,27 @@ async fn pump_output(
                 let Some(session) = session.upgrade() else {
                     return;
                 };
-                let (master, writer) = {
-                    let mut session = lock(&session);
-                    (session.master.take(), session.writer.take())
-                };
-                // ClosePseudoConsole may block until its output pipe is drained. The
-                // dedicated reader thread remains active while this runs.
-                let _ = tokio::task::spawn_blocking(move || {
-                    drop(writer);
-                    drop(master);
-                })
-                .await;
+                #[cfg(windows)]
+                {
+                    let cleanup = windows::Cleanup::start(&mut lock(&session));
+                    if !cleanup.wait_async().await {
+                        tracing::warn!("Windows terminal cleanup failed");
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let (master, writer) = {
+                        let mut session = lock(&session);
+                        (session.master.take(), session.writer.take())
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        drop(writer);
+                        drop(master);
+                    }).await;
+                }
             }
-            _ = tick.tick() => {
-                if !buffer.is_empty() && !emit(std::mem::take(&mut buffer)) {
+            _ = &mut flush, if !buffer.is_empty() => {
+                if !emit(std::mem::take(&mut buffer)) {
                     return;
                 }
             }
@@ -481,6 +559,84 @@ mod windows_tests {
 
     const EVENT_TIMEOUT: Duration = Duration::from_secs(15);
     const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn conpty_close_joins_natural_cleanup_without_blocking_pool_capacity() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Hold the entire blocking pool before launch. Windows shell launch,
+            // exit observation, console close and reader join must still progress.
+            let (release_pool, pool_gate) = std::sync::mpsc::channel();
+            let (started, pool_started) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = pool_gate.recv_timeout(Duration::from_secs(20));
+            });
+            pool_started.await.unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let terminals = Terminals::new();
+            let terminal = terminals
+                .open_with_shell(
+                    tmp.path().to_str().unwrap(),
+                    80,
+                    24,
+                    Some(powershell().to_str().unwrap()),
+                )
+                .unwrap();
+            let session = terminals.session(&terminal.id).unwrap();
+            let (release_reader, reader_gate) = std::sync::mpsc::channel();
+            let (drained, reader_drained) = tokio::sync::oneshot::channel();
+            {
+                let mut live = super::lock(&session);
+                let reader = live.reader_thread.take().unwrap();
+                // Keep reader completion pending after real ConPTY EOF. This
+                // exposes the resource-transferred-but-not-finished interval.
+                live.reader_thread = Some(std::thread::spawn(move || {
+                    reader.join().unwrap();
+                    let _ = drained.send(());
+                    let _ = reader_gate.recv_timeout(Duration::from_secs(20));
+                }));
+            }
+            write_line(&terminals, &terminal.id, "exit 0");
+            tokio::time::timeout(EVENT_TIMEOUT, reader_drained)
+                .await
+                .unwrap()
+                .unwrap();
+            {
+                let live = super::lock(&session);
+                assert!(
+                    live.master.is_none() && live.writer.is_none() && live.reader_thread.is_none()
+                );
+                assert!(!live.cleanup.as_ref().unwrap().wait(Duration::ZERO));
+            }
+            let (close_started, close_start) = tokio::sync::oneshot::channel();
+            let (done, mut closed) = tokio::sync::oneshot::channel();
+            let close_thread = std::thread::spawn(move || {
+                let _ = close_started.send(());
+                let _ = done.send(terminals.close(&terminal.id));
+            });
+            close_start.await.unwrap();
+            let premature = tokio::time::timeout(Duration::from_millis(250), &mut closed).await;
+            // Release gates before asserting, including on the regression path.
+            release_reader.send(()).unwrap();
+            release_pool.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(
+                premature.is_err(),
+                "close acknowledged an unfinished reader join"
+            );
+            tokio::time::timeout(Duration::from_secs(5), closed)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            close_thread.join().unwrap();
+        });
+    }
 
     fn powershell() -> PathBuf {
         let path = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set"))
@@ -727,5 +883,99 @@ mod windows_tests {
         let (terminals, _terminal_id, drop_pid) = open_pid_fixture(tmp.path()).await;
         drop(terminals);
         wait_for_process_exit(drop_pid).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conpty_cleanup_kills_descendants_on_close_shutdown_and_drop() {
+        for operation in ["close", "shutdown", "drop"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (terminals, id, root) = open_pid_fixture(tmp.path()).await;
+            let path = tmp.path().join("descendants.txt");
+            let script = format!(
+                "$leaf = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 20' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('{}', ('{{0}},{{1}}' -f $PID,$leaf.Id)); Start-Sleep -Seconds 20",
+                path.to_string_lossy().replace('\'', "''")
+            );
+            let encoded = BASE64.encode(
+                script
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            );
+            write_line(
+                &terminals,
+                &id,
+                &format!(
+                    "Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}' -WindowStyle Hidden | Out-Null"
+                ),
+            );
+            let descendants = tokio::time::timeout(EVENT_TIMEOUT, async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        if let Ok(pids) = text
+                            .split(',')
+                            .map(str::parse::<u32>)
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            if pids.len() == 2 {
+                                break pids;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("terminal descendant startup");
+            for &pid in &descendants {
+                assert!(process_exists(pid).await);
+            }
+            // Keep another session alive to prove cleanup targets only this job.
+            let (unrelated, other_id, other_pid) = open_pid_fixture(tmp.path()).await;
+            match operation {
+                "close" => terminals.close(&id).unwrap(),
+                "shutdown" => terminals.shutdown(),
+                _ => drop(terminals),
+            }
+            wait_for_process_exit(root).await;
+            for pid in descendants {
+                wait_for_process_exit(pid).await;
+            }
+            assert!(
+                process_exists(other_pid).await,
+                "cleanup killed an unrelated terminal"
+            );
+            unrelated.close(&other_id).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conpty_final_output_is_drained_before_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (terminals, id, _) = open_pid_fixture(tmp.path()).await;
+        let mut rx = terminals.subscribe(&id, None).unwrap();
+        write_line(
+            &terminals,
+            &id,
+            "[Console]::Write(('Z' * 131072)); [Console]::WriteLine(('FINAL' + '-TAIL')); exit 9",
+        );
+        let mut events = Vec::new();
+        collect_until(&mut rx, &mut events, |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::Exit { .. }))
+        })
+        .await;
+        let output = decoded(&events);
+        assert!(
+            output.matches('Z').count() >= 131072,
+            "buffered terminal output was lost"
+        );
+        assert!(output.contains("FINAL-TAIL"));
+        assert!(matches!(
+            events.last(),
+            Some(TerminalEvent::Exit { exit_code: 9, .. })
+        ));
+        assert!(rx.recv().await.is_none());
+        terminals.close(&id).unwrap();
     }
 }

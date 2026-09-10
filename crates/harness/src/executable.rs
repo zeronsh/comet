@@ -96,11 +96,24 @@ fn node_version_manager_bins_with(
     let home = home_dir_with(env, platform);
     let mut dirs = Vec::new();
 
+    if platform == Platform::Windows {
+        if let Some(active) = env_path(env, "FNM_MULTISHELL_PATH") {
+            dirs.push(active);
+        }
+    }
+
     let mut fnm_roots: Vec<PathBuf> = env("FNM_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .into_iter()
         .collect();
+    if platform == Platform::Windows {
+        if let Some(roaming) = env_path(env, "APPDATA").or_else(|| {
+            env_path(env, "USERPROFILE").map(|profile| profile.join("AppData").join("Roaming"))
+        }) {
+            fnm_roots.push(roaming.join("fnm"));
+        }
+    }
     if let Some(home) = &home {
         fnm_roots.push(home.join(".local").join("share").join("fnm"));
         fnm_roots.push(home.join("Library").join("Application Support").join("fnm"));
@@ -119,7 +132,14 @@ fn node_version_manager_bins_with(
         if let Some(dir) = env_path(env, "NVM_SYMLINK") {
             dirs.push(dir);
         }
-        if let Some(root) = env_path(env, "VOLTA_HOME") {
+        if let Some(root) = env_path(env, "VOLTA_HOME").or_else(|| {
+            env_path(env, "LOCALAPPDATA")
+                .or_else(|| {
+                    env_path(env, "USERPROFILE")
+                        .map(|profile| profile.join("AppData").join("Local"))
+                })
+                .map(|local| local.join("Volta"))
+        }) {
             dirs.push(root.join("bin"));
         }
         if let Some(dir) = env_path(env, "PNPM_HOME") {
@@ -340,6 +360,62 @@ mod tests {
         assert!(bins.contains(&nvm));
         assert!(bins.contains(&volta.join("bin")));
         assert!(bins.contains(&pnpm));
+    }
+
+    #[test]
+    fn windows_node_manager_discovery_finds_active_and_default_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("Profile with spaces");
+        let roaming = profile.join("AppData/Roaming");
+        let local = profile.join("AppData/Local");
+        let active = temp.path().join("active fnm");
+        let explicit = temp.path().join("custom fnm");
+        let defaults = [
+            active.clone(),
+            explicit.join("aliases/default"),
+            roaming.join("fnm/aliases/default"),
+            local.join("Volta/bin"),
+        ];
+        for dir in &defaults {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("node.exe"), b"MZ").unwrap();
+        }
+        let lookup = env(&[
+            ("USERPROFILE", profile.into_os_string()),
+            ("FNM_MULTISHELL_PATH", active.into_os_string()),
+            ("FNM_DIR", explicit.into_os_string()),
+        ]);
+        // Exercise selection, including fallback after a stale active link.
+        for dir in defaults {
+            assert_eq!(
+                find_on_paths_with("node", vec![], &lookup, None, Platform::Windows),
+                Some(dir.join("node.exe"))
+            );
+            std::fs::remove_file(dir.join("node.exe")).unwrap();
+        }
+        assert_eq!(
+            find_on_paths_with("node", vec![], &lookup, None, Platform::Windows),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_node_manager_defaults_honor_redirected_appdata_and_volta_override() {
+        let roaming = PathBuf::from("redirected roaming");
+        let local = PathBuf::from("redirected local");
+        let volta = PathBuf::from("custom volta");
+        let lookup = env(&[
+            ("APPDATA", roaming.clone().into_os_string()),
+            ("LOCALAPPDATA", local.clone().into_os_string()),
+            ("VOLTA_HOME", volta.clone().into_os_string()),
+        ]);
+        let bins = node_version_manager_bins_with(&lookup, Platform::Windows);
+        assert!(bins.contains(&roaming.join("fnm/aliases/default")));
+        assert!(bins.contains(&volta.join("bin")));
+        assert!(!bins.contains(&local.join("Volta/bin")));
+        let bins = node_version_manager_bins_with(&lookup, Platform::Unix);
+        assert!(!bins.contains(&roaming.join("fnm/aliases/default")));
+        assert!(!bins.contains(&volta.join("bin")));
     }
 
     #[test]

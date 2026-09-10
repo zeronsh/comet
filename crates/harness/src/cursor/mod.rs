@@ -35,7 +35,6 @@
 //!   parked session (parity with the previous ACP behavior).
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,7 +42,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -51,6 +49,7 @@ use zeron_proto::{
     RunRequest, SteeringMode, TodoItem, ToolCall,
 };
 
+use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
@@ -121,8 +120,7 @@ impl CursorHarness {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let run = async {
-            let output = cmd
-                .output()
+            let output = cmd.output()
                 .await
                 .map_err(|e| HarnessError::Protocol(format!("cursor models probe: {e}")))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -427,7 +425,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Str
 
 struct Session {
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<String>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
@@ -605,12 +603,12 @@ async fn run_session(session: Session) {
                 interrupt_sent = true;
                 interrupted = true;
                 let _ = stdin_tx.send(json!({ "op": "interrupt" }).to_string());
-                if let Some(pid) = child.id() {
+                if let Some(pid) = crate::process::signal_target(&child) {
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
-                        send_signal(pid, Signal::Term);
+                        send_signal(&pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
-                        send_signal(pid, Signal::Kill);
+                        send_signal(&pid, Signal::Kill);
                     }));
                 }
             },

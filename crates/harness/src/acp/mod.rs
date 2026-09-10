@@ -34,7 +34,6 @@ mod subagent_devin;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,7 +42,6 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -52,6 +50,7 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
+use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
@@ -2916,12 +2915,12 @@ async fn run_session(session: Session) {
                     client.notify("session/cancel", Some(json!({ "sessionId": session_id })));
                     // Escalate if the agent doesn't wind down (stopReason
                     // "cancelled") within the grace periods.
-                    if let Some(pid) = child.id() {
+                    if let Some(pid) = crate::process::signal_target(&child) {
                         escalation = Some(tokio::spawn(async move {
                             tokio::time::sleep(interrupt_grace).await;
-                            send_signal(pid, Signal::Term);
+                            send_signal(&pid, Signal::Term);
                             tokio::time::sleep(kill_grace).await;
-                            send_signal(pid, Signal::Kill);
+                            send_signal(&pid, Signal::Kill);
                         }));
                     }
                 } else {
