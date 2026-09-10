@@ -3700,6 +3700,13 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::redo))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, window, _| {
+                // Capture runs before the clicked control handles the press, so
+                // another input can take focus normally during bubbling.
+                if event.button == MouseButton::Left && this.focus_handle.is_focused(window) {
+                    window.blur();
+                }
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -4682,6 +4689,14 @@ impl Composer {
             .w_full()
             .max_h(px(320.0))
             .overflow_hidden()
+            // Completion choices belong to the input. Keep it focused until
+            // mouse-up can accept a choice (or while dragging the scrollbar).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             // GPUI dispatches this captured stream while the thumb is
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
@@ -4999,6 +5014,12 @@ impl Composer {
             .w_full()
             .max_h(px(320.0))
             .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             // GPUI dispatches this captured stream while the thumb is
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
@@ -7228,6 +7249,71 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn inputs_release_focus_on_click_away(cx: &mut gpui::TestAppContext) {
+        struct Inputs(Vec<Entity<ComposerInput>>);
+        impl Render for Inputs {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().flex().flex_col().children(
+                    self.0
+                        .iter()
+                        .map(|input| div().w(px(200.0)).child(input.clone())),
+                )
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let host = cx.add_window(|_, cx| {
+            Inputs(vec![
+                cx.new(|cx| ComposerInput::new("Composer", cx)),
+                cx.new(|cx| ComposerInput::new("URL", cx).with_single_line()),
+            ])
+        });
+        cx.run_until_parked();
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let inputs = host.read_with(cx, |host, _| host.0.clone()).unwrap();
+        // Visit both fields and return to the first: click-away capture must
+        // never clear focus acquired by the clicked input during bubbling.
+        for index in [0, 1, 0] {
+            let position =
+                inputs[index].read_with(cx, |input, _| input.last_bounds.unwrap().center());
+            cx.update_window(host.into(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                assert!(inputs[index].read(cx).focus_handle.is_focused(window));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        }
+        cx.update_window(host.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(400.0), px(300.0)),
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(window.focused(cx).is_none());
+        })
+        .unwrap();
+    }
 
     #[gpui::test]
     fn projectless_composer_allows_send_and_enter_submission(cx: &mut gpui::TestAppContext) {

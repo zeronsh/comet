@@ -99,12 +99,21 @@ pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
 fn restore_mounted_focus(
     root: &FocusHandle,
     preferred: &FocusHandle,
+    unfocused: &FocusHandle,
     window: &mut Window,
     cx: &mut App,
 ) {
     let preferred_mounted = root.contains(preferred, window);
     if !root.contains_focused(window, cx) || (root.is_focused(window) && preferred_mounted) {
-        let target = if preferred_mounted { preferred } else { root };
+        // Explicit blur keeps shortcuts active without returning the caret to
+        // an input. The root remains the temporary fallback for stale handles.
+        let target = if window.focused(cx).is_none() {
+            unfocused
+        } else if preferred_mounted {
+            preferred
+        } else {
+            root
+        };
         window.focus(target, cx);
     }
 }
@@ -1325,6 +1334,8 @@ pub struct Shell {
     /// settle, preserving focus on mounted controls.
     focus_sub: Option<Subscription>,
     shortcut_focus: FocusHandle,
+    /// Neutral shortcut target after clicking away from an input.
+    unfocused: FocusHandle,
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
@@ -1590,6 +1601,7 @@ impl Shell {
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             activation_sub: None,
             _ticker: ticker,
             _state_observation: observation,
@@ -8491,17 +8503,19 @@ impl Render for Shell {
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 let root = this.shortcut_focus.clone();
+                let unfocused = this.unfocused.clone();
                 let preferred = this.composer.focus_handle(cx);
                 window.on_next_frame(move |window, cx| {
-                    restore_mounted_focus(&root, &preferred, window, cx);
+                    restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
                 });
                 cx.notify();
             }));
         }
         let shortcut_focus = self.shortcut_focus.clone();
+        let unfocused = self.unfocused.clone();
         let preferred_focus = self.composer.focus_handle(cx);
         window.defer(cx, move |window, cx| {
-            restore_mounted_focus(&shortcut_focus, &preferred_focus, window, cx);
+            restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
         });
 
         // Modifier events follow focus too. Reconcile from the window's input
@@ -8517,6 +8531,7 @@ impl Render for Shell {
         let root = div()
             .id("shell-root")
             .track_focus(&self.shortcut_focus)
+            .child(div().track_focus(&self.unfocused))
             .relative()
             .flex()
             .flex_row()
@@ -10027,6 +10042,7 @@ mod shortcut_focus_regressions {
 
     struct ShortcutHost {
         root: FocusHandle,
+        unfocused: FocusHandle,
         editor: FocusHandle,
         show_editor: bool,
         jumps: usize,
@@ -10035,13 +10051,15 @@ mod shortcut_focus_regressions {
     impl Render for ShortcutHost {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let root = self.root.clone();
+            let unfocused = self.unfocused.clone();
             let preferred = self.editor.clone();
             window.defer(cx, move |window, cx| {
-                restore_mounted_focus(&root, &preferred, window, cx);
+                restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
             });
             div()
                 .size_full()
                 .track_focus(&self.root)
+                .child(div().track_focus(&self.unfocused))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -10064,6 +10082,30 @@ mod shortcut_focus_regressions {
     }
 
     #[gpui::test]
+    fn explicit_blur_does_not_refocus_a_mounted_input(cx: &mut TestAppContext) {
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        cx.run_until_parked();
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        host.update(cx, |host, window, cx| {
+            window.focus(&host.editor, cx);
+            window.blur();
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+            // Subsequent renders must keep the neutral shortcut focus too.
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
     fn shortcuts_recover_from_retained_editor_focus(cx: &mut TestAppContext) {
         cx.update(|cx| {
             cx.bind_keys([KeyBinding::new(
@@ -10074,6 +10116,7 @@ mod shortcut_focus_regressions {
         });
         let host = cx.add_window(|_, cx| ShortcutHost {
             root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
@@ -10090,7 +10133,7 @@ mod shortcut_focus_regressions {
             cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
                 .unwrap();
             host.update(cx, |host, window, cx| {
-                restore_mounted_focus(&host.root, &host.editor, window, cx);
+                restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
                 assert!(host.root.contains_focused(window, cx));
                 assert_eq!(host.editor.is_focused(window), show_editor);
             })
@@ -10100,8 +10143,8 @@ mod shortcut_focus_regressions {
         host.update(cx, |host, window, cx| {
             assert_eq!(host.jumps, 4);
             window.blur();
-            restore_mounted_focus(&host.root, &host.editor, window, cx);
-            assert!(host.root.is_focused(window));
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
         })
         .unwrap();
     }
@@ -10117,6 +10160,7 @@ mod shortcut_focus_regressions {
         });
         let host = cx.add_window(|_, cx| ShortcutHost {
             root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
