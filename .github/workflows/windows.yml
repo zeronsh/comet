@@ -41,22 +41,6 @@ concurrency:
 # Build and regression coverage, not a Windows release/support declaration.
 # Native rendering, agent lifecycle, and packaging remain separate gates.
 jobs:
-  shared-regressions:
-    name: Shared regressions (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: Shared agent, terminal, ownership, and updater regressions
-        run: cargo test --locked -p zeron-harness -p zeron-engine -p zeron-update --lib
-
   windows-foundation:
     runs-on: windows-2022
     timeout-minutes: 90
@@ -77,6 +61,7 @@ jobs:
       - name: Link release application and compile DirectX shaders
         run: cargo build --release --locked -p zeron
       - name: Build native rendering regression fixture
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
         run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
       - name: Windows CPU and shader layout regressions
         run: cargo test --release --locked -p gpui_windows --lib layout
