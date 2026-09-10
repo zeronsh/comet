@@ -847,3 +847,44 @@ async fn live_commands_discovery() {
     let commands = h.commands().await.expect("live discovery");
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }
+
+#[tokio::test]
+async fn title_run_preserves_read_only_and_replaces_coding_instructions() {
+    let (controls, _steer, token) = controls("Yes");
+    let stream = harness()
+        .run_title(request("scenario:title"), controls)
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = stream;
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .unwrap();
+    token.cancel();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Fix Login Flow")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+}

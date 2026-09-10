@@ -624,7 +624,11 @@ async fn live_real_cli_single_turn() {
 async fn commands_come_from_the_initialize_control_request() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert_eq!(commands.len(), 2, "nameless entries are dropped: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        2,
+        "nameless entries are dropped: {commands:?}"
+    );
     assert_eq!(commands[0].name, "review");
     assert_eq!(commands[0].description, "Review a pull request");
     assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));
@@ -647,4 +651,44 @@ async fn live_commands_discovery() {
     let commands = h.commands().await.expect("live discovery");
     assert!(!commands.is_empty());
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
+}
+
+#[tokio::test]
+async fn title_run_disables_tools_and_denies_unexpected_permissions() {
+    let (controls, _steer, token) = controls("Yes");
+    let mut stream = harness()
+        .run_title(request("scenario:title"), controls)
+        .await
+        .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .unwrap();
+    token.cancel();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Fix Login Flow")),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
 }

@@ -61,8 +61,9 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item,
+    notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_event,
+    user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -576,8 +577,32 @@ impl Harness for CodexHarness {
 
     async fn run(
         &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_with_mode(request, controls, false).await
+    }
+
+    async fn run_title(
+        &self,
         mut request: RunRequest,
         controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        self.run_with_mode(request, controls, true).await
+    }
+}
+
+impl CodexHarness {
+    async fn run_with_mode(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+        title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
@@ -587,7 +612,11 @@ impl Harness for CodexHarness {
         // sidesteps codex ≤0.144.x's workspace-write bug where a linked
         // worktree on a slash-named branch derives a malformed mount that
         // kills every command.
-        request.sandbox = zeron_proto::SandboxLevel::DangerFullAccess;
+        request.sandbox = if title_only {
+            zeron_proto::SandboxLevel::ReadOnly
+        } else {
+            zeron_proto::SandboxLevel::DangerFullAccess
+        };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
@@ -629,6 +658,7 @@ impl Harness for CodexHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            title_only,
             child,
             client,
             incoming,
@@ -652,6 +682,7 @@ impl Harness for CodexHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    title_only: bool,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -742,6 +773,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 /// steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        title_only,
         mut child,
         client,
         mut incoming,
@@ -780,6 +812,32 @@ async fn run_session(session: Session) {
 
     let start_params = {
         let mut p = serde_json::Map::new();
+        if title_only {
+            p.insert("baseInstructions".into(), crate::TITLE_INSTRUCTIONS.into());
+            p.insert(
+                "developerInstructions".into(),
+                crate::TITLE_INSTRUCTIONS.into(),
+            );
+            p.insert("ephemeral".into(), true.into());
+            p.insert(
+                "config".into(),
+                json!({
+                    "project_doc_max_bytes": 0,
+                    "web_search": "disabled",
+                    "features.shell_tool": false,
+                    "features.apply_patch_freeform": false,
+                    "features.multi_agent": false,
+                    "features.apps": false,
+                    "features.multi_agent_v2": false,
+                    "agents.enabled": false,
+                    "features.browser_use": false,
+                    "features.computer_use": false,
+                    "features.js_repl": false,
+                    "features.image_generation": false,
+                    "features.memories": false
+                }),
+            );
+        }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
@@ -809,6 +867,23 @@ async fn run_session(session: Session) {
             .await?;
         client.notify("initialized", None);
 
+        let mut start_params = start_params.clone();
+        if title_only {
+            // Disable each configured MCP server explicitly: an empty table
+            // would merge with user configuration and leave servers enabled.
+            let config = client
+                .request("config/read", json!({"includeLayers": false}))
+                .await?;
+            if let Some(servers) = config["config"]["mcp_servers"].as_object() {
+                let overrides = start_params
+                    .get_mut("config")
+                    .and_then(Value::as_object_mut)
+                    .unwrap();
+                for name in servers.keys() {
+                    overrides.insert(format!("mcp_servers.{name}.enabled"), false.into());
+                }
+            }
+        }
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
@@ -1679,7 +1754,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q

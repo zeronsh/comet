@@ -26,6 +26,10 @@ has "$line" '"method":"initialized"' || exit 1
 
 # ---- thread start / resume -------------------------------------------------
 read -r line || exit 1
+if has "$line" '"method":"config/read"'; then
+  emit "{\"id\":$(rid "$line"),\"result\":{\"config\":{\"mcp_servers\":{\"test\":{\"enabled\":true}}}}}"
+  read -r line || exit 1
+fi
 thread_line="$line"
 if has "$line" '"method":"skills/list"'; then
   # Command discovery probe: answer with two cwd groups sharing one skill
@@ -66,6 +70,17 @@ read -r turnline || exit 1
 tid=$(rid "$turnline")
 
 case "$turnline" in
+
+*scenario:title*)
+  for want in '"sandbox":"read-only"' '"ephemeral":true' '"baseInstructions":"You generate session titles.' '"features.shell_tool":false' '"mcp_servers.test.enabled":false'; do
+    has "$thread_line" "$want" || { fail_turn "$tid" "title restriction missing"; exit 0; }
+  done
+  has "$turnline" '"sandboxPolicy":{"type":"readOnly"}' || { fail_turn "$tid" "title turn not read-only"; exit 0; }
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"item/agentMessage/delta","params":{"threadId":"th-1","delta":"Fix Login Flow"}}'
+  emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  ;;
+
 
 *scenario:reasoning*)
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"

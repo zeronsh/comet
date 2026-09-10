@@ -913,6 +913,8 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::GET_TITLE_SETTINGS
+            | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
@@ -1183,6 +1185,14 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
+            methods::SET_TITLE_SETTINGS => {
+                let p: crate::registry::TitleSettings = parse_params(params)?;
+                self.registry
+                    .set_title_settings(p)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.title_settings())
+            }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
                 self.registry

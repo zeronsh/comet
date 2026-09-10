@@ -37,6 +37,8 @@ pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
+    pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
+    pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";

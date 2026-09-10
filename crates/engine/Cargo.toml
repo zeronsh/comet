@@ -36,8 +36,9 @@ reqwest.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true
 
-[dev-dependencies]
 tempfile.workspace = true
+
+[dev-dependencies]
 tokio-tungstenite.workspace = true
 # In-process registry server for the two-engine workspace integration tests.
 zeron-sync = { workspace = true, features = ["mock-server"] }
