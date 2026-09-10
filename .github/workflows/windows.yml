@@ -1,4 +1,4 @@
-name: Windows foundation
+name: Windows tests
 
 on:
   pull_request:
@@ -35,18 +35,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-foundation-${{ github.ref }}
+  group: windows-tests-${{ github.ref }}
   cancel-in-progress: true
 
-# Build and regression coverage, not a Windows release/support declaration.
-# Native rendering, agent lifecycle, and packaging remain separate gates.
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
-  windows-foundation:
+  tests:
     runs-on: windows-2022
     timeout-minutes: 90
-    defaults:
-      run:
-        shell: pwsh
     steps:
       - uses: actions/checkout@v4
       - name: Rust toolchain
@@ -58,27 +57,19 @@ jobs:
           if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
           "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
       - uses: Swatinem/rust-cache@v2
-      - name: Link release application and compile DirectX shaders
+      - name: Build application
         run: cargo build --release --locked -p zeron
-      - name: Build native rendering regression fixture
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
-        run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
-      - name: Windows CPU and shader layout regressions
+      - name: Shader layout tests
         run: cargo test --release --locked -p gpui_windows --lib layout
-      - name: Application and updater regressions
+      - name: Application and updater tests
         run: cargo test --release --locked -p zeron -p zeron-update
-      - name: Harness discovery and managed-adapter regressions
-        run: cargo test --release --locked -p zeron-harness --lib
-      - name: Codex native executable availability
-        run: cargo test --release --locked -p zeron-harness --test codex_availability
-      - name: Native ACP stdio, resume, and protocol cancellation
-        run: cargo test --release --locked -p zeron-harness --features native-fixture --test windows_native
-
-      - name: Engine regressions including ownership and source control
-        run: cargo test --release --locked -p zeron-engine --lib
-      - name: Codex production harness catalog
+      - name: Engine and harness unit tests
+        run: cargo test --release --locked -p zeron-engine -p zeron-harness --lib
+      - name: Native harness integration tests
+        run: cargo test --release --locked -p zeron-harness --features native-fixture --test codex_availability --test windows_native
+      - name: Harness catalog tests
         run: cargo test --release --locked -p zeron-engine --test codex_catalog
-      - name: UI regressions including bootstrap cleanup and remote paths
+      - name: UI tests
         run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
       - name: CLI startup without HOME
         run: |
@@ -99,14 +90,37 @@ jobs:
           if (-not ($output -match '^Mode:\s+local only$')) {
             throw 'An isolated Windows startup must select local-only mode'
           }
-      - name: Native GUI lifecycle regression
+      - name: Build rendering fixture
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+        run: cargo build --release --locked -p zeron-ui --example windows-render-fixture --features windows-render-fixture
+      - name: Upload GUI test binaries
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gui-binaries
+          path: |
+            target/release/zeron.exe
+            target/release/examples/windows-render-fixture.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  native-gui:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+    needs: tests
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-gui-binaries
+          path: target/release
+      - name: App lifecycle tests
         run: ./scripts/test-windows-lifecycle.ps1
-      - name: Native renderer pixel regression
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+      - name: Rendering tests
         run: ./scripts/test-windows-rendering.ps1
-      - name: Upload synthetic native probe evidence
-        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.native_gui }}
+      - name: Upload GUI test results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-native-probes
