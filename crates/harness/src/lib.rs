@@ -79,6 +79,12 @@ pub trait Harness: Send + Sync {
     fn deterministic_turn_end(&self) -> bool {
         false
     }
+    /// Whether a user-prompted turn has an authoritative completion signal.
+    /// Such turns must never be parked merely because their stream is quiet.
+    /// Unlike deterministic_turn_end, this need not cover autonomous activity.
+    fn authoritative_prompt_end(&self) -> bool {
+        self.deterministic_turn_end()
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
     /// for harnesses without them. May spawn a short-lived discovery process.

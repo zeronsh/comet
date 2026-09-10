@@ -1401,8 +1401,11 @@ async fn drive_run(
     // RETIRED for native drivers: a harness whose every turn shape ends with
     // a deterministic wire Done (claude/codex/cursor native) needs no
     // quiesce backstop — arming one only risks false parks on long silent
-    // work. The env knob still forces a window on for diagnostics.
+    // work. The env knob can configure a diagnostic window, but a prompt
+    // with an authoritative completion signal must still await that signal.
+    // ACP retains the watchdog only for unowned self-continued activity.
     let deterministic_turn_end = harness.deterministic_turn_end();
+    let authoritative_prompt_end = harness.authoritative_prompt_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1550,6 +1553,7 @@ async fn drive_run(
                 }
                 last_stream_activity + window
             }), if quiesce_after.is_some()
+                && (self_continued_turn || !authoritative_prompt_end)
                 && idle_since.is_none()
                 && !interrupted
                 && steerable

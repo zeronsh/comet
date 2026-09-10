@@ -169,3 +169,54 @@ agentclientprotocol.com (v1 spec + schema), agentclientprotocol org repos
 (claude-agent-acp v0.66.0, codex-acp v1.1.14 — steering wire shape),
 agent-client-protocol-schema 1.3.0 (serde tags), ACP registry entry
 `grok-build`, live `grok agent stdio` initialize handshake (2026-08-07).
+
+## Pending prompts and silence (#296, 2026-09-09)
+
+A completed tool result, partial assistant message, or usage update can precede
+another model request. None proves that `session/prompt` has finished. The old
+30-second blanket quiet settlement discarded the outstanding response future,
+then allowed another prompt into an agent that was still busy. The next request
+could fail with `Invalid request` and its specific `error.data` was discarded.
+
+The ACP quiet timer and `ZERON_ACP_QUIET_SETTLE_MS` override are retired. Pending
+prompts retain their response futures; boundary steers remain queued. Explicit
+completion extensions and `noRunningTurn` recovery retain their existing roles.
+Cancellation still sends `session/cancel`, awaits completion, and escalates to
+process termination if needed. The engine also exempts authoritative pending
+prompts from its quiet watchdog, including when a diagnostic window is set;
+unowned self-continued activity retains its fallback. RPC errors include their
+code and non-null data, preserving the agent's explanation in the terminal event.
+
+Regression checks:
+
+```sh
+cargo test -p zeron-harness
+cargo test -p zeron-engine --test acp_lifecycle
+```
+
+The stateful Python peer rejects overlapping prompts. Coverage includes quiet
+periods after four completed reads, partial text, reasoning, usage, open tools,
+multiple queued follow-ups, EOF without a response, cancellation, an unresponsive
+agent, and structured error details. The engine test checks Working status and
+transcript boundaries with a 100ms watchdog, then verifies autonomous activity
+still settles.
+
+For real-model testing, configure an isolated authenticated Pi agent directory,
+select a model in its settings, and load
+`crates/harness/tests/fixtures/pi-slow-model.ts` (for example, symlink it into that
+agent directory's `extensions/` directory). The extension waits 35 seconds before
+sending the next model request after a completed tool. It does not delay tool
+results or synthesize an ACP completion. Then run:
+
+```sh
+PI_CODING_AGENT_DIR=/path/to/isolated/pi-agent \
+PI_ACP_PI_COMMAND=/path/to/pi \
+ACP_TEST_RUNS=3 \
+cargo test -p zeron-harness --test real_acp_lifecycle -- --ignored --nocapture
+```
+
+These tests require successful real calls; missing authentication or an unloaded
+delay extension fails rather than skips. Verified locally with pi-acp 0.0.33,
+Pi 0.85.1, and `gpt-5.6-luna`: three sessions each completed the original turn and
+two queued follow-ups after 36.6–36.8-second post-tool gaps; cancellation during a
+32-second post-tool gap also completed as Interrupted.
