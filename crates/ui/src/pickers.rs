@@ -431,6 +431,10 @@ pub enum PickerKind {
     Device,
 }
 
+pub(crate) struct ReturnComposerFocus;
+
+impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -817,10 +821,19 @@ impl Pickers {
 
     /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
+        if self.is_open() {
+            cx.emit(ReturnComposerFocus);
+        }
+        self.dismiss(cx);
+    }
+
+    /// Outside clicks and navigation keep focus at the clicked destination.
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.model_bar = popover::MenuScrollbarState::default();
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
+        cx.notify();
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
@@ -860,6 +873,9 @@ impl Pickers {
         let pressed_open = self.open.take_press_was_open();
         if self.open_kind() == Some(kind) || pressed_open {
             self.animate_close(cx);
+            if pressed_open {
+                cx.emit(ReturnComposerFocus);
+            }
             cx.notify();
             return;
         }
@@ -2006,7 +2022,7 @@ impl Pickers {
         let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
             .id("project-new")
             .on_click(cx.listener(|this, _, window, cx| {
-                this.close(cx);
+                this.dismiss(cx);
                 window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
             }))
             .child(
@@ -2599,7 +2615,20 @@ impl Pickers {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx)
             }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.is_open() && !this.focus.contains_focused(window, cx) {
+                        window.focus(&this.focus, cx);
+                    }
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss(cx);
+                if this.focus.contains_focused(window, cx) {
+                    window.blur();
+                }
+            }))
             .flex()
             .flex_col()
             .child(content)
@@ -2622,7 +2651,20 @@ impl Pickers {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_key_down(event, window, cx)
             }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.is_open() && !this.focus.contains_focused(window, cx) {
+                        window.focus(&this.focus, cx);
+                    }
+                }),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss(cx);
+                if this.focus.contains_focused(window, cx) {
+                    window.blur();
+                }
+            }))
             .flex()
             .flex_col()
             .child(content)
@@ -3966,6 +4008,18 @@ impl Render for Pickers {
             }
         }
 
+        if self.is_open() {
+            let search = self.search.focus_handle(cx);
+            let frame = self.focus.clone();
+            window.defer(cx, move |window, cx| {
+                // Loading, empty, and error states can omit the search box.
+                // Keep Escape/arrow keys on the mounted menu in those states.
+                if search.is_focused(window) && !frame.contains(&search, window) {
+                    window.focus(&frame, cx);
+                }
+            });
+        }
+
         // Eager-load the harness catalog + every offered harness's models so
         // the chip reads "Fable 5" (a concrete pick) before any popover
         // opens, and rail switches inside the picker are instant.
@@ -4140,6 +4194,61 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn picker_completion_and_dismissal_have_distinct_focus_behavior(cx: &mut gpui::TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        let returned = Rc::new(Cell::new(0));
+        let observed = returned.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(
+                &handle.entity(cx).unwrap(),
+                move |_, _: &ReturnComposerFocus, _| observed.set(observed.get() + 1),
+            )
+        });
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.open.open(PickerKind::Checkout);
+                pickers.pick_checkout(CheckoutKind::Local, cx);
+            })
+            .unwrap();
+        assert_eq!(returned.get(), 1);
+        handle
+            .update(cx, |pickers, _, cx| {
+                pickers.open.open(PickerKind::HarnessModel);
+                pickers.pick_model("test-model".into(), cx);
+                assert!(
+                    pickers.is_open(),
+                    "model options remain available after a selection"
+                );
+                pickers.dismiss(cx);
+            })
+            .unwrap();
+        assert_eq!(
+            returned.get(),
+            1,
+            "outside clicks must not request composer focus"
+        );
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.open.open(PickerKind::Checkout);
+                pickers.open.note_trigger_press();
+                pickers.dismiss(cx); // Capture closes before the trigger's click.
+                pickers.toggle(PickerKind::Checkout, window, cx);
+            })
+            .unwrap();
+        assert_eq!(
+            returned.get(),
+            2,
+            "closing via the trigger returns to the composer"
+        );
+    }
 
     #[gpui::test]
     fn projectless_picker_clears_checkout_and_supports_keyboard_selection(
