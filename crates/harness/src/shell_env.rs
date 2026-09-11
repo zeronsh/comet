@@ -1,14 +1,15 @@
-//! Login-shell PATH snapshot.
+//! Login-shell environment snapshot.
 //!
 //! GUI/service launches (Dock, Finder, launchd, systemd) never run the user's
-//! shell init, so the daemon's own PATH misses everything the shell shapes:
-//! nvm's shell function, fnm multishells, asdf/mise shims, custom npm
+//! shell init, so the daemon's own environment misses everything the shell
+//! shapes: nvm's shell function, fnm multishells, asdf/mise shims, custom npm
 //! prefixes, nix profiles, `~/.zshrc` exports. The hardcoded known-location
 //! lists in the resolvers cover the common managers, but the only fix that
 //! works for *any* setup is asking the user's actual shell: spawn it once as
 //! an interactive login shell, have it print its environment between markers,
-//! and keep the PATH it reports. If `codex`/`claude` runs in their terminal,
-//! it resolves here too.
+//! and keep what it reports — the PATH, plus every exported variable
+//! (`ANTHROPIC_BASE_URL`, proxies, provider keys, …) that provider CLIs read.
+//! If `codex`/`claude` runs in their terminal, it resolves here too.
 //!
 //! The snapshot is captured once per process (cached, including a negative
 //! result) and is defensive about hostile shell init:
@@ -20,24 +21,90 @@
 //!   printing (or grandchildren inheriting the pipe) can't wedge us.
 //! - A hard per-attempt timeout kills the shell.
 //!
-//! Set `ZERON_NO_LOGIN_SHELL=1` to disable the snapshot entirely.
+//! Set `ZERON_NO_LOGIN_SHELL=1` to disable the snapshot entirely, or
+//! `ZERON_NO_LOGIN_SHELL_ENV=1` to keep only the PATH composition and skip
+//! forwarding the exported variables.
+//!
+//! Forwarding policy: a variable reaches a child only when the daemon's own
+//! environment doesn't already define it — explicit process env always wins,
+//! so embedders and tests keep full control. Shell bookkeeping (`PWD`,
+//! `OLDPWD`, `SHLVL`, `_`) and the probe's own markers are never forwarded.
 
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 
-static CACHE: OnceLock<Option<OsString>> = OnceLock::new();
+/// The environment the user's login shell reports, captured once and cached
+/// for the life of the process.
+#[derive(Clone, Debug, Default)]
+pub struct LoginShellEnv {
+    pub(crate) path: OsString,
+    /// Exported variables in dump order, `PATH` excluded (it is composed
+    /// separately with dedup — see `crate::compose_path`).
+    pub(crate) vars: Vec<(OsString, OsString)>,
+}
 
-/// The PATH the user's login shell reports, captured once and cached for the
+impl LoginShellEnv {
+    /// The PATH the login shell shaped.
+    pub fn path(&self) -> &OsStr {
+        &self.path
+    }
+
+    /// The value of one exported variable, if the shell's environment has it.
+    pub fn get(&self, key: &str) -> Option<&OsStr> {
+        self.vars
+            .iter()
+            .find(|(k, _)| k.as_os_str() == key)
+            .map(|(_, v)| v.as_os_str())
+    }
+
+    /// The exported variables (`PATH` excluded) in dump order.
+    pub fn vars(&self) -> &[(OsString, OsString)] {
+        &self.vars
+    }
+}
+
+static CACHE: OnceLock<Option<LoginShellEnv>> = OnceLock::new();
+
+/// The login shell's environment snapshot, captured once and cached for the
 /// life of the process. `None` when disabled, non-unix, no usable shell, or
 /// the shell never produced a parseable snapshot.
-pub fn login_shell_path() -> Option<&'static OsStr> {
+pub fn login_shell_env() -> Option<&'static LoginShellEnv> {
     #[cfg(unix)]
     {
-        CACHE.get_or_init(unix::capture).as_deref()
+        CACHE.get_or_init(unix::capture).as_ref()
     }
     #[cfg(not(unix))]
     {
         None
+    }
+}
+
+/// The PATH the user's login shell reports (the PATH entry of
+/// [`login_shell_env`]). `None` when disabled, non-unix, no usable shell, or
+/// the shell never produced a parseable snapshot.
+pub fn login_shell_path() -> Option<&'static OsStr> {
+    login_shell_env().map(|e| e.path.as_os_str())
+}
+
+/// Forward the login shell's exported variables onto a child command,
+/// skipping everything the current process already defines and the shell
+/// bookkeeping vars. No-op when the snapshot is unavailable or disabled via
+/// `ZERON_NO_LOGIN_SHELL_ENV`.
+pub fn apply_login_shell_env(cmd: &mut tokio::process::Command) {
+    const NEVER_FORWARD: &[&str] = &["PWD", "OLDPWD", "SHLVL", "_", "ZERON_RESOLVING_ENVIRONMENT"];
+    if std::env::var_os("ZERON_NO_LOGIN_SHELL_ENV").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    let Some(env) = login_shell_env() else {
+        return;
+    };
+    for (key, value) in &env.vars {
+        if NEVER_FORWARD.iter().any(|skip| key.as_os_str() == *skip)
+            || std::env::var_os(key).is_some()
+        {
+            continue;
+        }
+        cmd.env(key, value);
     }
 }
 
@@ -56,6 +123,7 @@ pub fn prewarm() {
 
 #[cfg(unix)]
 mod unix {
+    use super::LoginShellEnv;
     use std::ffi::OsString;
     use std::io::Read;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -72,12 +140,12 @@ mod unix {
     /// After the shell exits, wait this long for the pipe to flush.
     const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
-    pub(super) fn capture() -> Option<OsString> {
+    pub(super) fn capture() -> Option<LoginShellEnv> {
         if std::env::var_os("ZERON_NO_LOGIN_SHELL").is_some_and(|v| !v.is_empty()) {
             return None;
         }
         let shell = user_shell()?;
-        snapshot_path(&shell, ATTEMPT_TIMEOUT)
+        snapshot_env(&shell, ATTEMPT_TIMEOUT)
     }
 
     /// The user's shell: `$SHELL`, then the passwd entry, then well-known
@@ -135,14 +203,14 @@ mod unix {
         }
     }
 
-    /// Run `<shell> <flags> 'echo BEGIN; env; echo END'` per flag set until one
-    /// yields a parseable PATH.
-    pub(super) fn snapshot_path(shell: &Path, timeout: Duration) -> Option<OsString> {
+    /// Run `<shell> <flags> 'echo BEGIN; env; echo END'` per flag set until
+    /// one yields a parseable snapshot.
+    pub(super) fn snapshot_env(shell: &Path, timeout: Duration) -> Option<LoginShellEnv> {
         let script = format!("echo {BEGIN_MARKER}; env; echo {END_MARKER}");
         for flags in attempt_flag_sets(shell) {
             let output = run_and_capture(shell, &flags, &script, timeout);
-            if let Some(path) = parse_snapshot_path(&output) {
-                return Some(path);
+            if let Some(env) = parse_snapshot(&output) {
+                return Some(env);
             }
         }
         None
@@ -231,22 +299,50 @@ mod unix {
         b.clone()
     }
 
-    /// Extract PATH from the `env` dump between the LAST begin marker and the
-    /// first end marker after it (rc noise printed before our command — or a
-    /// marker echoed by init itself — lands before the real one).
-    fn parse_snapshot_path(output: &[u8]) -> Option<OsString> {
+    /// Parse the `env` dump between the LAST begin marker and the first end
+    /// marker after it (rc noise printed before our command — or a marker
+    /// echoed by init itself — lands before the real one). A snapshot is
+    /// valid only when it carries a non-empty `PATH`; that stays the gate so
+    /// a garbage dump can't inject variables. The probe's own injected pairs
+    /// (`ZERON_RESOLVING_ENVIRONMENT=1`, `TERM=dumb`) are dropped so they can
+    /// never reach real children; a user-set TERM survives.
+    fn parse_snapshot(output: &[u8]) -> Option<LoginShellEnv> {
         let begin = rfind_subslice(output, BEGIN_MARKER.as_bytes())?;
         let after = &output[begin + BEGIN_MARKER.len()..];
         let end = find_subslice(after, END_MARKER.as_bytes())?;
+        let mut vars: Vec<(OsString, OsString)> = Vec::new();
+        let mut index: std::collections::HashMap<OsString, usize> =
+            std::collections::HashMap::new();
+        let mut path: Option<OsString> = None;
         for line in after[..end].split(|b| *b == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if let Some(value) = line.strip_prefix(b"PATH=")
-                && !value.is_empty()
-            {
-                return Some(OsString::from_vec(value.to_vec()));
+            let Some(eq) = line.iter().position(|b| *b == b'=') else {
+                continue;
+            };
+            let key = OsString::from_vec(line[..eq].to_vec());
+            let value = OsString::from_vec(line[eq + 1..].to_vec());
+            if key.is_empty() {
+                continue;
+            }
+            if key == "PATH" {
+                if !value.is_empty() {
+                    path = Some(value);
+                }
+                continue;
+            }
+            if key == "ZERON_RESOLVING_ENVIRONMENT" || (key == "TERM" && value == "dumb") {
+                continue;
+            }
+            match index.get(&key) {
+                // `env` shouldn't repeat keys; if it does, last wins.
+                Some(&i) => vars[i].1 = value,
+                None => {
+                    index.insert(key.clone(), vars.len());
+                    vars.push((key, value));
+                }
             }
         }
-        None
+        path.map(|p| LoginShellEnv { path: p, vars })
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -264,6 +360,7 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::ffi::OsStr;
         use std::os::unix::fs::PermissionsExt;
 
         fn fake_shell(dir: &Path, body: &str) -> PathBuf {
@@ -283,12 +380,35 @@ exit 1
 "#;
 
         #[test]
-        fn parses_path_between_markers() {
+        fn parses_env_between_markers() {
             let output = format!(
                 "rc noise\n{BEGIN_MARKER}\nHOME=/home/u\nPATH=/custom/bin:/usr/bin\nX=y\n{END_MARKER}\ntrailing"
             );
-            let path = parse_snapshot_path(output.as_bytes()).unwrap();
-            assert_eq!(path, OsString::from("/custom/bin:/usr/bin"));
+            let env = parse_snapshot(output.as_bytes()).unwrap();
+            assert_eq!(env.path, OsString::from("/custom/bin:/usr/bin"));
+            assert_eq!(env.get("HOME"), Some(OsStr::new("/home/u")));
+            assert_eq!(env.get("X"), Some(OsStr::new("y")));
+            // PATH lives on `path`, not in the forwarded vars.
+            assert!(env.get("PATH").is_none());
+            assert_eq!(env.vars().len(), 2);
+        }
+
+        #[test]
+        fn drops_probe_injected_pairs() {
+            let output = format!(
+                "{BEGIN_MARKER}\nZERON_RESOLVING_ENVIRONMENT=1\nTERM=dumb\nPATH=/bin\nUSER=u\n{END_MARKER}\n"
+            );
+            let env = parse_snapshot(output.as_bytes()).unwrap();
+            assert!(env.get("ZERON_RESOLVING_ENVIRONMENT").is_none());
+            assert!(env.get("TERM").is_none(), "probe TERM=dumb must not leak");
+            assert_eq!(env.get("USER"), Some(OsStr::new("u")));
+        }
+
+        #[test]
+        fn later_duplicate_keys_win() {
+            let output = format!("{BEGIN_MARKER}\nX=first\nPATH=/bin\nX=second\n{END_MARKER}\n");
+            let env = parse_snapshot(output.as_bytes()).unwrap();
+            assert_eq!(env.get("X"), Some(OsStr::new("second")));
         }
 
         #[test]
@@ -297,12 +417,18 @@ exit 1
             // after it must not shadow the real snapshot.
             let output =
                 format!("{BEGIN_MARKER}\ngarbage\n{BEGIN_MARKER}\nPATH=/real/bin\n{END_MARKER}\n");
-            let path = parse_snapshot_path(output.as_bytes()).unwrap();
-            assert_eq!(path, OsString::from("/real/bin"));
+            let env = parse_snapshot(output.as_bytes()).unwrap();
+            assert_eq!(env.path, OsString::from("/real/bin"));
         }
 
         #[test]
-        fn snapshots_path_from_fake_shell() {
+        fn rejects_a_dump_without_path() {
+            let output = format!("{BEGIN_MARKER}\nHOME=/home/u\n{END_MARKER}\n");
+            assert!(parse_snapshot(output.as_bytes()).is_none());
+        }
+
+        #[test]
+        fn snapshots_env_from_fake_shell() {
             let dir = tempfile::tempdir().unwrap();
             let shell = fake_shell(
                 dir.path(),
@@ -310,8 +436,8 @@ exit 1
                     "#!/bin/sh\nPATH=\"/zeron-test/custom/bin:/usr/bin:/bin\"; export PATH\n{RUN_PAYLOAD}"
                 ),
             );
-            let path = snapshot_path(&shell, Duration::from_secs(10)).unwrap();
-            let path = path.to_string_lossy();
+            let env = snapshot_env(&shell, Duration::from_secs(10)).unwrap();
+            let path = env.path.to_string_lossy();
             assert!(path.starts_with("/zeron-test/custom/bin:"), "got: {path}");
         }
 
@@ -327,12 +453,13 @@ exit 1
                 ),
             );
             let start = Instant::now();
-            let path = snapshot_path(&shell, Duration::from_millis(400)).unwrap();
+            let env = snapshot_env(&shell, Duration::from_millis(400)).unwrap();
             assert!(
-                path.to_string_lossy()
+                env.path
+                    .to_string_lossy()
                     .starts_with("/zeron-test/fallback/bin"),
                 "got: {}",
-                path.to_string_lossy()
+                env.path.to_string_lossy()
             );
             // First attempt burned ~400ms then was killed; the whole resolve
             // must not have waited out the sleep.
@@ -344,7 +471,7 @@ exit 1
             let dir = tempfile::tempdir().unwrap();
             let shell = fake_shell(dir.path(), "#!/bin/sh\nsleep 60\n");
             let start = Instant::now();
-            assert!(snapshot_path(&shell, Duration::from_millis(300)).is_none());
+            assert!(snapshot_env(&shell, Duration::from_millis(300)).is_none());
             assert!(start.elapsed() < Duration::from_secs(5));
         }
     }
