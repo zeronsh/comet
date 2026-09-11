@@ -8,6 +8,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HarnessId, ReasoningLevel, SandboxLevel};
 
+/// Version facts published by an engine's release checker. Download and apply
+/// progress remain local host effects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    pub current_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub update_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
@@ -282,6 +299,31 @@ pub struct GitHistoryCommit {
     pub authored_at: String,
     #[serde(default)]
     pub refs: Vec<GitHistoryRef>,
+}
+
+/// Match a history commit with the same case-insensitive subsequence behavior
+/// on every protocol consumer.
+pub fn git_history_matches(query: &str, commit: &GitHistoryCommit) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let candidate = format!("{} {}", commit.sha, commit.subject).to_lowercase();
+    let matches = query.split_whitespace().all(|term| {
+        let mut at = 0;
+        for needle in term.to_lowercase().chars() {
+            let Some(found) = candidate[at..].find(needle) else {
+                return false;
+            };
+            at += found + needle.len_utf8();
+        }
+        true
+    });
+    commit
+        .sha
+        .to_ascii_lowercase()
+        .starts_with(&query.to_ascii_lowercase())
+        || matches
 }
 
 /// Divergence between the checked-out branch and the repository's integration

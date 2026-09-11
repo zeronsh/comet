@@ -21,6 +21,9 @@
   // while the rest of zeron.sh serves the landing page.
   "routes": [
     { "pattern": "edge.zeron.sh", "custom_domain": true },
+    { "pattern": "preview.edge.zeron.sh", "custom_domain": true },
+
+    { "pattern": "*.preview.edge.zeron.sh/*", "zone_name": "zeron.sh" },
     { "pattern": "zeron.sh/install.sh", "zone_name": "zeron.sh" },
     { "pattern": "zeron.sh/releases/*", "zone_name": "zeron.sh" },
     // Legacy comet hostnames — keep until 0.1.x clients are gone.
@@ -39,6 +42,7 @@
     "bindings": [
       { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
       { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "BROWSER_SESSIONS", "class_name": "BrowserSessionStore" },
       { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
       { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
       { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
@@ -61,7 +65,8 @@
       "tag": "v3",
       "new_sqlite_classes": ["ChatRoom"]
     },
-    { "tag": "v4", "new_sqlite_classes": ["PreviewRoom"] }
+    { "tag": "v4", "new_sqlite_classes": ["PreviewRoom"] },
+    { "tag": "v5", "new_sqlite_classes": ["BrowserSessionStore"] }
   ],
   "r2_buckets": [
     {
@@ -80,7 +85,8 @@
     // accept bearer==userId. WORKOS_API_KEY is a wrangler secret
     // (`wrangler secret put WORKOS_API_KEY`) powering the /auth/* routes.
     "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",
-    "AUTH_MODE": "workos"
+    "AUTH_MODE": "workos",
+    "BROWSER_PREVIEW_ORIGIN": "https://preview.edge.zeron.sh"
   },
   "observability": {
     "enabled": true

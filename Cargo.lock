@@ -179,8 +179,6 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
@@ -195,6 +193,7 @@ dependencies = [
  "rustix 1.1.4",
  "rustix-openpty",
  "serde",
+ "serde_json",
  "signal-hook",
  "unicode-width",
  "vte",
@@ -11747,6 +11746,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "uuid",
+ "wasm-bindgen-futures",
  "zeron-doc",
  "zeron-proto",
  "zeron-sync",
@@ -11841,8 +11841,9 @@ dependencies = [
  "gpui_platform",
  "gpui_tokio",
  "image",
- "mermaid-rs-renderer",
+ "js-sys",
  "libc",
+ "mermaid-rs-renderer",
  "mimalloc",
  "objc",
  "objc2 0.6.4",
@@ -11864,9 +11865,13 @@ dependencies = [
  "ttf-parser",
  "unicode-segmentation",
  "unicode-width",
- "usvg",
  "url",
+ "usvg",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "wry",
  "zeron-doc",
  "zeron-engine",
@@ -11891,6 +11896,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zeron-proto",
 ]
 
 [[package]]

@@ -12,7 +12,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, Context, FontStyle, FontWeight, Hsla, InteractiveText, Render,
@@ -1857,6 +1860,21 @@ fn render_code_block_source_with_actions(
             *off = start + line.len() + 1; // +1 for the '\n'
             let local = slice_spans(&veil_spans, start, start + line.len());
             let runs = apply_veil(runs.clone(), &local);
+            let styled = StyledText::new(line.clone()).with_runs(runs);
+            let layout = styled.layout().clone();
+            let text = line.clone();
+            let key: std::sync::Arc<str> = format!("{}:{ix}:code:{li}", opts.row_key).into();
+            let theme = theme.clone();
+            // Code uses the same document selection as prose, without changing
+            // its per-line layout or syntax/streaming runs.
+            let underlay = canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    paint_text_selection(window, &key, &text, &layout, &theme);
+                },
+            )
+            .absolute()
+            .size_full();
             Some(
                 div()
                     .map(|el| {
@@ -1866,7 +1884,9 @@ fn render_code_block_source_with_actions(
                             el.h(px(CODE_LINE_HEIGHT)).flex_none()
                         }
                     })
-                    .child(StyledText::new(line.clone()).with_runs(runs)),
+                    .relative()
+                    .child(underlay)
+                    .child(styled),
             )
         }));
 

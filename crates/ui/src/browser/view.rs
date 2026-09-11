@@ -103,7 +103,10 @@ impl BrowserSurface {
 
     fn preview_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let snapshot = &self.previews;
-        let available = snapshot.error.is_none();
+        // The native proxy owns this error on desktop. WASM uses the authenticated
+        // edge capability route instead, so its preview controls remain usable while
+        // preserving the discovery error below for diagnosis.
+        let available = snapshot.error.is_none() || cfg!(target_arch = "wasm32");
         let subtitle = if snapshot.remote {
             "Running on your device"
         } else {
@@ -125,8 +128,9 @@ impl BrowserSurface {
                     .child(subtitle),
             );
         for service in &snapshot.services {
-            let url = service.url(snapshot.proxy_port);
-            let row_url = url.clone();
+            let available = available && self.preview_address(service).is_some();
+            let row_service = service.clone();
+            let open_service = service.clone();
             let border_strong = theme.border_strong;
             let label = if snapshot.remote {
                 format!("{} · localhost:{}", service.device_name, service.port)
@@ -135,7 +139,10 @@ impl BrowserSurface {
             };
             content = content.child(
                 div()
-                    .id(gpui::SharedString::from(format!("preview-row-{}", service.id)))
+                    .id(gpui::SharedString::from(format!(
+                        "preview-row-{}",
+                        service.id
+                    )))
                     .w_full()
                     .h(px(56.0))
                     .px(px(14.0))
@@ -154,7 +161,7 @@ impl BrowserSurface {
                                     .border_color(border_strong)
                             })
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.navigate(&row_url, window, cx)
+                                this.navigate_preview(&row_service, window, cx)
                             }))
                     })
                     .child(
@@ -216,7 +223,7 @@ impl BrowserSurface {
                                     .hover(|style| style.bg(crate::theme::ink(0.05)))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.navigate(&url, window, cx)
+                                        this.navigate_preview(&open_service, window, cx)
                                     }))
                             })
                             .when(!available, |el| el.opacity(0.4))
@@ -281,7 +288,7 @@ impl BrowserSurface {
         if self.page.url.is_none() && self.previews_task.is_some() {
             return self.preview_body(theme, cx);
         }
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !self.embeds_page();
         let has_error = self.page.error.is_some();
         let title = if has_error {
             "Couldn’t load this page"
@@ -400,7 +407,7 @@ impl Render for BrowserSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let focused = self.address.focus_handle(cx).is_focused(window);
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !self.embeds_page();
         let has_page = self.page.url.is_some();
         let back = button(
             "browser-back",
@@ -605,7 +612,24 @@ impl Render for BrowserSurface {
         } else {
             body.child(self.empty_body(&theme, cx))
         };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_arch = "wasm32")]
+        let body = if let Some(native) = &self.native {
+            let native = native.clone();
+            body.child(
+                gpui::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let native = native.clone();
+                        window.on_present(move || native.sync(bounds));
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+        } else {
+            body.child(self.empty_body(&theme, cx))
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
         let body = body.child(self.empty_body(&theme, cx));
 
         #[cfg(target_os = "linux")]

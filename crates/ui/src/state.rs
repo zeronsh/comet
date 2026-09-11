@@ -24,17 +24,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gpui::{App, Context, Entity, Task};
+#[cfg(not(target_arch = "wasm32"))]
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use crate::comments::ReviewComment;
 use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+#[cfg(not(target_arch = "wasm32"))]
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
     EngineInfo, HarnessId, Session, Space, WorkspaceScope,
 };
-use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use zeron_rpc::{RpcClient, RpcError, methods};
+#[cfg(not(target_arch = "wasm32"))]
+use zeron_rpc::{RpcReply, RpcService, connect_ws, memory_client};
 
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
@@ -63,27 +67,12 @@ pub struct EngineBootConfig {
     pub default_harness: HarnessId,
 }
 
-/// How this UI reached its engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EngineMode {
-    /// Engine embedded in this process (in-memory RPC transport).
-    InProcess,
-    /// Connected to a separate daemon over localhost WebSocket.
-    Remote { url: String },
-}
-
-/// One of the two ways to own an engine connection. Both end at an [`RpcClient`]
-/// speaking the identical protocol — the trait only differs in provenance and
-/// teardown.
-#[async_trait]
-trait EngineBackend: Send + Sync {
-    fn client(&self) -> &RpcClient;
-    fn mode(&self) -> EngineMode;
-    /// Graceful teardown (drains runs / flushes docs for the in-process engine).
-    async fn shutdown(&self);
-}
+mod connection;
+pub use connection::{EngineHandle, EngineMode};
+use connection::{DeferredEngineState, EngineBackend};
 
 /// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
+#[cfg(not(target_arch = "wasm32"))]
 struct InProcessEngine {
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
@@ -94,6 +83,7 @@ struct InProcessEngine {
     client: RpcClient,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl EngineBackend for InProcessEngine {
     fn client(&self) -> &RpcClient {
@@ -116,16 +106,11 @@ impl EngineBackend for InProcessEngine {
     }
 }
 
-#[derive(Clone)]
-enum DeferredEngineState {
-    Waiting,
-    Ready,
-    Failed(String),
-}
 
 /// Serves engine identity and AuthRpc immediately, then holds data calls only
 /// while a captured synced profile still needs organization onboarding.
 /// Existing subscriptions attach to the assembled service without reconnecting.
+#[cfg(not(target_arch = "wasm32"))]
 struct DeferredEngineRpc {
     auth: AuthRpc,
     engine_info: EngineInfo,
@@ -133,6 +118,7 @@ struct DeferredEngineRpc {
     service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
@@ -188,12 +174,14 @@ async fn wait_for_deferred_engine(
 }
 
 /// External daemon over `ws://127.0.0.1:{port}`.
+#[cfg(not(target_arch = "wasm32"))]
 struct RemoteEngine {
     client: Arc<RpcClient>,
     url: String,
     lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl EngineBackend for RemoteEngine {
     fn client(&self) -> &RpcClient {
@@ -212,14 +200,8 @@ impl EngineBackend for RemoteEngine {
     }
 }
 
-/// Cheaply clonable handle to whichever backend won the probe.
-#[derive(Clone)]
-pub struct EngineHandle {
-    inner: Arc<dyn EngineBackend>,
-    engine_info: EngineInfo,
-    deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
-}
 
+#[cfg(not(target_arch = "wasm32"))]
 impl EngineHandle {
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
@@ -446,25 +428,6 @@ impl EngineHandle {
         }
     }
 
-    pub fn client(&self) -> &RpcClient {
-        self.inner.client()
-    }
-
-    pub fn mode(&self) -> EngineMode {
-        self.inner.mode()
-    }
-
-    pub fn engine_info(&self) -> &EngineInfo {
-        &self.engine_info
-    }
-
-    fn deferred_state(&self) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {
-        self.deferred_state.clone()
-    }
-
-    pub async fn shutdown(&self) {
-        self.inner.shutdown().await;
-    }
 }
 
 /// Query the current protocol first, with a conservative fallback for daemons
@@ -662,7 +625,7 @@ pub struct AppState {
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
+    pub update: Option<zeron_proto::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -1062,7 +1025,7 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
+    pub fn apply_update(&mut self, status: zeron_proto::UpdateStatus) {
         self.update = Some(status);
     }
 
@@ -1571,6 +1534,17 @@ impl AppState {
         self.engine.as_ref()
     }
 
+    /// Cancel every watch and clear account-scoped projections, returning the
+    /// previous transport so the caller can close only its viewport connection.
+    /// This is the browser device/account replacement seam; it never mutates the
+    /// old engine and therefore cannot replay a pending operation.
+    pub fn detach_engine(&mut self, cx: &mut Context<Self>) -> Option<EngineHandle> {
+        let engine = self.engine.clone();
+        self.prepare_runtime_replacement(cx);
+        engine
+    }
+
+
     /// Drop every account-scoped view and subscription after its runtime has
     /// stopped. The next bootstrap must never render rows from the previous
     /// account while the local profile is opening.
@@ -1614,6 +1588,7 @@ impl AppState {
 
     /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
@@ -1644,11 +1619,26 @@ impl AppState {
         })
         .detach();
     }
+#[cfg(target_arch = "wasm32")]
+pub fn bootstrap(state: Entity<AppState>, _config: EngineBootConfig, cx: &mut App) {
+    state.update(cx, |state, cx| {
+        state.connection = ConnectionStatus::Failed(
+            "Engine bootstrap is unavailable in the browser fixture. Attach a fixture endpoint instead."
+                .to_string(),
+        );
+        cx.notify();
+    });
+}
+
+
 
     /// Wire the connected engine: mark Ready and start the standing watches.
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
-    fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+    /// Attach a pre-authenticated typed transport to this one real state tree.
+    /// Browser fixtures must use this after their endpoint has answered the
+    /// EngineInfo and EngineReady handshake; it never bootstraps a host engine.
+    pub fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
         let engine_info = handle.engine_info();
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());

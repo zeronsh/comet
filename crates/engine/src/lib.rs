@@ -409,8 +409,8 @@ impl EngineCore {
     /// re-reads auth on every (re)dial, so token refreshes take effect at reconnect.
     pub fn start_host_relay(&self, edge_url: &str) -> zeron_rpc::HostRelay {
         let auth = self.auth();
-        let config =
-            zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
+        let config = zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth))
+            .with_device_name(local_device_name(&self.device_id));
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
@@ -422,7 +422,17 @@ impl EngineCore {
                 }
             }
         });
-        zeron_rpc::HostRelay::spawn(config, self.rpc_service(), on_nudge)
+        let previews = self.previews.clone();
+        let on_frame: zeron_rpc::FrameHandler = Arc::new(move |kind, frame| {
+            let previews = previews.clone();
+            Box::pin(async move {
+                if kind != zeron_preview::remote::KIND {
+                    return None;
+                }
+                previews.relay_request(&frame).await.ok()
+            })
+        });
+        zeron_rpc::HostRelay::spawn_with_frame(config, self.rpc_service(), on_nudge, Some(on_frame))
     }
 
     pub fn rpc_service(&self) -> Arc<EngineRpc> {

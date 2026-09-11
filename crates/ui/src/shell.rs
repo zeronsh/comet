@@ -13,6 +13,10 @@
 
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use chrono::Utc;
 use gpui::{
@@ -22,10 +26,41 @@ use gpui::{
     WindowControlArea, actions, div, prelude::*, px,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use gpui_tokio::Tokio;
+#[cfg(not(target_arch = "wasm32"))]
 use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
+
+#[cfg(not(target_arch = "wasm32"))]
+type InstallKind = zeron_update::InstallKind;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+enum InstallKind {
+    Unavailable,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn detect_install() -> InstallKind {
+    zeron_update::detect_install()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn detect_install() -> InstallKind {
+    InstallKind::Unavailable
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_mac_app(install: &InstallKind) -> bool {
+    matches!(install, zeron_update::InstallKind::MacApp { .. })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_mac_app(_install: &InstallKind) -> bool {
+    false
+}
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -77,6 +112,73 @@ actions!(
         ArchiveSession
     ]
 );
+
+/// A browser root may take ownership of account lifecycle actions without
+/// teaching the shared Shell about cookies or remote-device transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalLifecycleAction {
+    SwitchDevice,
+    SignOut,
+    Retry,
+}
+
+pub type ExternalLifecycleHandler = std::rc::Rc<dyn Fn(ExternalLifecycleAction)>;
+
+#[derive(Default)]
+struct ExternalLifecycleRelay {
+    handler: Option<ExternalLifecycleHandler>,
+}
+
+impl ExternalLifecycleRelay {
+    fn set(&mut self, handler: Option<ExternalLifecycleHandler>) {
+        self.handler = handler;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn is_installed(&self) -> bool {
+        self.handler.is_some()
+    }
+
+    fn dispatch(&self, action: ExternalLifecycleAction) -> bool {
+        let Some(handler) = &self.handler else {
+            return false;
+        };
+        handler(action);
+        true
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+std::thread_local! {
+    static EXTERNAL_LIFECYCLE_RELAY: std::cell::RefCell<ExternalLifecycleRelay> = Default::default();
+}
+
+/// Installs the browser-owned lifecycle coordinator for this UI root.
+#[cfg(target_arch = "wasm32")]
+pub fn set_external_lifecycle_handler(handler: Option<ExternalLifecycleHandler>) {
+    EXTERNAL_LIFECYCLE_RELAY.with(|relay| relay.borrow_mut().set(handler));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_external_lifecycle_action(action: ExternalLifecycleAction) -> bool {
+    EXTERNAL_LIFECYCLE_RELAY.with(|relay| relay.borrow().dispatch(action))
+}
+
+/// Whether this UI root delegates account lifecycle to its browser host.
+#[cfg(target_arch = "wasm32")]
+fn has_external_lifecycle_handler() -> bool {
+    EXTERNAL_LIFECYCLE_RELAY.with(|relay| relay.borrow().is_installed())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_external_lifecycle_action(_action: ExternalLifecycleAction) -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn has_external_lifecycle_handler() -> bool {
+    false
+}
 
 /// Restore a default focus only after an in-flight handoff has had a frame to
 /// claim the window. A synchronous focus-lost fallback can otherwise steal
@@ -139,7 +241,7 @@ pub(super) struct SidebarDisclosureMotion {
     pub(super) epoch: u64,
     pub(super) from: f32,
     pub(super) to: f32,
-    started: std::time::Instant,
+    started: Instant,
 }
 
 impl SidebarDisclosureMotion {
@@ -148,7 +250,7 @@ impl SidebarDisclosureMotion {
             epoch,
             from,
             to,
-            started: std::time::Instant::now(),
+            started: Instant::now(),
         }
     }
 
@@ -774,7 +876,7 @@ impl Render for DragGhost {
 struct WidthTween {
     from: f32,
     to: f32,
-    started: std::time::Instant,
+    started: Instant,
 }
 
 impl WidthTween {
@@ -782,7 +884,7 @@ impl WidthTween {
         Self {
             from,
             to,
-            started: std::time::Instant::now(),
+            started: Instant::now(),
         }
     }
 }
@@ -937,6 +1039,8 @@ enum AccountMenuAction {
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[cfg(not(target_arch = "wasm32"))]
+
 /// Wait until a stopped daemon can no longer win the next bootstrap probe and
 /// has released the data directory for the replacement runtime.
 async fn wait_for_remote_engine_shutdown(
@@ -966,6 +1070,8 @@ async fn wait_for_remote_engine_shutdown(
         tokio::time::sleep(RUNTIME_CHANGE_POLL_INTERVAL).await;
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
 
 /// Stop the engine that owns the synced profile and wait until a local runtime
 /// can safely acquire both its IPC port and data-directory lock.
@@ -1294,7 +1400,7 @@ pub struct Shell {
     update_dismissed: Option<String>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
-    install: zeron_update::InstallKind,
+    install: InstallKind,
     org: Option<OrgGateUi>,
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
@@ -1378,7 +1484,7 @@ pub struct Shell {
     motion_active: std::cell::Cell<bool>,
     /// All pane masks and chrome evaluate animation at the same frame time.
     /// A slow render must not give the native page and its titlebar different widths.
-    render_time: Option<std::time::Instant>,
+    render_time: Option<Instant>,
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
@@ -1611,7 +1717,7 @@ impl Shell {
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
-            install: zeron_update::detect_install(),
+            install: detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
@@ -3091,6 +3197,9 @@ impl Shell {
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
+        if dispatch_external_lifecycle_action(ExternalLifecycleAction::Retry) {
+            return;
+        }
         AppState::bootstrap(self.state.clone(), self.boot.clone(), cx);
     }
 
@@ -3600,6 +3709,9 @@ impl Shell {
 
     fn request_sign_out(&mut self, cx: &mut Context<Self>) {
         self.close_user_menu(cx);
+        if dispatch_external_lifecycle_action(ExternalLifecycleAction::SignOut) {
+            return;
+        }
         if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
             return;
         }
@@ -3610,6 +3722,13 @@ impl Shell {
     fn confirm_sign_out(&mut self, cx: &mut Context<Self>) {
         self.start_local_runtime_transition(true, cx);
     }
+
+    fn request_switch_device(&mut self, cx: &mut Context<Self>) {
+        self.close_user_menu(cx);
+        let _ = dispatch_external_lifecycle_action(ExternalLifecycleAction::SwitchDevice);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
 
     fn start_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
         if self.runtime_change_task.is_some() {
@@ -3751,6 +3870,8 @@ impl Shell {
     /// [`Self::drive_sync_switch`] run the import once the runtime is ready.
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.
+    #[cfg(not(target_arch = "wasm32"))]
+
     fn start_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
         if self.runtime_change_task.is_some() {
             return;
@@ -3848,6 +3969,8 @@ impl Shell {
 
     /// Subscribe to the engine's one-time import stream and mirror its
     /// progress into the wizard.
+    #[cfg(not(target_arch = "wasm32"))]
+
     fn spawn_local_import(&mut self, cx: &mut Context<Self>) {
         if self.import_task.is_some() {
             return;
@@ -3913,6 +4036,38 @@ impl Shell {
         cx.notify();
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn unavailable_host_effect(&mut self, action: &str, cx: &mut Context<Self>) {
+        self.sidebar_notice =
+            Some(format!("{action} is unavailable in the browser fixture.").into());
+        cx.notify();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn start_local_runtime_transition(&mut self, _sign_out: bool, cx: &mut Context<Self>) {
+        self.unavailable_host_effect("Runtime transitions", cx);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn start_synced_switch(&mut self, _import: bool, cx: &mut Context<Self>) {
+        self.unavailable_host_effect("Runtime transitions", cx);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_local_import(&mut self, cx: &mut Context<Self>) {
+        self.unavailable_host_effect("Local workspace import", cx);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
+        self.unavailable_host_effect("Stopping a runtime", cx);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn apply_staged_update(&mut self, _staged: PathBuf, cx: &mut Context<Self>) {
+        self.unavailable_host_effect("Installing updates", cx);
+    }
+
     fn apply_import_event(&mut self, item: &serde_json::Value, cx: &mut Context<Self>) {
         match item.get("kind").and_then(|k| k.as_str()) {
             Some("start") => {
@@ -3948,6 +4103,8 @@ impl Shell {
         }
         cx.notify();
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
 
     fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
         if !self.prepare_exit(PendingExit::RuntimeChange, cx) {
@@ -4159,9 +4316,9 @@ impl Shell {
 
     // ---- render pieces ----
 
-    fn tween_elapsed(&self, started: std::time::Instant) -> Duration {
+    fn tween_elapsed(&self, started: Instant) -> Duration {
         self.render_time
-            .unwrap_or_else(std::time::Instant::now)
+            .unwrap_or_else(Instant::now)
             .saturating_duration_since(started)
     }
 
@@ -4379,16 +4536,7 @@ impl Shell {
         // leave two competing + placements across the responsive variants.
         let plus_alpha = self.titlebar_plus_alpha(cx);
         let show_plus = plus_alpha > 0.01;
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .h(px(Theme::TITLEBAR_HEIGHT))
-            .flex()
-            .flex_row()
-            .items_center()
-            .pt(px(Theme::TITLEBAR_TOP_PAD))
-            .px(px(TITLEBAR_CLUSTER_PAD))
+        presentation::titlebar_cluster(TITLEBAR_CLUSTER_PAD)
             .children(self.titlebar_spacer(TITLEBAR_CLUSTER_PAD))
             // Left-side Linux captions (GNOME `close:…` layouts): the
             // root-level caption overlay owns the buttons; the cluster row
@@ -5004,143 +5152,108 @@ impl Shell {
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
-        div()
-            .id(SharedString::from(format!("chat-{id}")))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
-            // No selection ring (user request) — the wash alone marks the
-            // active row.
-            // Row hover drives BOTH the wash blend and the corner's
-            // status→Archive swap (one listener — gpui allows a single
-            // hover listener per element).
-            .on_hover({
-                let fade_hover = motion::hover_listener(fade_key.clone());
-                let hover_id = id.clone();
-                cx.listener(move |this, hovered: &bool, window, cx| {
-                    fade_hover(hovered, window, cx);
-                    if *hovered {
-                        if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
-                            this.chat_status_hover = Some(hover_id.clone());
-                            cx.notify();
-                        }
-                    } else if this.chat_status_hover.as_deref() == Some(hover_id.as_str()) {
-                        this.chat_status_hover = None;
+        presentation::chat_row(
+            format!("chat-{id}").into(),
+            &fade_key,
+            rest_text,
+            text,
+            rest_bg,
+            hover_bg,
+        )
+        // No selection ring (user request) — the wash alone marks the
+        // active row.
+        // Row hover drives BOTH the wash blend and the corner's
+        // status→Archive swap (one listener — gpui allows a single
+        // hover listener per element).
+        .on_hover({
+            let fade_hover = motion::hover_listener(fade_key.clone());
+            let hover_id = id.clone();
+            cx.listener(move |this, hovered: &bool, window, cx| {
+                fade_hover(hovered, window, cx);
+                if *hovered {
+                    if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
+                        this.chat_status_hover = Some(hover_id.clone());
                         cx.notify();
                     }
-                })
-            })
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_chat(select_id.clone(), cx);
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.chat_menu.open(ChatMenuState {
-                        chat_id: menu_id.clone(),
-                        position: event.position,
-                        page: ChatMenuPage::Root,
-                    });
+                } else if this.chat_status_hover.as_deref() == Some(hover_id.as_str()) {
+                    this.chat_status_hover = None;
                     cx.notify();
-                }),
-            )
-            // Line 1: "project @ device", status word / time-ago right.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
-                    )
-                    .child(div().text_color(subline).child(corner)),
-            )
-            // Line 2: harness identity belongs directly with the title,
-            // instead of floating as unrelated metadata below it.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
-                    .when_some(
-                        harness.map(crate::pickers::harness_brand_icon),
-                        |el, (path, tint)| {
-                            el.child(
-                                icon(path)
-                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                    .flex_none()
-                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
-                            )
-                        },
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .line_height(px(17.0))
-                            .child(title),
-                    ),
-            )
-            // Line 3 is structural, not reserved whitespace: compact states
-            // omit it completely when both Branch and Pull request are hidden.
-            .when(shows_metadata, |row| {
-                row.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .when_some(branch, |el, branch| {
-                            el.child(
-                                icon(icons::GIT_BRANCH)
-                                    .size(px(11.0))
-                                    .flex_none()
-                                    .text_color(subline),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(subline)
-                                    .child(branch),
-                            )
-                        })
-                        // Stable invisible spring keeps the optional PR badge
-                        // pinned right without changing no-PR paint.
-                        .child(div().flex_1().min_w_0())
-                        .when_some(change_request, |el, summary| {
-                            el.child(crate::change_requests::pull_request_badge(
-                                format!("chat-pr-{id}").into(),
-                                summary,
-                                crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
-                                theme,
-                            ))
-                        }),
-                )
+                }
             })
-            .into_any_element()
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.open_chat(select_id.clone(), cx);
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.chat_menu.open(ChatMenuState {
+                    chat_id: menu_id.clone(),
+                    position: event.position,
+                    page: ChatMenuPage::Root,
+                });
+                cx.notify();
+            }),
+        )
+        // Line 1: "project @ device", status word / time-ago right.
+        .child(presentation::chat_context(space_name, corner, subline))
+        // Line 2: harness identity belongs directly with the title,
+        // instead of floating as unrelated metadata below it.
+        .child(presentation::chat_title(
+            title,
+            harness
+                .map(crate::pickers::harness_brand_icon)
+                .map(|(path, tint)| {
+                    icon(path)
+                        .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                        .flex_none()
+                        .text_color(tint.unwrap_or(subline).opacity(0.8))
+                        .into_any_element()
+                }),
+            SIDEBAR_ACTIVE_HARNESS_TITLE_GAP,
+        ))
+        // Line 3 is structural, not reserved whitespace: compact states
+        // omit it completely when both Branch and Pull request are hidden.
+        .when(shows_metadata, |row| {
+            row.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when_some(branch, |el, branch| {
+                        el.child(
+                            icon(icons::GIT_BRANCH)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(subline),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .line_height(px(14.0))
+                                .text_color(subline)
+                                .child(branch),
+                        )
+                    })
+                    // Stable invisible spring keeps the optional PR badge
+                    // pinned right without changing no-PR paint.
+                    .child(div().flex_1().min_w_0())
+                    .when_some(change_request, |el, summary| {
+                        el.child(crate::change_requests::pull_request_badge(
+                            format!("chat-pr-{id}").into(),
+                            summary,
+                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            theme,
+                        ))
+                    }),
+            )
+        })
+        .into_any_element()
     }
 
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
@@ -5311,11 +5424,7 @@ impl Shell {
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
 
-        div()
-            .w(px(self.settings.sidebar_width))
-            .h_full()
-            .flex()
-            .flex_col()
+        presentation::sidebar(self.settings.sidebar_width)
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             .child(filter_row)
@@ -5334,17 +5443,8 @@ impl Shell {
                     true,
                     true,
                     div().relative().flex_1().min_h_0().child(
-                        div()
-                            .id("sidebar-lists")
-                            .size_full()
-                            .overflow_y_scroll()
+                        presentation::session_list()
                             .track_scroll(&self.sidebar_scroll)
-                            .px(px(Theme::SPACE_SM))
-                            .flex()
-                            .flex_col()
-                            // No "Sessions" header (user request) — the list
-                            // is the whole column; a little air stands in.
-                            .pt(px(4.0))
                             .child(if !list_items.is_empty() {
                                 div()
                                     .flex()
@@ -5416,7 +5516,7 @@ impl Shell {
         if self.update_dismissed.as_deref() == Some(latest.as_str()) {
             return None;
         }
-        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
+        let mac_app = is_mac_app(&self.install);
 
         let (label, clickable): (SharedString, bool) = if mac_app {
             match &self.update_flow {
@@ -5468,6 +5568,8 @@ impl Shell {
 
     /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
     /// installs → dismiss for this version.
+    #[cfg(not(target_arch = "wasm32"))]
+
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
             self.update_dismissed = self
@@ -5488,6 +5590,8 @@ impl Shell {
 
     /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    #[cfg(not(target_arch = "wasm32"))]
+
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
@@ -5520,6 +5624,8 @@ impl Shell {
     /// Swap the staged bundle over the installed one, arm the detached
     /// relauncher, and quit — the relauncher `open`s the new bundle once this
     /// process (and its engine lock / IPC port) is gone.
+    #[cfg(not(target_arch = "wasm32"))]
+
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
         if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
             return;
@@ -5539,6 +5645,12 @@ impl Shell {
             }
         }
     }
+    #[cfg(target_arch = "wasm32")]
+    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_notice =
+            Some("Installing updates is unavailable in the browser fixture.".into());
+        cx.notify();
+    }
 
     /// Scope-aware sidebar identity and account menu. Local runtimes advertise
     /// their storage boundary and offer sync; synced runtimes offer sign-out.
@@ -5551,7 +5663,10 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.user_menu.is_open();
-        let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
+        let browser_lifecycle = has_external_lifecycle_handler();
+        let action = browser_lifecycle
+            .then_some(AccountMenuAction::SignOut)
+            .or_else(|| account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow));
         // Bottom-of-sidebar identity: avatar circle + scope/account label and
         // its secondary status line.
         let initial: SharedString = user_line
@@ -5664,6 +5779,20 @@ impl Shell {
                         .truncate()
                         .child(menu_identity),
                 )
+                .when(browser_lifecycle, |menu| {
+                    menu.child(
+                        popover::menu_row(theme, false, "user-menu-switch-device")
+                            .id("user-menu-switch-device")
+                            .on_click(cx.listener(|this, _, _, cx| this.request_switch_device(cx)))
+                            .child(
+                                icon(icons::SMARTPHONE)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Switch device")),
+                    )
+                    .child(popover::menu_separator())
+                })
                 .when_some(action, |menu, action| {
                     let row = match action {
                         AccountMenuAction::EnableSync => {
@@ -6746,28 +6875,7 @@ impl Shell {
                     // strip + composer).
                     let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
                     let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
-                    // Opaque from the composer PILL's top (the reserved
-                    // status strip above it is empty air), zero at the
-                    // underlay's bottom edge.
-                    let bottom_band = (stack_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .bottom(px(term_h))
-                        .child(
-                            crate::edge_fade::edge_faded(
-                                Theme::TRANSCRIPT_FADE_BAND,
-                                true,
-                                true,
-                                div().size_full().child(outlet),
-                            )
-                            // Fully faded BY the titlebar's bottom edge (the
-                            // title text is opaque — overlap read as collision),
-                            // ramping in the band just below it.
-                            .inset_top(Theme::TITLEBAR_HEIGHT)
-                            .band_top(Theme::TRANSCRIPT_FADE_BAND)
-                            .band_bottom(bottom_band),
-                        )
+                    presentation::transcript_underlay(outlet, term_h, stack_h)
                         .children(self.render_jump_to_bottom(stack_h, cx))
                 },
             )
@@ -8331,50 +8439,8 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
 
 /// A size-6 icon button for the titlebar strip (zeron window-controls.tsx:
 /// `grid size-6 place-items-center rounded-md text-muted-foreground`).
-fn window_control_button(
-    id: &'static str,
-    icon_path: &'static str,
-    theme: &Theme,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let muted = theme.text_muted;
-    let fade_key = format!("window-control-{id}");
-    div()
-        .id(id)
-        .size(px(24.0))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(6.0))
-        .cursor_pointer()
-        // zeron window-controls.tsx: `transition-colors` — the wash fades.
-        .bg(motion::hover_blend(
-            &fade_key,
-            theme.glass_hover().opacity(0.0),
-            theme.glass_hover(),
-        ))
-        .on_hover(motion::hover_listener(fade_key))
-        // Buttons in/over a titlebar drag strip must be EXCLUDED from the
-        // strip's event surface entirely. `.occlude()` (gpui
-        // `HitboxBehavior::BlockMouse`) makes the window hit-test STOP at the
-        // button, so every `is_hovered`-guarded strip listener — the
-        // mouse-down that arms the drag, the mouse-move that hands AppKit a
-        // native drag session (`performWindowDragWithEvent:`, whose second
-        // quick click zooms NATIVELY on macOS), and the `click_count == 2`
-        // zoom handler — never fires with the pointer over a button. It also
-        // removes the button's rect from the native Drag control-area
-        // hit-test on Windows/Linux. The click-level stop_propagation is
-        // zed's ButtonLike belt on top. Double-click on EMPTY strip space
-        // still zooms — nothing occludes it there.
-        .occlude()
-        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-        .on_click(move |event, window, cx| {
-            cx.stop_propagation();
-            on_click(event, window, cx)
-        })
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
-}
+pub(crate) mod presentation;
+use presentation::window_control_button;
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
 const WINDOWS_CAPTION_WIDTH: f32 = WINDOWS_CAPTION_BUTTON_WIDTH * 3.0;
@@ -8485,32 +8551,7 @@ fn linux_caption_button(
 /// A titlebar history button (zeron window-controls.tsx): enabled it is a
 /// normal window-control button; disabled it dims to 35% opacity and ignores
 /// the pointer (`disabled:pointer-events-none disabled:opacity-35`).
-fn nav_history_button(
-    id: &'static str,
-    icon_path: &'static str,
-    enabled: bool,
-    theme: &Theme,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    if !enabled {
-        return div()
-            .size(px(24.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            // Even disabled it reads as a control — occlude so double-clicks
-            // on it don't fall through to the titlebar strip's zoom handler.
-            .occlude()
-            .child(
-                icon(icon_path)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted.opacity(0.35)),
-            )
-            .into_any_element();
-    }
-    window_control_button(id, icon_path, theme, on_click).into_any_element()
-}
+use presentation::nav_history_button;
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
 /// `grid size-7 place-items-center rounded-md text-muted-foreground`).
@@ -8552,7 +8593,7 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_time = Some(std::time::Instant::now());
+        self.render_time = Some(Instant::now());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()
         {
@@ -8586,13 +8627,7 @@ impl Render for Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
-        let theme = Theme::of(cx);
-        // The shell tone (zeron `.frost`): the surface the sidebar sits on and
-        // the main panel floats over as an inset rounded card. On macOS the
-        // window background is the blurred desktop (lib.rs `Blurred`), so the
-        // frost paints translucent — the sidebar and card margins read as
-        // glass while the opaque card keeps text off it.
-        let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        // Shared presentation resolves the shell tone and typography below.
         let (workspace_scope, auth) = {
             let state = self.state.read(cx);
             (state.workspace_scope, state.auth.clone())
@@ -8723,18 +8758,9 @@ impl Render for Shell {
             self.update_jump_hints(&window.modifiers(), cx);
         }
 
-        let root = div()
-            .id("shell-root")
+        let root = presentation::root(Theme::of(cx))
             .track_focus(&self.shortcut_focus)
             .child(div().track_focus(&self.unfocused))
-            .relative()
-            .flex()
-            .flex_row()
-            .size_full()
-            .bg(frost)
-            .text_color(text)
-            .font_family(font)
-            .text_size(crate::typography::ui_rems(14.0))
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
@@ -8985,15 +9011,7 @@ impl Render for Shell {
                 let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
                 // Hairline on its right edge — full height like the tone,
                 // so the sidebar column reads as its own surface.
-                let sidebar_tone = div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left_0()
-                    .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
-                    .border_r_1()
-                    .border_color(border_color);
+                let sidebar_tone = presentation::sidebar_tone(sidebar_now, border_color);
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
@@ -9099,6 +9117,32 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_lifecycle_relay_routes_browser_actions_without_runtime_rpc() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut relay = ExternalLifecycleRelay::default();
+        assert!(!relay.dispatch(ExternalLifecycleAction::SignOut));
+
+        let observed = seen.clone();
+        relay.set(Some(std::rc::Rc::new(move |action| {
+            observed.borrow_mut().push(action);
+        })));
+        assert!(relay.dispatch(ExternalLifecycleAction::SignOut));
+        assert!(relay.dispatch(ExternalLifecycleAction::SwitchDevice));
+        assert!(relay.dispatch(ExternalLifecycleAction::Retry));
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                ExternalLifecycleAction::SignOut,
+                ExternalLifecycleAction::SwitchDevice,
+                ExternalLifecycleAction::Retry,
+            ]
+        );
+
+        relay.set(None);
+        assert!(!relay.dispatch(ExternalLifecycleAction::SignOut));
+    }
 
     #[test]
     fn every_default_shortcut_binds_on_this_platform() {
@@ -9972,7 +10016,7 @@ mod tests {
     #[test]
     fn sidebar_disclosure_motion_lands_exactly_on_its_target() {
         let mut tween = SidebarDisclosureMotion::new(1, 240.0, 0.0);
-        tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
+        tween.started = Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
         assert_eq!(tween.current(), 0.0);
         assert!(!tween.animating());
     }
@@ -10018,7 +10062,7 @@ mod exit_regressions {
         window
             .update(cx, |shell, _, cx| {
                 let duration = RESIZE.total().mul_f32(motion::speed_scale());
-                let started = std::time::Instant::now() - duration.mul_f32(2.);
+                let started = Instant::now() - duration.mul_f32(2.);
                 let tween = Some(WidthTween {
                     from: 520.,
                     to: 0.,

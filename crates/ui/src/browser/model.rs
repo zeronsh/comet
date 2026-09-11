@@ -77,6 +77,20 @@ pub fn allowed_navigation(address: &str) -> bool {
     })
 }
 
+/// Cookie-authenticated same-origin route for a discovered remote preview.
+/// The IDs remain identifiers, never a host or port supplied by a page.
+pub fn preview_route_path(device_id: &str, service_id: &str) -> Option<String> {
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    };
+    (valid(device_id) && valid(service_id))
+        .then(|| format!("/api/browser/preview/{device_id}/{service_id}"))
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Presentation {
     #[default]
@@ -147,5 +161,20 @@ mod tests {
         assert_eq!(page.label(), "localhost");
         page.title = "Local preview".into();
         assert_eq!(page.label(), "Local preview");
+    }
+
+    #[test]
+    fn remote_preview_routes_are_identifier_only() {
+        assert_eq!(
+            preview_route_path("device_1", "service-2"),
+            Some("/api/browser/preview/device_1/service-2".into())
+        );
+        for invalid in ["", "a/b", "a?b", "a.b", "a b", &"x".repeat(129)] {
+            assert!(
+                preview_route_path(invalid, "service").is_none(),
+                "{invalid}"
+            );
+            assert!(preview_route_path("device", invalid).is_none(), "{invalid}");
+        }
     }
 }

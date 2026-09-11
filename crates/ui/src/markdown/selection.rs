@@ -50,7 +50,8 @@ fn state() -> &'static Mutex<Option<MdSelection>> {
 
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
-/// `(key, text)` pairs). Handles either direction; empty slices are skipped.
+/// `(key, text)` pairs). Handles either direction. Keep empty slices: the
+/// boundary between each pair of spans contributes a selected newline.
 pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, usize)) -> Vec<Span> {
     let (start, end) = if (a.0, a.1) <= (b.0, b.1) {
         (a, b)
@@ -62,13 +63,11 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
-            spans.push(Span {
-                key: (*key).to_string(),
-                range: from..to,
-                text: (*text).to_string(),
-            });
-        }
+        spans.push(Span {
+            key: (*key).to_string(),
+            range: from..to,
+            text: (*text).to_string(),
+        });
     }
     spans
 }
@@ -219,7 +218,7 @@ pub fn end_drag(key: &str) -> Option<String> {
         return None;
     }
     sel.dragging = false;
-    if sel.spans.iter().all(|s| s.range.is_empty()) {
+    if !has_selected_text(&sel.spans) {
         *guard = None;
         return None;
     }
@@ -235,7 +234,7 @@ pub fn end_active_drag() -> Option<String> {
         return None;
     }
     sel.dragging = false;
-    if sel.spans.iter().all(|span| span.range.is_empty()) {
+    if !has_selected_text(&sel.spans) {
         *guard = None;
         return None;
     }
@@ -270,16 +269,20 @@ pub fn wash_range(key: &str) -> Option<Range<usize>> {
 pub fn selected_text() -> Option<String> {
     let guard = state().lock().unwrap();
     let sel = guard.as_ref()?;
-    if sel.spans.iter().all(|s| s.range.is_empty()) {
+    if !has_selected_text(&sel.spans) {
         return None;
     }
     Some(join_spans(&sel.spans))
 }
 
+fn has_selected_text(spans: &[Span]) -> bool {
+    // Two empty endpoint slices still select the newline between them.
+    spans.len() > 1 || spans.iter().any(|span| !span.range.is_empty())
+}
+
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
-        .filter(|s| !s.range.is_empty())
         .map(|s| &s.text[s.range.clone()])
         .collect::<Vec<_>>()
         .join("\n")
@@ -351,6 +354,64 @@ mod tests {
         assert_eq!(&spans[2].text[spans[2].range.clone()], "third");
         // Reversed drag (bottom-up) resolves identically.
         assert_eq!(resolve_spans(&elems(), (2, 5), (0, 6)), spans);
+    }
+
+    #[test]
+    fn copy_preserves_blank_lines_and_boundary_newlines() {
+        let _state = state_lock();
+        // Includes a blank line, consecutive blanks, and an empty final line.
+        let lines = [
+            ("a", "a"),
+            ("blank1", ""),
+            ("b", "b"),
+            ("blank2", ""),
+            ("blank3", ""),
+            ("c", "c"),
+            ("last", ""),
+        ];
+        let cases = [
+            ((0, 0), (2, 1), "a\n\nb"),
+            ((2, 0), (5, 1), "b\n\n\nc"),
+            ((0, 1), (2, 1), "\n\nb"),
+            ((0, 0), (2, 0), "a\n\n"),
+            ((0, 1), (1, 0), "\n"),
+            ((0, 1), (2, 0), "\n\n"),
+            ((1, 0), (2, 0), "\n"),
+            ((5, 0), (6, 0), "c\n"),
+        ];
+        for (a, b, expected) in cases {
+            for (anchor, head) in [(a, b), (b, a)] {
+                let key = lines[anchor.0].0;
+                begin(key, anchor.1);
+                update_drag(&lines, head);
+                assert_eq!(
+                    selected_text().as_deref(),
+                    Some(expected),
+                    "{anchor:?} -> {head:?}"
+                );
+                assert_eq!(end_drag(key).as_deref(), Some(expected));
+                assert_eq!(selected_text().as_deref(), Some(expected));
+                begin(key, anchor.1);
+                update_drag(&lines, head);
+                assert_eq!(end_active_drag().as_deref(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_prose_boundary_and_empty_click() {
+        let _state = state_lock();
+        for (anchor, head) in [((0, 15), (1, 0)), ((1, 0), (0, 15))] {
+            begin(elems()[anchor.0].0, anchor.1);
+            update_drag(&elems(), head);
+            assert_eq!(end_active_drag().as_deref(), Some("\n"));
+        }
+        for (key, text, ix) in [("p", "paragraph", 4), ("blank", "", 0)] {
+            begin(key, ix);
+            update_drag(&[(key, text)], (0, ix));
+            assert_eq!(selected_text(), None);
+            assert_eq!(end_active_drag(), None);
+        }
     }
 
     /// The drag tests below mutate the process-global selection state —

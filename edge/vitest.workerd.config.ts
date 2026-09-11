@@ -20,7 +20,26 @@ export default defineConfig({
         compatibilityDate: "2026-07-01",
         durableObjects: {
           TEST_LOG: { className: "TestLogRoom", useSQLite: true },
-          PREVIEW_ROOMS: { className: "PreviewRoom", useSQLite: true }
+          PREVIEW_ROOMS: { className: "PreviewRoom", useSQLite: true },
+          BROWSER_SESSIONS: { className: "BrowserSessionStore", useSQLite: true }
+,
+          DEVICE_ROOMS: { className: "DeviceRoom", useSQLite: true }
+        },
+        bindings: {
+          AUTH_MODE: "dev",
+          WORKOS_CLIENT_ID: "client_test",
+          WORKOS_API_KEY: "test-only",
+          WORKOS_ISSUER: "https://issuer.test",
+          WORKOS_JWKS_URL: "https://issuer.test/jwks",
+          WORKOS_BROWSER_OWNER_SUBJECT: "browser-e2e-owner",
+          BROWSER_DEV_OWNER_SUBJECT: "browser-e2e-owner",
+
+          BROWSER_DEV_ORGANIZATION_ID: "dev-org",
+
+          BROWSER_DEV_ORIGIN: "http://localhost",
+          BROWSER_SESSION_KEY: "workerd-test-session-key",
+          WORKOS_BROWSER_ORIGIN: "https://test",
+          BROWSER_PREVIEW_ORIGIN: "https://preview.test"
         }
       }
     })

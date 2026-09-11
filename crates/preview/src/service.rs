@@ -146,6 +146,12 @@ impl PreviewService {
             )));
         }
     }
+    /// Serve one authenticated browser relay request. The service id is looked
+    /// up locally, so relay callers cannot make this device connect to arbitrary hosts.
+    pub async fn relay_request(&self, frame: &[u8]) -> anyhow::Result<Vec<u8>> {
+        crate::remote::serve(&self.0.catalog, frame).await
+    }
+
     pub fn stop(&self) {
         self.0.stop.cancel();
         self.0.catalog.clear_remote();

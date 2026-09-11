@@ -12,22 +12,35 @@
 //! `subscribe`. Both ends run over any pair of string channels, so the in-memory transport
 //! ([`memory_client`]) exercises the exact same code path as the WebSocket one.
 
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
+#[cfg(feature = "native")]
 use async_trait::async_trait;
+#[cfg(feature = "native")]
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
+pub mod device_frame;
+
+#[cfg(feature = "client")]
 mod client;
+#[cfg(feature = "native")]
 pub mod device_room;
+#[cfg(feature = "native")]
 mod server;
 
-pub use client::{RpcClient, RpcSubscription, connect_ws};
+#[cfg(feature = "native")]
+pub use client::connect_ws;
+#[cfg(feature = "client")]
+pub use client::{RpcClient, RpcSubscription};
+#[cfg(feature = "native")]
 pub use device_room::{
-    DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenSource, decode_device_frame,
-    device_room_ws_url, encode_device_frame,
+    DeviceFrameHeader, DeviceLink, FrameHandler, HostRelay, HostRelayConfig, LinkCache,
+    LinkCacheConfig, NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenSource,
+    decode_device_frame, device_room_ws_url, encode_device_frame,
 };
+#[cfg(feature = "native")]
 pub use server::{serve_connection, serve_ws_listener};
 
 /// RPC method names — single source of truth for both ends.
@@ -221,7 +234,7 @@ pub struct ClientFrame {
 }
 
 /// A server-originated frame. Exactly one of `ok` / `err` / `item` / `done` is meaningful.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ServerFrame {
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,7 +247,64 @@ pub struct ServerFrame {
     pub done: bool,
 }
 
+/// Decode one server frame while preserving the presence of `ok: null` and
+/// `item: null`. `Option<Value>` alone cannot represent that distinction.
+pub fn decode_server_frame(text: &str) -> Result<ServerFrame, String> {
+    let value = serde_json::from_str(text).map_err(|_| "Invalid RPC JSON".to_string())?;
+    parse_server_frame(value)
+}
+
+impl<'de> Deserialize<'de> for ServerFrame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_server_frame(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_server_frame(value: serde_json::Value) -> Result<ServerFrame, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Invalid RPC envelope".to_string())?;
+    let id = serde_json::from_value(
+        object
+            .get("id")
+            .cloned()
+            .ok_or_else(|| "Invalid RPC envelope".to_string())?,
+    )
+    .map_err(|_| "Invalid RPC envelope".to_string())?;
+    let done = match object.get("done") {
+        None => false,
+        Some(serde_json::Value::Bool(done)) => *done,
+        Some(_) => return Err("Invalid RPC envelope".into()),
+    };
+    let ok = object.get("ok").cloned();
+    let item = object.get("item").cloned();
+    let err = match object.get("err") {
+        None => None,
+        Some(serde_json::Value::String(err)) => Some(err.clone()),
+        Some(_) => return Err("Invalid RPC error".into()),
+    };
+    let count = usize::from(ok.is_some())
+        + usize::from(item.is_some())
+        + usize::from(err.is_some())
+        + usize::from(done);
+    if count != 1 {
+        return Err("Invalid RPC envelope".into());
+    }
+    Ok(ServerFrame {
+        id,
+        ok,
+        err,
+        item,
+        done,
+    })
+}
+
 /// What a service returns for one invocation.
+#[cfg(feature = "native")]
 pub enum RpcReply {
     /// Unary response — sent as `{id, ok}`.
     Value(serde_json::Value),
@@ -242,6 +312,7 @@ pub enum RpcReply {
     Stream(BoxStream<'static, serde_json::Value>),
 }
 
+#[cfg(feature = "native")]
 impl RpcReply {
     /// Serialize a value into a unary reply.
     pub fn value<T: Serialize>(value: &T) -> Result<Self, RpcError> {
@@ -252,6 +323,7 @@ impl RpcReply {
 }
 
 /// Server-side dispatch: one implementation serves every transport.
+#[cfg(feature = "native")]
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
@@ -267,6 +339,7 @@ pub fn parse_params<T: serde::de::DeserializeOwned>(
 /// Spawn an in-memory server for `service` and return a connected client.
 /// Same envelopes, same dispatch loop as the WebSocket path — the in-process UI
 /// transport (ARCHITECTURE §1 "zero serialization shortcuts").
+#[cfg(feature = "native")]
 pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
     let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
@@ -274,7 +347,7 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     RpcClient::new(client_out, client_in)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
     use futures::StreamExt;

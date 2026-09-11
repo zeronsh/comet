@@ -464,30 +464,15 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
 
 /// What the engine reports over the `UpdateStatus` stream. Version facts only —
 /// download/apply progress is owned by whoever drives the update (UI or CLI).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateStatus {
-    pub current_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_version: Option<String>,
-    #[serde(default)]
-    pub update_available: bool,
-    /// Epoch ms of the last successful check.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checked_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
+pub use zeron_proto::UpdateStatus;
 
-impl UpdateStatus {
-    fn initial() -> Self {
-        Self {
-            current_version: current_version().to_string(),
-            latest_version: None,
-            update_available: false,
-            checked_at: None,
-            error: None,
-        }
+fn initial_update_status() -> UpdateStatus {
+    UpdateStatus {
+        current_version: current_version().to_string(),
+        latest_version: None,
+        update_available: false,
+        checked_at: None,
+        error: None,
     }
 }
 
@@ -522,7 +507,7 @@ pub struct Updater {
 impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
     pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
-        let (status_tx, _) = watch::channel(UpdateStatus::initial());
+        let (status_tx, _) = watch::channel(initial_update_status());
         let (check_tx, _) = watch::channel(0);
         let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {

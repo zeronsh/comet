@@ -17,9 +17,9 @@ use gpui::{
     SharedString, Subscription, Task, Window, canvas, container_query, div, img, list, point,
     prelude::*, px,
 };
-use zeron_engine::repos::git_history_matches;
 use zeron_proto::{
     GitHistoryCommit, GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind,
+    git_history_matches,
 };
 use zeron_rpc::methods;
 

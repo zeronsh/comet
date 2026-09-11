@@ -11,6 +11,11 @@
 //! classification) lives in free functions with unit tests; the elements only
 //! feed them measurements/events.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 use gpui::{
     Anchor, AnyElement, Context, Div, ElementId, IntoElement, Pixels, Point, SharedString, Window,
     div, prelude::*, px,
@@ -68,7 +73,7 @@ impl<T> Loadable<T> {
 pub struct Popup<T> {
     /// `Some((state, closing_since))` while mounted; `closing_since` is the
     /// exit-phase start.
-    inner: Option<(T, Option<std::time::Instant>)>,
+    inner: Option<(T, Option<Instant>)>,
     /// Whether the popup was still mounted when the current trigger press
     /// began — see [`Self::note_trigger_press`].
     pressed_while_open: bool,
@@ -99,7 +104,7 @@ impl<T> Popup<T> {
 
     /// When the exit phase began — what the render path hands to the popover
     /// wrappers, which derive the eased exit progress from it each frame.
-    pub fn closing_since(&self) -> Option<std::time::Instant> {
+    pub fn closing_since(&self) -> Option<Instant> {
         match &self.inner {
             Some((_, Some(since))) => Some(*since),
             _ => None,
@@ -134,7 +139,7 @@ impl<T> Popup<T> {
     pub fn begin_close(&mut self) -> bool {
         match &mut self.inner {
             Some((_, closing @ None)) => {
-                *closing = Some(std::time::Instant::now());
+                *closing = Some(Instant::now());
                 true
             }
             _ => false,
@@ -348,7 +353,7 @@ fn pinned_layer(layer: AnyElement) -> AnyElement {
 /// Eased exit progress (0..=1) for a [`Popup`] closing instant, computed from
 /// the wall clock at render time. Monotonic by construction — unlike the
 /// animation element's own clock, it can never replay from 0 mid-exit.
-fn exit_progress(since: std::time::Instant) -> f32 {
+fn exit_progress(since: Instant) -> f32 {
     let total = motion::MENU_OUT
         .total()
         .mul_f32(motion::speed_scale())
@@ -420,7 +425,7 @@ fn menu_motion(id: SharedString, exit: Option<f32>, inner: gpui::Div) -> AnyElem
 pub fn anchored_menu(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
@@ -447,7 +452,7 @@ pub fn anchored_menu(
 pub fn anchored_menu_below(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     anchored_menu_below_gap(id, content, closing, 6.0)
 }
@@ -458,7 +463,7 @@ pub fn anchored_menu_below(
 pub fn anchored_menu_below_end(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
@@ -490,7 +495,7 @@ pub fn anchored_menu_below_end(
 pub fn anchored_menu_below_gap(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
     gap: f32,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
@@ -523,7 +528,7 @@ pub fn anchored_menu_below_gap(
 pub fn anchored_menu_above(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
@@ -550,7 +555,7 @@ pub fn anchored_menu_above_at(
     id: impl Into<SharedString>,
     position: Point<Pixels>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     div()
         .absolute()
@@ -564,7 +569,7 @@ pub fn anchored_menu_above_at(
 pub fn full_width_menu_above(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
@@ -590,7 +595,7 @@ pub fn full_width_menu_above(
 pub fn anchored_menu_above_end(
     id: impl Into<SharedString>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
@@ -622,7 +627,7 @@ pub fn menu_at(
     id: impl Into<SharedString>,
     position: Point<Pixels>,
     content: AnyElement,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);

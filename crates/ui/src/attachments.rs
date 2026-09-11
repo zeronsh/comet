@@ -14,14 +14,24 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsCast as _, closure::Closure};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::TryStreamExt as _;
+use gpui::BackgroundExecutor;
 use gpui::{
-    AnyElement, BackgroundExecutor, Image, ImageFormat, ObjectFit, SharedString, Size,
-    StyledImage as _, div, img, prelude::*, px,
+    AnyElement, Image, ImageFormat, ObjectFit, SharedString, Size, StyledImage as _, div, img,
+    prelude::*, px,
 };
 
 use crate::state::EngineHandle;
@@ -229,26 +239,145 @@ pub fn ensure_extension(name: &str, format: ImageFormat) -> String {
     }
 }
 
-/// Stage a file from disk (picker / drop / pasted path). `Err` carries the
-/// user-facing message (mirrors the old `onError` copy).
-pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
-    let display_name = path
+/// Stage image bytes from any trusted picker or clipboard source. This is the
+/// browser boundary: browser `File` objects are read to bytes here rather than
+/// represented as host paths.
+pub fn stage_bytes(name: &str, bytes: Vec<u8>) -> Result<StagedAttachment, String> {
+    let display_name = Path::new(name)
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "image".to_string());
-    let Some(format) = format_by_extension(path) else {
+    let Some(format) = format_by_extension(Path::new(&display_name)) else {
         return Err(format!("{display_name} is not a supported image."));
     };
-    let meta = std::fs::metadata(path).map_err(|_| format!("{display_name} could not be read."))?;
-    if meta.len() > MAX_ATTACHMENT_BYTES {
+    if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
         return Err(format!("{display_name} is too large (24 MB max)."));
     }
-    let bytes = std::fs::read(path).map_err(|_| format!("{display_name} could not be read."))?;
+    if !image_bytes_match_format(format, &bytes) {
+        return Err(format!(
+            "{display_name} is not a valid {} image.",
+            format.extension()
+        ));
+    }
     Ok(StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension(&display_name, format),
         image: Arc::new(Image::from_bytes(format, bytes)),
     })
+}
+
+fn image_bytes_match_format(format: ImageFormat, bytes: &[u8]) -> bool {
+    match format {
+        ImageFormat::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        ImageFormat::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        ImageFormat::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        ImageFormat::Webp => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        ImageFormat::Svg => std::str::from_utf8(&bytes[..bytes.len().min(1024)])
+            .ok()
+            .is_some_and(|text| text.trim_start_matches('\u{feff}').contains("<svg")),
+        ImageFormat::Bmp => bytes.starts_with(b"BM"),
+        ImageFormat::Tiff => bytes.starts_with(b"II\x2a\0") || bytes.starts_with(b"MM\0\x2a"),
+        _ => false,
+    }
+}
+
+/// Stage a file from disk (picker / drop / pasted path). `Err` carries the
+/// user-facing message (mirrors the old `onError` copy).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
+    let display_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "image".to_string());
+    let bytes = std::fs::read(path).map_err(|_| format!("{display_name} could not be read."))?;
+    stage_bytes(&display_name, bytes)
+}
+
+/// Open a native browser file input and stage the selected files from their
+/// actual browser-owned bytes. No filesystem path crosses this boundary.
+#[cfg(target_arch = "wasm32")]
+pub async fn pick_browser_files() -> Result<Vec<StagedAttachment>, String> {
+    let window = web_sys::window().ok_or_else(|| "Browser window is unavailable.".to_string())?;
+    let document = window
+        .document()
+        .ok_or_else(|| "Browser document is unavailable.".to_string())?;
+    let body = document
+        .body()
+        .ok_or_else(|| "Browser document body is unavailable.".to_string())?;
+    let input: web_sys::HtmlInputElement = document
+        .create_element("input")
+        .map_err(|error| format!("Could not open the attachment picker: {error:?}"))?
+        .dyn_into()
+        .map_err(|_| "Could not create the attachment picker.".to_string())?;
+    input.set_type("file");
+    input.set_accept("image/*");
+    input.set_multiple(true);
+    input.set_hidden(true);
+    body.append_child(&input)
+        .map_err(|error| format!("Could not open the attachment picker: {error:?}"))?;
+
+    let (sender, receiver) =
+        futures::channel::oneshot::channel::<Result<Option<web_sys::FileList>, String>>();
+    let sender = std::rc::Rc::new(RefCell::new(Some(sender)));
+    let change_input = input.clone();
+    let change_sender = sender.clone();
+    let change = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if let Some(sender) = change_sender.borrow_mut().take() {
+            let _ = sender.send(Ok(change_input.files()));
+        }
+    }) as Box<dyn FnMut(_)>);
+    let cancel_sender = sender;
+    let cancel = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if let Some(sender) = cancel_sender.borrow_mut().take() {
+            let _ = sender.send(Ok(None));
+        }
+    }) as Box<dyn FnMut(_)>);
+    let change_callback = change.as_ref().unchecked_ref();
+    let cancel_callback = cancel.as_ref().unchecked_ref();
+    input
+        .add_event_listener_with_callback("change", change_callback)
+        .map_err(|error| format!("Could not open the attachment picker: {error:?}"))?;
+    input
+        .add_event_listener_with_callback("cancel", cancel_callback)
+        .map_err(|error| format!("Could not open the attachment picker: {error:?}"))?;
+    input.click();
+
+    let selected = receiver
+        .await
+        .map_err(|_| "The attachment picker closed unexpectedly.".to_string())?;
+    let _ = input.remove_event_listener_with_callback("change", change_callback);
+    let _ = input.remove_event_listener_with_callback("cancel", cancel_callback);
+    let _ = body.remove_child(&input);
+    let Some(files) = selected? else {
+        return Ok(Vec::new());
+    };
+
+    let mut staged = Vec::with_capacity(files.length() as usize);
+    for index in 0..files.length() {
+        let file = files
+            .item(index)
+            .ok_or_else(|| "The selected attachment could not be read.".to_string())?;
+        let name = file.name();
+        if file.size() > MAX_ATTACHMENT_BYTES as f64 {
+            return Err(format!("{name} is too large (24 MB max)."));
+        }
+        let buffer = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+            .await
+            .map_err(|_| format!("{name} could not be read."))?;
+        staged.push(stage_bytes(
+            &name,
+            js_sys::Uint8Array::new(&buffer).to_vec(),
+        )?);
+    }
+    Ok(staged)
+}
+
+/// Host paths cannot be read by the browser. File-picker bytes must enter
+/// through [`pick_browser_files`] rather than a path-shaped host request.
+#[cfg(target_arch = "wasm32")]
+pub fn stage_file(_path: &Path) -> Result<StagedAttachment, String> {
+    Err("Local file paths are unavailable in the browser.".to_string())
 }
 
 /// Stage an image pasted from the clipboard.
@@ -651,12 +780,12 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
             // resolves the rewritten ref instantly instead of blanking the
             // thumbnail into a skeleton while the bytes round-trip
             // (2026-08-19 "photo disappears after it finishes sending").
-            if let Some(image) = upload_alias_id8(path)
-                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+            if let Some(image) = upload_alias_id8(path).and_then(|id8| {
+                match cache.map.get(&alias_key(device_id, &id8)) {
                     Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
                     _ => None,
-                })
-            {
+                }
+            }) {
                 cache.insert_loaded(key(device_id, path), image.clone());
                 return AttachmentSnapshot::Loaded(image);
             }
@@ -671,9 +800,8 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
 fn upload_alias_id8(path: &str) -> Option<String> {
     let base = std::path::Path::new(path).file_name()?.to_str()?;
     let (id8, _) = base.split_at_checked(8)?;
-    (base.as_bytes().get(8) == Some(&b'-')
-        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
-    .then(|| id8.to_string())
+    (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| id8.to_string())
 }
 
 fn alias_key(device_id: &str, id8: &str) -> (String, String) {
@@ -931,6 +1059,32 @@ mod tests {
     }
 
     #[test]
+    fn byte_staging_keeps_selected_image_bytes_and_name() {
+        let bytes = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+        let staged = stage_bytes("screenshot.png", bytes.clone()).unwrap();
+        assert_eq!(staged.name, "screenshot.png");
+        assert_eq!(staged.image.format, ImageFormat::Png);
+        assert_eq!(staged.bytes(), bytes);
+    }
+
+    #[test]
+    fn byte_staging_rejects_oversized_and_invalid_content() {
+        let too_large = vec![0; MAX_ATTACHMENT_BYTES as usize + 1];
+        assert!(matches!(
+            stage_bytes("large.png", too_large),
+            Err(message) if message.contains("too large")
+        ));
+        assert!(matches!(
+            stage_bytes("not-an-image.png", b"not a png".to_vec()),
+            Err(message) if message.contains("not a valid png image")
+        ));
+        assert!(matches!(
+            stage_bytes("notes.txt", b"hello".to_vec()),
+            Err(message) if message.contains("not a supported image")
+        ));
+    }
+
+    #[test]
     fn retry_ladder_is_2s_doubling_capped_at_15s() {
         assert_eq!(retry_delay(0), Duration::from_millis(2_000));
         assert_eq!(retry_delay(1), Duration::from_millis(4_000));
@@ -955,7 +1109,10 @@ mod tests {
         // Exact multiple: no trailing empty chunk.
         let exact = chunk_ranges(UPLOAD_CHUNK_B64_CHARS * 2);
         assert_eq!(exact.len(), 2);
-        assert_eq!(exact[1], (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS * 2));
+        assert_eq!(
+            exact[1],
+            (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS * 2)
+        );
         // Partial tail.
         let partial = chunk_ranges(UPLOAD_CHUNK_B64_CHARS + 7);
         assert_eq!(partial.len(), 2);

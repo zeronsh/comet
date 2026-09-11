@@ -115,7 +115,7 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 notify = "7"
 portable-pty = "0.8"
-alacritty_terminal = "0.26"
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
 unicode-width = "0.2"

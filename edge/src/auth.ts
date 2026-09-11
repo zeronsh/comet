@@ -14,6 +14,10 @@ import type { Env } from "./env";
 export interface Verified {
   readonly userId: string;
   readonly sessionId?: string;
+  /** Access-token expiry in epoch milliseconds when present. */
+  readonly expiresAt?: number;
+  /** AuthKit authentication time in epoch milliseconds. */
+  readonly authTime?: number;
   /** WorkOS `org_id` claim — the org the caller's session is scoped to. */
   readonly orgId?: string;
 }
@@ -27,6 +31,41 @@ const getJwks = (url: string) => {
     jwksCache.set(url, jwks);
   }
   return jwks;
+};
+
+/**
+ * Browser BFF exchanges are never permitted to use the native development
+ * bearer shortcut or inferred WorkOS defaults. Requiring both explicit trust
+ * anchors keeps a deployment typo fail-closed without changing native auth.
+ */
+export const verifyBrowserToken = async (env: Env, token: string): Promise<Verified | undefined> => {
+  if (!env.WORKOS_ISSUER || !env.WORKOS_JWKS_URL) return undefined;
+  try {
+    const { payload } = await jwtVerify(token, getJwks(env.WORKOS_JWKS_URL), {
+      issuer: env.WORKOS_ISSUER
+    });
+    if (
+      typeof payload.sub !== "string" ||
+      payload.sub.length === 0 ||
+      typeof payload.sid !== "string" ||
+      payload.sid.length === 0 ||
+      typeof payload.exp !== "number" ||
+      typeof payload.auth_time !== "number" ||
+      !Number.isSafeInteger(payload.auth_time) ||
+      payload.auth_time * 1000 > Date.now() + 60_000
+    ) {
+      return undefined;
+    }
+    return {
+      userId: payload.sub,
+      sessionId: payload.sid,
+      expiresAt: payload.exp * 1000,
+      authTime: payload.auth_time * 1000,
+      orgId: typeof payload.org_id === "string" ? payload.org_id : undefined
+    };
+  } catch {
+    return undefined;
+  }
 };
 
 export const bearerFromRequest = (request: Request): string | undefined => {

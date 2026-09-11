@@ -24,12 +24,17 @@ use gpui::{
     px,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use zeron_engine::registry::TitleSettings;
+#[cfg(not(target_arch = "wasm32"))]
 use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
-use zeron_proto::HarnessId;
-use zeron_proto::Model;
+#[cfg(target_arch = "wasm32")]
+use zeron_proto::{HarnessDescriptor, HarnessId, descriptor_enabled};
+#[cfg(not(target_arch = "wasm32"))]
+use zeron_proto::{HarnessId, Model};
 use zeron_rpc::methods;
 
+#[cfg(target_arch = "wasm32")]
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};
 use crate::settings::widgets;
@@ -68,10 +73,15 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
 }
 
 pub struct HarnessesPage {
+    #[cfg(not(target_arch = "wasm32"))]
     title_settings: Loadable<TitleSettings>,
+    #[cfg(not(target_arch = "wasm32"))]
     title_models: Loadable<Vec<Model>>,
+    #[cfg(not(target_arch = "wasm32"))]
     title_menu: Option<bool>, // false = harness, true = model
+    #[cfg(not(target_arch = "wasm32"))]
     title_task: Option<Task<()>>,
+    #[cfg(not(target_arch = "wasm32"))]
     title_saving: bool,
     state: Entity<AppState>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
@@ -93,10 +103,15 @@ pub struct HarnessesPage {
 impl HarnessesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut page = Self {
+            #[cfg(not(target_arch = "wasm32"))]
             title_settings: Loadable::Idle,
+            #[cfg(not(target_arch = "wasm32"))]
             title_models: Loadable::Idle,
+            #[cfg(not(target_arch = "wasm32"))]
             title_menu: None,
+            #[cfg(not(target_arch = "wasm32"))]
             title_task: None,
+            #[cfg(not(target_arch = "wasm32"))]
             title_saving: false,
             state,
             harnesses: Loadable::Idle,
@@ -127,11 +142,14 @@ impl HarnessesPage {
             cx.notify();
             return;
         }
-        self.title_task = None;
-        self.title_settings = Loadable::Idle;
-        self.title_models = Loadable::Idle;
-        self.title_menu = None;
-        self.title_saving = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.title_task = None;
+            self.title_settings = Loadable::Idle;
+            self.title_models = Loadable::Idle;
+            self.title_menu = None;
+            self.title_saving = false;
+        }
         self.target_device = target;
         self.error = None;
         self.harnesses = Loadable::Idle;
@@ -146,6 +164,7 @@ impl HarnessesPage {
             return;
         };
         let params = self.with_target(serde_json::json!({}));
+        #[cfg(not(target_arch = "wasm32"))]
         self.load_titles(None, cx);
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
@@ -163,6 +182,8 @@ impl HarnessesPage {
             .ok();
         }));
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
 
     fn load_titles(&mut self, save: Option<TitleSettings>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -243,6 +264,8 @@ impl HarnessesPage {
         }));
         cx.notify();
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
 
     fn render_titles(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut card = widgets::section_card(theme).mt(px(20.0)).p(px(16.0))
@@ -588,6 +611,9 @@ impl HarnessesPage {
         let Loadable::Ready(list) = &self.harnesses else {
             return Vec::new();
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let descriptors = list.clone();
+        #[cfg(target_arch = "wasm32")]
         let descriptors = visible_harnesses(list);
         let enabled_count = descriptors.iter().filter(|d| descriptor_enabled(d)).count();
         descriptors
@@ -717,7 +743,10 @@ impl Render for HarnessesPage {
             .clone()
             .map(|message| widgets::error_strip(&theme, message).into_any_element());
         let switcher = self.render_device_switcher(&theme, cx);
-        let titles = self.render_titles(&theme, cx);
+        #[cfg(not(target_arch = "wasm32"))]
+        let titles = Some(self.render_titles(&theme, cx));
+        #[cfg(target_arch = "wasm32")]
+        let titles: Option<AnyElement> = None;
 
         div()
             .id("harnesses-page")
@@ -746,7 +775,7 @@ impl Render for HarnessesPage {
                     )
                     .children(error)
                     .child(body)
-                    .child(titles),
+                    .children(titles),
             )
     }
 }

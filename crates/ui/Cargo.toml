@@ -26,17 +26,13 @@ url = "2"
 zeron-proto.workspace = true
 similar.workspace = true
 zeron-doc.workspace = true
-zeron-engine.workspace = true
-zeron-harness.workspace = true
-zeron-rpc.workspace = true
-zeron-update.workspace = true
-zeron-syntax.workspace = true
+zeron-rpc = { path = "../rpc", default-features = false, features = ["client"] }
+zeron-syntax = { path = "../syntax", default-features = false }
 zeron-theme.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
-gpui_tokio.workspace = true
+
 gpui-base.workspace = true
-tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -73,6 +69,28 @@ image = { version = "0.25", default-features = false, features = ["png", "ico", 
 
 [target.'cfg(target_os = "linux")'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+web-sys = { version = "0.3", features = ["Blob", "CssStyleDeclaration", "Document", "Element", "Event", "EventTarget", "File", "FileList", "HtmlElement", "HtmlIFrameElement", "HtmlInputElement", "Location", "Node", "Storage", "Window"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+web-time = "1"
+
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+
+zeron-rpc = { path = "../rpc", features = ["native"] }
+zeron-update.workspace = true
+gpui_tokio.workspace = true
+tokio.workspace = true
+zeron-syntax = { path = "../syntax", features = ["highlighting"] }
+
+
+zeron-engine.workspace = true
+zeron-harness.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
