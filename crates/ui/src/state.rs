@@ -4100,3 +4100,11 @@ mod tests {
         assert!(s.send_undelivered("c-remote", now));
     }
 }
+
+#[cfg(feature = "appshots-fixture")]
+impl AppState {
+    /// Keep fixture documents deterministic while using the real attachment RPC.
+    pub fn fixture_attachment_engine(&mut self, engine: EngineHandle) {
+        self.engine = Some(engine);
+    }
+}

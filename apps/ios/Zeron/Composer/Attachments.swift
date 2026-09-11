@@ -33,6 +33,7 @@ struct UserImageAttachment: Identifiable, Hashable {
     let id: String
     let path: String
     let name: String
+    var appshot: AppshotPresentation? = nil
 }
 
 struct ParsedUserMessage {
@@ -48,6 +49,7 @@ private func nameFromPath(_ path: String) -> String {
 /// message-attachments.ts `parseUserMessageImages`: split the visible prompt
 /// from its attachment-ref trailer (case-insensitive marker, `- path` lines).
 func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
+    let presentations = AppshotContext.presentations(content)
     let lines = content.components(separatedBy: "\n")
     var markerIx: Int?
     for (ix, raw) in lines.enumerated() where ix > 0 {
@@ -60,7 +62,7 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
         }
     }
     guard let markerIx else {
-        return ParsedUserMessage(text: content, attachments: [])
+        return ParsedUserMessage(text: AppshotContext.visibleText(content), attachments: [])
     }
     let attachments = lines[(markerIx + 1)...].compactMap { line -> String? in
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -68,14 +70,15 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
         let path = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
         return path.isEmpty ? nil : path
     }.enumerated().map { ix, path in
-        UserImageAttachment(id: "\(ix):\(path)", path: path, name: nameFromPath(path))
+        UserImageAttachment(id: "\(ix):\(path)", path: path, name: nameFromPath(path), appshot: presentations[path])
     }
     guard !attachments.isEmpty else {
-        return ParsedUserMessage(text: content, attachments: [])
+        return ParsedUserMessage(text: AppshotContext.visibleText(content), attachments: [])
     }
     let body = lines[..<(markerIx - 1)].joined(separator: "\n")
         .trimmingCharacters(in: .whitespacesAndNewlines)
-    return ParsedUserMessage(text: body == attachmentOnlyText ? "" : body,
+    let visible = AppshotContext.visibleText(body)
+    return ParsedUserMessage(text: visible == attachmentOnlyText ? "" : visible,
                              attachments: attachments)
 }
 
@@ -464,16 +467,37 @@ struct UserAttachmentsStrip: View {
     let attachments: [UserImageAttachment]
 
     var body: some View {
-        HStack(spacing: 8) {
-            Spacer(minLength: 0)
-            ForEach(attachments) { att in
-                AttachmentThumbView(deviceId: deviceId, path: att.path)
+        if attachments.contains(where: { $0.appshot != nil }) {
+            // Each capture remains reachable on a phone, including mixed
+            // ordinary images. Fixed card width avoids squeezing three into
+            // one clipped row; scrolling does not alter transcript height.
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 8) {
+                    ForEach(attachments) { att in
+                        if let source = att.appshot {
+                            AppshotCardView(deviceId: deviceId, attachment: att, source: source)
+                                .frame(width: 220)
+                        } else {
+                            AttachmentThumbView(deviceId: deviceId, path: att.path)
+                        }
+                    }
+                }
             }
+            .defaultScrollAnchor(.trailing)
+            .frame(height: 196)
+            .accessibilityLabel("Appshots and images")
+            .accessibilityIdentifier("appshot-attachments")
+        } else {
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                ForEach(attachments) { att in
+                    AttachmentThumbView(deviceId: deviceId, path: att.path)
+                }
+            }
+            .frame(height: 80)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .clipped()
         }
-        // Fixed height: load-state flips never shift the transcript.
-        .frame(height: 80)
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .clipped()
     }
 }
 
@@ -558,6 +582,15 @@ struct AttachmentLightbox: View {
             }
             .contentShape(Rectangle())
             .onTapGesture { dismiss() }
+            .overlay(alignment: .topTrailing) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.white).frame(width: 44, height: 44)
+                        .background(.black.opacity(0.6), in: Circle())
+                }
+                .accessibilityLabel("Close image preview")
+                .padding(12)
+            }
         }
         .presentationBackground(.clear)
     }

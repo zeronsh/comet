@@ -1,10 +1,11 @@
 //! Session notification sounds — the herdr approach (state-transition chimes
 //! played through the platform's own audio CLI, zero Rust audio deps):
 //!
-//! - two short chimes embedded in the binary (`assets/sounds/*.wav`, synthesized
+//! - short chimes embedded in the binary (`assets/sounds/*.wav`, synthesized
 //!   in-repo — no external assets): **done** (run finished) and **request**
-//!   (agent is asking a question);
-//! - playback = write to a temp file, hand it to the system player on a
+//!   (agent is asking a question), plus an **Appshot** confirmation cue;
+//! - macOS Appshots use a preloaded native player; other cues write to a
+//!   temp file and use the system player on a
 //!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
 //!   (Windows), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux —
 //!   WAV, so even bare ALSA `aplay` decodes it);
@@ -17,6 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static SOUND_APPSHOT: &[u8] = include_bytes!("../assets/sounds/appshot.wav");
 
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
 static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.wav");
@@ -33,16 +37,138 @@ pub enum Sound {
 /// Play a chime on a background thread. Silently a no-op when disabled or no
 /// player is available.
 pub fn play(sound: Sound) {
+    let data = match sound {
+        Sound::Done => SOUND_DONE,
+        Sound::Request => SOUND_REQUEST,
+    };
+    play_in_background(data);
+}
+
+/// Confirm captured pixels with a soft shutter and clear chime.
+/// The caller honors the dedicated capture sound setting.
+pub fn play_appshot() {
+    if std::env::var_os(DISABLE_ENV).is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if macos_appshot::play() {
+        return;
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    play_in_background(SOUND_APPSHOT);
+}
+
+/// Load the macOS capture cue before the first capture, without playing it.
+pub fn prepare_appshot() {
+    #[cfg(target_os = "macos")]
+    if std::env::var_os(DISABLE_ENV).is_none() {
+        macos_appshot::sender();
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_appshot {
+    use objc::rc::{StrongPtr, autoreleasepool};
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    use std::sync::{OnceLock, mpsc};
+
+    #[link(name = "AVFoundation", kind = "framework")]
+    unsafe extern "C" {}
+
+    // Keep native objects on one worker. A bounded mailbox avoids a backlog of
+    // stale confirmations when captures arrive in a burst.
+    pub(super) fn sender() -> Option<&'static mpsc::SyncSender<()>> {
+        static SENDER: OnceLock<Option<mpsc::SyncSender<()>>> = OnceLock::new();
+        SENDER
+            .get_or_init(|| {
+                let (tx, rx) = mpsc::sync_channel(1);
+                std::thread::Builder::new()
+                    .name("appshot-audio".into())
+                    .spawn(move || {
+                        let player = autoreleasepool(load);
+                        while rx.recv().is_ok() {
+                            if std::env::var_os(super::DISABLE_ENV).is_some() {
+                                continue;
+                            }
+                            let started = std::time::Instant::now();
+                            let played = player.as_ref().is_some_and(|player| {
+                                autoreleasepool(|| unsafe {
+                                    // Pause preserves prepared audio resources; stop would discard them.
+                                    let _: () = msg_send![**player, pause];
+                                    let _: () = msg_send![**player, setCurrentTime: 0.0_f64];
+                                    let played: bool = msg_send![**player, play];
+                                    played
+                                })
+                            });
+                            tracing::debug!(
+                                elapsed_ms = started.elapsed().as_millis(),
+                                played,
+                                "Appshot native playback requested"
+                            );
+                            if !played {
+                                super::play_in_background(super::SOUND_APPSHOT);
+                            }
+                        }
+                    })
+                    .ok()
+                    .map(|_| tx)
+            })
+            .as_ref()
+    }
+
+    fn load() -> Option<StrongPtr> {
+        let player = decode()?;
+        let ready: bool = unsafe { msg_send![*player, prepareToPlay] };
+        if !ready {
+            tracing::warn!("Could not prepare native Appshot audio; using system player");
+            return None;
+        }
+        Some(player)
+    }
+
+    fn decode() -> Option<StrongPtr> {
+        unsafe {
+            let data: *mut Object = msg_send![class!(NSData),
+                dataWithBytes: super::SOUND_APPSHOT.as_ptr()
+                length: super::SOUND_APPSHOT.len()];
+            let allocated: *mut Object = msg_send![class!(AVAudioPlayer), alloc];
+            let mut error: *mut Object = std::ptr::null_mut();
+            let player: *mut Object = msg_send![allocated, initWithData: data error: &mut error];
+            if player.is_null() {
+                tracing::warn!("Could not decode native Appshot audio; using system player");
+                return None;
+            }
+            Some(StrongPtr::new(player))
+        }
+    }
+
+    #[test]
+    fn embedded_appshot_decodes_natively_without_playback() {
+        autoreleasepool(|| {
+            let player = decode().expect("embedded Appshot should decode in AVAudioPlayer");
+            let duration: f64 = unsafe { msg_send![*player, duration] };
+            let playing: bool = unsafe { msg_send![*player, isPlaying] };
+            assert!((duration - 0.67).abs() < 0.001);
+            assert!(!playing);
+        });
+    }
+
+    pub(super) fn play() -> bool {
+        match sender().map(|tx| tx.try_send(())) {
+            Some(Ok(()) | Err(mpsc::TrySendError::Full(()))) => true,
+            _ => false,
+        }
+    }
+}
+
+fn play_in_background(data: &'static [u8]) {
     if std::env::var_os(DISABLE_ENV).is_some() {
         return;
     }
     std::thread::spawn(move || {
-        let data = match sound {
-            Sound::Done => SOUND_DONE,
-            Sound::Request => SOUND_REQUEST,
-        };
         if let Err(err) = play_bytes(data) {
-            tracing::debug!(?sound, error = %err, "notification sound playback failed");
+            tracing::debug!(error = %err, "sound playback failed");
         }
     });
 }
@@ -259,7 +385,12 @@ mod tests {
 
     #[test]
     fn embedded_chimes_are_wav() {
-        for data in [SOUND_DONE, SOUND_REQUEST] {
+        for data in [
+            SOUND_DONE,
+            SOUND_REQUEST,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            SOUND_APPSHOT,
+        ] {
             assert!(data.len() > 1000);
             assert_eq!(&data[..4], b"RIFF");
             assert_eq!(&data[8..12], b"WAVE");

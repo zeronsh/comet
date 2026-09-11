@@ -69,7 +69,8 @@ struct QueueComposerEdit {
     }
 
     func textToCommit(_ text: String) -> String? {
-        MessageQueue.editedText(text, hasAttachments: hasAttachments)
+        guard let edited = MessageQueue.editedText(text, hasAttachments: hasAttachments) else { return nil }
+        return edited + (AppshotContext.suffix(lease.text) ?? "")
     }
 }
 
@@ -84,9 +85,10 @@ enum MessageQueue {
     /// trailer. Strip it only for legacy rows whose parsed paths exactly match
     /// the separate attachments field.
     static func visibleText(_ text: String, attachments: [String]) -> String {
-        guard !attachments.isEmpty else { return text }
+        let visible = AppshotContext.visibleText(text)
+        guard !attachments.isEmpty else { return visible }
         let parsed = parseUserMessageImages(text)
-        guard parsed.attachments.map(\.path) == attachments else { return text }
+        guard parsed.attachments.map(\.path) == attachments else { return visible.isEmpty ? attachmentOnlyText : visible }
         return parsed.text.isEmpty ? attachmentOnlyText : parsed.text
     }
 

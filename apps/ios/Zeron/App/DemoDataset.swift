@@ -5,6 +5,7 @@
 
 import Foundation
 import Observation
+import UIKit
 
 @MainActor
 @Observable
@@ -181,7 +182,9 @@ final class DemoDataset {
     func sessionStore(for chatId: String) -> SessionStore {
         if let existing = stores[chatId] { return existing }
         let store = SessionStore(chatId: chatId, config: Self.dummyConfig, offline: true)
-        if ProcessInfo.processInfo.arguments.contains("-longprompt") {
+        if ProcessInfo.processInfo.arguments.contains("-appshots") {
+            seedAppshots(store)
+        } else if ProcessInfo.processInfo.arguments.contains("-longprompt") {
             store.setEntries([
                 MessageEntry(id: "long-prompt", role: .user,
                     parts: [.text(id: "t0", text: (1...18).map { "Requirement \($0): keep the transcript visible through every keyboard, streaming, and navigation transition." }.joined(separator: "\n"))],
@@ -199,6 +202,39 @@ final class DemoDataset {
         }
         stores[chatId] = store
         return store
+    }
+
+    /// Neutral, offline captures for native simulator presentation checks.
+    private func seedAppshots(_ store: SessionStore) {
+        let names = ["Safari", "Notes", "Finder"]
+        let titles = ["Fieldnotes · Product planning", "Design review · Notes", "Workspace ideas"]
+        let sizes = [CGSize(width: 960, height: 540), CGSize(width: 400, height: 800), CGSize(width: 600, height: 600)]
+        let paths = ["/demo/appshot-wide.png", "/demo/appshot-tall.png", "/demo/appshot-square.png"]
+        var context = AppshotContext.marker + "\n"
+        for index in names.indices {
+            let size = sizes[index]
+            let format = UIGraphicsImageRendererFormat(); format.scale = 1
+            let image = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+                UIColor(red: 0.96, green: 0.96, blue: 0.93, alpha: 1).setFill()
+                UIBezierPath(rect: CGRect(origin: .zero, size: size)).fill()
+                let ink = UIColor(red: 0.19, green: 0.30, blue: 0.23, alpha: 1)
+                ("Make room for good ideas." as NSString).draw(in: CGRect(x: 24, y: 40, width: size.width - 48, height: 70), withAttributes: [.font: UIFont.systemFont(ofSize: 28, weight: .semibold), .foregroundColor: ink])
+                for row in 0..<3 {
+                    let rect = CGRect(x: 24, y: 150 + row * 110, width: Int(size.width) - 48, height: 90)
+                    UIColor.white.setFill(); UIBezierPath(roundedRect: rect, cornerRadius: 10).fill()
+                    (["A calmer workspace", "Next steps", "Progress"][row] as NSString).draw(at: CGPoint(x: 40, y: rect.minY + 24), withAttributes: [.font: UIFont.systemFont(ofSize: 20), .foregroundColor: ink])
+                }
+            }
+            AttachmentImageCache.shared.seed(deviceId: "dev-mac", path: paths[index], name: "\(names[index]) Appshot.png", data: image.pngData()!)
+            context += "<appshot app=\"\(names[index])\" window-title=\"\(titles[index])\" image=\"\(paths[index])\">PRIVATE_OBSERVED_TEXT_MUST_STAY_HIDDEN</appshot>\n"
+        }
+        store.setEntries([
+            MessageEntry(id: "appshots-user", role: .user, parts: [.text(id: "t0", text: withAttachments(text: "Compare these layouts." + context, paths: paths))], createdAt: nowMs(), deviceId: "dev-mac", status: .complete, continuationOf: nil),
+            MessageEntry(id: "appshots-reply", role: .assistant, parts: [.text(id: "t0", text: "I’ll compare the spacing and reading order across these captures.")], createdAt: nowMs(), deviceId: "dev-mac", status: .complete, continuationOf: nil)
+        ])
+        store.enqueueMessage(text: "Check the narrow layout." + context, attachments: paths)
+        store.enqueueMessage(text: "Then review keyboard navigation.")
+        store.hostDeviceId = "dev-mac"
     }
 
     // MARK: Scripted transcripts

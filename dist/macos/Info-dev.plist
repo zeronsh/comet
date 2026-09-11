@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Zeron Dev</string>
+    <key>CFBundleExecutable</key>
+    <string>zeron</string>
+    <key>CFBundleIconFile</key>
+    <string>zeron.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>sh.zeron.app.dev</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Zeron Dev</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <!-- Filled by scripts/run-macos-dev.sh. Keeping these in the bundle (not
+         only the parent shell) means macOS privacy's “Quit & Reopen” starts
+         the same isolated development instance. -->
+    <key>LSEnvironment</key>
+    <dict>
+        <key>ZERON_DATA_DIR</key>
+        <string>__DATA_DIR__</string>
+        <key>ZERON_IPC_PORT</key>
+        <string>__IPC_PORT__</string>
+    </dict>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>

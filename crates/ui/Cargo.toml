@@ -7,6 +7,7 @@ publish.workspace = true
 
 [features]
 browser-fixture = []
+appshots-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
 [[example]]
@@ -20,6 +21,10 @@ required-features = ["browser-fixture"]
 [[example]]
 name = "browser-fixture"
 required-features = ["browser-fixture"]
+
+[[example]]
+name = "appshots-fixture"
+required-features = ["appshots-fixture"]
 
 [dependencies]
 url = "2"
@@ -56,6 +61,9 @@ chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+roxmltree = "0.21.1"
+png = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "webp"] }
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -69,10 +77,17 @@ objc2-app-kit = { version = "0.3.2", features = ["NSBitmapImageRep", "NSImage", 
 objc2-foundation = "0.3.2"
 objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKNavigationDelegate", "WKNavigationAction", "WKSnapshotConfiguration"] }
 reqwest.workspace = true
-image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "webp"] }
+core-foundation = "0.10"
+core-graphics = { version = "0.24", features = ["elcapitan", "highsierra", "link"] }
+foreign-types = "0.5"
+block = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts", "screenshot"] }
+atspi = { version = "0.30.0", features = ["zbus"] }
+async-io = "2"
+url = "2"
+x11rb = { version = "0.14.0", features = ["image"] }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

@@ -74,13 +74,15 @@ impl Render for QueueActionTooltip {
 /// Compact, borderless rows inside the queue's single glass surface.
 const ROW_HEIGHT: f32 = 36.0;
 const QUEUE_TEXT_SIZE: f32 = 12.5;
-const ROW_GAP: f32 = 2.0;
+const ROW_GAP: f32 = 0.0;
 const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
-const ROW_RADIUS: f32 = 8.0;
-const PANEL_PAD_X: f32 = 8.0;
-const PANEL_RADIUS: f32 = ROW_RADIUS + PANEL_PAD_X;
-const PANEL_PAD_TOP: f32 = PANEL_PAD_X;
+const PANEL_RADIUS: f32 = 16.0;
+const PANEL_BORDER: f32 = 1.0;
+const PANEL_INSET: f32 = 4.0;
+// Concentric with the tray's outer edge, including its layout border.
+const ROW_RADIUS: f32 = PANEL_RADIUS - PANEL_BORDER - PANEL_INSET;
+const PANEL_PAD_TOP: f32 = PANEL_INSET;
 /// The custom 24px queue glyphs have quieter geometry than the legacy set, so
 /// render them slightly larger to preserve the previous optical weight.
 const QUEUE_ICON_SIZE: f32 = 13.0;
@@ -176,6 +178,10 @@ fn one_line(text: &str) -> SharedString {
 /// an older client may still have stored the attachment trailer in `text`.
 /// Hide it only when the parsed paths exactly match the row's attachment field.
 fn queue_visible_text(text: &str, attachments: &[String]) -> String {
+    let text = crate::appshots::strip_context_for_display(text);
+    if text.trim().is_empty() && !attachments.is_empty() {
+        return crate::attachments::ATTACHMENT_ONLY_TEXT.to_string();
+    }
     if attachments.is_empty() {
         return text.to_string();
     }
@@ -196,6 +202,22 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     }
 }
 
+/// Presentation-only metadata. Never expose the observed accessibility payload.
+fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
+    let presentations = crate::appshots::presentations(text);
+    paths
+        .iter()
+        .map(|path| match presentations.get(path) {
+            Some(appshot) => format!("{} Appshot", appshot.app_name),
+            None => std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Image")
+                .to_owned(),
+        })
+        .collect()
+}
+
 fn queue_panel_surface(theme: &Theme) -> gpui::Div {
     div()
         .occlude()
@@ -204,9 +226,12 @@ fn queue_panel_surface(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.border)
         .when(!theme.is_frost(), |el| el.shadow_lg())
-        .px(px(PANEL_PAD_X))
+        // Inset hover surfaces so they stay inside the rounded tray.
+        .px(px(PANEL_INSET))
         .pt(px(PANEL_PAD_TOP))
-        .pb(px(QUEUE_COMPOSER_OVERLAP))
+        // The overlap is hidden behind the composer; retain a visible inset
+        // below the final row, matching the top and sides.
+        .pb(px(QUEUE_COMPOSER_OVERLAP + PANEL_INSET))
         .flex()
         .flex_col()
 }
@@ -235,6 +260,24 @@ fn queue_rows(
     .outset_bottom(QUEUE_TEXT_SIZE)
 }
 
+fn preview_load_gate() -> &'static futures::lock::Mutex<()> {
+    static GATE: std::sync::OnceLock<futures::lock::Mutex<()>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| futures::lock::Mutex::new(()))
+}
+
+pub(crate) struct QueuePreview {
+    image: Option<crate::attachments::CachedAttachmentImage>,
+    finished: bool,
+    // Keeping the task here cancels offscreen transfers on eviction.
+    _task: gpui::Task<()>,
+}
+
+fn visible_queue_rows(offset: f32, height: f32, count: usize) -> std::ops::Range<usize> {
+    let first = ((-offset).max(0.0) / ROW_SLOT).floor() as usize;
+    let last = first.saturating_add((height.max(0.0) / ROW_SLOT).ceil() as usize + 1);
+    first.min(count)..last.min(count)
+}
+
 impl Composer {
     /// The queue panel, or `None` when nothing is waiting. Like the composer,
     /// it is one frosted surface; rows use spacing and hover wash rather than
@@ -242,7 +285,7 @@ impl Composer {
     pub(crate) fn render_queue_panel(
         &mut self,
         show_head_shortcut: bool,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         // A drop outside the panel ends GPUI's active drag without invoking our
@@ -259,6 +302,7 @@ impl Composer {
             );
             (state.queue.clone(), chat_id, host_supports_actions)
         };
+        self.prepare_queue_previews(&items, window, cx);
         if items.is_empty() {
             return None;
         }
@@ -291,6 +335,7 @@ impl Composer {
         );
 
         let panel = queue_panel_surface(&theme)
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             // The complete glass surface is a drop target, including its
             // padding.
             .on_drag_move::<QueueDragPayload>(cx.listener(
@@ -397,6 +442,11 @@ impl Composer {
             &key,
             primary_action,
             resolved_primary.is_some(),
+            queue_head_shortcut_visible(
+                ix,
+                show_head_shortcut,
+                resolved_primary.is_some() && !being_removed,
+            ),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.activate_queued_primary(primary_id.clone(), primary_action, cx);
@@ -453,7 +503,11 @@ impl Composer {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(if self.queue_preview_limit() == 1 {
+                4.0
+            } else {
+                8.0
+            }))
             .rounded(px(ROW_RADIUS))
             .when(being_edited, |el| el.bg(crate::theme::ink(0.06)))
             .when(!being_edited && !being_removed, |el| {
@@ -481,15 +535,71 @@ impl Composer {
             // from the editing state.
             .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
             .when(!being_edited, |el| {
-                el.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(QUEUE_TEXT_SIZE))
-                        .text_color(theme.text.opacity(0.9))
-                        .child(text),
+                let labels = queue_attachment_labels(&item.text, &item.attachments);
+                let summary = if labels.len() > 1 {
+                    format!("{} attachments · {}", labels.len(), labels.join(" · "))
+                } else {
+                    labels.join(" · ")
+                };
+                let only_images = text.as_ref() == crate::attachments::ATTACHMENT_ONLY_TEXT;
+                let title = if only_images {
+                    summary.clone().into()
+                } else {
+                    text
+                };
+                let mut content = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(QUEUE_TEXT_SIZE))
+                            .line_height(px(16.0))
+                            .text_color(theme.text.opacity(0.9))
+                            .child(title),
+                    );
+                if !labels.is_empty() && !only_images {
+                    content = content.child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .line_height(px(13.0))
+                            .text_color(theme.text_muted)
+                            .child(summary),
+                    );
+                }
+                el.children(
+                    item.attachments
+                        .iter()
+                        .take(self.queue_preview_limit())
+                        .enumerate()
+                        .map(|(index, path)| self.queue_thumbnail(&key, index, path, cx)),
                 )
+                .when(item.attachments.len() > self.queue_preview_limit(), |el| {
+                    let remaining = item.attachments.len() - self.queue_preview_limit();
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("{key}-more-attachments")))
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .bg(crate::theme::ink(0.06))
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .aria_label(format!(
+                                "{remaining} more attachments; edit message to view all"
+                            ))
+                            .child(format!("+{remaining}")),
+                    )
+                })
+                .child(content)
             })
             .when(being_edited, |el| {
                 el.child(
@@ -503,14 +613,6 @@ impl Composer {
                         } else {
                             "Editing in composer"
                         }),
-                )
-            })
-            // Keep queued attachments visible alongside the message.
-            .when(!item.attachments.is_empty(), |el| {
-                el.child(
-                    crate::icons::icon(crate::icons::QUEUE_PAPERCLIP)
-                        .size(px(QUEUE_ICON_SIZE))
-                        .text_color(theme.text_muted.opacity(0.7)),
                 )
             })
             .when(being_edited, |el| {
@@ -535,19 +637,6 @@ impl Composer {
                         .gap(px(3.0))
                         .child(discard)
                         .child(edit)
-                        .when(
-                            queue_head_shortcut_visible(
-                                ix,
-                                show_head_shortcut,
-                                resolved_primary.is_some() && !being_removed,
-                            ),
-                            |el| {
-                                el.child(crate::popover::kbd_hint(
-                                    theme,
-                                    modifier_send_label(cfg!(target_os = "macos")),
-                                ))
-                            },
-                        )
                         .child(primary),
                 )
             });
@@ -573,6 +662,251 @@ impl Composer {
             .into_any_element()
     }
 
+    pub(crate) fn release_queue_previews(&mut self, cx: &mut gpui::App) {
+        for (_, preview) in self.queue_previews.drain() {
+            if let Some(image) = preview.image {
+                gpui::ImageSource::Image(image.image).evict(None, cx);
+            }
+        }
+    }
+
+    fn prepare_queue_previews(
+        &mut self,
+        items: &[QueuedMessage],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::attachments;
+        let state = self.state.read(cx);
+        let device = state
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .unwrap_or_default();
+        let engine = state.engine().cloned();
+        let target =
+            (state.local_device_id.as_deref() != Some(device.as_str())).then(|| device.clone());
+        let visible = visible_queue_rows(
+            f32::from(self.queue_scroll.offset().y),
+            f32::from(window.viewport_size().height) * 0.3,
+            items.len(),
+        );
+        let keys: std::collections::HashSet<_> = items[visible]
+            .iter()
+            .flat_map(|item| item.attachments.iter().take(self.queue_preview_limit()))
+            .map(|path| (device.clone(), path.clone()))
+            .take(64)
+            .collect();
+        self.queue_previews.retain(|key, preview| {
+            if keys.contains(key) {
+                return true;
+            }
+            if let Some(image) = &preview.image {
+                gpui::ImageSource::Image(image.image.clone()).evict(Some(window), cx);
+            }
+            false
+        });
+        let Some(engine) = engine else { return };
+        for key in keys {
+            if self.queue_previews.contains_key(&key) {
+                continue;
+            }
+            let engine = engine.clone();
+            let target = target.clone();
+            let task_key = key.clone();
+            let task = cx.spawn(async move |this, cx| {
+                let _permit = preview_load_gate().lock().await;
+                let source = match attachments::attachment_snapshot(&task_key.0, &task_key.1) {
+                    attachments::AttachmentSnapshot::Loaded(image) => {
+                        Some(attachments::LoadedAttachmentImage {
+                            name: image.name.to_string(),
+                            image: image.image,
+                        })
+                    }
+                    _ => {
+                        attachments::read_attachment_image(
+                            &engine,
+                            cx.background_executor(),
+                            target.as_deref(),
+                            &task_key.1,
+                        )
+                        .await
+                    }
+                };
+                let image = if let Some(source) = source {
+                    cx.background_executor()
+                        .spawn(async move {
+                            attachments::queue_thumbnail_image(&source.image).map(|image| {
+                                attachments::CachedAttachmentImage {
+                                    name: source.name.into(),
+                                    image,
+                                }
+                            })
+                        })
+                        .await
+                } else {
+                    None
+                };
+                this.update(cx, |this, cx| {
+                    if let Some(preview) = this.queue_previews.get_mut(&task_key) {
+                        preview.image = image;
+                        preview.finished = true;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+            self.queue_previews.insert(
+                key,
+                QueuePreview {
+                    image: None,
+                    finished: false,
+                    _task: task,
+                },
+            );
+        }
+    }
+
+    fn load_queue_full_preview(&mut self, device: String, path: String, cx: &mut Context<Self>) {
+        use crate::attachments;
+        if let attachments::AttachmentSnapshot::Loaded(image) =
+            attachments::attachment_snapshot(&device, &path)
+        {
+            self.queue_full_preview = None;
+            self.show_queue_image(
+                attachments::PreviewImage {
+                    name: image.name,
+                    image: image.image,
+                },
+                cx,
+            );
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let target = (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device);
+        let chat = state.selected_chat.clone();
+        self.queue_full_preview = Some(cx.spawn(async move |this, cx| {
+            let image = attachments::read_attachment_image(
+                &engine,
+                cx.background_executor(),
+                target.as_deref(),
+                &path,
+            )
+            .await;
+            this.update(cx, |this, cx| {
+                this.queue_full_preview = None;
+                if this.state.read(cx).selected_chat != chat {
+                    return;
+                }
+                if let Some(image) = image {
+                    this.show_queue_image(
+                        attachments::PreviewImage {
+                            name: image.name.into(),
+                            image: image.image,
+                        },
+                        cx,
+                    );
+                } else {
+                    this.show_appshot_error(
+                        "Could not load the image. Try opening it again.".into(),
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn queue_thumbnail(
+        &self,
+        key: &SharedString,
+        index: usize,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::attachments;
+        let device = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .unwrap_or_default();
+        let cache_key = (device.clone(), path.to_string());
+        let failed = self
+            .queue_previews
+            .get(&cache_key)
+            .is_some_and(|preview| preview.finished && preview.image.is_none());
+        let snapshot = self
+            .queue_previews
+            .get(&cache_key)
+            .and_then(|preview| preview.image.clone());
+        let frame = div()
+            .id(SharedString::from(format!("{key}-image-{index}")))
+            .w(px(40.0))
+            .h(px(28.0))
+            .flex_none()
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.1))
+            .bg(crate::theme::ink(0.035))
+            .overflow_hidden();
+        match snapshot {
+            Some(image) => {
+                let label = image.name.clone();
+                let path = path.to_owned();
+                let accent = Theme::of(cx).accent;
+                frame
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("Preview {}", label))
+                    .tab_index(0)
+                    .focus_visible(move |style| style.border_color(accent))
+                    .hover(move |style| style.border_color(accent))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.load_queue_full_preview(device.clone(), path.clone(), cx);
+                    }))
+                    .child(
+                        gpui::img(image.image)
+                            .w(px(38.0))
+                            .h(px(26.0))
+                            .rounded(px(4.0))
+                            .object_fit(gpui::ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            }
+            _ => frame
+                .when(failed, |frame| {
+                    let accent = Theme::of(cx).accent;
+                    frame
+                        .role(gpui::Role::Button)
+                        .aria_label("Open attachment preview")
+                        .tab_index(0)
+                        .focus_visible(move |style| style.border_color(accent))
+                        .cursor_pointer()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.queue_previews.remove(&cache_key);
+                            this.load_queue_full_preview(
+                                cache_key.0.clone(),
+                                cache_key.1.clone(),
+                                cx,
+                            );
+                            cx.notify();
+                        }))
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(icons::QUEUE_PAPERCLIP).size(px(14.0)))
+                .into_any_element(),
+        }
+    }
+
     /// A permanently-visible trailing glyph button. The queue reference keeps
     /// edit and remove present instead of revealing them only on hover.
     fn queue_action(
@@ -586,10 +920,13 @@ impl Composer {
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
         let own = SharedString::from(format!("{key}-{slot}-grp"));
+        let accent = theme.accent;
         div()
             .id(SharedString::from(format!("{key}-{slot}")))
             .group(own.clone())
-            .size(px(18.0))
+            .role(gpui::Role::Button)
+            .aria_label(label)
+            .size(px(28.0))
             .flex_none()
             .flex()
             .items_center()
@@ -599,7 +936,13 @@ impl Composer {
             .when(enabled, |el| {
                 el.cursor_pointer()
                     .hover(|s| s.opacity(1.0).bg(crate::theme::ink(0.07)))
-                    .on_click(on_click)
+                    .tab_index(0)
+                    .focus_visible(move |s| s.bg(accent.opacity(0.18)).text_color(accent))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |event, window, cx| {
+                        cx.stop_propagation();
+                        on_click(event, window, cx);
+                    })
             })
             .when(!enabled, |el| {
                 el.cursor(gpui::CursorStyle::Arrow).opacity(0.45)
@@ -626,6 +969,7 @@ impl Composer {
         key: &SharedString,
         action: QueuePrimaryAction,
         enabled: bool,
+        show_shortcut: bool,
         theme: &Theme,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
@@ -634,27 +978,35 @@ impl Composer {
         } else {
             "Waiting for provider capabilities"
         };
+        let accent = theme.accent;
+        let compact = self.queue_preview_limit() == 1;
         div()
             .id(SharedString::from(format!("{key}-primary")))
-            .h(px(22.0))
+            .role(gpui::Role::Button)
+            .aria_label(tooltip)
+            // Both labels occupy the same slot; modifier previews never move
+            // the message text, thumbnails, or adjacent actions.
+            .w(px(if compact { 28.0 } else { 72.0 }))
+            .h(px(28.0))
             .flex_none()
-            .px(px(6.0))
             .flex()
-            .flex_row()
             .items_center()
-            .gap(px(4.0))
-            .rounded(px(6.0))
+            .justify_center()
+            .rounded(px(5.0))
             .text_size(px(11.5))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_muted.opacity(0.82))
+            .text_color(theme.text_muted)
             .when(enabled, |el| {
                 el.cursor_pointer()
+                    .tab_index(0)
                     .hover(|s| s.bg(crate::theme::ink(0.07)).text_color(theme.text))
-                    .on_click(on_click)
+                    .focus_visible(move |s| s.bg(accent.opacity(0.18)).text_color(accent))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |event, window, cx| {
+                        cx.stop_propagation();
+                        on_click(event, window, cx);
+                    })
             })
-            .when(!enabled, |el| {
-                el.cursor(gpui::CursorStyle::Arrow).opacity(0.5)
-            })
+            .when(!enabled, |el| el.opacity(0.45))
             .tooltip(move |_, cx| {
                 cx.new(|_| QueueActionTooltip {
                     label: tooltip.into(),
@@ -662,7 +1014,26 @@ impl Composer {
                 .into()
             })
             .tooltip_show_delay(std::time::Duration::from_millis(350))
-            .child("Send now")
+            .child(if show_shortcut {
+                div()
+                    .child(if compact {
+                        if cfg!(target_os = "macos") {
+                            "⌘↵"
+                        } else {
+                            "⌃↵"
+                        }
+                    } else {
+                        modifier_send_label(cfg!(target_os = "macos"))
+                    })
+                    .into_any_element()
+            } else if compact {
+                icon(icons::QUEUE_SEND)
+                    .size(px(QUEUE_ICON_SIZE))
+                    .text_color(theme.text_muted)
+                    .into_any_element()
+            } else {
+                div().child("Send now").into_any_element()
+            })
             .into_any_element()
     }
 
@@ -928,6 +1299,7 @@ impl Composer {
                 .call(methods::BEGIN_QUEUED_MESSAGE_EDIT, params)
                 .await;
             let mut loaded_attachments = Vec::new();
+            let mut loaded_appshots = Vec::new();
             if let Ok(reply) = &result
                 && reply.get("outcome").and_then(|v| v.as_str()) == Some("acquired")
             {
@@ -945,6 +1317,16 @@ impl Composer {
                         None => { load_failed = true; break; }
                     }
                 }
+                if !load_failed {
+                    let paths: Vec<String> = serde_json::from_value(reply["attachments"].clone()).unwrap_or_default();
+                    match crate::appshots::restore_queued_appshots(
+                        reply.get("text").and_then(|v| v.as_str()).unwrap_or_default(),
+                        &paths, &loaded_attachments,
+                    ) {
+                        Ok((ordinary, shots)) => { loaded_attachments = ordinary; loaded_appshots = shots; }
+                        Err(_) => { load_failed = true; }
+                    }
+                }
                 if load_failed {
                     let _ = engine.client().call(methods::FINISH_QUEUED_MESSAGE_EDIT, serde_json::json!({
                         "chatId": chat_id, "id": id, "leaseId": reply.get("leaseId"),
@@ -952,7 +1334,7 @@ impl Composer {
                     })).await;
                     this.update(cx, |composer, cx| {
                         composer.queue_edit_pending_id = None;
-                        composer.failure = Some("Couldn't load the queued attachments. Check the connection and update the chat host.".into());
+                        composer.failure = Some("Couldn't load the queued attachments or Appshot context. Check the connection and update the chat host.".into());
                         cx.notify();
                     }).ok();
                     return;
@@ -1018,8 +1400,10 @@ impl Composer {
                         composer.queue_edit_draft = Some((
                             composer.input.read(cx).text().to_string(),
                             composer.attachments.remove(&composer.current_key).unwrap_or_default(),
+                            composer.appshots.remove(&composer.current_key).unwrap_or_default(),
                         ));
                         composer.attachments.insert(composer.current_key.clone(), loaded_attachments);
+                        composer.appshots.insert(composer.current_key.clone(), loaded_appshots);
                         composer.focus_pending = true;
                         composer.input.update(cx, |input, cx| input.set_text(text, cx));
                         composer.start_queue_edit_renewal(engine.clone(), cx);
@@ -1054,7 +1438,7 @@ impl Composer {
             return false;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        if text.is_empty() && self.staged().is_empty() {
+        if text.is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
             self.finish_queue_edit("discard", None, cx);
         } else {
             self.finish_queue_edit("commit", Some(text), cx);
@@ -1090,7 +1474,8 @@ impl Composer {
         });
         self.queue_edit_task = None;
         self.queue_edit_renew_task = None;
-        if let Some((text, attachments)) = self.queue_edit_draft.take() {
+        if let Some((text, attachments, appshots)) = self.queue_edit_draft.take() {
+            self.appshots.insert(self.current_key.clone(), appshots);
             self.input.update(cx, |input, cx| input.set_text(text, cx));
             self.attachments
                 .insert(self.current_key.clone(), attachments);
@@ -1120,7 +1505,9 @@ impl Composer {
             return;
         };
         let expected = self.queue_edit_base_text_hash.clone();
-        let staged = self.staged().to_vec();
+        let mut staged = self.staged().to_vec();
+        let staged_appshots = self.staged_appshots().to_vec();
+        staged.extend(staged_appshots.iter().map(|shot| shot.screenshot.clone()));
         let mut params = serde_json::json!({
             "chatId": chat_id,
             "id": id,
@@ -1147,6 +1534,11 @@ impl Composer {
                         ).await.map_err(|err| err.to_string())?;
                         paths.push(path);
                     }
+                    let appshot_paths = staged.iter().zip(&paths)
+                        .map(|(attachment, path)| (attachment.id.clone(), path.clone())).collect();
+                    params["text"] = crate::appshots::with_appshots(
+                        params["text"].as_str().unwrap_or_default(), &staged_appshots, &appshot_paths,
+                    ).into();
                     if params["text"].as_str().is_some_and(|text| text.trim().is_empty()) && !paths.is_empty() {
                         params["text"] = crate::attachments::ATTACHMENT_ONLY_TEXT.into();
                     }
@@ -1396,8 +1788,21 @@ mod tests {
     use super::{
         PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action, one_line,
         queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_head_shortcut_visible,
-        queue_mutation_acknowledged, queue_visible_text,
+        queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
     };
+
+    #[test]
+    fn queue_preview_work_follows_the_visible_rows() {
+        assert_eq!(visible_queue_rows(0.0, ROW_SLOT * 3.0, 1000), 0..4);
+        assert_eq!(
+            visible_queue_rows(-ROW_SLOT * 20.0, ROW_SLOT * 3.0, 1000),
+            20..24
+        );
+        assert_eq!(
+            visible_queue_rows(-ROW_SLOT * 20.0, ROW_SLOT * 3.0, 0),
+            0..0
+        );
+    }
 
     #[test]
     fn available_primary_action_obeys_row_and_host_gates() {
@@ -1480,6 +1885,60 @@ mod tests {
             "fix the test then ship it"
         );
         assert_eq!(one_line("  spaced   out  ").as_ref(), "spaced out");
+    }
+
+    #[test]
+    fn appshot_context_is_hidden_in_clean_and_legacy_queue_rows() {
+        let shot = crate::appshots::tests::shot();
+        let paths: Vec<String> = vec!["/host/image.png".into()];
+        for user_text in ["inspect this", ""] {
+            let body = crate::appshots::with_appshots(
+                user_text,
+                &[shot.clone()],
+                &std::collections::HashMap::from([(shot.screenshot.id.clone(), paths[0].clone())]),
+            );
+            let expected = if user_text.is_empty() {
+                crate::attachments::ATTACHMENT_ONLY_TEXT
+            } else {
+                user_text
+            };
+            assert_eq!(queue_visible_text(&body, &paths), expected);
+            assert_eq!(
+                queue_visible_text(&crate::attachments::with_attachments(&body, &paths), &paths),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_labels_decode_app_names_and_preserve_ordinary_images() {
+        let shot = crate::appshots::tests::shot();
+        let paths = vec![
+            "/tmp/shot & detail.png".to_owned(),
+            "/tmp/reference.png".to_owned(),
+        ];
+        let mut shot = shot;
+        shot.app_name = "Notes & Ideas".into();
+        let body = crate::appshots::with_appshots(
+            "look",
+            &[shot.clone()],
+            &[(shot.screenshot.id.clone(), paths[0].clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            super::queue_attachment_labels(&body, &paths),
+            vec!["Notes & Ideas Appshot", "reference.png"]
+        );
+        assert_eq!(
+            super::queue_attachment_labels(&body, &["/tmp/other.png".into()]),
+            vec!["other.png"]
+        );
+        let malformed = format!("\n\n{}\n<appshot", crate::appshots::CONTEXT_MARKER);
+        assert_eq!(
+            super::queue_attachment_labels(&malformed, &paths),
+            vec!["shot & detail.png", "reference.png"]
+        );
     }
 
     #[test]
@@ -1578,5 +2037,32 @@ mod scroll_tests {
         cx.run_until_parked();
         assert_eq!(transcript.offset().y, px(0.0));
         assert_eq!(queue.max_offset().y, px(0.0));
+    }
+}
+
+#[cfg(test)]
+mod appshot_edit_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn restoring_displaced_draft_keeps_appshots_and_new_captures(cx: &mut TestAppContext) {
+        let state = cx.new(|_| crate::state::AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let original = crate::appshots::tests::shot();
+            let mut during_save = original.clone();
+            during_save.id = "during-save".into();
+            composer.queue_edit_draft = Some(("draft".into(), vec![], vec![original]));
+            composer.editing_queued = Some("row".into());
+            composer.queue_edit_finishing = true;
+            composer.stage_appshot(during_save, cx);
+            assert!(composer.staged_appshots().is_empty());
+            composer.clear_queue_edit_local(cx);
+            assert_eq!(composer.input.read(cx).text(), "draft");
+            assert_eq!(composer.staged_appshots().len(), 2);
+            assert_eq!(composer.staged_appshots()[1].id, "during-save");
+            assert!(composer.editing_queued.is_none());
+        });
     }
 }

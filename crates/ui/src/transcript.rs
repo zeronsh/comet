@@ -4512,6 +4512,7 @@ impl Transcript {
         &mut self,
         row_id: &SharedString,
         atts: &[crate::attachments::UserImageAttachment],
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -4559,6 +4560,151 @@ impl Transcript {
                         .then(|| self.state.read(cx).upload_progress_percent())
                         .flatten()
                 });
+            if let Some(appshot) = &att.appshot {
+                let has_image = matches!(&state, AttachmentSnapshot::Loaded(_));
+                let theme = Theme::of(cx).clone();
+                let accent = theme.accent;
+                let width = 240.0;
+                let mut card = div()
+                    .id(SharedString::from(format!("{row_id}-appshot-{aix}")))
+                    .w(px(width))
+                    .max_w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .rounded(px(14.0))
+                    .p(px(8.0))
+                    .gap(px(6.0))
+                    .hover(|style| style.bg(crate::theme::ink(0.045)));
+                let image_frame = div()
+                    .w_full()
+                    .h(px(128.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.0))
+                    .overflow_hidden();
+                card = match state {
+                    AttachmentSnapshot::Loaded(image) => {
+                        let preview = crate::attachments::PreviewImage {
+                            name: image.name,
+                            image: image.image.clone(),
+                        };
+                        card.role(gpui::Role::Button)
+                            .aria_label(format!(
+                                "Preview {} Appshot: {}",
+                                appshot.app_name,
+                                appshot.title()
+                            ))
+                            .tab_index(0)
+                            .cursor_pointer()
+                            .focus_visible(move |style| style.border_2().border_color(accent))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.attachment_preview = Some(preview.clone());
+                                window.focus(&this.attachment_preview_focus, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                image_frame.child(crate::edge_fade::edge_faded(
+                                    32.0,
+                                    false,
+                                    true,
+                                    img(image.image)
+                                        .w_full()
+                                        .h(px(126.0))
+                                        .rounded(px(5.0))
+                                        .object_fit(ObjectFit::Contain),
+                                )),
+                            )
+                    }
+                    AttachmentSnapshot::Loading => card.child(
+                        image_frame.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(if sending {
+                                    "Uploading Appshot…"
+                                } else {
+                                    "Loading Appshot…"
+                                }),
+                        ),
+                    ),
+                    AttachmentSnapshot::Error { .. } => card.child(
+                        image_frame.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .child(if sending {
+                                    "Uploading Appshot…"
+                                } else {
+                                    "Appshot unavailable"
+                                }),
+                        ),
+                    ),
+                };
+                card = card
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .max_w_full()
+                            .child(
+                                div()
+                                    .size(px(24.0))
+                                    .flex_none()
+                                    .rounded(px(6.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(match crate::appshots::presentation_icon(appshot) {
+                                        Some(icon) => img(icon)
+                                            .size(px(24.0))
+                                            .object_fit(ObjectFit::Contain)
+                                            .into_any_element(),
+                                        None => crate::icons::icon(crate::icons::MONITOR)
+                                            .size(px(15.0))
+                                            .text_color(theme.text_muted)
+                                            .into_any_element(),
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(format!(
+                                        "{} · Appshot",
+                                        appshot.app_name
+                                    ))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_center()
+                            .text_size(px(12.0))
+                            .text_color(theme.text)
+                            .child(SharedString::from(appshot.title().to_string())),
+                    );
+                if sending && (has_image || uploading.is_some()) {
+                    card = card.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(
+                                uploading
+                                    .map(|pct| format!("Uploading {pct}%"))
+                                    .unwrap_or_else(|| "Uploading…".into()),
+                            )),
+                    );
+                }
+                strip = strip.child(card);
+                continue;
+            }
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -4867,7 +5013,12 @@ impl Transcript {
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
-                    column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
+                    column = column.child(self.render_user_attachments(
+                        &row.id,
+                        &attachments,
+                        window,
+                        cx,
+                    ));
                 }
                 if !badges.is_empty() {
                     column = column.child(
@@ -10020,5 +10171,13 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+}
+
+#[cfg(feature = "appshots-fixture")]
+impl Transcript {
+    pub fn fixture_appshots_start(&mut self, cx: &mut Context<Self>) {
+        self.list.scroll_to(gpui::ListOffset::default());
+        cx.notify();
     }
 }
