@@ -170,7 +170,9 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
 }
 
 /// Compose the child's PATH: the resolved executable's directory first, then
-/// our own PATH, then the login-shell PATH snapshot — deduped. npm-shim CLIs
+/// our own PATH, then the login-shell PATH snapshot — deduped. Also forwards
+/// login-shell-exported environment variables the daemon doesn't define
+/// (see [`crate::shell_env`]). npm-shim CLIs
 /// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
 /// version manager's bin dir, and the CLIs themselves shell out to tools
 /// (git, rg, node) that a GUI/service launch's own PATH may lack.
@@ -197,6 +199,9 @@ fn compose_path<'a>(
     if let Ok(joined) = std::env::join_paths(paths) {
         cmd.env("PATH", joined);
     }
+    // Exported rc-file variables — API keys, base URLs, proxies, … — reach
+    // the child too, but only ones the daemon's own env doesn't define.
+    shell_env::apply_login_shell_env(cmd);
 }
 
 /// Rolling tail of a child's stderr, shared between the reader task and the
