@@ -10,31 +10,17 @@ publish = false
 debug = 0
 
 [dependencies]
-zeron-doc = { path = "../../crates/doc" }
-
 zeron-ui = { path = "../../crates/ui" }
 zeron-proto = { path = "../../crates/proto" }
 zeron-rpc = { path = "../../crates/rpc", default-features = false, features = ["client"] }
-zeron-theme = { path = "../../crates/theme" }
-zeron-syntax = { path = "../../crates/syntax", default-features = false }
 gpui = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
 gpui_platform = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
-gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "8c3af053189209db83b92b64aaa5cbcbedd9b72f" }
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Node", "HtmlElement", "Location", "WebSocket", "BinaryType", "MessageEvent", "Event", "CloseEvent", "ErrorEvent", "Request", "RequestInit", "RequestCredentials", "Response", "Headers", "AbortController", "AbortSignal"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-time = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["js"] }
-unicode-segmentation = "1"
-pulldown-cmark = "0.12"
-chrono = { version = "0.4", features = ["wasmbind"] }
-similar = "2"
-sha2 = "0.10"
-tracing = "0.1"
-async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [patch."https://github.com/zeronsh/zui"]

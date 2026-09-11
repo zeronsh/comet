@@ -1407,30 +1407,17 @@ dependencies = [
 name = "comet-web"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "chrono",
  "gpui",
- "gpui-base",
  "gpui_platform",
  "js-sys",
- "pulldown-cmark",
  "serde",
  "serde_json",
- "sha2",
- "similar",
  "tokio",
- "tracing",
- "unicode-segmentation",
- "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "web-time",
- "zeron-doc",
  "zeron-proto",
  "zeron-rpc",
- "zeron-syntax",
- "zeron-theme",
  "zeron-ui",
 ]
 
