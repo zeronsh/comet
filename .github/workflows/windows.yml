@@ -67,6 +67,8 @@ jobs:
         run: cargo test --release --locked -p zeron-harness --features native-fixture --test codex_availability --test windows_native
       - name: Harness catalog tests
         run: cargo test --release --locked -p zeron-engine --test codex_catalog
+      - name: Auth integration tests
+        run: cargo test --release --locked -p zeron-engine --test auth
       - name: UI tests
         run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
       - name: CLI startup without HOME

@@ -57,11 +57,13 @@ use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
-/// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
-/// then our own PATH, then the login-shell PATH snapshot (the user's shell
-/// init shapes PATH in ways a GUI/service launch never sees — see
-/// [`crate::shell_env`]), then known install locations as a last resort.
-/// Resolved per call — cheap after the snapshot is cached.
+/// Locate the device's installed Claude Code CLI: our own PATH, then the
+/// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
+/// GUI/service launch never sees — see [`crate::shell_env`]), then known
+/// install locations as a last resort. The `CLAUDE_CODE_EXECUTABLE` override
+/// is applied by [`ClaudeHarness::resolve_executable`], so availability and
+/// launches agree on one resolution order. Resolved per call — cheap after
+/// the snapshot is cached.
 fn resolve_claude_executable() -> Option<PathBuf> {
     let mut extra = Vec::new();
     if let Some(home) = crate::executable::home_dir() {
@@ -358,7 +360,10 @@ impl Harness for ClaudeHarness {
         ]
     }
     fn installed(&self) -> bool {
-        self.executable.is_some() || resolve_claude_executable().is_some()
+        // The launch resolver, not bare discovery: a valid CLAUDE_CODE_EXECUTABLE
+        // (or a test `executable`) must report installed, and an invalid one
+        // must not — availability and launches share one resolution.
+        self.resolve_executable().is_ok()
     }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {

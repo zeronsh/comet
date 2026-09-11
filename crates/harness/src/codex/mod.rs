@@ -82,6 +82,21 @@ fn resolve_codex_executable() -> Option<PathBuf> {
     crate::executable::find_on_paths("codex", extra)
 }
 
+/// A ready-to-spawn `codex login` command for the engine's account flow.
+///
+/// Shares the harness's full resolution (`CODEX_EXECUTABLE`, PATH, login-shell
+/// snapshot, install locations — including the Windows npm payload layout) and
+/// its child-PATH composition, so "Add account" launches exactly the binary
+/// the harness itself would run. `CODEX_HOME` isolates the login from the live
+/// `~/.codex` session; the caller owns stdio wiring and cancellation.
+pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessError> {
+    let exe = CodexHarness::new().resolve_executable()?;
+    let mut cmd = Command::new(&exe);
+    crate::compose_child_path(&mut cmd, &exe);
+    cmd.arg("login").env("CODEX_HOME", codex_home);
+    Ok(cmd)
+}
+
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {

@@ -231,7 +231,9 @@ impl InstallKind {
         match self {
             Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
             #[cfg(windows)]
-            Self::WindowsPortable { directory } => windows::stage(edge_url, manifest, directory).await,
+            Self::WindowsPortable { directory } => {
+                windows::stage(edge_url, manifest, directory).await
+            }
             _ => bail!("this installation does not support desktop updates"),
         }
     }

@@ -589,10 +589,25 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut command = zeron_harness::process::Command::new("codex");
+        // Resolve through the harness itself (`CODEX_EXECUTABLE`, PATH, the
+        // login-shell snapshot, install dirs — the Windows npm payload
+        // included) and compose the same child PATH a chat run gets, so
+        // account login never diverges from what the harness can launch.
+        let mut command = match zeron_harness::codex::login_command(&home) {
+            Ok(command) => command,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(match err {
+                    zeron_harness::HarnessError::NotInstalled(hint) => {
+                        format!(
+                            "The `codex` CLI was not found on this device — install it first. ({hint})"
+                        )
+                    }
+                    other => format!("Could not resolve the codex CLI for login: {other}"),
+                }));
+            }
+        };
         command
-            .arg("login")
-            .env("CODEX_HOME", &home)
             .stdin(zeron_harness::process::Stdio::null())
             .stdout(zeron_harness::process::Stdio::piped())
             .stderr(zeron_harness::process::Stdio::piped());
