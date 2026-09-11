@@ -7564,19 +7564,21 @@ impl Shell {
                         this.close_right_surface(surface, window, cx);
                     }),
                 )
-                .on_drag(
-                    RightTabDrag {
-                        panel_key: self.panel_key(cx),
-                        from: ix,
-                        title: ghost_title,
-                        workspace_path,
-                    },
-                    |payload, _point, _, cx| {
-                        let title = payload.title.clone();
-                        cx.stop_propagation();
-                        cx.new(|_| SurfaceTabGhost { title })
-                    },
-                )
+                .when(crate::click_activation_drag_enabled(), |el| {
+                    el.on_drag(
+                        RightTabDrag {
+                            panel_key: self.panel_key(cx),
+                            from: ix,
+                            title: ghost_title,
+                            workspace_path,
+                        },
+                        |payload, _point, _, cx| {
+                            let title = payload.title.clone();
+                            cx.stop_propagation();
+                            cx.new(|_| SurfaceTabGhost { title })
+                        },
+                    )
+                })
                 .child(
                     // Leading slot: icon normally, ✕ on tab hover — two
                     // stacked layers opacity-swapped by the group hover.
@@ -10658,13 +10660,41 @@ mod right_tab_mouse_regressions {
             Some(MouseButton::Left),
             gpui::Modifiers::default(),
         );
-        cx.update(|_, cx| assert!(cx.has_active_drag(), "tab body no longer starts a drag"));
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.has_active_drag(),
+                crate::click_activation_drag_enabled(),
+                "tab drag policy does not match the current platform"
+            )
+        });
         cx.simulate_mouse_up(start, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_down(start, MouseButton::Middle, gpui::Modifiers::default());
         cx.simulate_mouse_up(start, MouseButton::Middle, gpui::Modifiers::default());
         shell.read_with(cx, |shell, _| {
             assert!(!shell.subagent_tabs.contains_key(&1));
             assert!(shell.subagent_tabs.contains_key(&2));
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    fn subagent_tab_click_jitter_selects_without_starting_a_drag(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let start = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        let end = start + gpui::point(px(8.), px(0.));
+
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            assert!(
+                !cx.has_active_drag(),
+                "ordinary Windows click jitter started a tab drag"
+            )
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
         });
     }
 }

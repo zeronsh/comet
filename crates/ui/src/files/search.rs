@@ -550,9 +550,11 @@ impl FilesSurface {
                 this.search_state.active = index;
                 this.activate_search_result(cx);
             }))
-            .on_drag(drag_payload, |payload, _, _, cx| {
-                cx.stop_propagation();
-                workspace_path_drag_ghost(payload, cx)
+            .when(crate::click_activation_drag_enabled(), |element| {
+                element.on_drag(drag_payload, |payload, _, _, cx| {
+                    cx.stop_propagation();
+                    workspace_path_drag_ghost(payload, cx)
+                })
             })
             .child(
                 div()
