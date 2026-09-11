@@ -10,13 +10,20 @@ mod update_cli;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "zeron", about = "Multi-device controller for coding agents")]
+#[command(
+    name = "zeron",
+    version,
+    about = "Multi-device controller for coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     /// Open a Zeron conversation URL.
     #[arg(value_name = "URL")]
     open_url: Option<String>,
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    wait_for_exit: Option<u32>,
 }
 
 #[derive(Subcommand)]
@@ -103,6 +110,10 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Some(pid) = cli.wait_for_exit {
+        zeron_update::windows::wait_for_exit(pid)?;
+    }
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     // loro's internal block-encode diagnostics log at info and flood

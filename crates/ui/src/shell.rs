@@ -5323,9 +5323,9 @@ impl Shell {
         if self.update_dismissed.as_deref() == Some(latest.as_str()) {
             return None;
         }
-        let mac_app = matches!(self.install, zeron_update::InstallKind::MacApp { .. });
+        let desktop_update = self.install.supports_desktop_update();
 
-        let (label, clickable): (SharedString, bool) = if mac_app {
+        let (label, clickable): (SharedString, bool) = if desktop_update {
             match &self.update_flow {
                 UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
                 UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
@@ -5376,7 +5376,7 @@ impl Shell {
     /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
     /// installs → dismiss for this version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.install, zeron_update::InstallKind::MacApp { .. }) {
+        if !self.install.supports_desktop_update() {
             self.update_dismissed = self
                 .state
                 .read(cx)
@@ -5398,10 +5398,11 @@ impl Shell {
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
+        let install = self.install.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
             let manifest = zeron_update::fetch_latest(&edge_url).await?;
-            zeron_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            install.stage_desktop(&edge_url, &manifest, &data_dir).await
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -5431,12 +5432,8 @@ impl Shell {
         if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
             return;
         }
-        let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
-            return;
-        };
-        match zeron_update::apply_mac_app(&staged, &bundle) {
+        match self.install.apply_desktop(&staged) {
             Ok(()) => {
-                zeron_update::relaunch_app_after_exit(&bundle);
                 crate::app_menus::quit_after_save(cx);
             }
             Err(err) => {

@@ -28,6 +28,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
 
+#[cfg(windows)]
+pub mod windows;
+
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -132,9 +135,9 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
 /// Fetch the newest release metadata: `manifest.json`, falling back to
 /// `latest.txt` (version only, no checksums) for pre-manifest releases.
 pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
-    let base = edge_url.trim_end_matches('/');
+    let base = release_base(edge_url)?;
     let client = http_client()?;
-    let manifest_url = format!("{base}/releases/manifest.json");
+    let manifest_url = format!("{base}/manifest.json");
     match client.get(&manifest_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let manifest: Manifest = resp.json().await.context("parsing manifest.json")?;
@@ -148,7 +151,7 @@ pub async fn fetch_latest(edge_url: &str) -> anyhow::Result<Manifest> {
         }
         Err(err) => tracing::debug!(error = %err, "manifest.json fetch failed; trying latest.txt"),
     }
-    let latest_url = format!("{base}/releases/latest.txt");
+    let latest_url = format!("{base}/latest.txt");
     let version = client
         .get(&latest_url)
         .send()
@@ -177,6 +180,19 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
         .context("building http client")
 }
 
+fn release_base(edge_url: &str) -> anyhow::Result<String> {
+    if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
+        && !url.trim().is_empty()
+    {
+        return Ok(url.trim_end_matches('/').to_owned());
+    }
+    #[cfg(windows)]
+    if let Some(url) = windows::release_url()? {
+        return Ok(url.trim_end_matches('/').to_owned());
+    }
+    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+}
+
 // ---------------------------------------------------------------------------
 // Install-kind detection
 // ---------------------------------------------------------------------------
@@ -189,8 +205,50 @@ pub enum InstallKind {
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
     MacApp { bundle: PathBuf },
+    /// Portable Windows package with an explicit update-feed configuration.
+    #[cfg(windows)]
+    WindowsPortable { directory: PathBuf },
     /// Source build or hand-copied binary — updates are report-only.
     Unmanaged,
+}
+
+impl InstallKind {
+    pub fn supports_desktop_update(&self) -> bool {
+        match self {
+            Self::MacApp { .. } => true,
+            #[cfg(windows)]
+            Self::WindowsPortable { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub async fn stage_desktop(
+        &self,
+        edge_url: &str,
+        manifest: &Manifest,
+        data_dir: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        match self {
+            Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
+            #[cfg(windows)]
+            Self::WindowsPortable { directory } => windows::stage(edge_url, manifest, directory).await,
+            _ => bail!("this installation does not support desktop updates"),
+        }
+    }
+
+    /// Install and arrange a relaunch. The UI must quit after this succeeds.
+    pub fn apply_desktop(&self, staged: &Path) -> anyhow::Result<()> {
+        match self {
+            Self::MacApp { bundle } => {
+                apply_mac_app(staged, bundle)?;
+                relaunch_app_after_exit(bundle);
+                Ok(())
+            }
+            #[cfg(windows)]
+            Self::WindowsPortable { directory } => windows::apply(staged, directory, true),
+            _ => bail!("this installation does not support desktop updates"),
+        }
+    }
 }
 
 pub fn detect_install() -> InstallKind {
@@ -206,8 +264,14 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
 }
 
 fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> InstallKind {
-    // Windows has no in-process installer yet. Never interpret a coincidental
-    // `%HOME%\.zeron\app` layout as the Unix symlink-managed installation.
+    #[cfg(windows)]
+    if os == "windows" && windows::is_managed(exe) {
+        return InstallKind::WindowsPortable {
+            directory: exe.parent().unwrap().to_owned(),
+        };
+    }
+    // Never interpret a coincidental Windows `%HOME%\.zeron\app` layout as
+    // the Unix symlink-managed installation.
     if !managed_updates_supported(os) {
         return InstallKind::Unmanaged;
     }
@@ -243,7 +307,7 @@ pub async fn download_release_file(
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/releases/{file}", edge_url.trim_end_matches('/'));
+    let url = format!("{}/{file}", release_base(edge_url)?);
     let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
     if expected.is_none() {
         tracing::warn!(

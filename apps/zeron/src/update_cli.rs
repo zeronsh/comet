@@ -55,12 +55,22 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
             Ok(())
         }
+        #[cfg(windows)]
+        InstallKind::WindowsPortable { directory } => {
+            let staged = zeron_update::windows::stage(edge_url, &manifest, &directory).await?;
+            zeron_update::windows::apply(&staged, &directory, false)?;
+            println!(
+                "updated to {} — relaunch Zeron to finish.",
+                manifest.version
+            );
+            Ok(())
+        }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
                  Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
                  macOS: download the new Zeron.app dmg, or rebuild from source.\n\
-                 Windows: automatic installation is not supported; rebuild from source."
+                 Windows: use an update-enabled portable package, or rebuild from source."
             )
         }
     }
