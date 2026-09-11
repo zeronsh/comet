@@ -1,6 +1,8 @@
 //! AcpHarness integration tests against the fake ACP agent in
 //! `tests/fixtures/fake-acp.sh` (no real `grok` binary involved).
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

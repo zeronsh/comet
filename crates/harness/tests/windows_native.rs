@@ -1,4 +1,5 @@
-//! Windows-native ACP transport coverage. No shell, npm download, or credentials.
+//! Windows-native ACP transport coverage. No npm download or credentials;
+//! `.cmd`/`.bat` shims launch through a wrapped cmd.exe with literal arguments.
 #![cfg(all(windows, feature = "native-fixture"))]
 
 use futures::StreamExt;
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls};
-use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
+use zeron_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel};
 
 #[test]
 fn managed_process_protocol_progresses_with_one_blocking_worker() {
@@ -421,18 +422,58 @@ async fn process_exit_drains_buffered_output_despite_inherited_descendant_pipes(
     );
 }
 
+/// Runs only when spawned by `batch_overrides_launch_through_cmd`: records
+/// the argv the inner program received under the batch shim (everything after
+/// the `--` separator, so agent-shaped flags stay literal filters).
+#[test]
+fn batch_override_helper() {
+    let Some(file) = std::env::var_os("ZERON_TEST_BATCH_ARGS_FILE") else {
+        return;
+    };
+    let argv: Vec<String> = std::env::args().collect();
+    let forwarded = match argv.iter().position(|arg| arg == "--") {
+        Some(index) => argv[index + 1..].to_vec(),
+        None => Vec::new(),
+    };
+    std::fs::write(file, forwarded.join("\n")).unwrap();
+}
+
 #[tokio::test]
-async fn batch_overrides_are_rejected_before_any_command_runs() {
+async fn batch_overrides_launch_through_cmd() {
     let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("batch-was-executed.txt");
-    let script = dir.path().join("unsupported.CmD");
-    std::fs::write(&script, "@echo ran>batch-was-executed.txt\r\n").unwrap();
+    let received = dir.path().join("batch-args.txt");
+    let injected = dir.path().join("injected.txt");
+    let script = dir.path().join("shim.CmD");
+    std::fs::write(
+        &script,
+        format!(
+            "@echo off\r\n\"{}\" --exact batch_override_helper -- %*\r\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
     let harnesses: Vec<Box<dyn Harness>> = vec![
         Box::new(AcpHarness::grok().with_executable(script.clone())),
         Box::new(zeron_harness::ClaudeHarness::new().with_executable(script.clone())),
         Box::new(zeron_harness::CodexHarness::new().with_executable(script)),
     ];
     for harness in harnesses {
+        let expected_prefix: Vec<String> = match harness.id() {
+            HarnessId::Grok => vec![
+                "--no-auto-update".into(),
+                "agent".into(),
+                "--no-leader".into(),
+                "stdio".into(),
+            ],
+            HarnessId::ClaudeCode => vec!["--print".into()],
+            HarnessId::Codex => vec!["app-server".into()],
+            other => panic!("unexpected harness: {other:?}"),
+        };
+        let _ = std::fs::remove_file(&received);
+        // The harness owns its child's environment; reach the helper through
+        // the inherited process env. No other test in this binary reads it.
+        // SAFETY: written before any child exists in this iteration.
+        unsafe { std::env::set_var("ZERON_TEST_BATCH_ARGS_FILE", &received) };
         let (_steer, steering) = mpsc::channel(1);
         let controls = RunControls {
             request_input: Box::new(|_| {
@@ -443,25 +484,58 @@ async fn batch_overrides_are_rejected_before_any_command_runs() {
             steering,
             interrupt: CancellationToken::new(),
         };
+        // Consume the whole stream: the shim cannot speak any agent protocol,
+        // so the run must fail loudly — but only AFTER a safe launch.
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            harness.run(request(dir.path(), "unsafe & | > %PATH%", None), controls),
+            Duration::from_secs(10),
+            harness.run(request(dir.path(), "prompt & | > %PATH%", None), controls),
         )
         .await
-        .expect("batch rejection must precede startup");
-        let error = match result {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("{} accepted a batch override", harness.display_name()),
-        };
+        .expect("override launch must not stall");
+        match result {
+            Ok(mut stream) => {
+                let mut surfaced_failure = false;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Err(_) | Ok(AgentEvent::Done { error: Some(_), .. }) => {
+                            surfaced_failure = true;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                assert!(
+                    surfaced_failure,
+                    "{} accepted a batch override as a protocol peer",
+                    harness.display_name()
+                );
+            }
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    !error.contains("batch"),
+                    "batch scripts must not be rejected as overrides: {error}"
+                );
+            }
+        }
+        let output = std::fs::read_to_string(&received)
+            .unwrap_or_else(|_| panic!("{} launched nothing", harness.display_name()));
+        let forwarded: Vec<&str> = output.lines().collect();
         assert!(
-            error.contains(".exe"),
-            "missing native executable guidance: {error}"
-        );
-        assert!(
-            !marker.exists(),
-            "{} executed the batch override",
+            forwarded.len() >= expected_prefix.len()
+                && forwarded
+                    .iter()
+                    .zip(&expected_prefix)
+                    .all(|(got, want)| got == want),
+            "{} forwarded {forwarded:?}, expected it to start with {expected_prefix:?}",
             harness.display_name()
         );
+        assert!(
+            !injected.exists(),
+            "{} let a prompt through a shell interpretation",
+            harness.display_name()
+        );
+        // SAFETY: no other test in this binary reads this variable.
+        unsafe { std::env::remove_var("ZERON_TEST_BATCH_ARGS_FILE") };
     }
 }
 

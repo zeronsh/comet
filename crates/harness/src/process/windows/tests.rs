@@ -227,3 +227,125 @@ fn owner_death_immediately_after_creation_kills_suspended_child() {
     }
     drop(owner_guard);
 }
+
+// ---------------------------------------------------------------------------
+// Batch (`.cmd`/`.bat`) launches through cmd.exe
+// ---------------------------------------------------------------------------
+
+/// Runs only when spawned by `batch_scripts_spawn_through_cmd_with_literal_arguments`
+/// through a `.cmd` shim: records the CRT-parsed argv the inner program (the
+/// role node plays under a real npm shim) actually received.
+#[test]
+fn batch_inner_helper() {
+    let Some(file) = std::env::var_os("ZERON_TEST_BATCH_ARGS_FILE") else {
+        return;
+    };
+    // argv = [test binary, --exact, helper name, forwarded arguments…]
+    let forwarded: Vec<String> = std::env::args().skip(3).collect();
+    std::fs::write(file, forwarded.join("\n")).unwrap();
+}
+
+#[tokio::test]
+async fn batch_scripts_spawn_through_cmd_with_literal_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let received = dir.path().join("received.txt");
+    // A real shim shape: forward `%*` to an inner program. What that program's
+    // C runtime parses is the contract — exactly what node receives under an
+    // npm `.cmd` shim launched by zeron.
+    let script = dir.path().join("forward-args.cmd");
+    std::fs::write(
+        &script,
+        format!(
+            "@echo off\r\n\"{}\" --exact process::windows::tests::batch_inner_helper %*\r\n",
+            std::env::current_exe().unwrap().display()
+        ),
+    )
+    .unwrap();
+    let arguments = [
+        "plain",
+        "a b",
+        "trailing \\",
+        "日本語 😀",
+        "meta & | > < ^ ( ) !",
+    ];
+    let mut command = Command::new(&script);
+    command
+        .args(arguments)
+        .env("ZERON_TEST_BATCH_ARGS_FILE", &received)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("batch spawn");
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("batch deadline")
+        .unwrap();
+    assert!(status.success(), "batch exit: {status}");
+    let output = std::fs::read_to_string(&received).expect("arguments were recorded");
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        arguments,
+        "arguments must reach the inner program verbatim (no splitting, no injection)"
+    );
+    assert!(!dir.path().join("injected.txt").exists());
+}
+
+#[tokio::test]
+async fn batch_scripts_report_shim_exit_codes_and_kill_their_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let failing = dir.path().join("fail.bat");
+    std::fs::write(&failing, "@exit /b 7\r\n").unwrap();
+    let mut command = Command::new(&failing);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .expect("batch deadline")
+        .unwrap()
+        .status;
+    assert_eq!(status.code(), Some(7), "the .bat exit code must propagate");
+
+    // A shim that parks itself behind a long-running grandchild: killing the
+    // owned cmd.exe must take the whole job down with it.
+    let parked = dir.path().join("parked-tree.cmd");
+    std::fs::write(
+        &parked,
+        "@echo off\r\nstart /b \"\" ping -n 30 127.0.0.1 >nul\r\npause >nul\r\n",
+    )
+    .unwrap();
+    let mut command = Command::new(&parked);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("batch spawn");
+    child.start_kill().expect("job terminate");
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("kill deadline")
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn bare_batch_program_resolves_from_child_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("only-a-shim.CMD");
+    std::fs::write(&script, "@exit /b 0\r\n").unwrap();
+    // No extension in the program name: resolution must find the shim on the
+    // child's PATH through the PATHEXT variants and spawn it through cmd.exe.
+    let mut command = Command::new("only-a-shim");
+    command
+        .env("PATH", dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("shim resolves from child PATH");
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("shim deadline")
+        .unwrap();
+    assert!(status.success(), "shim exit: {status}");
+}

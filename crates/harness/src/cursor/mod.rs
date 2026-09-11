@@ -60,9 +60,23 @@ const SHIM_SOURCE: &str = include_str!("shim.mjs");
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // USERPROFILE-aware home (see `crate::executable::home_dir`), plus the
+    // Windows native installer location when LOCALAPPDATA is reachable.
+    if let Some(home) = crate::executable::home_dir() {
         dirs.push(home.join(".local").join("bin").join("cursor-agent"));
         dirs.push(home.join(".cursor").join("bin").join("cursor-agent"));
+    }
+    if cfg!(windows)
+        && let Some(local) = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join("AppData").join("Local"))
+            })
+    {
+        dirs.push(local.join("cursor-agent").join("cursor-agent"));
     }
     dirs.push(PathBuf::from("/opt/homebrew/bin/cursor-agent"));
     dirs.push(PathBuf::from("/usr/local/bin/cursor-agent"));
@@ -120,7 +134,8 @@ impl CursorHarness {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let run = async {
-            let output = cmd.output()
+            let output = cmd
+                .output()
                 .await
                 .map_err(|e| HarnessError::Protocol(format!("cursor models probe: {e}")))?;
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -944,10 +959,9 @@ mod tests {
 
     #[test]
     fn nested_frames_arrive_tagged() {
-        let frame: Value = serde_json::from_str(
-            r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#,
-        )
-        .unwrap();
+        let frame: Value =
+            serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
+                .unwrap();
         assert_eq!(
             map_shim_frame(&frame, false),
             vec![AgentEvent::Subagent {

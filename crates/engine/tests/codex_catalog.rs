@@ -36,18 +36,14 @@ async fn catalog_child() {
     println!("Codex RPC descriptor: {codex}");
 }
 
+/// `npm i -g @openai/codex` leaves a `codex.cmd` shim on PATH (the native
+/// payload stays buried in `node_modules`): that shim is what the registry
+/// must discover and the launcher must be able to run.
 #[test]
 fn npm_codex_is_offered_by_production_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let prefix = dir.path().join("Node Current");
-    let (arch, triple) = if cfg!(target_arch = "aarch64") {
-        ("arm64", "aarch64-pc-windows-msvc")
-    } else {
-        ("x64", "x86_64-pc-windows-msvc")
-    };
-    let exe = prefix.join(format!("node_modules/@openai/codex/node_modules/@openai/codex-win32-{arch}/vendor/{triple}/bin/codex.exe"));
-    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-    std::fs::write(exe, b"MZ").unwrap();
+    std::fs::create_dir_all(&prefix).unwrap();
     std::fs::write(prefix.join("codex.cmd"), b"npm shim").unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command.args(["--exact", "catalog_child", "--nocapture"]);

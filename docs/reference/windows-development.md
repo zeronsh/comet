@@ -24,13 +24,19 @@ set `GPUI_FXC_PATH` to the Windows SDK's `fxc.exe`.
 | Application data | `%LOCALAPPDATA%\Zeron`, falling back to `%USERPROFILE%\AppData\Local\Zeron`. Override with `ZERON_DATA_DIR`. |
 | Managed adapters | `ZERON_ADAPTERS_DIR`, then `ZERON_DATA_DIR/adapters`, then the default application's `adapters` directory. |
 | Provider credentials | Keep their provider-owned locations; changing Zeron's data root does not migrate them. |
-| `CODEX_EXECUTABLE` | Native executable override; `.cmd` and `.bat` wrappers are rejected. |
+| `CODEX_EXECUTABLE` | Executable override. `.exe` (and `.com`) launch directly; `.cmd`/`.bat` shims launch through a wrapped `cmd.exe` with literal, individually escaped arguments. The override must exist on disk. |
 
-ACP, Claude, and Codex search PATH and known native installation directories.
-Codex also supports nested and hoisted npm platform packages. Managed JavaScript
-adapters run through Node; installation requires `node.exe` beside
-`node_modules/npm/bin/npm-cli.js`. General batch wrappers, older Codex vendor
-layouts, and Volta's selected tool-image npm location are unsupported.
+ACP, Claude, Codex, and opencode search PATH and known native installation
+directories. Discovery is PATHEXT-aware: npm's `.cmd` shims (and any `.bat`)
+resolve like `cmd.exe` would — per directory, extensions in PATHEXT order —
+and spawn through `cmd.exe /d /s /c` inside the same Job Object, so npm-
+installed agents (`codex`, `opencode`, `pi-acp`, a bare `npm i -g grok`)
+work without following `node_modules` payloads. GUI launches additionally
+backfill `%APPDATA%\npm`, `%LOCALAPPDATA%\{pnpm,Programs\nodejs,Volta\bin}`,
+scoop shims, and `%USERPROFILE%\{.local\bin,.bun\bin}` from PATH. Managed
+JavaScript adapters run through Node; installation requires `node.exe` beside
+`node_modules/npm/bin/npm-cli.js`. Volta's selected tool-image npm location is
+unsupported.
 
 An OS file lock prevents engines from sharing a profile; `engine.lock.pid` is
 only diagnostic. Terminals use ConPTY. Windows agents, login commands, adapter
@@ -55,7 +61,7 @@ on Linux and macOS. To run the engine and harness checks locally:
 ```powershell
 cargo test --locked -p zeron-engine -p zeron-harness --lib
 cargo test --locked -p zeron-harness --features native-fixture --test codex_availability --test windows_native
-cargo test --locked -p zeron-engine --test codex_catalog
+cargo test --locked -p zeron-engine --test codex_catalog --test codex_login_resolution --test auth
 ```
 
 Fixtures use synthetic agents, so these tests do not establish authenticated

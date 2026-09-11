@@ -4,6 +4,8 @@
 //! Done instead of indefinite Working. Own test binary: the env knob is
 //! process-global.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 

@@ -2,6 +2,8 @@
 //! `tests/fixtures/fake-claude.sh` (no real `claude` binary involved).
 //! A live smoke test against the real CLI lives at the bottom, `#[ignore]`d.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

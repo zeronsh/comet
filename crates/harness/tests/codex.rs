@@ -1,6 +1,8 @@
 //! CodexHarness integration tests against the fake app server in
 //! `tests/fixtures/fake-codex.sh` (no real `codex` binary involved).
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
