@@ -80,7 +80,10 @@ const ROW_PAD_X: f32 = 8.0;
 const ROW_RADIUS: f32 = 8.0;
 const PANEL_PAD_X: f32 = 8.0;
 const PANEL_RADIUS: f32 = ROW_RADIUS + PANEL_PAD_X;
-const PANEL_PAD_TOP: f32 = PANEL_PAD_X;
+const PANEL_PAD_Y: f32 = 8.0;
+// The font's visible glyphs sit 1px above the row's geometric center.
+const PANEL_PAD_TOP: f32 = PANEL_PAD_Y + 1.0;
+const PANEL_PAD_BOTTOM: f32 = PANEL_PAD_Y - 1.0;
 /// The custom 24px queue glyphs have quieter geometry than the legacy set, so
 /// render them slightly larger to preserve the previous optical weight.
 const QUEUE_ICON_SIZE: f32 = 13.0;
@@ -206,7 +209,8 @@ fn queue_panel_surface(theme: &Theme) -> gpui::Div {
         .when(!theme.is_frost(), |el| el.shadow_lg())
         .px(px(PANEL_PAD_X))
         .pt(px(PANEL_PAD_TOP))
-        .pb(px(QUEUE_COMPOSER_OVERLAP))
+        // Preserve the visible bottom padding above the overlapping composer.
+        .pb(px(PANEL_PAD_BOTTOM + QUEUE_COMPOSER_OVERLAP))
         .flex()
         .flex_col()
 }
