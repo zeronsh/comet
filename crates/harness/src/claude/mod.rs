@@ -36,7 +36,6 @@ mod normalize;
 mod wire;
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +44,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -53,54 +51,28 @@ use zeron_proto::{
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{apply_ultrathink, static_models, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
-/// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
-/// then our own PATH, then the login-shell PATH snapshot (the user's shell
-/// init shapes PATH in ways a GUI/service launch never sees — see
-/// [`crate::shell_env`]), then known install locations as a last resort.
-/// Resolved per call — cheap after the snapshot is cached.
+/// Locate the device's installed Claude Code CLI: our own PATH, then the
+/// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
+/// GUI/service launch never sees — see [`crate::shell_env`]), then known
+/// install locations as a last resort. The `CLAUDE_CODE_EXECUTABLE` override
+/// is applied by [`ClaudeHarness::resolve_executable`], so availability and
+/// launches agree on one resolution order. Resolved per call — cheap after
+/// the snapshot is cached.
 fn resolve_claude_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+    let mut extra = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        extra.push(home.join(".claude").join("local").join("claude"));
+        extra.push(home.join(".local").join("bin").join("claude"));
     }
-    let exe = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    extra.push(PathBuf::from("/usr/local/bin/claude"));
+    crate::executable::find_on_paths("claude", extra)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -155,14 +127,20 @@ impl ClaudeHarness {
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
-            return Ok(p.clone());
+            return crate::executable::validate_native_override(p);
+        }
+        if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
+            && !p.is_empty()
+        {
+            return crate::executable::validate_native_override(&PathBuf::from(p));
         }
         resolve_claude_executable().ok_or_else(|| {
             HarnessError::NotInstalled(
                 "claude (searched PATH, the login shell's PATH, ~/.claude/local, \
                  ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and \
-                 fnm/nvm/volta/pnpm/bun install dirs; set CLAUDE_CODE_EXECUTABLE \
-                 to override)"
+                 fnm/nvm/volta/pnpm/bun install dirs; Windows also checks USERPROFILE \
+                 and explicit NVM_SYMLINK/VOLTA_HOME/PNPM_HOME; set \
+                 CLAUDE_CODE_EXECUTABLE to override)"
                     .into(),
             )
         })
@@ -382,7 +360,10 @@ impl Harness for ClaudeHarness {
         ]
     }
     fn installed(&self) -> bool {
-        self.executable.is_some() || resolve_claude_executable().is_some()
+        // The launch resolver, not bare discovery: a valid CLAUDE_CODE_EXECUTABLE
+        // (or a test `executable`) must report installed, and an invalid one
+        // must not — availability and launches share one resolution.
+        self.resolve_executable().is_ok()
     }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
@@ -625,7 +606,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 struct Session {
     title_only: bool,
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
@@ -744,12 +725,12 @@ async fn run_session(session: Session) {
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
                 // then SIGKILL. Aborted once the child is reaped.
-                if let Some(pid) = child.id() {
+                if let Some(pid) = crate::process::signal_target(&child) {
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
-                        send_signal(pid, Signal::Term);
+                        send_signal(&pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
-                        send_signal(pid, Signal::Kill);
+                        send_signal(&pid, Signal::Kill);
                     }));
                 }
             },

@@ -27,5 +27,11 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 [dev-dependencies]
 tempfile.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.11"

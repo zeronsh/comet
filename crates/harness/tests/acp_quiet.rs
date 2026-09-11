@@ -1,6 +1,8 @@
 //! Regression tests for #296: quiet output never relinquishes a pending prompt.
 //! The retired env knob stays set so reintroducing its old behavior fails fast.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;

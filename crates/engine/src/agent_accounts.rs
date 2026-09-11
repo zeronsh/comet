@@ -206,7 +206,7 @@ enum LoginFlow {
     Spawned {
         harness: HarnessId,
         /// The login child; monitored (try_wait) + killable from cancel.
-        child: Arc<Mutex<Option<tokio::process::Child>>>,
+        child: Arc<Mutex<Option<zeron_harness::process::Child>>>,
         /// Throwaway credential dir, reclaimed on cancel/completion.
         home: PathBuf,
         started_at: Instant,
@@ -589,13 +589,28 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut command = tokio::process::Command::new("codex");
+        // Resolve through the harness itself (`CODEX_EXECUTABLE`, PATH, the
+        // login-shell snapshot, install dirs — the Windows npm payload
+        // included) and compose the same child PATH a chat run gets, so
+        // account login never diverges from what the harness can launch.
+        let mut command = match zeron_harness::codex::login_command(&home) {
+            Ok(command) => command,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(match err {
+                    zeron_harness::HarnessError::NotInstalled(hint) => {
+                        format!(
+                            "The `codex` CLI was not found on this device — install it first. ({hint})"
+                        )
+                    }
+                    other => format!("Could not resolve the codex CLI for login: {other}"),
+                }));
+            }
+        };
         command
-            .arg("login")
-            .env("CODEX_HOME", &home)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdin(zeron_harness::process::Stdio::null())
+            .stdout(zeron_harness::process::Stdio::piped())
+            .stderr(zeron_harness::process::Stdio::piped());
         // The CLI opens the authorization tab itself (via the `webbrowser`
         // crate) AND the app opens the page when this start reply lands —
         // users got TWO identical auth.openai.com tabs. `webbrowser` prefers
@@ -662,12 +677,10 @@ impl AgentAccounts {
                 let _ = std::fs::remove_dir_all(&home);
                 EngineError::Other(format!("Could not start the Cursor login: {e}"))
             })?;
-        let child = match cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+        cmd.stdin(zeron_harness::process::Stdio::null())
+            .stdout(zeron_harness::process::Stdio::piped())
+            .stderr(zeron_harness::process::Stdio::piped());
+        let child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&home);
@@ -1856,7 +1869,7 @@ fn scan_shim_fatal(output: &str) -> Option<String> {
 }
 
 type LoginChildHandles = (
-    Arc<Mutex<Option<tokio::process::Child>>>,
+    Arc<Mutex<Option<zeron_harness::process::Child>>>,
     Arc<Mutex<String>>,
     Arc<Mutex<Option<Option<i32>>>>,
 );
@@ -1865,7 +1878,7 @@ type LoginChildHandles = (
 /// (the URL can land on either stream), and a monitor polls `try_wait` so the
 /// child is reaped without owning it — the cancel path needs concurrent kill
 /// access.
-fn wire_login_child(mut child: tokio::process::Child) -> LoginChildHandles {
+fn wire_login_child(mut child: zeron_harness::process::Child) -> LoginChildHandles {
     let output = Arc::new(Mutex::new(String::new()));
     for pipe in [
         child

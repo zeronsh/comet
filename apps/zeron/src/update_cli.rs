@@ -49,19 +49,28 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
                 "downloading {}…",
                 zeron_update::mac_app_artifact(&manifest.version)
             );
-            let data_dir = std::env::var_os("ZERON_DATA_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(super::dirs_data_dir);
+            let data_dir = super::paths::data_dir();
             let staged = zeron_update::stage_mac_app(edge_url, &manifest, &data_dir).await?;
             zeron_update::apply_mac_app(&staged, &bundle)?;
             println!("updated {} — relaunch Zeron to finish.", bundle.display());
+            Ok(())
+        }
+        #[cfg(windows)]
+        InstallKind::WindowsPortable { directory } => {
+            let staged = zeron_update::windows::stage(edge_url, &manifest, &directory).await?;
+            zeron_update::windows::apply(&staged, &directory, false)?;
+            println!(
+                "updated to {} — relaunch Zeron to finish.",
+                manifest.version
+            );
             Ok(())
         }
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
                  Linux: curl -fsSL https://zeron.sh/install.sh | sh\n\
-                 macOS: download the new Zeron.app dmg, or rebuild from source."
+                 macOS: download the new Zeron.app dmg, or rebuild from source.\n\
+                 Windows: use an update-enabled portable package, or rebuild from source."
             )
         }
     }

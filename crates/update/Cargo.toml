@@ -17,3 +17,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target."cfg(windows)".dependencies]
+tempfile.workspace = true
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

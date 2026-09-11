@@ -116,57 +116,20 @@ pub(crate) mod adapter_install;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub(crate) mod executable;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod opencode;
+pub mod process;
 pub mod shell_env;
-
-/// Bin directories where npm-installed CLIs land under Node version managers.
-/// GUI launches never see these on PATH — the managers shape PATH in shell
-/// init (fnm's per-shell multishells, nvm's shell function), which a
-/// Dock/Finder-launched app never runs.
-pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    // fnm: `aliases/default` is a stable symlink to the active default
-    // installation (the multishell PATH entries are ephemeral, per-shell).
-    let mut fnm_roots: Vec<PathBuf> = std::env::var_os("FNM_DIR")
-        .map(PathBuf::from)
-        .into_iter()
-        .collect();
-    if let Some(home) = &home {
-        fnm_roots.push(home.join(".local").join("share").join("fnm"));
-        fnm_roots.push(home.join("Library").join("Application Support").join("fnm"));
-        fnm_roots.push(home.join(".fnm"));
-    }
-    for root in fnm_roots {
-        dirs.push(root.join("aliases").join("default").join("bin"));
-    }
-    if let Some(home) = &home {
-        // volta / bun keep real shims in a fixed bin dir; pnpm has a global bin.
-        dirs.push(home.join(".volta").join("bin"));
-        dirs.push(home.join(".bun").join("bin"));
-        dirs.push(home.join("Library").join("pnpm"));
-        dirs.push(home.join(".local").join("share").join("pnpm"));
-        // nvm: every installed version's bin, newest first.
-        let nvm = home.join(".nvm").join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(&nvm) {
-            let mut versions: Vec<PathBuf> =
-                entries.flatten().map(|e| e.path().join("bin")).collect();
-            versions.sort();
-            versions.reverse();
-            dirs.append(&mut versions);
-        }
-    }
-    dirs
-}
+#[cfg(windows)]
+pub mod windows_process;
 
 /// Add the login shell's PATH to a child process while preserving the PATH of
 /// the current process. This lets GUI/service launches find user-installed
 /// CLIs such as Homebrew's `gh` without changing the daemon's own environment.
 pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
-    compose_path(cmd, std::iter::empty());
+    compose_path(cmd.as_std_mut(), std::iter::empty());
 }
 
 /// Compose the child's PATH: the resolved executable's directory first, then
@@ -174,12 +137,15 @@ pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
 /// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
 /// version manager's bin dir, and the CLIs themselves shell out to tools
 /// (git, rg, node) that a GUI/service launch's own PATH may lack.
-pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
-    compose_path(cmd, exe.parent().filter(|d| !d.as_os_str().is_empty()));
+pub(crate) fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
+    compose_path(
+        cmd.as_std_mut(),
+        exe.parent().filter(|d| !d.as_os_str().is_empty()),
+    );
 }
 
 fn compose_path<'a>(
-    cmd: &mut tokio::process::Command,
+    cmd: &mut std::process::Command,
     executable_dir: impl IntoIterator<Item = &'a std::path::Path>,
 ) {
     let mut paths: Vec<std::path::PathBuf> = Vec::new();
@@ -282,23 +248,30 @@ pub use opencode::OpencodeHarness;
 // Child lifecycle (shared by the codex and ACP harnesses)
 // ---------------------------------------------------------------------------
 
-/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
-pub(crate) async fn shutdown_child(
-    child: &mut tokio::process::Child,
-    kill_grace: std::time::Duration,
-) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
+/// Reap the child: Unix sends SIGTERM then SIGKILL after `kill_grace`;
+/// Windows terminates the owned job after protocol shutdown has finished.
+pub(crate) async fn shutdown_child(child: &mut process::Child, kill_grace: std::time::Duration) {
+    #[cfg(windows)]
+    {
+        let _ = kill_grace;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
         return;
     }
-    if let Some(pid) = child.id() {
-        send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
+    #[cfg(not(windows))]
+    {
+        if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
+        if let Some(pid) = child.id() {
+            send_signal(&pid, Signal::Term);
+            if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
+                return;
+            }
+        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 #[derive(Clone, Copy)]
@@ -308,20 +281,22 @@ pub(crate) enum Signal {
 }
 
 #[cfg(unix)]
-pub(crate) fn send_signal(pid: u32, signal: Signal) {
+pub(crate) fn send_signal(pid: &u32, signal: Signal) {
     let sig = match signal {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
     // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
     unsafe {
-        libc::kill(pid as libc::pid_t, sig);
+        libc::kill(*pid as libc::pid_t, sig);
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
-    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+#[cfg(windows)]
+pub(crate) fn send_signal(job: &std::sync::Arc<windows_process::Job>, _signal: Signal) {
+    if let Err(error) = job.terminate() {
+        tracing::warn!(%error, "could not terminate Windows agent job");
+    }
 }
 
 /// System instruction shared by the title-only drivers.

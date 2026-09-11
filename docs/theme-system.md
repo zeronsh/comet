@@ -34,10 +34,12 @@ luminance. Floating overlays, settings cards, and inputs run the same
 composited-background check independently; a delicate palette can therefore
 receive a thicker material on one surface without disabling frost everywhere.
 
-macOS can frost the main window. Linux and Windows keep the main window opaque
-because compositor blur is not guaranteed; supported floating surfaces can
-still frost on macOS and Linux. The preference remains portable even where a
-particular surface cannot honor blur.
+macOS and Windows can frost the main window (native vibrancy and Acrylic,
+respectively). Linux keeps the main window opaque because compositor blur is
+not guaranteed. Supported floating surfaces can frost on macOS and Linux;
+Windows keeps those surfaces opaque until the DirectX renderer implements
+`BackdropBlur`. The preference remains portable even where a particular
+surface cannot honor blur.
 
 The built-in registry contains 30 variants across 19 families:
 

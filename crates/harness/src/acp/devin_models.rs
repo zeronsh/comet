@@ -3,11 +3,9 @@
 //! instead of racing `session/new` against `config_option_update` notifications.
 
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -15,6 +13,7 @@ use zeron_proto::Model;
 
 use crate::HarnessError;
 use crate::jsonrpc::{Incoming, RpcClient};
+use crate::process::{Command, Stdio};
 
 /// A freshly discovered variant may also arrive after `session/new` in the
 /// process that runs the prompt. Wait for that exact id; the generic ACP

@@ -473,12 +473,21 @@ mod tests {
         assert!(racing.exists(), "fresh empty staging dir was reclaimed");
 
         let stale = std::time::SystemTime::now() - (STAGING_TTL + Duration::from_secs(60));
-        std::fs::File::open(&racing)
-            .unwrap()
-            .set_modified(stale)
-            .unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // A directory handle needs backup semantics; setting its timestamp
+            // needs FILE_WRITE_ATTRIBUTES rather than write access to its data.
+            options.custom_flags(0x02000000).access_mode(0x100);
+        }
+        options.open(&racing).unwrap().set_modified(stale).unwrap();
         uploads.append("upload-other", "aGk=", Some(0)).unwrap();
-        assert!(!racing.exists(), "abandoned empty staging dir must be swept");
+        assert!(
+            !racing.exists(),
+            "abandoned empty staging dir must be swept"
+        );
     }
 
     #[test]

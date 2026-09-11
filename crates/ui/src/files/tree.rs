@@ -151,9 +151,11 @@ impl FilesSurface {
                         this.tree_focus.focus(window, cx);
                         this.activate_tree_path(path.clone(), cx);
                     }))
-                    .on_drag(drag_payload, |payload, _, _, cx| {
-                        cx.stop_propagation();
-                        workspace_path_drag_ghost(payload, cx)
+                    .when(crate::click_activation_drag_enabled(), |element| {
+                        element.on_drag(drag_payload, |payload, _, _, cx| {
+                            cx.stop_propagation();
+                            workspace_path_drag_ghost(payload, cx)
+                        })
                     })
                     .child(
                         div()

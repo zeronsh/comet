@@ -776,15 +776,19 @@ impl TerminalColors {
 
 impl Theme {
     // ---- numbers drive layout (px) ----
-    /// Frost translucency over the blurred window background (macOS vibrancy).
-    /// Opaque elsewhere: Linux/Windows get no compositor-blur guarantee, and a
-    /// merely transparent window would show raw desktop through the sidebar.
+    /// Frost translucency over the blurred window background (macOS vibrancy
+    /// or Windows Acrylic). Linux stays opaque because compositor blur is not
+    /// guaranteed; a merely transparent window would expose the raw desktop.
     /// Darkness matched by eye to a reference Electron app's dark glass. That
     /// scrim is 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's
     /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
     /// backdrop blur has no material layer, so the scrim runs heavier to land
     /// on the same perceived tone (see [`Theme::glass`]).
-    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
+    pub const GLASS_ALPHA: f32 = if cfg!(any(target_os = "macos", target_os = "windows")) {
+        0.80
+    } else {
+        1.0
+    };
     /// Light-mode frost alpha — glass-forward, like dark mode.
     ///
     /// A light tint controls the blur less than a dark one: the desktop's
@@ -794,7 +798,11 @@ impl Theme {
     /// vibrancy material is mostly white). Floating cards compensate further:
     /// see [`Self::glass_overlay`], where light coverage steps up to keep menu
     /// text legible over an unknown backdrop.
-    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
+    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(any(target_os = "macos", target_os = "windows")) {
+        0.80
+    } else {
+        1.0
+    };
     /// Main-panel header height (zeron `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
@@ -877,8 +885,8 @@ impl Theme {
     }
 
     /// Whether this appearance paints translucent chrome over the blurred
-    /// desktop. Glass-only recipes — backdrop blurs, translucent popover
-    /// tints, per-glyph edge fades — must gate on this, not on
+    /// desktop. Window-glass recipes such as translucent chrome and per-glyph
+    /// edge fades must gate on this, not on
     /// [`Self::GLASS_ALPHA`]: that constant is platform-wide, while the frost
     /// alpha (and with it whether glass is on at all) is per-appearance.
     pub fn is_glass(&self) -> bool {
@@ -890,8 +898,8 @@ impl Theme {
     /// scene-level: the blur runs on in-app content inside the window, not on
     /// the desktop behind it, so it needs no compositor vibrancy — macOS
     /// rasterizes it in Metal and Linux in the vendored wgpu renderer (other
-    /// wgpu platforms keep opaque floats until tested). The window chrome
-    /// itself stays opaque off macOS either way.
+    /// wgpu platforms keep opaque floats until tested). Windows window chrome
+    /// can still use native Acrylic independently of these scene-level blurs.
     pub fn is_frost(&self) -> bool {
         self.surface_treatment == SurfaceTreatment::Frosted
             && cfg!(any(target_os = "macos", target_os = "linux"))
@@ -1902,6 +1910,15 @@ mod tests {
         assert_eq!(frosted.glass().h, frosted.surface.h);
         assert_eq!(frosted.glass().s, frosted.surface.s);
         assert_eq!(frosted.glass().l, frosted.surface.l);
+        #[cfg(target_os = "windows")]
+        {
+            assert!(frosted.is_glass());
+            assert_eq!(
+                frosted.window_background_appearance(),
+                gpui::WindowBackgroundAppearance::Blurred
+            );
+            assert!(!frosted.is_frost());
+        }
 
         let opaque_zeron = Theme::for_selection(
             Appearance::Dark,
@@ -2504,10 +2521,19 @@ mod tests {
                 light.glass().a > dark.glass().a - f32::EPSILON,
                 "a light tint dominates the blur less, so it must not run looser than dark"
             );
-            assert!(
-                light.glass_overlay().a > dark.glass_overlay().a,
-                "light floating cards need more coverage over blur for legible rows"
-            );
+            if cfg!(target_os = "macos") {
+                assert!(
+                    light.glass_overlay().a > dark.glass_overlay().a,
+                    "light floating cards need more coverage over blur for legible rows"
+                );
+            } else {
+                // Windows has native Acrylic window glass, but the DirectX
+                // renderer does not yet rasterize in-app BackdropBlur regions.
+                assert_eq!(dark.glass_overlay().a, 1.0);
+                assert_eq!(light.glass_overlay().a, 1.0);
+                assert!(!dark.is_frost());
+                assert!(!light.is_frost());
+            }
         } else {
             assert_eq!(Theme::light().glass().a, 1.0);
             assert_eq!(Theme::dark().glass().a, 1.0);

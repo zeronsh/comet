@@ -1,6 +1,8 @@
 //! CursorHarness integration tests against the fake shim in
 //! `tests/fixtures/fake-cursor-shim.sh` (no node/@cursor/sdk involved).
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 
