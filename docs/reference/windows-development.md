@@ -1,7 +1,8 @@
 # Windows development
 
-Windows supports native x64 source builds. Installers, managed updates, and
-background services are not supported yet.
+Windows supports native x64 source builds and portable release ZIPs. Release
+packages offer in-app updates through GitHub; keep `zeron-update.json` beside
+`zeron.exe`. Installers and background services are not supported yet.
 
 ## Build and run
 

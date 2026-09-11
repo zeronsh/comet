@@ -3,6 +3,7 @@ name: release
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
+#   - Windows portable zip (x86_64) via scripts/package-windows.ps1
 # then create a GitHub Release AND upload everything to the
 # `comet-native-releases` R2 bucket (served at zeron.sh/releases/* for
 # `curl -fsSL https://zeron.sh/install.sh | sh`), bumping latest.txt.
@@ -49,8 +50,7 @@ jobs:
           path: target/package/*.tar.gz
           if-no-files-found: error
 
-  # All desktop artifacts must build before publishing the release and updater
-  # manifest. A macOS failure must not publish a Linux-only version as latest.
+  # Every platform must build before publishing the release and updater manifest.
   #
   # Signing/notarization (both optional — absent secrets fall back to an
   # ad-hoc-signed build):
@@ -111,9 +111,36 @@ jobs:
             target/package/*.tar.gz
           if-no-files-found: error
 
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+      - name: package portable app
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ runner.arch }}
+          path: |
+            target/package/*.zip
+            target/package/*.exe
+          if-no-files-found: error
+
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
@@ -129,12 +156,27 @@ jobs:
         run: |
           ver="${GITHUB_REF_NAME#v}"
           ls dist/
-          ls dist/ | grep -q "zeron-$ver-" \
-            || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
+          for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
+              macos-arm64.dmg macos-arm64-app.tar.gz \
+              windows-x86_64.zip windows-x86_64.exe; do
+            test -f "dist/zeron-$ver-$platform" \
+              || { echo "missing artifact for tag v$ver: $platform — check builds and Cargo.toml version"; exit 1; }
+          done
           echo "VERSION=$ver" >> "$GITHUB_ENV"
+      - name: updater manifest
+        run: |
+          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
+          for f in dist/*; do
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
+              '.files[$name] = {sha256: $sha}' <<<"$manifest")
+          done
+          printf '%s' "$manifest" > manifest.json
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/*
+            manifest.json
           generate_release_notes: true
       - name: upload to R2 (zeron.sh/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
@@ -146,13 +188,6 @@ jobs:
           # manifest.json: version + per-artifact sha256 — the auto-updater
           # (crates/update) verifies downloads against it. Published before
           # latest.txt so no client ever sees a version without its checksums.
-          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
-          for f in dist/*; do
-            sha=$(sha256sum "$f" | cut -d' ' -f1)
-            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
-              '.files[$name] = {sha256: $sha}' <<<"$manifest")
-          done
-          printf '%s' "$manifest" > manifest.json
           npx wrangler@4 r2 object put comet-native-releases/manifest.json \
             --file manifest.json --remote
           printf '%s' "$VERSION" > latest.txt
