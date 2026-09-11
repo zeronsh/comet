@@ -403,10 +403,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     zeron_proto::DoneStatus::Errored => SubagentStatus::Failed,
                     _ => SubagentStatus::Done,
                 }),
-                // A steer RESURRECTS a settled chip — it announces more work
-                // (claude: a queued SendMessage relaunches the agent), so
-                // this is the one event allowed past the no-regress guard.
-                AgentEvent::UserMessage { .. } => Some(SubagentStatus::Running),
+                // A new assignment reopens a settled chip. Providers may
+                // announce it with user text or a confirmed turn boundary.
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. } => {
+                    Some(SubagentStatus::Running)
+                }
                 _ => None,
             };
             for p in out.iter_mut() {
@@ -1153,6 +1154,24 @@ mod tests {
             } => assert_eq!(*subagent_status, Some(SubagentStatus::Done)),
             other => panic!("{other:?}"),
         }
+        // A confirmed follow-up can reopen the same chip without user text.
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Subagent {
+                parent_tool_use_id: "toolu_sub".into(),
+                event: Box::new(AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }),
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                subagent_status: Some(SubagentStatus::Running),
+                ..
+            }
+        ));
         // Content never leaked into the parent parts.
         assert_eq!(parts.len(), 1);
     }

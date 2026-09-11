@@ -3956,11 +3956,6 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
-    /// Chats whose durable Interrupt command has been accepted or is still
-    /// being queued. Kept independently so stopping one chat cannot replace
-    /// another chat's request when the user navigates quickly.
-    interrupting: HashSet<String>,
-    interrupt_tasks: HashMap<String, Task<()>>,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -3991,6 +3986,11 @@ pub struct Composer {
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
+    /// Chats whose durable Interrupt command has been accepted or is still
+    /// being queued. Kept independently so stopping one chat cannot replace
+    /// another chat's request when the user navigates quickly.
+    interrupting: HashSet<String>,
+    interrupt_tasks: HashMap<String, Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -6180,6 +6180,10 @@ impl Composer {
             }
         });
         self.interrupt_tasks.insert(chat_id, task);
+    }
+
+    pub(crate) fn is_interrupting(&self, chat_id: &str) -> bool {
+        self.interrupting.contains(chat_id)
     }
 
     // ---- wizard glue ----

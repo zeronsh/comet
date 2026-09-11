@@ -1652,7 +1652,10 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
-            let is_steer = matches!(sub_event.as_ref(), AgentEvent::UserMessage { .. });
+            let is_steer = matches!(
+                sub_event.as_ref(),
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
+            );
             if is_steer {
                 settled_subagents.remove(parent_tool_use_id);
             } else if settled_subagents.contains(parent_tool_use_id)

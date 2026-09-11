@@ -1,0 +1,29 @@
+{"method":"item/started","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-alpha","kind":"started","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-alpha","kind":"started","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/completed","params":{"threadId":"child-alpha","item":{"type":"userMessage","id":"alpha-input-1","text":"First assignment"}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"child-alpha","itemId":"alpha-answer-1","delta":"first alpha"}}
+{"method":"item/completed","params":{"threadId":"child-alpha","item":{"type":"agentMessage","id":"alpha-answer-1","text":"first alpha"}}}
+{"method":"item/completed","params":{"threadId":"child-alpha","item":{"type":"agentMessage","id":"alpha-answer-1","text":"first alpha"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"agentMessage","id":"parent-progress","text":"parent progress"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-alpha","kind":"started","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"subagent-completed-alpha-turn-1","kind":"completed","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"turn/completed","params":{"threadId":"child-alpha","turn":{"id":"alpha-turn-1","status":"completed"}}}
+{"method":"turn/completed","params":{"threadId":"child-alpha","turn":{"id":"alpha-turn-1","status":"completed"}}}
+{"method":"thread/closed","params":{"threadId":"child-alpha"}}
+{"method":"item/started","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-beta","kind":"started","agentThreadId":"child-beta","agentPath":"/root/beta"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-beta","kind":"started","agentThreadId":"child-beta","agentPath":"/root/beta"}}}
+{"method":"item/completed","params":{"threadId":"child-beta","item":{"type":"userMessage","id":"beta-input","text":"Inspect beta"}}}
+{"method":"item/completed","params":{"threadId":"child-beta","item":{"type":"agentMessage","id":"beta-answer","text":"beta answer"}}}
+{"method":"turn/completed","params":{"threadId":"child-beta","turn":{"id":"beta-turn","status":"completed"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"message-alpha","kind":"interacted","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"turn/started","params":{"threadId":"child-alpha","turn":{"id":"alpha-turn-2","status":"inProgress"}}}
+{"method":"item/completed","params":{"threadId":"child-alpha","item":{"type":"userMessage","id":"alpha-input-1","text":"First assignment"}}}
+{"method":"turn/completed","params":{"threadId":"child-alpha","turn":{"id":"alpha-turn-1","status":"completed"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"followup-alpha","kind":"started","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/completed","params":{"threadId":"child-alpha","item":{"type":"agentMessage","id":"alpha-answer-2","text":"second alpha"}}}
+{"method":"turn/completed","params":{"threadId":"child-alpha","turn":{"id":"alpha-turn-2","status":"failed","error":{"message":"followup failed"}}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"failed-alpha","kind":"failed","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"thread/closed","params":{"threadId":"child-alpha"}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"root-activity","kind":"started","agentThreadId":"th-1","agentPath":"/root"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"agentMessage","id":"parent-answer","text":"parent answer"}}}
+{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}
