@@ -48,6 +48,9 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
+        HarnessId::Cline => {
+            "Cline's open-source coding agent (cline CLI) — plan/act modes, MCP, checkpoints."
+        }
         HarnessId::Mock => "Scripted test harness.",
     }
 }
@@ -63,6 +66,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
+        HarnessId::Cline => "cline",
         HarnessId::Mock => "mock",
     }
 }
