@@ -9,7 +9,87 @@ use std::collections::{HashMap, HashSet};
 use gpui::{AnyElement, Context, Render, SharedString, Window, div, prelude::*, px};
 use zeron_proto::{ChangeRequestSummary, Chat, CheckoutChangeRequestStatus, Space};
 
+use crate::settings::PullRequestLinkTarget;
 use crate::theme::Theme;
+
+/// The parts of a GitHub pull request link that review tools key on.
+struct GitHubPullRequest<'a> {
+    owner: &'a str,
+    repo: &'a str,
+    number: &'a str,
+    /// Whatever follows the number: a sub-page, query, or fragment, or nothing.
+    rest: &'a str,
+}
+
+/// Parse `https://github.com/{owner}/{repo}/pull/{number}…`.
+///
+/// Other hosts and other GitHub pages (issues, compare views) return `None`
+/// so callers keep the original link instead of sending the user to a page a
+/// review tool cannot show.
+fn github_pull_request(url: &str) -> Option<GitHubPullRequest<'_>> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("https://www.github.com/"))?;
+    let mut segments = path.splitn(4, '/');
+    let owner = segments.next().filter(|segment| !segment.is_empty())?;
+    let repo = segments.next().filter(|segment| !segment.is_empty())?;
+    if segments.next()? != "pull" {
+        return None;
+    }
+    let tail = segments.next()?;
+    let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let (number, rest) = tail.split_at(digits);
+    match rest.as_bytes().first() {
+        None | Some(b'/' | b'?' | b'#') => {}
+        Some(_) => return None,
+    }
+    Some(GitHubPullRequest {
+        owner,
+        repo,
+        number,
+        rest,
+    })
+}
+
+/// Linear's review page for a GitHub pull request. Linear mirrors GitHub's
+/// path, so a sub-page, query, or fragment survives the rewrite.
+pub fn linear_review_url(url: &str) -> Option<String> {
+    let pr = github_pull_request(url)?;
+    Some(format!(
+        "https://linear.review/{}/{}/pull/{}{}",
+        pr.owner, pr.repo, pr.number, pr.rest
+    ))
+}
+
+/// Graphite's review page for a GitHub pull request. Graphite has its own
+/// page layout, so only the pull request identity carries over.
+pub fn graphite_url(url: &str) -> Option<String> {
+    let pr = github_pull_request(url)?;
+    Some(format!(
+        "https://app.graphite.com/github/pr/{}/{}/{}",
+        pr.owner, pr.repo, pr.number
+    ))
+}
+
+/// The link a pull request badge opens for the configured target. Links a
+/// review tool cannot rewrite fall back to the original page.
+pub fn pull_request_link(url: &str, target: PullRequestLinkTarget) -> String {
+    let rewritten = match target {
+        PullRequestLinkTarget::GitHub => None,
+        PullRequestLinkTarget::Linear => linear_review_url(url),
+        PullRequestLinkTarget::Graphite => graphite_url(url),
+    };
+    rewritten.unwrap_or_else(|| url.to_owned())
+}
+
+/// The tooltip's destination hint when the badge leaves the provider site.
+fn destination_label(url: &str, target: PullRequestLinkTarget) -> Option<SharedString> {
+    (target != PullRequestLinkTarget::GitHub && pull_request_link(url, target) != url)
+        .then(|| SharedString::from(format!("Opens in {}", target.label())))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChangeRequestBadgeTone {
@@ -56,12 +136,14 @@ impl ChangeRequestBadgeModel {
 
 pub(crate) struct ChangeRequestTooltip {
     model: ChangeRequestBadgeModel,
+    destination: Option<SharedString>,
 }
 
 impl ChangeRequestTooltip {
-    pub fn new(summary: &ChangeRequestSummary) -> Self {
+    pub fn new(summary: &ChangeRequestSummary, target: PullRequestLinkTarget) -> Self {
         Self {
             model: ChangeRequestBadgeModel::from_summary(summary),
+            destination: destination_label(&summary.url, target),
         }
     }
 }
@@ -103,7 +185,15 @@ impl Render for ChangeRequestTooltip {
                     .text_size(px(11.0))
                     .text_color(theme.text_muted)
                     .child(self.model.title.clone()),
-            );
+            )
+            .when_some(self.destination.clone(), |card, destination| {
+                card.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child(destination),
+                )
+            });
         crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
     }
 }
@@ -142,12 +232,16 @@ pub(crate) fn pull_request_badge(
         .text_color(color.opacity(0.85))
         .cursor_pointer()
         .hover(move |style| style.bg(color.opacity(0.16)).text_color(color))
+        // The target is read at click time rather than captured at render so a
+        // settings flip applies to badges already on screen.
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
-            cx.open_url(&url);
+            let target = crate::settings::pull_request_link_target(cx);
+            cx.open_url(&pull_request_link(&url, target));
         })
         .tooltip(move |_, cx| {
-            cx.new(|_| ChangeRequestTooltip::new(&tooltip_summary))
+            let target = crate::settings::pull_request_link_target(cx);
+            cx.new(|_| ChangeRequestTooltip::new(&tooltip_summary, target))
                 .into()
         })
         .tooltip_show_delay(std::time::Duration::from_millis(350))
@@ -589,6 +683,85 @@ mod tests {
                 "branch": "feature/pr",
                 "targetDeviceId": "host"
             })
+        );
+    }
+
+    #[test]
+    fn github_pull_request_links_rewrite_to_linear_review() {
+        assert_eq!(
+            linear_review_url("https://github.com/acme/zeron/pull/90").as_deref(),
+            Some("https://linear.review/acme/zeron/pull/90")
+        );
+        assert_eq!(
+            linear_review_url("https://www.github.com/acme/zeron/pull/90/files?diff=split#top")
+                .as_deref(),
+            Some("https://linear.review/acme/zeron/pull/90/files?diff=split#top")
+        );
+    }
+
+    #[test]
+    fn github_pull_request_links_rewrite_to_graphite() {
+        assert_eq!(
+            graphite_url("https://github.com/acme/zeron/pull/90").as_deref(),
+            Some("https://app.graphite.com/github/pr/acme/zeron/90")
+        );
+        // Graphite has its own page layout: GitHub sub-pages do not carry over.
+        assert_eq!(
+            graphite_url("https://www.github.com/acme/zeron/pull/90/files?diff=split#top")
+                .as_deref(),
+            Some("https://app.graphite.com/github/pr/acme/zeron/90")
+        );
+    }
+
+    #[test]
+    fn non_pull_request_links_are_left_alone() {
+        for url in [
+            "https://github.com/acme/zeron/issues/90",
+            "https://github.com/acme/zeron/pull",
+            "https://github.com/acme/zeron/pull/",
+            "https://github.com/acme/zeron/pull/next",
+            "https://github.com/acme/zeron/pull/90abc",
+            "https://github.com//zeron/pull/90",
+            "https://github.com/acme",
+            "https://gitlab.com/acme/zeron/-/merge_requests/90",
+            "https://github.example.com/acme/zeron/pull/90",
+            "http://github.com/acme/zeron/pull/90",
+        ] {
+            assert_eq!(linear_review_url(url), None, "{url}");
+            assert_eq!(graphite_url(url), None, "{url}");
+            for target in PullRequestLinkTarget::ALL {
+                assert_eq!(pull_request_link(url, target), url, "{url} via {target:?}");
+                assert_eq!(destination_label(url, target), None, "{url} via {target:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pull_request_link_follows_the_target() {
+        let github = "https://github.com/acme/zeron/pull/90";
+        assert_eq!(
+            pull_request_link(github, PullRequestLinkTarget::GitHub),
+            github
+        );
+        assert_eq!(
+            pull_request_link(github, PullRequestLinkTarget::Linear),
+            "https://linear.review/acme/zeron/pull/90"
+        );
+        assert_eq!(
+            pull_request_link(github, PullRequestLinkTarget::Graphite),
+            "https://app.graphite.com/github/pr/acme/zeron/90"
+        );
+        assert_eq!(
+            destination_label(github, PullRequestLinkTarget::GitHub),
+            None
+        );
+        assert_eq!(
+            destination_label(github, PullRequestLinkTarget::Linear).as_deref(),
+            Some("Opens in Linear")
+        );
+        assert_eq!(
+            destination_label(github, PullRequestLinkTarget::Graphite).as_deref(),
+            Some("Opens in Graphite")
         );
     }
 

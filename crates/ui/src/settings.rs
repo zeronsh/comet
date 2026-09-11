@@ -23,6 +23,7 @@ pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod source_control;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -224,6 +225,14 @@ pub fn current(cx: &App) -> UiSettings {
         .unwrap_or_default()
 }
 
+/// Where pull request badges open, read at click time so a settings flip
+/// applies to badges that were rendered before it.
+pub fn pull_request_link_target(cx: &App) -> PullRequestLinkTarget {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.pull_request_link_target)
+        .unwrap_or_default()
+}
+
 /// Monotonic id of the global code-fence layout choice. Every transcript
 /// compares this during render so inactive subagent tabs can observe all mode
 /// transitions when they next become visible.
@@ -292,6 +301,35 @@ pub enum ComposerSendBehavior {
     ModEnter,
 }
 
+/// Where a pull request badge opens its link.
+///
+/// Linear and Graphite only rewrite GitHub pull request links; anything else
+/// keeps its own page (`change_requests::pull_request_link`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PullRequestLinkTarget {
+    /// The pull request's own page on github.com.
+    #[default]
+    GitHub,
+    /// Linear's review surface (`linear.review`).
+    Linear,
+    /// Graphite's review surface (`app.graphite.com`).
+    Graphite,
+}
+
+impl PullRequestLinkTarget {
+    /// Selector order on the Source control settings page.
+    pub const ALL: [Self; 3] = [Self::GitHub, Self::Linear, Self::Graphite];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::Linear => "Linear",
+            Self::Graphite => "Graphite",
+        }
+    }
+}
+
 /// Persist the latest revision. Safe to call at shutdown.
 pub fn flush(cx: &mut App) {
     if !cx.has_global::<SettingsStore>() {
@@ -358,6 +396,9 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
+    /// Where the sidebar and composer pull request badges open. Device-local,
+    /// like the badge visibility flag above.
+    pub pull_request_link_target: PullRequestLinkTarget,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -457,6 +498,7 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
+            pull_request_link_target: PullRequestLinkTarget::default(),
             last_space_id: None,
             open_tabs: None,
             space_filter: None,
@@ -1101,6 +1143,7 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
+            pull_request_link_target: PullRequestLinkTarget::Graphite,
             last_space_id: Some("space-1".into()),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
@@ -1162,6 +1205,32 @@ mod tests {
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
+        assert!(json.contains(r#""pullRequestLinkTarget": "graphite""#));
+    }
+
+    #[test]
+    fn pull_request_link_target_defaults_to_github_for_old_settings() {
+        let loaded: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(
+            loaded.pull_request_link_target,
+            PullRequestLinkTarget::GitHub
+        );
+
+        let linear: UiSettings =
+            serde_json::from_str(r#"{"pullRequestLinkTarget":"linear"}"#).unwrap();
+        assert_eq!(
+            linear.pull_request_link_target,
+            PullRequestLinkTarget::Linear
+        );
+
+        assert_eq!(
+            PullRequestLinkTarget::ALL.map(PullRequestLinkTarget::label),
+            ["GitHub", "Linear", "Graphite"]
+        );
+        assert_eq!(
+            PullRequestLinkTarget::ALL[0],
+            PullRequestLinkTarget::default()
+        );
     }
 
     #[test]
