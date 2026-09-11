@@ -7,7 +7,11 @@
 //!
 //! Two modes:
 //! - **Dev** (no WorkOS client id configured, or the edge reports `auth: "dev"`): always
-//!   signed in; the bearer IS the configured user id (current M2/M3 behavior).
+//!   signed in; the bearer IS the configured user id (current M2/M3 behavior). A
+//!   self-hosted edge in `AUTH_MODE=none` is the same mode from the engine's side,
+//!   except the identity comes from the edge: [`Auth::detect`] reads `userId`/`orgId`
+//!   off `/health` and uses `user@org` as the dev bearer, so every device pointed at
+//!   that edge lands in the same workspace without coordinating env vars.
 //! - **WorkOS**: authorization-code flow. Headed devices use a loopback callback server
 //!   on an ephemeral port; headless devices use the paste-code flow (the redirect is the
 //!   edge's hosted `/auth/cli/callback` page, which shows `state.code` to paste back via
@@ -136,6 +140,10 @@ pub struct AuthConfig {
     pub dev_user_id: String,
     /// Loopback callback port; `None` = ephemeral.
     pub callback_port: Option<u16>,
+    /// Set by [`Auth::detect`] when the edge answered `auth: "none"`: a self-hosted
+    /// open edge whose identity this config adopted. Sync is on for such an edge even
+    /// though no bearer was configured — the edge does not want one.
+    pub open_edge: bool,
 }
 
 impl AuthConfig {
@@ -147,6 +155,7 @@ impl AuthConfig {
             workos_api_base: "https://api.workos.com".into(),
             dev_user_id: "dev-user".into(),
             callback_port: None,
+            open_edge: false,
         }
     }
 }
@@ -289,39 +298,67 @@ impl Auth {
         }
     }
 
-    /// Like [`Auth::new`], but additionally probes `{edge}/health`: an edge running in
-    /// dev auth mode forces dev mode even when a client id is configured (matching the
-    /// edge's "bearer = user id" verification).
+    /// Like [`Auth::new`], but additionally probes `{edge}/health`:
+    /// - `auth: "dev"` forces dev mode even when a client id is configured (matching
+    ///   the edge's "bearer = user id" verification).
+    /// - `auth: "none"` (self-hosted open edge) forces dev mode and adopts the edge's
+    ///   fixed `userId`/`orgId` as the `user@org` dev bearer, so the engine's
+    ///   development profile lands in the workspace the edge actually serves.
+    ///
+    /// An unreachable edge leaves the config untouched; this never blocks boot on
+    /// the network for longer than the probe timeout.
     pub async fn detect(mut config: AuthConfig) -> Self {
-        if config.workos_client_id.is_some() {
-            #[derive(Deserialize)]
-            struct Health {
-                auth: Option<String>,
+        #[derive(Deserialize)]
+        struct Health {
+            auth: Option<String>,
+            #[serde(default, rename = "userId")]
+            user_id: Option<String>,
+            #[serde(default, rename = "orgId")]
+            org_id: Option<String>,
+        }
+        let url = format!("{}/health", config.edge_url.trim_end_matches('/'));
+        let probe = async {
+            let response = reqwest::Client::new()
+                .get(&url)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            response.json::<Health>().await.map_err(|e| e.to_string())
+        };
+        match probe.await {
+            Err(error) => {
+                tracing::debug!(%url, %error, "auth: edge health probe failed; keeping configured mode");
             }
-            let url = format!("{}/health", config.edge_url.trim_end_matches('/'));
-            let probe = async {
-                reqwest::Client::new()
-                    .get(&url)
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<Health>()
-                    .await
-                    .ok()
-            };
-            if let Some(health) = probe.await
-                && health.auth.as_deref() == Some("dev")
-            {
-                tracing::info!("auth: edge is in dev mode — using dev bearer");
-                config.workos_client_id = None;
-            }
+            Ok(health) => match health.auth.as_deref() {
+                Some("none") => {
+                    let non_empty = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+                    let user = non_empty(health.user_id).unwrap_or_else(|| "local".into());
+                    let org = non_empty(health.org_id).unwrap_or_else(|| "local".into());
+                    tracing::info!(%user, %org, "auth: edge is open (AUTH_MODE=none) — skipping WorkOS");
+                    config.workos_client_id = None;
+                    config.dev_user_id = format!("{user}@{org}");
+                    config.open_edge = true;
+                }
+                Some("dev") if config.workos_client_id.is_some() => {
+                    tracing::info!("auth: edge is in dev mode — using dev bearer");
+                    config.workos_client_id = None;
+                }
+                _ => {}
+            },
         }
         Self::new(config)
     }
 
     pub fn workos_enabled(&self) -> bool {
         self.inner.workos.is_some()
+    }
+
+    /// True when [`Auth::detect`] found a self-hosted edge in `AUTH_MODE=none` and
+    /// adopted its identity. Such an edge is meant to be synced against even though the
+    /// runtime is in dev mode with no configured bearer.
+    pub fn open_edge(&self) -> bool {
+        self.inner.config.open_edge
     }
 
     /// True when construction loaded a parseable persisted WorkOS session.
@@ -349,6 +386,21 @@ impl Auth {
             return Some(dev.split('@').next().unwrap_or(dev).to_string());
         }
         self.state().user().map(|u| u.id.clone())
+    }
+
+    /// The org half of a `user@org` dev bearer — set by [`Auth::detect`] when a
+    /// self-hosted edge advertises its identity. `None` in WorkOS mode or for a bare
+    /// dev user id.
+    pub fn dev_org_id(&self) -> Option<String> {
+        if self.inner.workos.is_some() {
+            return None;
+        }
+        self.inner
+            .config
+            .dev_user_id
+            .split_once('@')
+            .map(|(_, org)| org.to_string())
+            .filter(|org| !org.is_empty())
     }
 
     /// Current bearer for edge rooms / the device relay — `None` when signed out.

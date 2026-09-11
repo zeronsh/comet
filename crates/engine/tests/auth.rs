@@ -569,3 +569,52 @@ async fn detect_probes_edge_dev_mode() {
     assert_eq!(auth.access_token().await.as_deref(), Some("dev-w"));
     task.abort();
 }
+
+#[tokio::test]
+async fn detect_probes_edge_none_mode_adopts_identity() {
+    // A self-hosted open edge advertises its fixed identity; the engine adopts it as the
+    // `user@org` dev bearer even over an explicitly configured one.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            if read_request(&mut stream).await.is_some() {
+                respond(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"ok":true,"auth":"none","userId":"home","orgId":"lab"}"#,
+                )
+                .await;
+            }
+        }
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = workos_config(&format!("http://127.0.0.1:{port}"), dir.path());
+    config.dev_user_id = "someone@else".into();
+    let auth = Auth::detect(config).await;
+    assert!(!auth.workos_enabled(), "open edge skips WorkOS");
+    assert_eq!(auth.access_token().await.as_deref(), Some("home@lab"));
+    assert_eq!(auth.user_id().as_deref(), Some("home"));
+    assert_eq!(auth.dev_org_id().as_deref(), Some("lab"));
+    assert!(auth.open_edge(), "an open edge is one we sync against");
+    task.abort();
+}
+
+#[tokio::test]
+async fn detect_leaves_dev_config_alone_when_edge_is_unreachable() {
+    // Nothing listening: the probe times out and the configured dev identity stands.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = AuthConfig::new(format!("http://127.0.0.1:{port}"), dir.path());
+    config.dev_user_id = "alice@acme".into();
+    let auth = Auth::detect(config).await;
+    assert!(!auth.workos_enabled());
+    assert_eq!(auth.user_id().as_deref(), Some("alice"));
+    assert_eq!(auth.dev_org_id().as_deref(), Some("acme"));
+    assert!(!auth.open_edge());
+}

@@ -13,8 +13,14 @@ export interface Env {
    * /releases/* for the curl-install flow. */
   RELEASES: R2Bucket;
   WORKOS_CLIENT_ID: string;
-  /** "workos" (verify AuthKit JWTs) or "dev" (bearer == userId, never prod). */
+  /** "workos" (verify AuthKit JWTs), "dev" (bearer == userId, never prod), or
+   * "none" (self-host: no bearer, every caller is the fixed SELFHOST_* identity;
+   * docs/SELFHOST.md). */
   AUTH_MODE: string;
+  /** AUTH_MODE=none identity (default `local` / `local`). Single-tenant
+   * self-host: every device shares this user+org. */
+  SELFHOST_USER_ID?: string;
+  SELFHOST_ORG_ID?: string;
   /** Optional overrides for the WorkOS trust anchor. */
   WORKOS_ISSUER?: string;
   WORKOS_JWKS_URL?: string;

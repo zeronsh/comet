@@ -1,0 +1,55 @@
+{
+  // Self-host config: the same Worker, Durable Objects and R2 bindings as
+  // wrangler.jsonc, but run under local workerd with disk persistence —
+  // no Cloudflare account, no routes, no WorkOS (AUTH_MODE=none).
+  //
+  //   wrangler dev --config wrangler.selfhost.jsonc --local --persist-to ./data
+  //   docker compose -f ../docker-compose.selfhost.yml up   (see docs/SELFHOST.md)
+  //
+  // Keep the bindings and migrations in lockstep with wrangler.jsonc: DO
+  // storage is keyed by class name, so a class missing here is a room the
+  // Worker will fail to route to.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zeron-edge-selfhost",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "workers_dev": false,
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "alias": {
+    "loro-crdt": "loro-crdt/base64"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
+      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+      { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SessionRoom", "DeviceRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["RegistryRoom"] },
+    { "tag": "v3", "new_sqlite_classes": ["ChatRoom"] },
+    { "tag": "v4", "new_sqlite_classes": ["PreviewRoom"] }
+  ],
+  "r2_buckets": [
+    {
+      // Attachments + backups — disk-backed under --persist-to.
+      "binding": "BLOBS",
+      "bucket_name": "zeron-selfhost-blobs"
+    },
+    {
+      // Release mirror for /releases/*; unused unless you publish builds
+      // through your own edge, but the Worker binds it unconditionally.
+      "binding": "RELEASES",
+      "bucket_name": "zeron-selfhost-releases"
+    }
+  ],
+  "vars": {
+    "WORKOS_CLIENT_ID": "",
+    "AUTH_MODE": "none",
+    "SELFHOST_USER_ID": "local",
+    "SELFHOST_ORG_ID": "local"
+  }
+}

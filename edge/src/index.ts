@@ -36,7 +36,7 @@
  *   GET  /chat2/:chatId/stats
  *   POST /chat2/:chatId/reset
  */
-import { authenticate } from "./auth";
+import { authMode, authenticate, selfhostIdentity } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
@@ -116,7 +116,14 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
 
     if (url.pathname === "/health") {
-      return json({ ok: true, auth: env.AUTH_MODE === "dev" ? "dev" : "workos" });
+      const mode = authMode(env);
+      if (mode === "none") {
+        // Self-host: advertise the fixed identity so engines adopt it without
+        // any out-of-band `user@org` configuration.
+        const id = selfhostIdentity(env);
+        return json({ ok: true, auth: mode, userId: id.userId, orgId: id.orgId });
+      }
+      return json({ ok: true, auth: mode });
     }
 
     // ── public install surface (also routed from zeron.sh): the

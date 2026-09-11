@@ -7,6 +7,11 @@
  * Workspace rooms (`ws/{orgId}`) authorize on the token's WorkOS organization
  * claim (`org_id`, present when the session was refreshed scoped to an org):
  * membership = claim equals the room's orgId.
+ *
+ * AUTH_MODE=none (self-host): no bearer required. The edge is a single-tenant
+ * trust boundary — every caller is the fixed user+org from `SELFHOST_USER_ID`
+ * / `SELFHOST_ORG_ID` (default `local`/`local`). Anyone who can reach the
+ * port is that user, so this mode belongs on a private network.
  */
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { Env } from "./env";
@@ -17,6 +22,21 @@ export interface Verified {
   /** WorkOS `org_id` claim — the org the caller's session is scoped to. */
   readonly orgId?: string;
 }
+
+export type AuthMode = "workos" | "dev" | "none";
+
+/** Normalized `AUTH_MODE`; anything unrecognized is treated as `workos`. */
+export const authMode = (env: Env): AuthMode => {
+  const mode = (env.AUTH_MODE ?? "workos").trim().toLowerCase();
+  return mode === "dev" || mode === "none" ? mode : "workos";
+};
+
+/** The single identity every caller gets under AUTH_MODE=none. */
+export const selfhostIdentity = (env: Env): Verified => {
+  const userId = (env.SELFHOST_USER_ID ?? "local").trim() || "local";
+  const orgId = (env.SELFHOST_ORG_ID ?? "local").trim() || "local";
+  return { userId, orgId };
+};
 
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
@@ -37,7 +57,12 @@ export const bearerFromRequest = (request: Request): string | undefined => {
 };
 
 export const verifyToken = async (env: Env, token: string): Promise<Verified | undefined> => {
-  if (env.AUTH_MODE === "dev") {
+  const mode = authMode(env);
+  if (mode === "none") {
+    // The bearer is ignored: self-host is open to whoever can reach the process.
+    return selfhostIdentity(env);
+  }
+  if (mode === "dev") {
     // Dev mode mirrors the old apps/server: the bearer string IS the user id.
     // `userId@orgId` additionally carries a fake org claim so workspace-room
     // membership is exercisable locally (smoke tests).
@@ -63,6 +88,7 @@ export const verifyToken = async (env: Env, token: string): Promise<Verified | u
 };
 
 export const authenticate = async (env: Env, request: Request): Promise<Verified | undefined> => {
+  if (authMode(env) === "none") return selfhostIdentity(env);
   const token = bearerFromRequest(request);
   if (!token) return undefined;
   return verifyToken(env, token);

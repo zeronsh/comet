@@ -1,0 +1,31 @@
+# Self-hosted Zeron edge: rooms + blobs on a Docker volume, no Cloudflare,
+# no WorkOS. See docs/SELFHOST.md.
+#
+#   docker compose -f docker-compose.selfhost.yml up --build
+#
+# Point a client at it:
+#   ZERON_EDGE_URL=http://localhost:8787 ZERON_WORKOS_CLIENT_ID= zeron headless
+services:
+  edge:
+    build:
+      context: ./edge
+      dockerfile: Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      AUTH_MODE: ${AUTH_MODE:-none}
+      SELFHOST_USER_ID: ${SELFHOST_USER_ID:-local}
+      SELFHOST_ORG_ID: ${SELFHOST_ORG_ID:-local}
+    volumes:
+      # Durable Object SQLite + R2 object store (attachments, backups).
+      - zeron-edge-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  zeron-edge-data:

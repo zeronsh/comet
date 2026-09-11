@@ -592,6 +592,14 @@ impl Engine {
     /// Resolve the shared dev/WorkOS auth configuration for headed and headless
     /// modes. A clean WorkOS boot deliberately avoids probing Edge: signed-out
     /// installations must be able to start locally without network access.
+    ///
+    /// A dev-mode boot (no WorkOS client id) that was pointed at an edge
+    /// explicitly (`ZERON_EDGE_URL` set) does probe: that is the self-host path
+    /// (`ZERON_EDGE_URL=… ZERON_WORKOS_CLIENT_ID=`), and an edge answering
+    /// `auth: "none"` dictates the identity every device must use — its
+    /// `userId`/`orgId` override any `ZERON_EDGE_TOKEN`, because the edge will
+    /// only ever authorize rooms under its own fixed org. A dev boot with no
+    /// edge named stays offline and makes no requests at all.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
@@ -608,6 +616,10 @@ impl Engine {
         );
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
+        }
+        let edge_named = std::env::var("ZERON_EDGE_URL").is_ok_and(|url| !url.trim().is_empty());
+        if auth_config.workos_client_id.is_none() && edge_named {
+            return Auth::detect(auth_config).await;
         }
         Auth::new(auth_config)
     }
@@ -640,7 +652,11 @@ impl Engine {
                     .and_then(|token| token.split_once('@'))
                     .map(|(_, org)| org.to_string())
                     .filter(|org| !org.is_empty());
-                let org_id = dev_token_org
+                // The auth service's org wins: a self-hosted `AUTH_MODE=none` edge
+                // advertises the org it serves and `build_auth` adopted it there.
+                let org_id = auth
+                    .dev_org_id()
+                    .or(dev_token_org)
                     .or(config.org_id.clone())
                     .unwrap_or_else(|| env_or("ZERON_ORG_ID", DEFAULT_ORG_ID));
                 let user_id = auth
@@ -731,11 +747,15 @@ impl Engine {
             // Dev Auth always exposes `dev_user_id` as its synthetic access
             // token, including when WorkOS was merely disabled with
             // ZERON_WORKOS_CLIENT_ID="". Only an explicitly configured,
-            // non-empty bearer opts this runtime into Edge rooms and relays.
-            WorkspaceScope::Development => config
-                .edge_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty()),
+            // non-empty bearer — or a self-hosted edge that announced itself
+            // as open on `/health` — opts this runtime into Edge rooms and relays.
+            WorkspaceScope::Development => {
+                auth.open_edge()
+                    || config
+                        .edge_token
+                        .as_deref()
+                        .is_some_and(|token| !token.trim().is_empty())
+            }
         };
         if edge_enabled {
             // OS network-path events (macOS NWPathMonitor): the instant the

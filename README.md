@@ -53,6 +53,8 @@ zeron daemon start
 
 On macOS: use the desktop release, or build `zeron` from source and run `zeron daemon install` to install the launchd service.
 
+Prefer to keep sync off other people's servers? The edge can run on your own machine with `docker compose`, no Cloudflare or WorkOS account needed — see [docs/SELFHOST.md](docs/SELFHOST.md).
+
 ---
 
 Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/zeron) or check out [ARCHITECTURE.md](ARCHITECTURE.md).

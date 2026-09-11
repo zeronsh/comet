@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --port 27640 --var AUTH_MODE:dev",
+    "dev:selfhost": "wrangler dev --config wrangler.selfhost.jsonc --port 8787 --ip 0.0.0.0 --local --persist-to ./data",
     "deploy": "wrangler deploy",
     "build": "wrangler deploy --dry-run --outdir dist",
     "typecheck": "tsc --noEmit",
