@@ -1020,7 +1020,7 @@ impl Composer {
                             composer.attachments.remove(&composer.current_key).unwrap_or_default(),
                         ));
                         composer.attachments.insert(composer.current_key.clone(), loaded_attachments);
-                        composer.queue_edit_focus_pending = true;
+                        composer.focus_pending = true;
                         composer.input.update(cx, |input, cx| input.set_text(text, cx));
                         composer.start_queue_edit_renewal(engine.clone(), cx);
                     }
@@ -1095,7 +1095,7 @@ impl Composer {
             self.attachments
                 .insert(self.current_key.clone(), attachments);
         }
-        self.queue_edit_focus_pending = true;
+        self.focus_pending = true;
         cx.notify();
     }
 
@@ -1304,9 +1304,26 @@ impl Composer {
             cx.notify();
             return;
         }
+        let pending_message = matches!(
+            method,
+            methods::SEND_QUEUED_MESSAGE_NOW | methods::STEER_QUEUED_MESSAGE_NOW
+        )
+        .then(|| {
+            params
+                .get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_owned)
+        })
+        .flatten();
+        if let Some(id) = &pending_message {
+            self.state.update(cx, |state, cx| {
+                state.begin_pending_send(&chat_id, id, chrono::Utc::now());
+                cx.notify();
+            });
+        }
         let mut params = params;
         if let Some(object) = params.as_object_mut() {
-            object.insert("chatId".into(), serde_json::Value::String(chat_id));
+            object.insert("chatId".into(), serde_json::Value::String(chat_id.clone()));
             if let Some(host) = host_device_id {
                 object.insert("targetDeviceId".into(), serde_json::Value::String(host));
             }
@@ -1317,7 +1334,19 @@ impl Composer {
         // showing an order the doc never got.
         cx.spawn(
             async move |this, cx| match engine.client().call(method, params).await {
-                Ok(reply) if queue_mutation_acknowledged(method, &reply) => {}
+                Ok(reply) if queue_mutation_acknowledged(method, &reply) => {
+                    // The host has adopted this message. Clear even if the
+                    // user switched chats and its transcript is no longer watched.
+                    if let Some(id) = &pending_message {
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |state, cx| {
+                                state.end_pending_send(&chat_id, id);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                    }
+                }
                 Ok(reply) => {
                     tracing::debug!(
                         method,
@@ -1325,6 +1354,12 @@ impl Composer {
                         "queue mutation was not applied; reconciling"
                     );
                     this.update(cx, |composer, cx| {
+                        if let Some(id) = &pending_message {
+                            composer.state.update(cx, |state, cx| {
+                                state.end_pending_send(&chat_id, id);
+                                cx.notify();
+                            });
+                        }
                         composer
                             .state
                             .update(cx, |state, cx| state.refresh_selected_queue(cx));
@@ -1334,6 +1369,12 @@ impl Composer {
                 Err(err) => {
                     tracing::warn!(method, error = %err, "queue mutation failed");
                     this.update(cx, |composer, cx| {
+                        if let Some(id) = &pending_message {
+                            composer.state.update(cx, |state, cx| {
+                                state.end_pending_send(&chat_id, id);
+                                cx.notify();
+                            });
+                        }
                         composer.failure = Some(failure.into());
                         composer
                             .state

@@ -1510,3 +1510,45 @@ async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
         core.shutdown().await;
     }
 }
+
+/// Normal queued turns each publish a completion; Send now's interrupted
+/// predecessor does not. The replacement's own completion must still arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_completion_markers_distinguish_normal_turns_from_interrupts() {
+    for send_now in [false, true] {
+        let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+        core.doc_host
+            .queue_message(CHAT, "opening", Vec::new())
+            .unwrap();
+        wait_for(|| prompts.lock().unwrap().len() == 1, "opening turn").await;
+        let id = core
+            .doc_host
+            .queue_message(CHAT, "follow-up", Vec::new())
+            .unwrap();
+        let completion = || {
+            core.sessions
+                .session_status(CHAT)
+                .and_then(|s| s.last_completed_turn)
+        };
+        assert_eq!(completion(), None);
+        if send_now {
+            assert!(core.doc_host.send_queued_now(CHAT, &id).await.unwrap());
+        } else {
+            harness.finish.send(()).unwrap();
+        }
+        wait_for(|| prompts.lock().unwrap().len() == 2, "follow-up turn").await;
+        let first_completion = completion();
+        assert_eq!(
+            first_completion.is_some(),
+            !send_now,
+            "only a naturally completed predecessor should notify"
+        );
+        harness.finish.send(()).unwrap();
+        wait_for(
+            || completion().is_some() && completion() != first_completion,
+            "follow-up completion marker",
+        )
+        .await;
+        core.shutdown().await;
+    }
+}

@@ -64,7 +64,6 @@ use crate::theme::Theme;
 use zeron_syntax::LanguageId as Lang;
 
 pub mod presentation;
-pub(crate) use presentation::render_file_body_with_syntax;
 pub use presentation::{
     ACCENT_BAR_WIDTH, BODY_BOTTOM_PAD, DIFF_LINE_HEIGHT, DiffHighlights, DiffLine, FileDiff,
     FileStatus, GUTTER_WIDTH, HUNK_HEADER_HEIGHT, Hunk, LineKind, MARKER_WIDTH, NOTICE_HEIGHT,
@@ -2545,6 +2544,20 @@ impl Changes {
         }
     }
 
+    /// Handle Escape before focused descendants such as a terminal receive it.
+    /// A popup in its exit animation remains a blocker until it unmounts.
+    pub(crate) fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ref_menu.is_open() {
+            self.close_ref_menu(cx);
+            return true;
+        }
+        if self.scope_menu.is_open() {
+            self.close_scope_menu(cx);
+            return true;
+        }
+        self.scope_menu.get().is_some() || self.ref_menu.get().is_some()
+    }
+
     fn open_ref_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
@@ -2602,7 +2615,10 @@ impl Changes {
             event.keystroke.modifiers.control,
         );
         match key {
-            popover::MenuKey::Escape => self.close_ref_menu(cx),
+            popover::MenuKey::Escape => {
+                self.close_ref_menu(cx);
+                cx.stop_propagation();
+            }
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let count = self.ref_menu_rows(cx).len();
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
@@ -2965,7 +2981,12 @@ impl Changes {
                 };
                 let comments = self.comments_for(&file_diff.path, cx);
                 match comments.get(card as usize) {
-                    Some(comment) => render_comment_card(comment, &theme, cx),
+                    Some(comment) => crate::comment_ui::render_comment_card(
+                        comment,
+                        &theme,
+                        cx,
+                        Self::remove_comment,
+                    ),
                     None => gpui::Empty.into_any_element(),
                 }
             }
@@ -2980,12 +3001,14 @@ impl Changes {
                 {
                     // Header cites the same path the staged card and the
                     // prompt bullet will.
-                    Some(draft) => render_comment_draft(
+                    Some(draft) => crate::comment_ui::render_comment_draft(
                         draft_cite_path(draft),
                         draft.line,
                         draft.input.clone(),
                         &theme,
                         cx,
+                        Self::cancel_draft,
+                        Self::commit_draft,
                     ),
                     None => gpui::Empty.into_any_element(),
                 }
@@ -4008,118 +4031,12 @@ fn render_comment_adder(
     cx: &Context<Changes>,
 ) -> AnyElement {
     let target = path.to_string();
-    div()
-        .id(SharedString::from(format!(
-            "cmt-add-{path}-{}-{line}",
-            side.tag()
-        )))
-        .size(px(COMMENT_ADDER_SIZE))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.0))
-        .bg(theme.solid)
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.open_draft(target.clone(), side, line, window, cx);
-        }))
-        .child(
-            crate::icons::icon(crate::icons::PLUS)
-                .size(px(11.0))
-                .text_color(theme.on_solid),
-        )
-        .into_any_element()
-}
-
-fn render_comment_card(
-    comment: &ReviewComment,
-    theme: &Theme,
-    cx: &Context<Changes>,
-) -> AnyElement {
-    let group: SharedString = format!("cmt-card-{}", comment.id).into();
-    let id = comment.id.clone();
-    div()
-        .group(group.clone())
-        .h(px(comments::card_height(&comment.body)))
-        .w_full()
-        .flex_none()
-        .flex()
-        .flex_row()
-        .bg(crate::theme::ink(0.05))
-        // A bar, not a border: it must match ACCENT_BAR_WIDTH exactly or the
-        // card's edge steps in and out of the column.
-        .child(comment_accent_bar(theme.solid.opacity(0.35)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .px(px(Theme::SPACE_LG))
-                .py(px(comments::CARD_PAD_V / 2.0))
-                .child(
-                    div()
-                        .h(px(comments::CARD_HEADER_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_faint),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(comment.location())),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("cmt-remove-{}", comment.id)))
-                                .flex_none()
-                                .size(px(16.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .opacity(0.0)
-                                .group_hover(group, |s| s.opacity(1.0))
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.remove_comment(&id, cx)),
-                                )
-                                .child(
-                                    crate::icons::icon(crate::icons::CLOSE_CIRCLE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        // Height is analytic, so an over-long body clips
-                        // inside the card rather than past the fold height.
-                        .overflow_hidden()
-                        .text_size(px(12.0))
-                        .line_height(px(comments::CARD_LINE_HEIGHT))
-                        .text_color(theme.text_dim)
-                        .child(SharedString::from(comment.body.clone())),
-                ),
-        )
-        .into_any_element()
-}
-
-fn comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
-    div().w(px(ACCENT_BAR_WIDTH)).h_full().flex_none().bg(color)
+    crate::comment_ui::render_comment_adder(
+        format!("cmt-add-{path}-{}-{line}", side.tag()).into(),
+        theme,
+        cx,
+        move |this, window, cx| this.open_draft(target.clone(), side, line, window, cx),
+    )
 }
 
 /// Mirrors [`ReviewComment::cite_path`] for the not-yet-staged note.
@@ -4130,111 +4047,47 @@ fn draft_cite_path(draft: &CommentDraft) -> &str {
     }
 }
 
-/// Fixed height, so an open draft never fights the fold tween.
-fn render_comment_draft(
-    path: &str,
-    line: u32,
-    input: Entity<ComposerInput>,
+/// The expanded body of one file section: notices, hunk headers, +/-/context
+/// lines with a coloured accent bar, dual line-number gutters, a marker
+/// column, and paint-only syntax runs (zeron checkout-diff-sidebar).
+/// Shared with the transcript's tool-diff detail blocks — the same component
+/// renders a checkout diff section and an inline ACP tool diff. (The changes
+/// pane itself virtualizes these rows individually; this stacked form serves
+/// the transcript and the fold tween's clipped stand-in.)
+/// Full-document old/new highlighting for tool and checkout diffs.
+pub(crate) fn render_file_body_with_syntax(
+    file: &FileDiff,
+    highlights: Option<Arc<DiffHighlights>>,
     theme: &Theme,
-    cx: &Context<Changes>,
 ) -> AnyElement {
+    let mut children: Vec<AnyElement> = Vec::new();
+    let gutter_px = gutter_width(file);
+    for notice in file_notices(file) {
+        children.push(notice_row(notice, theme));
+    }
+    for hunk in &file.hunks {
+        children.push(hunk_header_row(&hunk.header, theme));
+        for line in &hunk.lines {
+            let spans = highlights
+                .as_deref()
+                .map(|highlights| highlights.spans(line))
+                .unwrap_or(&[]);
+            children.push(diff_line_row(
+                line,
+                spans,
+                theme,
+                gutter_px,
+                DiffCodeWidth::Clipped,
+                None,
+            ));
+        }
+    }
     div()
-        .h(px(comments::DRAFT_CARD_HEIGHT))
-        .w_full()
-        .flex_none()
         .flex()
-        .flex_row()
-        .bg(crate::theme::ink(0.08))
-        .child(comment_accent_bar(theme.solid.opacity(0.7)))
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .px(px(Theme::SPACE_LG))
-                .py(px(10.0))
-                .child(
-                    div()
-                        .h(px(comments::CARD_HEADER_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_faint),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(format!("{path}:{line}"))),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(46.0))
-                        .flex_none()
-                        .overflow_hidden()
-                        .text_size(px(12.0))
-                        .child(input.into_any_element()),
-                )
-                .child(
-                    div()
-                        .h(px(28.0))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(6.0))
-                        .child(
-                            comment_action("cmt-cancel", "Cancel", false, theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_draft(cx))),
-                        )
-                        .child(
-                            comment_action("cmt-commit", "Comment", true, theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.commit_draft(cx))),
-                        ),
-                ),
-        )
+        .flex_col()
+        .pb(px(BODY_BOTTOM_PAD))
+        .children(children)
         .into_any_element()
-}
-
-fn comment_action(
-    id: &'static str,
-    label: &'static str,
-    primary: bool,
-    theme: &Theme,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .h(px(22.0))
-        .px(px(10.0))
-        .flex()
-        .items_center()
-        .rounded(px(6.0))
-        .text_size(px(11.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .cursor_pointer()
-        .when(primary, |el| el.bg(theme.solid).text_color(theme.on_solid))
-        .when(!primary, |el| {
-            el.text_color(motion::hover_blend(id, theme.text_muted, theme.text))
-                .bg(motion::hover_blend(
-                    id,
-                    gpui::transparent_black(),
-                    theme.element_hover,
-                ))
-                .on_hover(motion::hover_listener(id))
-        })
-        .child(SharedString::from(label))
 }
 
 /// Build only rows that start above `max_px` so the fold tween's stand-in

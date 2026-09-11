@@ -6,7 +6,7 @@
 //! types) are accepted, and unknown item types map to nothing.
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, TodoItem, ToolCall};
+use zeron_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -205,6 +205,34 @@ pub(crate) fn item_type(item: &Value) -> &str {
     item.get("type").and_then(Value::as_str).unwrap_or("")
 }
 
+pub(super) fn is_collab_spawn(item: &Value) -> bool {
+    matches!(
+        item_type(item),
+        "collabAgentToolCall" | "collab_agent_tool_call"
+    ) && matches!(
+        item.get("tool").and_then(Value::as_str),
+        Some("spawnAgent" | "spawn_agent")
+    )
+}
+
+/// A v1 spawn names its child in the completed result. Other collaboration
+/// tools can address several receivers, but only a spawn owns a transcript.
+pub(super) fn collab_spawn_child(item: &Value) -> Option<&str> {
+    if !is_collab_spawn(item)
+        || matches!(
+            item.get("status").and_then(Value::as_str),
+            Some("failed" | "errored")
+        )
+    {
+        return None;
+    }
+    let receivers = field(item, &["receiverThreadIds", "receiver_thread_ids"])?.as_array()?;
+    match receivers.as_slice() {
+        [child] => child.as_str().filter(|id| !id.is_empty()),
+        _ => None,
+    }
+}
+
 /// Map one `item/started` or `item/completed` payload's item to events.
 /// `agentMessage` and `reasoning` flow through their delta channels and are
 /// handled by the session loop, not here.
@@ -299,11 +327,42 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
         }],
+        "collabAgentToolCall" | "collab_agent_tool_call" => {
+            let tool = str_field(item, &["tool"]);
+            let name = if is_collab_spawn(item) {
+                "Agent".to_owned()
+            } else {
+                match tool.as_str() {
+                    "sendInput" | "send_input" => "Send agent message".to_owned(),
+                    "wait" => "Wait for agents".to_owned(),
+                    "closeAgent" | "close_agent" => "Close agent".to_owned(),
+                    "resumeAgent" | "resume_agent" => "Resume agent".to_owned(),
+                    _ => format!("Agent control: {tool}"),
+                }
+            };
+            tool_lifecycle(
+                phase,
+                id,
+                ToolCall::Unknown {
+                    name,
+                    input: Some(item.clone()),
+                },
+                matches!(status.as_str(), "failed" | "errored"),
+            )
+        }
         // A subagent spawn/lifecycle marker on the PARENT thread (multi-agent
         // v2, codex 0.146.x): the parent-feed chip for the child thread. The
         // child's own traffic routes separately (see `route_child_notification`
         // in mod.rs); this is only the spawn tool call the chip folds from.
         "subAgentActivity" | "sub_agent_activity" => {
+            // A lifecycle marker has its own item id. It is not another
+            // spawn; the child's turn notifications carry its terminal state.
+            if !matches!(
+                item.get("kind").and_then(Value::as_str),
+                Some("started" | "spawned")
+            ) {
+                return Vec::new();
+            }
             let name = str_field(item, &["agentPath"])
                 .rsplit('/')
                 .find(|s| !s.is_empty())
@@ -345,6 +404,156 @@ pub(crate) fn user_message_text(item: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n\n");
     (!joined.trim().is_empty()).then_some(joined)
+}
+
+/// Per-child stream state, retained across parent turns and follow-up tasks.
+/// Completion-only messages need the same text fallback as the root. Replayed
+/// user items must not reopen a finished document or duplicate a steering entry.
+#[derive(Default)]
+pub(super) struct ChildStream {
+    reasoning: ReasoningStream,
+    streamed_text: std::collections::HashSet<String>,
+    completed_items: std::collections::VecDeque<String>,
+    completed_turns: std::collections::VecDeque<String>,
+    settled: bool,
+}
+
+fn remember(ids: &mut std::collections::VecDeque<String>, id: String) -> bool {
+    if id.is_empty() {
+        return true;
+    }
+    if ids.contains(&id) {
+        return false;
+    }
+    if ids.len() == 256 {
+        ids.pop_front();
+    }
+    ids.push_back(id);
+    true
+}
+
+impl ChildStream {
+    pub(super) fn map(&mut self, child: &str, method: &str, params: &Value) -> Vec<AgentEvent> {
+        if method == "turn/started" {
+            let id = turn_id(params);
+            if !id.is_empty() && self.completed_turns.contains(&id) {
+                return Vec::new();
+            }
+            if self.settled {
+                self.settled = false;
+                // v2 followup_task starts a new child turn without echoing a
+                // userMessage. Reopen the existing document without inventing
+                // a user prompt or attributing an activity id as a new spawn.
+                return vec![AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }];
+            }
+            return Vec::new();
+        }
+        if matches!(method, "item/started" | "item/completed") {
+            let item = params.get("item").unwrap_or(&Value::Null);
+            let phase = if method == "item/started" {
+                Phase::Started
+            } else {
+                Phase::Completed
+            };
+            if phase == Phase::Completed
+                && !remember(&mut self.completed_items, str_field(item, &["id"]))
+            {
+                return Vec::new();
+            }
+            if matches!(item_type(item), "userMessage" | "user_message") {
+                return if phase == Phase::Completed {
+                    user_message_text(item)
+                        .map(|text| {
+                            self.settled = false;
+                            AgentEvent::UserMessage { text }
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
+            if self.settled {
+                return Vec::new();
+            }
+            if matches!(item_type(item), "agentMessage" | "agent_message") {
+                if phase == Phase::Started {
+                    return Vec::new();
+                }
+                let mut events = Vec::new();
+                if !self.streamed_text.remove(&str_field(item, &["id"])) {
+                    let text = str_field(item, &["text"]);
+                    if !text.is_empty() {
+                        events.push(AgentEvent::TextDelta { text });
+                    }
+                }
+                events.push(AgentEvent::TextDelta {
+                    text: "\n\n".into(),
+                });
+                return events;
+            }
+            return map_item(phase, item);
+        }
+        if self.settled {
+            return Vec::new();
+        }
+        match method {
+            "item/agentMessage/delta" => {
+                let id = item_id(params);
+                if !id.is_empty() && self.completed_items.contains(&id) {
+                    return Vec::new();
+                }
+                self.streamed_text.insert(id);
+                delta_text(params)
+                    .map(|text| AgentEvent::TextDelta { text })
+                    .into_iter()
+                    .collect()
+            }
+            "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded" => self.reasoning.map(method, params),
+            "turn/completed" | "turn/failed" | "turn/aborted" | "thread/closed" => {
+                if method != "thread/closed"
+                    && !remember(&mut self.completed_turns, turn_id(params))
+                {
+                    return Vec::new();
+                }
+                self.settled = true;
+                self.streamed_text.clear();
+                let error = turn_error_message(params);
+                let status = if method == "turn/failed"
+                    || error.is_some()
+                    || params.pointer("/turn/status").and_then(Value::as_str) == Some("failed")
+                {
+                    DoneStatus::Errored
+                } else if method == "turn/aborted"
+                    || params.pointer("/turn/status").and_then(Value::as_str) == Some("interrupted")
+                {
+                    DoneStatus::Interrupted
+                } else {
+                    DoneStatus::Completed
+                };
+                vec![AgentEvent::Done {
+                    status,
+                    result: None,
+                    error,
+                    session_id: Some(child.to_owned()),
+                }]
+            }
+            "error" => vec![AgentEvent::Error {
+                message: params
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| params.get("message").and_then(Value::as_str))
+                    .unwrap_or("Codex subagent error")
+                    .to_owned(),
+            }],
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The thread a notification is addressed to: `thread/started` carries it at
@@ -401,16 +610,16 @@ pub(crate) fn route_child_notification(method: &str) -> ChildRoute {
         | "item/reasoning/textDelta"
         | "item/reasoning/summaryTextDelta"
         | "item/reasoning/summaryPartAdded"
+        | "turn/started"
         | "turn/completed"
         | "turn/failed"
         | "turn/aborted"
         | "error"
         | "thread/closed" => ChildRoute::Subagent,
-        // Child turn/status bookkeeping with no subagent meaning: consumed
+        // Child status bookkeeping with no subagent meaning: consumed
         // so it can never settle the PARENT turn (the exact bug class the
         // explicit table exists for).
-        "turn/started"
-        | "thread/status/changed"
+        "thread/status/changed"
         | "thread/tokenUsage/updated"
         // Child chatter with no consumer on this wire.
         | "item/commandExecution/outputDelta"
@@ -591,6 +800,70 @@ mod tests {
     }
 
     #[test]
+    fn v1_spawns_and_controls_have_distinct_roles() {
+        for tool in ["spawnAgent", "spawn_agent"] {
+            let mut item = json!({"type":"collabAgentToolCall", "id":"spawn", "tool":tool,
+                "status":"completed", "receiverThreadIds":["child"], "model":"child-model"});
+            assert_eq!(collab_spawn_child(&item), Some("child"));
+            let events = map_item(Phase::Completed, &item);
+            assert!(matches!(&events[0], AgentEvent::ToolCall { call, .. }
+                if call.is_subagent_spawn() && call.subagent_model() == Some("child-model")));
+            assert!(matches!(
+                &events[1],
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ));
+            item["status"] = "failed".into();
+            assert_eq!(collab_spawn_child(&item), None);
+            assert!(matches!(
+                map_item(Phase::Completed, &item).last(),
+                Some(AgentEvent::ToolResult { is_error: true, .. })
+            ));
+        }
+        for tool in [
+            "sendInput",
+            "send_input",
+            "wait",
+            "closeAgent",
+            "resumeAgent",
+            "futureControl",
+        ] {
+            let item = json!({"type":"collabAgentToolCall", "id":"control", "tool":tool,
+                "receiverThreadIds":["child"]});
+            assert_eq!(collab_spawn_child(&item), None);
+            assert!(
+                matches!(&map_item(Phase::Started, &item)[0], AgentEvent::ToolCall { call, .. } if !call.is_subagent_spawn())
+            );
+        }
+        for receivers in [json!([]), json!(["one", "two"]), json!([""])] {
+            assert_eq!(
+                collab_spawn_child(
+                    &json!({"type":"collabAgentToolCall", "tool":"spawnAgent", "receiverThreadIds":receivers})
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn activity_updates_are_not_spawns_in_either_item_phase() {
+        for kind in [
+            "interacted",
+            "completed",
+            "failed",
+            "errored",
+            "futureActivity",
+        ] {
+            let item = json!({"type":"subAgentActivity", "id":"activity", "kind":kind,
+                "agentThreadId":"child", "agentPath":"/root/alpha"});
+            assert!(map_item(Phase::Started, &item).is_empty());
+            assert!(map_item(Phase::Completed, &item).is_empty());
+        }
+    }
+
+    #[test]
     fn sub_agent_activity_maps_to_a_named_parent_chip() {
         let started = map_item(
             Phase::Started,
@@ -605,7 +878,7 @@ mod tests {
         ));
         let completed = map_item(
             Phase::Completed,
-            &json!({"type": "subAgentActivity", "id": "call_1", "kind": "completed",
+            &json!({"type": "subAgentActivity", "id": "call_1", "kind": "started",
                     "agentThreadId": "child-1", "agentPath": "/root/alpha"}),
         );
         assert!(matches!(
@@ -632,11 +905,11 @@ mod tests {
         for m in ["turn/completed", "turn/aborted", "turn/failed"] {
             assert_eq!(route_child_notification(m), ChildRoute::Subagent, "{m}");
         }
-        // …while turn/started stays consumed — and NONE of them may reach
-        // the parent turn router.
+        // A child turn start can reopen a completed assignment. It must never
+        // reach the parent turn router.
         assert_eq!(
             route_child_notification("turn/started"),
-            ChildRoute::Consumed
+            ChildRoute::Subagent
         );
         // Child-owned thread lifecycle would rewrite parent state — consumed.
         for m in ["thread/archived", "thread/compacted", "thread/started"] {
@@ -660,10 +933,16 @@ mod tests {
             Some("th-c".into())
         );
         assert_eq!(
-            notification_thread_id("turn/completed", &json!({"threadId": "th-1", "turn": {"id": "t"}})),
+            notification_thread_id(
+                "turn/completed",
+                &json!({"threadId": "th-1", "turn": {"id": "t"}})
+            ),
             Some("th-1".into())
         );
-        assert_eq!(notification_thread_id("error", &json!({"message": "x"})), None);
+        assert_eq!(
+            notification_thread_id("error", &json!({"message": "x"})),
+            None
+        );
     }
 
     #[test]

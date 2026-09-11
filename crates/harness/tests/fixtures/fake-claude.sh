@@ -13,6 +13,28 @@ emit() { printf '%s\n' "$1"; }
 
 case "$first" in
 
+*scenario:title*)
+  tools_off=false
+  system_set=false
+  mcp_off=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tools) shift; [ "$1" = "" ] && tools_off=true ;;
+      --system-prompt) shift; case "$1" in "You generate session titles."*) system_set=true ;; esac ;;
+      --strict-mcp-config) mcp_off=true ;;
+      --dangerously-skip-permissions) exit 1 ;;
+    esac
+    shift
+  done
+  [ "$tools_off" = true ] && [ "$system_set" = true ] && [ "$mcp_off" = true ] || exit 1
+  emit '{"type":"control_request","request_id":"title-tool","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch should-not-exist"}}}'
+  read -r response || exit 1
+  case "$response" in *'"behavior":"deny"'*) ;; *) exit 1 ;; esac
+  emit '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Fix Login Flow"}}}'
+  emit '{"type":"result","subtype":"success","result":"Fix Login Flow","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-title"}'
+  ;;
+
+
 *scenario:happy*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash","Read"],"cwd":"/tmp","session_id":"sess-1"}'
   # Re-emitted init mid-run (background-task wakeup): must be deduped.

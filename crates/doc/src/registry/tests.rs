@@ -292,6 +292,7 @@ fn space(id: &str, device_id: &str, path: &str) -> Space {
 
 fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
     Session {
+        last_completed_turn: None,
         chat_id: chat_id.into(),
         device_id: device_id.into(),
         status,
@@ -880,4 +881,21 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
         doc.chat("chat-1").unwrap().unwrap().title.as_deref(),
         Some("live rename")
     );
+}
+
+#[test]
+fn completion_marker_replicates_and_survives_next_turn() {
+    let mut source = RegistryDoc::new("dev-a");
+    let mut viewer = RegistryDoc::new("dev-b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+    row.last_completed_turn = Some("turn-one".into());
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row.clone()]);
+    row.status = SessionStatus::Working;
+    source.upsert_session(&row).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut source, &mut viewer]);
+    assert_eq!(viewer.read_sessions().unwrap(), vec![row]);
 }

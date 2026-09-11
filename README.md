@@ -55,6 +55,6 @@ On macOS: use the desktop release, or build `zeron` from source and run `zeron d
 
 ---
 
-Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/comet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/zeronsh/zeron) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Licensed under the [MIT License](LICENSE).

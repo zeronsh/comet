@@ -437,6 +437,8 @@ pub enum AgentEvent {
     InputResolved {
         request_id: String,
     },
+    /// A confirmed new assignment. When tagged as Subagent, this reopens the
+    /// same child transcript even if the provider does not echo the user text.
     #[serde(rename_all = "camelCase")]
     Steered {
         assistant_message_id: Option<String>,

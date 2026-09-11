@@ -467,6 +467,11 @@ impl WorkspaceDoc {
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
+        set_opt_str(
+            &row,
+            "lastCompletedTurn",
+            session.last_completed_turn.as_deref(),
+        )?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit();
@@ -738,6 +743,8 @@ impl From<RawChat> for Chat {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawSession {
+    #[serde(default)]
+    last_completed_turn: Option<String>,
     chat_id: String,
     device_id: String,
     status: SessionStatus,
@@ -750,6 +757,7 @@ pub(crate) struct RawSession {
 impl From<RawSession> for Session {
     fn from(raw: RawSession) -> Self {
         Session {
+            last_completed_turn: raw.last_completed_turn,
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
@@ -823,6 +831,7 @@ mod tests {
 
     fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         Session {
+            last_completed_turn: None,
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,
@@ -885,6 +894,23 @@ mod tests {
         assert_eq!(row.source_context, Some(context));
         assert_eq!(row.branch.as_deref(), Some("feature/sidebar"));
         assert_eq!(row.checkout_id.as_deref(), Some("checkout-a"));
+    }
+
+    #[test]
+    fn completion_marker_survives_workspace_sync_and_legacy_rows() {
+        let ws = WorkspaceDoc::new();
+        let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+        row.last_completed_turn = Some("turn-one".into());
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row.clone()]);
+        row.status = SessionStatus::Working;
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row]);
+        ws.row("sessions", "chat-1")
+            .unwrap()
+            .delete("lastCompletedTurn")
+            .unwrap();
+        assert_eq!(ws.read_sessions().unwrap()[0].last_completed_turn, None);
     }
 
     #[test]

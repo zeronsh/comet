@@ -19,6 +19,7 @@ pub mod badges;
 pub mod browser;
 pub mod change_requests;
 pub mod changes;
+mod comment_ui;
 pub mod comments;
 pub mod composer;
 mod context_usage;

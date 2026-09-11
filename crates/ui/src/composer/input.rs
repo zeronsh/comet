@@ -7,7 +7,6 @@ const INPUT_FADE_BAND: f32 = 12.0;
 /// Drag-selection autoscroll runs at the display-friendly 60fps cadence.
 pub const DRAG_SCROLL_FRAME_MS: u64 = 16;
 
-
 /// Caret blink half-period (standard textarea cadence: ~500ms on / 500ms off).
 pub const CARET_BLINK_MS: u64 = 500;
 
@@ -22,7 +21,6 @@ pub fn caret_visible(ms_since_activity: u64) -> bool {
 pub fn input_content_height(wrapped_lines: usize) -> f32 {
     wrapped_lines.max(1) as f32 * INPUT_LINE_HEIGHT
 }
-
 
 fn input_max_scroll(content_height: f32, viewport_height: f32) -> f32 {
     (content_height - viewport_height).max(0.0)
@@ -135,11 +133,9 @@ fn input_drag_scroll_delta(
     distance.signum() * (distance.abs() * 0.2).clamp(1.0, line_height)
 }
 
-
 fn escape_dismisses_completion(key: &str, completion_open: bool) -> bool {
     key == "escape" && completion_open
 }
-
 
 // ---------------------------------------------------------------------------
 // Multiline text input (adapted from gpui examples/input.rs)
@@ -1002,6 +998,8 @@ pub struct ComposerInput {
     follow_cursor: bool,
     text_size: f32,
     configured_line_height: f32,
+    single_line: bool,
+    scroll_left: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
@@ -1093,6 +1091,8 @@ impl ComposerInput {
             follow_cursor: true,
             text_size: INPUT_TEXT_SIZE,
             configured_line_height: INPUT_LINE_HEIGHT,
+            single_line: false,
+            scroll_left: 0.0,
             last_lines: Vec::new(),
             line_starts: vec![0],
             last_bounds: None,
@@ -1128,6 +1128,12 @@ impl ComposerInput {
         self.configured_line_height = line_height;
         self.line_height = px(line_height);
         self.content_height = line_height;
+        self
+    }
+
+    /// Keep compact fields on one row and reveal the caret horizontally.
+    pub fn with_single_line(mut self) -> Self {
+        self.single_line = true;
         self
     }
 
@@ -1343,12 +1349,16 @@ impl ComposerInput {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.invalidate_mention_tooltip();
         self.content = text.into();
+        if self.single_line {
+            self.content = self.content.replace(['\r', '\n'], " ");
+        }
         self.refresh_projection();
         let end = self.content.len();
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
         self.scroll_top = 0.0;
+        self.scroll_left = 0.0;
         self.follow_cursor = true;
         // Programmatic replacement (draft load, clear-on-submit) is a new
         // document, not an edit — undo must not reach back past it.
@@ -1927,7 +1937,7 @@ impl ComposerInput {
             return;
         }
         if let Some(text) = item.text() {
-            // Multiline input: newlines are welcome (unlike the single-line example).
+            // Compact fields normalize newlines in the input handler.
             self.replace_text_in_range(None, &text, window, cx);
         }
     }
@@ -2092,7 +2102,7 @@ impl ComposerInput {
             return 0;
         };
         let local = point(
-            position.x - bounds.left(),
+            position.x - bounds.left() + px(self.scroll_left),
             position.y - bounds.top() + px(self.scroll_top),
         );
         self.index_for_point(local)
@@ -2396,7 +2406,13 @@ impl ComposerInput {
 
         let lines = window
             .text_system()
-            .shape_text(display, font_size, &runs, Some(width), None)
+            .shape_text(
+                display,
+                font_size,
+                &runs,
+                (!self.single_line).then_some(width),
+                None,
+            )
             .map(|small| small.into_vec())
             .unwrap_or_default();
 
@@ -2464,6 +2480,17 @@ impl ComposerInput {
 
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
+        if self.single_line {
+            let previous = self.scroll_left;
+            let width = (self.last_width - 2.0).max(1.0);
+            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
+                let x = f32::from(cursor.x);
+                self.scroll_left = self.scroll_left.min(x).max(x - width).max(0.0);
+            }
+            self.scroll_left = self.scroll_left.min((self.max_line_width - width).max(0.0));
+            self.scroll_top = 0.0;
+            return self.scroll_left != previous;
+        }
         let previous = self.scroll_top;
         if self.follow_cursor {
             if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
@@ -2544,6 +2571,13 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        let single_line_text;
+        let new_text = if self.single_line {
+            single_line_text = new_text.replace(['\r', '\n'], " ");
+            single_line_text.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -2581,6 +2615,13 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        let single_line_text;
+        let new_text = if self.single_line {
+            single_line_text = new_text.replace(['\r', '\n'], " ");
+            single_line_text.as_str()
+        } else {
+            new_text
+        };
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -2630,7 +2671,7 @@ impl EntityInputHandler for ComposerInput {
             .normalize_range(self.range_from_utf16(&range_utf16));
         let start = self.point_for_index(range.start)?;
         let origin = point(
-            bounds.left() + start.x,
+            bounds.left() + start.x - px(self.scroll_left),
             bounds.top() + start.y - px(self.scroll_top),
         );
         Some(Bounds::new(origin, size(px(2.0), self.line_height)))
@@ -2767,7 +2808,7 @@ impl gpui::Element for ComposerTextElement {
         let input = self.input.read(cx);
         let paint_bounds = input.paint_bounds(bounds);
         let scroll = px(input.scroll_top);
-        let origin = point(bounds.left(), bounds.top() - scroll);
+        let origin = point(bounds.left() - px(input.scroll_left), bounds.top() - scroll);
         let selection_color = Theme::of(cx).selection;
         let caret_color = Theme::of(cx).caret;
         // The inline-code recipe: chips use the spectrum wash like `code` spans.
@@ -2947,11 +2988,12 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, line_height, scroll) = self.input.update(cx, |input, _| {
+        let (lines, line_height, scroll, scroll_left) = self.input.update(cx, |input, _| {
             (
                 std::mem::take(&mut input.last_lines),
                 input.line_height,
                 input.scroll_top,
+                input.scroll_left,
             )
         });
 
@@ -2971,7 +3013,7 @@ impl gpui::Element for ComposerTextElement {
                 for line in &lines {
                     let height = line.size(line_height).height;
                     let _ = line.paint(
-                        point(bounds.left(), y),
+                        point(bounds.left() - px(scroll_left), y),
                         line_height,
                         gpui::TextAlign::Left,
                         Some(bounds),
@@ -3077,6 +3119,13 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::redo))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, window, _| {
+                // Capture runs before the clicked control handles the press, so
+                // another input can take focus normally during bubbling.
+                if event.button == MouseButton::Left && this.focus_handle.is_focused(window) {
+                    window.blur();
+                }
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -3120,4 +3169,3 @@ impl Render for ComposerInput {
             })
     }
 }
-

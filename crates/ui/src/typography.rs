@@ -203,6 +203,11 @@ impl Global for TypographyState {}
 pub(crate) mod bundled;
 use bundled::{GEIST, GEIST_MONO};
 
+/// Font faces shared by the interface and SVG text-to-path conversion.
+pub(crate) fn bundled_font_faces() -> impl Iterator<Item = &'static [u8]> {
+    GEIST.iter().chain(GEIST_MONO.iter()).copied()
+}
+
 fn register_family(cx: &App, family: &UiFontFamily, faces: &'static [&'static [u8]]) -> bool {
     bundled::register(cx, family.label(), faces)
 }

@@ -356,6 +356,7 @@ impl Render for TabGhost {
 pub struct TerminalPanel {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
+    focus_pending: bool,
     chats: HashMap<String, ChatTabs>,
     /// Shell-driven visibility gate: no RPC happens while closed (lazy).
     open: bool,
@@ -393,6 +394,7 @@ impl TerminalPanel {
         Self {
             state,
             focus_handle: cx.focus_handle(),
+            focus_pending: false,
             chats: HashMap::new(),
             open: false,
             embedded: false,
@@ -421,6 +423,12 @@ impl TerminalPanel {
         self.focus_handle.clone()
     }
 
+    /// Claim focus once the terminal body mounts, after opening or selecting it.
+    pub fn request_focus(&mut self, cx: &mut Context<Self>) {
+        self.focus_pending = true;
+        cx.notify();
+    }
+
     pub fn set_resize_suspended(&mut self, suspended: bool) {
         self.resize_suspended = suspended;
     }
@@ -430,6 +438,9 @@ impl TerminalPanel {
     /// keeps every session alive (detach ≠ close).
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.open = open;
+        if !open {
+            self.focus_pending = false;
+        }
         if open && !self.embedded {
             self.ensure_tab(cx);
         }
@@ -470,6 +481,7 @@ impl TerminalPanel {
     pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
         let chat = self.selected_chat(cx)?;
         self.open_tab(chat, cx);
+        self.request_focus(cx);
         Some(self.tab_seq)
     }
 
@@ -1518,6 +1530,7 @@ impl TerminalPanel {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_tab(&chat_select, ix, cx);
+                                this.request_focus(cx);
                             }))
                             // Middle-click closes (§1.10).
                             .on_mouse_down(
@@ -1594,6 +1607,7 @@ impl TerminalPanel {
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(chat) = this.selected_chat(cx) {
                             this.open_tab(chat, cx);
+                            this.request_focus(cx);
                         }
                     }))
                     .child(
@@ -1661,6 +1675,9 @@ impl Render for TerminalPanel {
                 .child(SharedString::from("Select a chat to open a terminal"))
                 .into_any_element();
         };
+        if std::mem::take(&mut self.focus_pending) && self.open {
+            window.focus(&self.focus_handle, cx);
+        }
         let focused = self.focus_handle.is_focused(window);
         let scrollbar = self.render_scrollbar(&theme, cx);
 

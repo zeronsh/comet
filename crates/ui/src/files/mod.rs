@@ -21,6 +21,8 @@ pub mod client;
 pub mod document;
 pub mod editor;
 pub mod editor_adapter;
+pub(crate) mod markdown_media;
+mod markdown_preview;
 pub mod model;
 pub mod preview;
 pub mod search;
@@ -520,6 +522,7 @@ impl FilesSurface {
             if this.sync_target(cx) {
                 this.ensure_loaded(cx);
             }
+            this.sync_active_markdown_comments(cx);
         });
         let mut surface = Self {
             state,
@@ -962,17 +965,7 @@ impl FilesSurface {
         let include_ignored = self.tree.include_ignored();
         toolbar(theme)
             .child(
-                div()
-                    .h(px(TOOLBAR_BUTTON_SIZE))
-                    .min_w_0()
-                    .flex_1()
-                    .px(px(8.0))
-                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                    .bg(crate::theme::ink(0.035))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_size(px(11.5))
+                crate::surface_chrome::input()
                     .child(
                         crate::icons::icon(crate::icons::MAGNIFER)
                             .size(px(12.0))

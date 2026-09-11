@@ -1,0 +1,14 @@
+{"method":"thread/started","params":{"thread":{"id":"child-alpha","source":{"subAgent":{"thread_spawn":{"parent_thread_id":"th-1"}}}}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"child-alpha","itemId":"early","delta":"early alpha"}}
+{"method":"item/started","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-alpha","kind":"started","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-alpha","kind":"started","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/started","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"spawn-beta","kind":"started","agentThreadId":"child-beta","agentPath":"/root/beta"}}}
+{"method":"item/started","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"message-alpha","kind":"interacted","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"child-alpha","itemId":"later","delta":"later alpha"}}
+{"method":"item/agentMessage/delta","params":{"threadId":"child-beta","itemId":"beta","delta":"beta output"}}
+{"method":"item/completed","params":{"threadId":"th-1","item":{"type":"subAgentActivity","id":"subagent-completed-alpha","kind":"completed","agentThreadId":"child-alpha","agentPath":"/root/alpha"}}}
+{"method":"turn/completed","params":{"threadId":"child-alpha","turn":{"id":"alpha-turn","status":"completed"}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"child-beta","itemId":"beta","delta":"beta continues"}}
+{"method":"turn/completed","params":{"threadId":"child-beta","turn":{"id":"beta-turn","status":"completed"}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"th-1","itemId":"parent","delta":"parent output"}}
+{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"completed"}}}

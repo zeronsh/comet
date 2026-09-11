@@ -272,6 +272,14 @@ async fn parked_self_continuation_folds_and_requiesces() {
     )
     .await;
 
+    let first_completion = rig
+        .core
+        .sessions
+        .session_status(CHAT)
+        .unwrap()
+        .last_completed_turn;
+    assert!(first_completion.is_some());
+
     // Self-continuation: streamed output with NO turn behind it, arriving
     // well past the resume gate (a real one follows a whole agent round
     // trip — the incident's came five minutes after the park).
@@ -291,6 +299,18 @@ async fn parked_self_continuation_folds_and_requiesces() {
         "watchdog re-parks the self-continued turn",
     )
     .await;
+
+    let second_completion = rig
+        .core
+        .sessions
+        .session_status(CHAT)
+        .unwrap()
+        .last_completed_turn;
+    assert!(second_completion.is_some());
+    assert_ne!(
+        second_completion, first_completion,
+        "engine-settled responses still notify"
+    );
 
     // The self-continued output is in the doc as its own COMPLETE entry —
     // this exact text was lost in the incident.

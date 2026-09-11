@@ -913,6 +913,8 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::GET_TITLE_SETTINGS
+            | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
@@ -947,6 +949,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
+            | methods::READ_WORKSPACE_IMAGE
             | methods::READ_WORKSPACE_FILE
             | methods::WRITE_WORKSPACE_FILE
             | methods::WATCH_WORKSPACE_FILES
@@ -1183,6 +1186,14 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
+            methods::SET_TITLE_SETTINGS => {
+                let p: crate::registry::TitleSettings = parse_params(params)?;
+                self.registry
+                    .set_title_settings(p)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.title_settings())
+            }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
                 self.registry
@@ -2058,6 +2069,17 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&matches)
             }
+            methods::READ_WORKSPACE_IMAGE => {
+                let request: zeron_proto::ReadWorkspaceImageRequest = parse_params(params)?;
+                let chunk = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.read_image(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("Workspace image read timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&chunk)
+            }
             methods::READ_WORKSPACE_FILE => {
                 let request: zeron_proto::ReadWorkspaceFileRequest = parse_params(params)?;
                 let file = tokio::time::timeout(
@@ -2307,6 +2329,7 @@ mod tests {
         assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
+        assert!(forwardable(methods::READ_WORKSPACE_IMAGE));
         assert!(forwardable(methods::WRITE_WORKSPACE_FILE));
         assert!(forwardable(methods::WATCH_WORKSPACE_FILES));
         assert!(!is_stream_method(methods::LIST_WORKSPACE_DIRECTORY));

@@ -1,15 +1,10 @@
-//! Production-settings survey across ALL harnesses: does a real multi-tool
-//! turn settle exactly once, at the end, and how close do its silent gaps
-//! come to the 30s blanket quiet-settle window? Run explicitly:
+//! Production-settings survey: real multi-tool turns must settle exactly
+//! once with no orphaned output. Silent gaps are measured for diagnostics;
+//! silence is never proof that an ACP prompt has completed (#296).
 //!
-//!   SURVEY_RUNS=3 cargo test -p zeron-harness --test real_quiet_survey -- --ignored --nocapture
-//!
-//! No env knob is set here — this binary runs the DEFAULTS the app ships:
-//! Claude exempt from the blanket settle, every other adapter on the 30s
-//! window. For each installed+authenticated agent CLI it reports, per run:
-//! the Done count, content events after the first Done (orphan signature),
-//! and the maximum inter-event silent gap — the safety margin against the
-//! window. Uninstalled/unauthenticated agents are skipped by name.
+//! SURVEY_RUNS=3 cargo test -p zeron-harness --test real_quiet_survey -- --ignored --nocapture
+//! Uninstalled/unauthenticated agents are skipped. For mandatory live Pi
+//! regression coverage with an injected delay, use real_acp_lifecycle.rs.
 
 use std::time::Duration;
 
@@ -219,7 +214,7 @@ async fn real_all_harnesses_quiet_survey() {
                 && o.finished;
             println!(
                 "[{name}] run {i}/{runs}: dones={:?} after_first_done={} finished={} \
-                 max_live_gap={:.3}s (window margin {:.1}x) → {}",
+                 max_live_gap={:.3}s → {}",
                 o.dones
                     .iter()
                     .map(|(s, _)| format!("{s:?}"))
@@ -227,7 +222,6 @@ async fn real_all_harnesses_quiet_survey() {
                 o.after_first_done,
                 o.finished,
                 o.max_gap.as_secs_f64(),
-                30.0 / o.max_gap.as_secs_f64().max(0.001),
                 if clean { "CLEAN" } else { "VIOLATION" }
             );
             if !clean {

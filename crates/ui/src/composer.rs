@@ -21,10 +21,10 @@ use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Role,
-    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, Pixels, Point, Role, ScrollWheelEvent,
+    SharedString, Style, StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, quad,
+    relative, size,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -132,7 +132,6 @@ fn composer_width_changed(previous: Option<f32>, current: f32) -> bool {
     previous.is_none_or(|previous| (current - previous).abs() > COMPOSER_WIDTH_EPSILON)
 }
 
-
 /// Total expanded composer height (border-box) for a content height: the
 /// textarea BOX (content + `pt-4 pb-1`) clamps to 76–260 exactly like the
 /// original's auto-grow effect, then the 46px actions row and the hairline
@@ -142,7 +141,6 @@ pub fn composer_total_height(content_height: f32) -> f32 {
         + ACTIONS_ROW_HEIGHT
         + PILL_BORDER_V
 }
-
 
 /// Staged-attachment strip metrics (zeron attachment-ui.tsx AttachmentStrip:
 /// `flex flex-wrap gap-2 px-4 pt-3`, `size-14` thumbs).
@@ -392,7 +390,6 @@ fn interrupt_params(chat_id: &str) -> serde_json::Value {
         "command": { "kind": "interrupt" },
     })
 }
-
 
 fn wizard_escape_goes_back(key: &str, input_focused: bool, input_empty: bool) -> bool {
     key == "escape" && (!input_focused || input_empty)
@@ -800,11 +797,6 @@ pub struct Composer {
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
-    /// Chats whose durable Interrupt command has been accepted or is still
-    /// being queued. Kept independently so stopping one chat cannot replace
-    /// another chat's request when the user navigates quickly.
-    interrupting: HashSet<String>,
-    interrupt_tasks: HashMap<String, Task<()>>,
     /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
@@ -819,8 +811,8 @@ pub struct Composer {
     pub(crate) queue_edit_finishing: bool,
     pub(crate) queue_edit_task: Option<Task<()>>,
     pub(crate) queue_edit_renew_task: Option<Task<()>>,
-    /// Apply focus on the next render after opening or closing an edit.
-    pub(crate) queue_edit_focus_pending: bool,
+    /// Focus once on mount, navigation, or after opening/closing a queue edit.
+    pub(crate) focus_pending: bool,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
     pub(crate) queue_scroll: gpui::ScrollHandle,
@@ -835,6 +827,11 @@ pub struct Composer {
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
     /// a send grinds" shape).
     action_task: Option<Task<()>>,
+    /// Chats whose durable Interrupt command has been accepted or is still
+    /// being queued. Kept independently so stopping one chat cannot replace
+    /// another chat's request when the user navigates quickly.
+    interrupting: HashSet<String>,
+    interrupt_tasks: HashMap<String, Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -872,6 +869,7 @@ pub struct Composer {
     route_snap_until: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
+    _picker_focus: Subscription,
     _input_events: Subscription,
 }
 
@@ -916,6 +914,13 @@ impl Composer {
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
         let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let picker_focus = cx.subscribe(
+            &pickers,
+            |this: &mut Self, _, _: &crate::pickers::ReturnComposerFocus, cx| {
+                this.focus_pending = true;
+                cx.notify();
+            },
+        );
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -999,7 +1004,7 @@ impl Composer {
             queue_edit_finishing: false,
             queue_edit_task: None,
             queue_edit_renew_task: None,
-            queue_edit_focus_pending: false,
+            focus_pending: true,
             queue_drag: None,
             queue_scroll: gpui::ScrollHandle::new(),
             queue_removing: HashSet::new(),
@@ -1020,6 +1025,7 @@ impl Composer {
             route_snap_until: None,
             _observe: observe,
             _pickers_observe: pickers_observe,
+            _picker_focus: picker_focus,
             _input_events: input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
@@ -1095,6 +1101,7 @@ impl Composer {
             .entry(self.current_key.clone())
             .or_default()
             .extend(staged);
+        self.focus_pending = true;
         cx.notify();
     }
 
@@ -1305,10 +1312,16 @@ impl Composer {
             prompt: Some("Attach".into()),
         });
         self.picker_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                this.update(cx, |composer, cx| composer.add_paths(paths, cx))
-                    .ok();
-            }
+            let result = rx.await;
+            this.update(cx, |composer, cx| {
+                if let Ok(Ok(Some(paths))) = result {
+                    composer.add_paths(paths, cx);
+                }
+                // Both Attach and Cancel return to the draft.
+                composer.focus_pending = true;
+                cx.notify();
+            })
+            .ok();
         }));
     }
 
@@ -1553,6 +1566,14 @@ impl Composer {
             .w_full()
             .max_h(px(320.0))
             .overflow_hidden()
+            // Completion choices belong to the input. Keep it focused until
+            // mouse-up can accept a choice (or while dragging the scrollbar).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             // GPUI dispatches this captured stream while the thumb is
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
@@ -1870,6 +1891,12 @@ impl Composer {
             .w_full()
             .max_h(px(320.0))
             .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }),
+            )
             // GPUI dispatches this captured stream while the thumb is
             // dragged, including when the pointer has left the popup.
             .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
@@ -3016,6 +3043,10 @@ impl Composer {
         self.interrupt_tasks.insert(chat_id, task);
     }
 
+    pub(crate) fn is_interrupting(&self, chat_id: &str) -> bool {
+        self.interrupting.contains(chat_id)
+    }
+
     // ---- wizard glue ----
 
     fn wizard_select(&mut self, option_ix: usize, cx: &mut Context<Self>) {
@@ -3386,10 +3417,18 @@ impl Composer {
     ) -> gpui::AnyElement {
         let theme = Theme::of(cx);
         match mode {
-            SendButtonMode::Stop => presentation::send_button(theme, true, true,
-                cx.listener(|this, _, _, cx| this.interrupt_selected(cx))),
-            SendButtonMode::Send | SendButtonMode::Queue => presentation::send_button(theme, false, !self.send_blocked(cx),
-                cx.listener(|this, _, _, cx| this.on_submit(cx))),
+            SendButtonMode::Stop => presentation::send_button(
+                theme,
+                true,
+                true,
+                cx.listener(|this, _, _, cx| this.interrupt_selected(cx)),
+            ),
+            SendButtonMode::Send | SendButtonMode::Queue => presentation::send_button(
+                theme,
+                false,
+                !self.send_blocked(cx),
+                cx.listener(|this, _, _, cx| this.on_submit(cx)),
+            ),
         }
     }
 }
@@ -3404,8 +3443,8 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.queue_edit_focus_pending {
-            self.queue_edit_focus_pending = false;
+        if self.focus_pending {
+            self.focus_pending = false;
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);
         }
@@ -3829,7 +3868,16 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill = presentation::pill(&theme);
+        let pill = presentation::pill(&theme).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, cx| {
+                // Padding and action controls are part of the text composer.
+                // Open menus keep their own keyboard/search focus.
+                if !this.pickers.read(cx).is_open() {
+                    window.focus(&this.input.focus_handle(cx), cx);
+                }
+            }),
+        );
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -3847,12 +3895,23 @@ impl Render for Composer {
             // full alpha — chips,
             // attach and send are all (near-)stationary on the bottom anchor.
             let text_pt = morph_text_pad(morph_t);
-            presentation::expanded(pill, pill_height, textarea_height, text_pt,
-                cluster_dy, morph_cluster_inset(true, morph_t), ACTIONS_ROW_HEIGHT,
-                ACTION_PRIMARY_GAP, ACTION_UTILITY_GAP,
-                comments_chip.map(IntoElement::into_any_element), strip.map(IntoElement::into_any_element),
+            presentation::expanded(
+                pill,
+                pill_height,
+                textarea_height,
+                text_pt,
+                cluster_dy,
+                morph_cluster_inset(true, morph_t),
+                ACTIONS_ROW_HEIGHT,
+                ACTION_PRIMARY_GAP,
+                ACTION_UTILITY_GAP,
+                comments_chip.map(IntoElement::into_any_element),
+                strip.map(IntoElement::into_any_element),
                 self.render_input_with_completion().into_any_element(),
-                self.pickers.clone().into_any_element(), Some(attach.into_any_element()), send_button)
+                self.pickers.clone().into_any_element(),
+                Some(attach.into_any_element()),
+                send_button,
+            )
         } else {
             // Compact pill: input and the actions cluster on one 47px line
             // (`py-3 pl-4 pr-2` textarea, `gap-2 py-1.5 pl-1 pr-2` cluster;
@@ -4002,10 +4061,221 @@ impl Render for Composer {
 mod tests {
     use super::*;
 
+    fn composer_focus_window(
+        cx: &mut gpui::TestAppContext,
+    ) -> (tempfile::TempDir, gpui::WindowHandle<Composer>) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Composer::new(state, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        (dir, window)
+    }
+
     #[gpui::test]
-    fn projectless_composer_allows_send_and_enter_submission(
+    fn composer_padding_and_file_prompt_restore_focus(cx: &mut gpui::TestAppContext) {
+        let (dir, handle) = composer_focus_window(cx);
+        let image_path = dir.path().join("attachment.png");
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF1cAAAAASUVORK5CYII=").unwrap();
+        std::fs::write(&image_path, png).unwrap();
+        let input = handle
+            .read_with(cx, |composer, _| composer.input.clone())
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.blur();
+            window.draw(cx).clear();
+            let bounds = input.read(cx).last_bounds.unwrap();
+            // Click padding immediately left of the actual editor.
+            let position = point(bounds.left() - px(4.0), bounds.center().y);
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(input.read(cx).focus_handle.is_focused(window));
+            window.dispatch_event(
+                gpui::PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        for accepted in [false, true] {
+            handle
+                .update(cx, |composer, window, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text("Keep this draft", cx));
+                    window.blur();
+                    composer.open_file_picker(cx);
+                })
+                .unwrap();
+            assert!(cx.did_prompt_for_paths());
+            let path = image_path.clone();
+            cx.simulate_path_prompt_response(move |_| accepted.then(|| vec![path]));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert!(input.read(cx).focus_handle.is_focused(window));
+                assert_eq!(input.read(cx).text(), "Keep this draft");
+            })
+            .unwrap();
+            assert_eq!(
+                handle
+                    .read_with(cx, |composer, _| composer.staged().len())
+                    .unwrap(),
+                usize::from(accepted)
+            );
+        }
+        // The same staging path handles external file drops.
+        handle
+            .update(cx, |composer, window, cx| {
+                window.blur();
+                composer.add_paths(vec![image_path], cx);
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            assert!(input.read(cx).focus_handle.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn composer_picker_escape_restores_focus_but_click_away_does_not(
         cx: &mut gpui::TestAppContext,
     ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let input = handle
+            .read_with(cx, |composer, _| composer.input.clone())
+            .unwrap();
+        for escape in [true, false] {
+            handle
+                .update(cx, |composer, window, cx| {
+                    composer
+                        .pickers
+                        .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert!(!input.read(cx).focus_handle.is_focused(window));
+            })
+            .unwrap();
+            if escape {
+                cx.simulate_keystrokes(handle.into(), "escape");
+            } else {
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.dispatch_event(
+                        gpui::PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: point(px(5.0), window.viewport_size().height - px(1.0)),
+                            click_count: 1,
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+            }
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert_eq!(input.read(cx).focus_handle.is_focused(window), escape);
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn inputs_release_focus_on_click_away(cx: &mut gpui::TestAppContext) {
+        struct Inputs(Vec<Entity<ComposerInput>>);
+        impl Render for Inputs {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().flex().flex_col().children(
+                    self.0
+                        .iter()
+                        .map(|input| div().w(px(200.0)).child(input.clone())),
+                )
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let host = cx.add_window(|_, cx| {
+            Inputs(vec![
+                cx.new(|cx| ComposerInput::new("Composer", cx)),
+                cx.new(|cx| ComposerInput::new("URL", cx).with_single_line()),
+            ])
+        });
+        cx.run_until_parked();
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        let inputs = host.read_with(cx, |host, _| host.0.clone()).unwrap();
+        // Visit both fields and return to the first: click-away capture must
+        // never clear focus acquired by the clicked input during bubbling.
+        for index in [0, 1, 0] {
+            let position =
+                inputs[index].read_with(cx, |input, _| input.last_bounds.unwrap().center());
+            cx.update_window(host.into(), |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        click_count: 1,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+                assert!(inputs[index].read(cx).focus_handle.is_focused(window));
+                window.dispatch_event(
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        }
+        cx.update_window(host.into(), |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(400.0), px(300.0)),
+                    click_count: 1,
+                    ..Default::default()
+                }),
+                cx,
+            );
+            assert!(window.focused(cx).is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn projectless_composer_allows_send_and_enter_submission(cx: &mut gpui::TestAppContext) {
         let state = cx.new(|_| AppState::new());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         // A device with no projects is a valid home-directory target too.
@@ -4642,6 +4912,67 @@ mod tests {
                 assert_eq!(changes.get(), settled, "unchanged draws must not schedule more layout");
                 cx.update(|cx| cx.quit());
             }).detach();
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_line_address_reveals_caret_and_maps_scrolled_pointer() {
+        gpui_platform::headless().run(|cx| {
+            cx.set_global(Theme::dark());
+            let handle = cx
+                .open_window(gpui::WindowOptions::default(), |_, cx| {
+                    cx.new(|cx| {
+                        ComposerInput::new("Address", cx)
+                            .with_single_line()
+                            .with_text_metrics(11.0, 16.0)
+                    })
+                })
+                .unwrap();
+            handle
+                .update(cx, |input, window, cx| {
+                    let style = window.text_style();
+                    input.set_text(
+                        "http://device.a-very-long-project-name.localhost:7331/path",
+                        cx,
+                    );
+                    input.layout_text(px(100.0), &style, window, cx);
+                    assert_eq!(input.content_height, 16.0, "long hostnames must not wrap");
+                    input.clamp_scroll(16.0);
+                    assert!(input.scroll_left > 0.0);
+                    let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(100.0), px(16.0)));
+                    input.last_bounds = Some(bounds);
+                    let caret = input
+                        .bounds_for_range(
+                            input.content.len()..input.content.len(),
+                            bounds,
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    assert!(caret.left() >= bounds.left() && caret.right() <= bounds.right());
+                    assert_eq!(
+                        input.index_for_mouse_position(caret.origin),
+                        input.content.len()
+                    );
+                    input.selected_range = 0..0;
+                    input.clamp_scroll(16.0);
+                    assert_eq!(input.scroll_left, 0.0, "Home must reveal the URL start");
+                    input.replace_text_in_range(None, "one\r\ntwo", window, cx);
+                    assert!(!input.content.contains(['\r', '\n']));
+                    input.set_text("short", cx);
+                    input.layout_text(px(100.0), &style, window, cx);
+                    input.clamp_scroll(16.0);
+                    assert_eq!(
+                        input.scroll_left, 0.0,
+                        "short replacement must reset scrolling"
+                    );
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
         });
     }
 

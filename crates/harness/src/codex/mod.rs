@@ -3,7 +3,7 @@
 //! uses. Resurrected from the pre-ACP driver and modernized.
 //!
 //! VERSION PIN: the app-server API is EXPERIMENTAL (`capabilities.
-//! experimentalApi`); this driver is validated against codex-cli 0.149.0 —
+//! experimentalApi`); this driver is validated against codex-cli 0.153.4 —
 //! revalidate the method/notification surface when bumping past it.
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
@@ -20,11 +20,11 @@
 //!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
-//! - Subagents are full child app-server threads (`thread/started` with
-//!   `source.subAgent.thread_spawn`, `subAgentActivity` items on the parent).
+//! - Subagents are full child app-server threads. Parent spawn items establish
+//!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
-//!   ([`normalize::route_child_notification`]) — item lifecycles/errors become
-//!   tagged [`AgentEvent::Subagent`] events, child turn bookkeeping is
+//!   ([`normalize::route_child_notification`]) — content, errors and child turns
+//!   become tagged [`AgentEvent::Subagent`] events; unrelated child bookkeeping is
 //!   consumed so it can never settle the parent turn, and unknown methods
 //!   fall through to the parent path (fail open, never silent loss).
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
@@ -37,6 +37,7 @@
 
 pub(crate) mod catalog;
 mod normalize;
+mod subagents;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -61,8 +62,8 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
+    route_child_notification, turn_error_message, turn_id, usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -576,8 +577,32 @@ impl Harness for CodexHarness {
 
     async fn run(
         &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_with_mode(request, controls, false).await
+    }
+
+    async fn run_title(
+        &self,
         mut request: RunRequest,
         controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        self.run_with_mode(request, controls, true).await
+    }
+}
+
+impl CodexHarness {
+    async fn run_with_mode(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+        title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
@@ -587,7 +612,11 @@ impl Harness for CodexHarness {
         // sidesteps codex ≤0.144.x's workspace-write bug where a linked
         // worktree on a slash-named branch derives a malformed mount that
         // kills every command.
-        request.sandbox = zeron_proto::SandboxLevel::DangerFullAccess;
+        request.sandbox = if title_only {
+            zeron_proto::SandboxLevel::ReadOnly
+        } else {
+            zeron_proto::SandboxLevel::DangerFullAccess
+        };
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
@@ -629,6 +658,7 @@ impl Harness for CodexHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            title_only,
             child,
             client,
             incoming,
@@ -652,6 +682,7 @@ impl Harness for CodexHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    title_only: bool,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -742,6 +773,7 @@ async fn start_turn(client: &RpcClient, params: Value) -> Result<String, Harness
 /// steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        title_only,
         mut child,
         client,
         mut incoming,
@@ -780,6 +812,32 @@ async fn run_session(session: Session) {
 
     let start_params = {
         let mut p = serde_json::Map::new();
+        if title_only {
+            p.insert("baseInstructions".into(), crate::TITLE_INSTRUCTIONS.into());
+            p.insert(
+                "developerInstructions".into(),
+                crate::TITLE_INSTRUCTIONS.into(),
+            );
+            p.insert("ephemeral".into(), true.into());
+            p.insert(
+                "config".into(),
+                json!({
+                    "project_doc_max_bytes": 0,
+                    "web_search": "disabled",
+                    "features.shell_tool": false,
+                    "features.apply_patch_freeform": false,
+                    "features.multi_agent": false,
+                    "features.apps": false,
+                    "features.multi_agent_v2": false,
+                    "agents.enabled": false,
+                    "features.browser_use": false,
+                    "features.computer_use": false,
+                    "features.js_repl": false,
+                    "features.image_generation": false,
+                    "features.memories": false
+                }),
+            );
+        }
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
         p.insert("approvalPolicy".into(), approval_policy.into());
         p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
@@ -809,6 +867,23 @@ async fn run_session(session: Session) {
             .await?;
         client.notify("initialized", None);
 
+        let mut start_params = start_params.clone();
+        if title_only {
+            // Disable each configured MCP server explicitly: an empty table
+            // would merge with user configuration and leave servers enabled.
+            let config = client
+                .request("config/read", json!({"includeLayers": false}))
+                .await?;
+            if let Some(servers) = config["config"]["mcp_servers"].as_object() {
+                let overrides = start_params
+                    .get_mut("config")
+                    .and_then(Value::as_object_mut)
+                    .unwrap();
+                for name in servers.keys() {
+                    overrides.insert(format!("mcp_servers.{name}.enabled"), false.into());
+                }
+            }
+        }
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
@@ -831,9 +906,11 @@ async fn run_session(session: Session) {
                 .await?
         };
         let thread_id = thread["thread"]["id"].as_str().unwrap_or("").to_owned();
-        Ok::<String, HarnessError>(thread_id)
+        let mut children = subagents::Subagents::new(thread_id.clone());
+        children.restore(&thread["thread"]);
+        Ok::<_, HarnessError>((thread_id, children))
     };
-    let thread_id = tokio::select! {
+    let (thread_id, mut children) = tokio::select! {
         res = setup => match res {
             Ok(thread_id) => thread_id,
             Err(e) => {
@@ -908,11 +985,6 @@ async fn run_session(session: Session) {
     }
 
     let mut router = TurnRouter::default();
-    // Child app-server threads (multi-agent v2): child thread id → the
-    // parent-feed spawn call id its traffic is attributed to. Registered
-    // from `subAgentActivity` items on the parent thread and from a child
-    // `thread/started` carrying a spawn source.
-    let mut children: HashMap<String, String> = HashMap::new();
     match start_turn(&client, turn_params(&request.prompt)).await {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
@@ -958,19 +1030,6 @@ async fn run_session(session: Session) {
                     && !nthread.is_empty()
                     && nthread != thread_id
                 {
-                    // Registration path: a child thread/started with an
-                    // explicit spawn source. The spawn-call mapping from a
-                    // subAgentActivity item wins (that id IS the parent
-                    // chip); this only seeds a fallback.
-                    if method == "thread/started"
-                        && params
-                            .pointer("/thread/source/subAgent/thread_spawn")
-                            .is_some()
-                    {
-                        children
-                            .entry(nthread.clone())
-                            .or_insert_with(|| nthread.clone());
-                    }
                     match route_child_notification(&method) {
                         ChildRoute::Parent => {
                             // Unknown/parent-owned: fall through so a codex
@@ -979,120 +1038,9 @@ async fn run_session(session: Session) {
                         }
                         ChildRoute::Consumed => continue,
                         ChildRoute::Subagent => {
-                            // Attributed child traffic — but only for a
-                            // REGISTERED child; pre-registration lifecycle
-                            // (captured ordering: a child's status change
-                            // can precede its registration) is dropped, not
-                            // passed to the parent path.
-                            if let Some(parent_call) = children.get(&nthread).cloned() {
-                                let events: Vec<AgentEvent> = match method.as_str() {
-                                    // The child settling its turn IS the
-                                    // subagent finishing its assignment —
-                                    // the chip's terminal state.
-                                    "turn/completed" => vec![AgentEvent::Done {
-                                        status: if turn_error_message(&params).is_some()
-                                            || params
-                                                .pointer("/turn/status")
-                                                .and_then(Value::as_str)
-                                                == Some("failed")
-                                        {
-                                            DoneStatus::Errored
-                                        } else {
-                                            DoneStatus::Completed
-                                        },
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "turn/failed" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Errored,
-                                        result: None,
-                                        error: turn_error_message(&params),
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "turn/aborted" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Interrupted,
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "item/agentMessage/delta" => delta_text(&params)
-                                        .map(|text| AgentEvent::TextDelta { text })
-                                        .into_iter()
-                                        .collect(),
-                                    "item/reasoning/textDelta"
-                                    | "item/reasoning/summaryTextDelta"
-                                    | "item/reasoning/summaryPartAdded" => reasoning_streams
-                                        .entry(nthread.clone()).or_default().map(&method, &params),
-                                    "item/started" | "item/completed" => {
-                                        let phase = if method == "item/started" {
-                                            Phase::Started
-                                        } else {
-                                            Phase::Completed
-                                        };
-                                        let item =
-                                            params.get("item").cloned().unwrap_or(Value::Null);
-                                        // Same paragraphing as the parent:
-                                        // a child's completed message ends
-                                        // a paragraph in its transcript.
-                                        if phase == Phase::Completed
-                                            && matches!(
-                                                item_type(&item),
-                                                "agentMessage" | "agent_message"
-                                            )
-                                        {
-                                            vec![AgentEvent::TextDelta {
-                                                text: "\n\n".into(),
-                                            }]
-                                        } else if matches!(
-                                            item_type(&item),
-                                            "userMessage" | "user_message"
-                                        ) {
-                                            // A CHILD thread's user message
-                                            // is the parent steering it (the
-                                            // collab send_message path) —
-                                            // its own entry in the subagent
-                                            // doc. Completed only: both
-                                            // lifecycle events carry the
-                                            // full item.
-                                            if phase == Phase::Completed {
-                                                user_message_text(&item)
-                                                    .map(|text| AgentEvent::UserMessage { text })
-                                                    .into_iter()
-                                                    .collect()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            map_item(phase, &item)
-                                        }
-                                    }
-                                    "error" => vec![AgentEvent::Error {
-                                        message: params
-                                            .pointer("/error/message")
-                                            .and_then(Value::as_str)
-                                            .or_else(|| {
-                                                params.get("message").and_then(Value::as_str)
-                                            })
-                                            .unwrap_or("Codex subagent error")
-                                            .to_owned(),
-                                    }],
-                                    "thread/closed" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Completed,
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    _ => Vec::new(),
-                                };
-                                for ev in events {
-                                    let wrapped = AgentEvent::Subagent {
-                                        parent_tool_use_id: parent_call.clone(),
-                                        event: Box::new(ev),
-                                    };
-                                    if !send(&event_tx, wrapped).await {
-                                        break 'main;
-                                    }
+                            for event in children.notification(&nthread, &method, &params) {
+                                if !send(&event_tx, event).await {
+                                    break 'main;
                                 }
                             }
                             continue;
@@ -1129,40 +1077,6 @@ async fn run_session(session: Session) {
                             Phase::Completed
                         };
                         let item = params.get("item").cloned().unwrap_or(Value::Null);
-                        // A subAgentActivity item on the parent thread names a
-                        // child: register it (its call id = the parent chip
-                        // its traffic is attributed to). NEVER the root
-                        // thread itself — the wire emits subAgentActivity
-                        // about the root during collab runs, and registering
-                        // it would intercept every subsequent root
-                        // notification including turn/completed (the thread
-                        // would hang Working after the fleet finished).
-                        if matches!(
-                            item_type(&item),
-                            "subAgentActivity" | "sub_agent_activity"
-                        ) {
-                            let child = item
-                                .get("agentThreadId")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let path = item
-                                .get("agentPath")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let call = item.get("id").and_then(Value::as_str).unwrap_or("");
-                            if !child.is_empty()
-                                && child != thread_id
-                                && path != "/root"
-                                && path != "/"
-                                && !call.is_empty()
-                            {
-                                children.insert(child.to_owned(), call.to_owned());
-                            } else if child == thread_id || path == "/root" || path == "/" {
-                                // The root's own activity marker: no chip, no
-                                // registration — it is not a subagent.
-                                continue;
-                            }
-                        }
                         if matches!(item_type(&item), "agentMessage" | "agent_message") {
                             if phase == Phase::Completed {
                                 // Fallback for non-streamed messages only.
@@ -1207,7 +1121,7 @@ async fn run_session(session: Session) {
                                 }
                             }
                         } else {
-                            for ev in map_item(phase, &item) {
+                            for ev in children.parent_item(phase, &item) {
                                 if !send(&event_tx, ev).await {
                                     break 'main;
                                 }
@@ -1679,7 +1593,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q

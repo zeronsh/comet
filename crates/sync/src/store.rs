@@ -2,6 +2,7 @@
 //! processed-command ledger (ARCHITECTURE §2 command plane: entries are marked
 //! processed BEFORE execution so a crash can never double-execute a command).
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +38,16 @@ const MIGRATIONS: &[&str] = &[
     // (M1/M3): 2 = thin chat2 rebuild; NULL/0 = pre-migration s2 doc.
     "ALTER TABLE snapshots ADD COLUMN cursor INTEGER;
      ALTER TABLE snapshots ADD COLUMN epoch INTEGER;",
+    // v3 — publication survives actor eviction and process restart.
+    "CREATE TABLE chat_outbox (
+        ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL UNIQUE,
+        bytes BLOB NOT NULL,
+        needs_checkpoint INTEGER NOT NULL DEFAULT 0
+     ) STRICT;
+     CREATE INDEX chat_outbox_doc ON chat_outbox(doc_id,ordinal);
+     CREATE TABLE chat_outbox_initialized (doc_id TEXT PRIMARY KEY) STRICT;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -46,6 +57,7 @@ const MIGRATIONS: &[&str] = &[
 /// that gives command execution mark-BEFORE-execute idempotence.
 pub struct DocsStore {
     conn: Mutex<Connection>,
+    failed_publications: Mutex<HashSet<String>>,
 }
 
 impl DocsStore {
@@ -60,7 +72,102 @@ impl DocsStore {
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            failed_publications: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Insert before sending. Stable IDs make crash-after-ACK replay idempotent.
+    pub fn enqueue_chat_update(
+        &self,
+        doc_id: &str,
+        batch_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let result = self.conn().execute(
+            "INSERT OR IGNORE INTO chat_outbox(doc_id,batch_id,bytes) VALUES (?1,?2,?3)",
+            params![doc_id, batch_id, bytes],
+        );
+        if result.is_err() {
+            self.failed_publications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(doc_id.to_string());
+        }
+        result?;
+        Ok(())
+    }
+
+    pub fn pending_chat_updates(&self, doc_id: &str) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT batch_id,bytes FROM chat_outbox WHERE doc_id=?1 ORDER BY ordinal")?;
+        Ok(stmt
+            .query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn reject_chat_update(&self, doc_id: &str, batch_id: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE chat_outbox SET needs_checkpoint=1 WHERE doc_id=?1 AND batch_id=?2",
+            params![doc_id, batch_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn rejected_chat_updates(
+        &self,
+        doc_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT batch_id,bytes FROM chat_outbox WHERE doc_id=?1 AND needs_checkpoint=1 ORDER BY ordinal")?;
+        Ok(stmt
+            .query_map(params![doc_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn acknowledge_chat_update(&self, doc_id: &str, batch_id: &str) -> Result<(), StoreError> {
+        self.conn().execute(
+            "DELETE FROM chat_outbox WHERE doc_id=?1 AND batch_id=?2",
+            params![doc_id, batch_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn chat_outbox_initialized(&self, doc_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM chat_outbox_initialized WHERE doc_id=?1",
+                params![doc_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Upgrade legacy snapshots (including orphaned local history) once. The
+    /// marker and complete replay obligation commit together; never reset cursors.
+    pub fn initialize_chat_outbox(
+        &self,
+        doc_id: &str,
+        updates: &[Vec<u8>],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if tx.execute(
+            "INSERT OR IGNORE INTO chat_outbox_initialized(doc_id) VALUES (?1)",
+            params![doc_id],
+        )? != 0
+        {
+            for bytes in updates {
+                tx.execute(
+                    "INSERT INTO chat_outbox(doc_id,batch_id,bytes) VALUES (?1,?2,?3)",
+                    params![doc_id, uuid::Uuid::new_v4().to_string(), bytes],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Latest saved snapshot for `doc_id`, if any.
@@ -78,11 +185,15 @@ impl DocsStore {
 
     /// Save (upsert) the snapshot for `doc_id`.
     pub fn save_snapshot(&self, doc_id: &str, bytes: &[u8]) -> Result<(), StoreError> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at",
             params![doc_id, bytes, now_ms()],
         )?;
+        self.invalidate_failed_publication(&tx, doc_id)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -96,12 +207,16 @@ impl DocsStore {
         cursor: u64,
         epoch: u32,
     ) -> Result<(), StoreError> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO snapshots (doc_id, bytes, saved_at, cursor, epoch) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at,
                  cursor = excluded.cursor, epoch = excluded.epoch",
             params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
         )?;
+        self.invalidate_failed_publication(&tx, doc_id)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -131,8 +246,15 @@ impl DocsStore {
     /// Delete the snapshot row for `doc_id` (destructive schema breaks: the
     /// legacy `workspace` row is dropped on open). Missing rows are a no-op.
     pub fn delete_snapshot(&self, doc_id: &str) -> Result<(), StoreError> {
-        self.conn()
-            .execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM snapshots WHERE doc_id = ?1", params![doc_id])?;
+        tx.execute("DELETE FROM chat_outbox WHERE doc_id = ?1", params![doc_id])?;
+        tx.execute(
+            "DELETE FROM chat_outbox_initialized WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -196,6 +318,28 @@ impl DocsStore {
             params![command_id, now_ms()],
         )?;
         Ok(changed > 0)
+    }
+
+    // Every snapshot path, including ACK/cursor persistence, must retain a
+    // replay obligation for operations whose outbox write failed. Invalidate
+    // the marker atomically with those operations becoming durable in a snapshot.
+    fn invalidate_failed_publication(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        doc_id: &str,
+    ) -> Result<(), StoreError> {
+        if self
+            .failed_publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(doc_id)
+        {
+            tx.execute(
+                "DELETE FROM chat_outbox_initialized WHERE doc_id=?1",
+                params![doc_id],
+            )?;
+        }
+        Ok(())
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -327,5 +471,88 @@ mod tests {
         );
         assert!(store.is_processed("cmd-1").unwrap());
         assert!(!store.mark_processed("cmd-1").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[test]
+    fn outbox_survives_restart_initializes_once_and_preserves_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let original;
+        {
+            let store = DocsStore::open(dir.path()).unwrap();
+            store
+                .save_snapshot_with_cursor("chat", b"snapshot", 40229, 2)
+                .unwrap();
+            store
+                .initialize_chat_outbox("chat", &[b"legacy-tail".to_vec()])
+                .unwrap();
+            original = store.pending_chat_updates("chat").unwrap();
+            store
+                .enqueue_chat_update("chat", "stable-id", b"new-turn")
+                .unwrap();
+            store
+                .enqueue_chat_update("chat", "stable-id", b"new-turn")
+                .unwrap();
+        }
+        let store = DocsStore::open(dir.path()).unwrap();
+        store
+            .initialize_chat_outbox("chat", &[b"must-not-reseed".to_vec()])
+            .unwrap();
+        let pending = store.pending_chat_updates("chat").unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0], original[0]);
+        assert_eq!(pending[1], ("stable-id".into(), b"new-turn".to_vec()));
+        assert_eq!(
+            store.load_snapshot_with_cursor("chat").unwrap().unwrap(),
+            (b"snapshot".to_vec(), 40229, 2)
+        );
+        store
+            .acknowledge_chat_update("other-chat", "stable-id")
+            .unwrap();
+        assert_eq!(store.pending_chat_updates("chat").unwrap().len(), 2);
+        store.acknowledge_chat_update("chat", "stable-id").unwrap();
+        assert_eq!(store.pending_chat_updates("chat").unwrap(), original);
+        store.delete_snapshot("chat").unwrap();
+        assert!(store.pending_chat_updates("chat").unwrap().is_empty());
+        assert!(!store.chat_outbox_initialized("chat").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod publication_failure_tests {
+    use super::*;
+    #[test]
+    fn cursor_save_after_failed_outbox_write_keeps_a_durable_replay_obligation() {
+        for cursor_save in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = DocsStore::open(dir.path()).unwrap();
+            store
+                .save_snapshot_with_cursor("chat", b"before", 42, 2)
+                .unwrap();
+            store.initialize_chat_outbox("chat", &[]).unwrap();
+            store.conn().execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON chat_outbox BEGIN SELECT RAISE(FAIL, 'injected disk failure'); END;").unwrap();
+            assert!(
+                store
+                    .enqueue_chat_update("chat", "batch", b"cleanup")
+                    .is_err()
+            );
+            if cursor_save {
+                store
+                    .save_snapshot_with_cursor("chat", b"after", 43, 2)
+                    .unwrap();
+            } else {
+                store.save_snapshot("chat", b"after").unwrap();
+            }
+            drop(store);
+            let reopened = DocsStore::open(dir.path()).unwrap();
+            assert!(!reopened.chat_outbox_initialized("chat").unwrap());
+            assert_eq!(
+                reopened.load_snapshot_with_cursor("chat").unwrap().unwrap(),
+                (b"after".to_vec(), if cursor_save { 43 } else { 42 }, 2)
+            );
+        }
     }
 }

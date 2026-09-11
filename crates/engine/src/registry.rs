@@ -88,10 +88,21 @@ struct HarnessPrefsFile {
     /// so the file only records "no" — an agent installed later turns itself
     /// on without a trip to Settings.
     disabled: Vec<HarnessId>,
+    titles: TitleSettings,
     /// The allow-list written back when enablement was a fixed default set.
     /// Read once, folded into `disabled`, and never written again.
     #[serde(skip_serializing)]
     enabled: Option<Vec<HarnessId>>,
+}
+
+/// Per-device automatic session title preferences.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TitleSettings {
+    /// None follows the session harness, using a supported installed fallback.
+    pub harness: Option<HarnessId>,
+    /// None selects the cheapest model offered by the selected harness.
+    pub model: Option<String>,
 }
 
 type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + Sync>;
@@ -255,6 +266,24 @@ impl HarnessRegistry {
         if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
             tracing::warn!(error = %err, "harness-prefs save failed");
         }
+    }
+
+    pub fn title_settings(&self) -> TitleSettings {
+        self.prefs().titles.clone()
+    }
+
+    pub fn set_title_settings(&self, mut settings: TitleSettings) -> Result<(), String> {
+        if let Some(id) = settings.harness {
+            if !zeron_harness::supports_titles(id) || !self.enabled_set().contains(&id) {
+                return Err("Choose an enabled harness that supports title generation".into());
+            }
+        } else if settings.model.is_some() {
+            return Err("Choose a title harness before choosing a model".into());
+        }
+        settings.model = settings.model.filter(|model| !model.trim().is_empty());
+        self.prefs().titles = settings;
+        self.persist_prefs();
+        Ok(())
     }
 
     pub fn register(&self, harness: Arc<dyn Harness>) {
@@ -938,5 +967,57 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    #[test]
+    fn title_preferences_persist_and_validate_harness_model_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        registry.register(Arc::new(
+            zeron_harness::ClaudeHarness::new().with_executable(std::env::current_exe().unwrap()),
+        ));
+        let settings = TitleSettings {
+            harness: Some(HarnessId::ClaudeCode),
+            model: Some("haiku-test".into()),
+        };
+        registry.set_title_settings(settings.clone()).unwrap();
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.title_settings(), settings);
+        assert!(
+            registry
+                .set_title_settings(TitleSettings {
+                    harness: None,
+                    model: Some("orphan".into())
+                })
+                .is_err()
+        );
+        assert!(
+            registry
+                .set_title_settings(TitleSettings {
+                    harness: Some(HarnessId::Cursor),
+                    model: None
+                })
+                .is_err()
+        );
+        assert_eq!(registry.title_settings(), settings);
+        registry
+            .set_title_settings(TitleSettings::default())
+            .unwrap();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.title_settings(), TitleSettings::default());
+    }
+
+    #[test]
+    fn old_harness_preferences_default_to_automatic_titles() {
+        let prefs: HarnessPrefsFile = serde_json::from_str(r#"{"disabled":["codex"]}"#).unwrap();
+        assert_eq!(prefs.titles, TitleSettings::default());
+        assert_eq!(prefs.disabled, vec![HarnessId::Codex]);
     }
 }

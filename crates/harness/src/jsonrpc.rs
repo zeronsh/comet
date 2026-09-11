@@ -146,6 +146,28 @@ fn response_id(id: &Value) -> Option<i64> {
     id.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64)
 }
 
+/// Preserve the agent's rejection reason as well as the generic RPC label.
+fn response_error(error: &Value) -> String {
+    let Some(message) = error.get("message").and_then(Value::as_str) else {
+        return error.to_string();
+    };
+    let mut rendered = message.to_owned();
+    if let Some(code) = error.get("code").and_then(Value::as_i64) {
+        rendered.push_str(&format!(" (code {code})"));
+    }
+    if let Some(data) = error.get("data").filter(|v| !v.is_null()) {
+        let detail = data
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| data.to_string());
+        if !detail.is_empty() {
+            rendered.push_str(": ");
+            rendered.push_str(&detail);
+        }
+    }
+    rendered
+}
+
 /// Parse stdout lines: responses resolve the pending map, everything else is
 /// forwarded in order. Non-JSON noise is skipped; on EOF all pending requests
 /// fail (their senders drop) and one final [`Incoming::Eof`] is delivered.
@@ -172,11 +194,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     continue;
                 };
                 let outcome = match msg.get("error") {
-                    Some(err) => Err(err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| err.to_string())),
+                    Some(err) => Err(response_error(err)),
                     None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 let _ = sender.send(outcome);
@@ -208,4 +226,41 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
     // EOF/read error: fail every awaiting request, then signal the loop.
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_error_preserves_string_and_structured_details() {
+        for data in [
+            json!("A prompt is already running"),
+            json!({"reason": "A prompt is already running"}),
+            json!(["busy", 7]),
+        ] {
+            let rendered = response_error(
+                &json!({"code": -32600, "message": "Invalid request", "data": data}),
+            );
+            assert!(rendered.starts_with("Invalid request (code -32600): "));
+            assert!(rendered.ends_with(data.as_str().unwrap_or(&data.to_string())));
+        }
+    }
+
+    #[test]
+    fn rpc_error_handles_missing_null_and_unstructured_fields() {
+        for error in [
+            json!({"message": "busy"}),
+            json!({"message": "busy", "data": null}),
+            json!({"message": "busy", "data": ""}),
+        ] {
+            assert_eq!(response_error(&error), "busy");
+        }
+        for error in [
+            json!({"code": -32600, "data": {"reason": "busy"}}),
+            json!("unstructured error"),
+        ] {
+            assert_eq!(response_error(&error), error.to_string());
+        }
+    }
 }

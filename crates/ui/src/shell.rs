@@ -201,12 +201,21 @@ pub(crate) fn restore_focus_if_empty_on_next_frame<T: 'static>(
 fn restore_mounted_focus(
     root: &FocusHandle,
     preferred: &FocusHandle,
+    unfocused: &FocusHandle,
     window: &mut Window,
     cx: &mut App,
 ) {
     let preferred_mounted = root.contains(preferred, window);
     if !root.contains_focused(window, cx) || (root.is_focused(window) && preferred_mounted) {
-        let target = if preferred_mounted { preferred } else { root };
+        // Explicit blur keeps shortcuts active without returning the caret to
+        // an input. The root remains the temporary fallback for stale handles.
+        let target = if window.focused(cx).is_none() {
+            unfocused
+        } else if preferred_mounted {
+            preferred
+        } else {
+            root
+        };
         window.focus(target, cx);
     }
 }
@@ -263,6 +272,7 @@ impl SidebarDisclosureMotion {
 /// Vertical pane resize hitboxes yield the global titlebar. Keeping this in
 /// the shared constructor makes left/right seams mirror each other and avoids
 /// relying on paint order when chrome crosses an animated pane boundary.
+const PANE_RESIZE_HITBOX_HALF_WIDTH: f32 = 6.0;
 const PANE_RESIZE_HITBOX_TOP: f32 = Theme::TITLEBAR_HEIGHT;
 
 fn stable_panel_content_width(target: f32, transition: Option<(f32, f32)>) -> f32 {
@@ -963,6 +973,58 @@ impl SyncFlow {
                 | SyncFlow::ImportFailed { .. }
         )
     }
+
+    fn has_visible_overlay(self) -> bool {
+        match self {
+            SyncFlow::Idle
+            | SyncFlow::SwitchOffer { notice_open: false }
+            | SyncFlow::ImportFailed { notice_open: false }
+            | SyncFlow::RestartPending { notice_open: false }
+            | SyncFlow::SignedOutRestartRequired => false,
+            SyncFlow::Enabling
+            | SyncFlow::Canceling
+            | SyncFlow::SwitchOffer { notice_open: true }
+            | SyncFlow::Switching { .. }
+            | SyncFlow::Importing { .. }
+            | SyncFlow::ImportDone { .. }
+            | SyncFlow::ImportFailed { notice_open: true }
+            | SyncFlow::RestartPending { notice_open: true }
+            | SyncFlow::SignOutConfirm
+            | SyncFlow::SigningOut => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellEscapeOutcome {
+    OtherKey,
+    Blocked,
+    InterruptChat(String),
+    Ignored,
+}
+
+fn resolve_shell_escape(
+    key: &str,
+    blocking_overlay: bool,
+    escape_stops_active_agent: bool,
+    route: Route,
+    selected_chat: Option<&str>,
+    indicator: Indicator,
+    interrupting: bool,
+) -> ShellEscapeOutcome {
+    if key != "escape" {
+        ShellEscapeOutcome::OtherKey
+    } else if blocking_overlay {
+        ShellEscapeOutcome::Blocked
+    } else if !escape_stops_active_agent || !matches!(route, Route::Chat) || interrupting {
+        ShellEscapeOutcome::Ignored
+    } else if matches!(indicator, Indicator::Working | Indicator::AwaitingInput) {
+        selected_chat
+            .map(|chat_id| ShellEscapeOutcome::InterruptChat(chat_id.to_owned()))
+            .unwrap_or(ShellEscapeOutcome::Ignored)
+    } else {
+        ShellEscapeOutcome::Ignored
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1324,7 +1386,7 @@ pub struct Shell {
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
-    sound_prev: std::collections::HashMap<String, zeron_proto::SessionStatus>,
+    sound_prev: std::collections::HashMap<String, crate::sound::SessionNotificationState>,
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
@@ -1431,6 +1493,8 @@ pub struct Shell {
     /// settle, preserving focus on mounted controls.
     focus_sub: Option<Subscription>,
     shortcut_focus: FocusHandle,
+    /// Neutral shortcut target after clicking away from an input.
+    unfocused: FocusHandle,
     /// Clears the jump hints when the window deactivates: a Cmd+Tab away
     /// swallows the key-up, so without this the chips stay on screen for good.
     activation_sub: Option<Subscription>,
@@ -1696,6 +1760,7 @@ impl Shell {
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             activation_sub: None,
             _ticker: ticker,
             _state_observation: observation,
@@ -1813,48 +1878,26 @@ impl Shell {
                 });
             }
         }
-        // Session chimes (herdr semantics, `sound::sound_for_transition`): a
-        // question rings whenever a session flips to AwaitingInput, a
-        // completion rings on the Working→Idle edge — for ANY session on any
-        // device. A row's first appearance only seeds the baseline, so boot
-        // (restored rows) and fresh sends stay silent. Desktop banners
-        // (`notify::post`) ride the SAME edges and gates behind their own
-        // settings flag — one detector, two outputs, so the banner can never
-        // fire where the chime wouldn't.
-        //
-        // STALENESS-GATED like the dot (`effective_indicator`), for the same
-        // reason: raw row statuses include the past. A dead turn's Working row
-        // (host killed mid-run, Idle write lost to a wedged room) seeded
-        // prev=Working here, and the moment the old Idle finally synced in —
-        // typically piggybacked on the round-trip of a fresh send — the chime
-        // heard a phantom Working→Idle and rang "done" on send (user report
-        // 2026-07-31). The dot never showed that ghost; the chime must judge
-        // by the identical clock.
-        //
-        // SEND-PENDING-GATED too (`AppState::send_pending`): a send whose
-        // queued command the host hasn't executed yet can still surface a
-        // phantom Working→Idle (a stale Working row crossing the 45s gate on
-        // the send's own re-render, or a late old Idle row) — the done-chime
-        // stays quiet for that chat until the host acks, while the baseline
-        // keeps tracking silently so the ghost edge never fires later. The
-        // question chime is NOT gated: an instant AwaitingInput ack should
-        // still ring.
+        // Banners and chimes share one detector. Completion markers survive
+        // queue handoffs and never advance for interrupts or stale activity.
+        // A row's first appearance seeds the baseline silently (boot/replay).
+        // Pending sends consume completion changes silently, while questions
+        // still ring immediately. Output settings do not affect the baseline.
         {
             let now = Utc::now();
-            type Ping = (String, zeron_proto::SessionStatus, bool, Option<String>);
+            type Ping = (
+                String,
+                crate::sound::SessionNotificationState,
+                bool,
+                Option<String>,
+            );
             let sessions: Vec<Ping> = {
                 let state = state.read(cx);
                 state
                     .sessions
                     .iter()
                     .map(|s| {
-                        use zeron_proto::view::Indicator;
-                        let status = match zeron_proto::view::effective_indicator(Some(s), now) {
-                            Indicator::Working => zeron_proto::SessionStatus::Working,
-                            Indicator::AwaitingInput => zeron_proto::SessionStatus::AwaitingInput,
-                            Indicator::Errored => zeron_proto::SessionStatus::Errored,
-                            Indicator::None => zeron_proto::SessionStatus::Idle,
-                        };
+                        let status = crate::sound::SessionNotificationState::new(s, now);
                         let send_pending = state.send_pending(&s.chat_id, now);
                         let title = state
                             .chats
@@ -1871,10 +1914,9 @@ impl Shell {
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
             for (chat_id, status, send_pending, title) in sessions {
-                let prev = self.sound_prev.insert(chat_id, status);
+                let prev = self.sound_prev.insert(chat_id, status.clone());
                 if let Some(prev) = prev
-                    && let Some(sound) = crate::sound::sound_for_transition(prev, status)
-                    && !(send_pending && sound == crate::sound::Sound::Done)
+                    && let Some(sound) = status.sound_since(&prev, send_pending)
                 {
                     if self.settings.sound_enabled {
                         crate::sound::play(sound);
@@ -2281,7 +2323,12 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
+                self.composer
+                    .update(cx, |composer, _| composer.focus_pending = false);
+                panel.update(cx, |panel, cx| {
+                    panel.select_tab_by_key(tab, cx);
+                    panel.request_focus(cx);
+                });
             }
             RightSurface::Diff(id) => {
                 if let Some(changes) = self.diffs.get(&id).cloned() {
@@ -2895,6 +2942,36 @@ impl Shell {
         self.prepare_exit(PendingExit::CloseWindow, cx)
     }
 
+    /// The first rung of `⌘W` / Window > Close Window: when the right pane is
+    /// open on a real surface (the file / diff / terminal / browser tab the
+    /// user just opened), close THAT and leave the window alone. Returns true
+    /// when the close was consumed by the pane.
+    ///
+    /// The pane's empty picker state and a closed pane both yield false, so the
+    /// caller falls through to [`Self::prepare_window_close`] and the window
+    /// closes — the same cascade browsers use. The native traffic-light close
+    /// deliberately skips this rung: it always closes the window.
+    pub fn close_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(surface) = self.closable_right_surface(cx) else {
+            return false;
+        };
+        self.close_right_surface(surface, window, cx);
+        true
+    }
+
+    /// The right pane's closable surface for the `⌘W` cascade: the resolved
+    /// active surface while the pane is open, or `None` on the picker empty
+    /// state / a closed pane / the new-session canvas.
+    fn closable_right_surface(&self, cx: &App) -> Option<RightSurface> {
+        if !self.right_pane_open(cx) {
+            return None;
+        }
+        match self.resolved_right_active(cx) {
+            RightSurface::Picker => None,
+            surface => Some(surface),
+        }
+    }
+
     pub fn prepare_quit(&mut self, cx: &mut Context<Self>) -> bool {
         self.prepare_exit(PendingExit::Quit, cx)
     }
@@ -3019,6 +3096,9 @@ impl Shell {
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
+            self.composer
+                .update(cx, |composer, _| composer.focus_pending = false);
+            panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
             // to the prompt, no click needed (zeron terminal-panel.tsx: the
             // visible+active effect calls `terminal.focus()` on every open).
@@ -3215,6 +3295,7 @@ impl Shell {
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
         cx.notify();
     }
@@ -3240,6 +3321,7 @@ impl Shell {
         match entry {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
+                self.focus_composer(cx);
                 let target = (!chat_id.is_empty()).then_some(chat_id);
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
@@ -3396,9 +3478,17 @@ impl Shell {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
+                    let escape_stops_active_agent = self.settings.escape_stops_active_agent;
                     let composer_send_behavior = self.settings.composer_send_behavior;
-                    let page =
-                        cx.new(|cx| ShortcutsPage::new(state, keymap, composer_send_behavior, cx));
+                    let page = cx.new(|cx| {
+                        ShortcutsPage::new(
+                            state,
+                            keymap,
+                            escape_stops_active_agent,
+                            composer_send_behavior,
+                            cx,
+                        )
+                    });
                     // Persist + re-apply shortcut preferences whenever the page changes them.
                     self.shortcuts_sub = Some(cx.subscribe(
                         &page,
@@ -3406,6 +3496,9 @@ impl Shell {
                             match event {
                                 ShortcutsEvent::KeymapChanged(keymap) => {
                                     this.settings.keymap = keymap.clone();
+                                }
+                                ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled) => {
+                                    this.settings.escape_stops_active_agent = *enabled;
                                 }
                                 ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
                                     this.settings.composer_send_behavior = *behavior;
@@ -6154,8 +6247,106 @@ impl Shell {
         Some(popover::modal("sync-lifecycle-dialog", viewport, card))
     }
 
-    /// Floating layers owned by the shell: context menus, edit dialogs, and
-    /// the local-to-synced account lifecycle.
+    fn active_changes(&self, cx: &App) -> Option<Entity<Changes>> {
+        if !self.right_pane_open(cx) {
+            return None;
+        }
+        let RightSurface::Diff(id) = self.resolved_right_active(cx) else {
+            return None;
+        };
+        self.diffs.get(&id).cloned()
+    }
+
+    /// Resolve shell-owned Escape surfaces in capture phase, before focused
+    /// descendants such as an integrated terminal can consume the key.
+    fn capture_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        // Modals and context menus sit above the rest of the shell. Preserve
+        // their existing behavior: only surfaces that already have a Cancel
+        // path close here; the others remain explicit blockers.
+        if self.sync_flow.has_visible_overlay()
+            || self.delete_confirm.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.chat_menu.get().is_some()
+            || self.space_menu.get().is_some()
+            || self.user_menu.get().is_some()
+        {
+            return true;
+        }
+        if self.rename_dialog.is_some() {
+            self.rename_dialog = None;
+            cx.notify();
+            return true;
+        }
+        if self.rename_space_dialog.is_some() {
+            self.rename_space_dialog = None;
+            cx.notify();
+            return true;
+        }
+        if self.add_space.is_some() {
+            self.add_space = None;
+            cx.notify();
+            return true;
+        }
+        if self.spaces_menu.is_open() {
+            self.close_spaces_menu(cx);
+            return true;
+        }
+        if self.spaces_menu.get().is_some() {
+            return true;
+        }
+
+        if self.right_plus.is_open() {
+            self.close_right_plus(cx);
+            return true;
+        }
+        if self.right_plus.get().is_some() {
+            return true;
+        }
+        self.active_changes(cx)
+            .is_some_and(|changes| changes.update(cx, |changes, cx| changes.handle_escape(cx)))
+    }
+
+    fn on_key_down_capture(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" && self.capture_escape_surface(cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    fn on_key_down(&mut self, event: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let selected_chat = self.state.read(cx).selected_chat.clone();
+        let indicator = selected_chat
+            .as_deref()
+            .map(|chat_id| self.state.read(cx).indicator_for(chat_id, Utc::now()))
+            .unwrap_or(Indicator::None);
+        let interrupting = selected_chat
+            .as_deref()
+            .is_some_and(|chat_id| self.composer.read(cx).is_interrupting(chat_id));
+        let escape_stops_active_agent = self.settings.escape_stops_active_agent;
+
+        match resolve_shell_escape(
+            &event.keystroke.key,
+            false,
+            escape_stops_active_agent,
+            self.route,
+            selected_chat.as_deref(),
+            indicator,
+            interrupting,
+        ) {
+            ShellEscapeOutcome::Blocked => cx.stop_propagation(),
+            ShellEscapeOutcome::InterruptChat(chat_id) => {
+                cx.stop_propagation();
+                self.composer
+                    .update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
+            }
+            ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
+        }
+    }
+
     fn render_overlays(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -6343,6 +6534,7 @@ impl Shell {
                     if ev.keystroke.key == "escape" {
                         this.rename_dialog = None;
                         cx.notify();
+                        cx.stop_propagation();
                     }
                 }))
                 .child(popover::dialog_title(&theme, "Rename session"))
@@ -6457,8 +6649,9 @@ impl Shell {
             .absolute()
             .top(px(PANE_RESIZE_HITBOX_TOP))
             .bottom_0()
-            .w(px(12.0))
+            .w(px(PANE_RESIZE_HITBOX_HALF_WIDTH * 2.0))
             .flex_none()
+            .occlude()
             .cursor_col_resize()
             .on_hover(motion::hover_listener(fade_key))
             // Codex-style seam feedback: the existing 1px panel border stays
@@ -8472,6 +8665,16 @@ impl Render for Shell {
         // Native clipping follows the animated GPUI mask. Drags only transfer
         // pointer ownership; the browser continues rendering and reflowing.
         let browser_dragging = cx.has_active_drag();
+        #[cfg(target_os = "macos")]
+        let browser_resize_inset = if self.right_pane_open(cx)
+            && !self.right_pane_expanded
+            && !self.tween_active(self.right_tween)
+        {
+            // The browser starts inside the panel's one-point left border.
+            px(PANE_RESIZE_HITBOX_HALF_WIDTH - 1.0)
+        } else {
+            px(0.0)
+        };
         let selected_surface = self.resolved_right_active(cx);
         for (id, browser) in &self.browsers {
             let presentation = crate::browser::model::presentation(
@@ -8479,6 +8682,8 @@ impl Render for Shell {
                 browser_dragging,
             );
             browser.update(cx, |browser, cx| {
+                #[cfg(target_os = "macos")]
+                browser.set_resize_inset(browser_resize_inset, cx);
                 browser.set_shortcuts(&self.settings.keymap);
                 browser.set_presentation(presentation, cx);
             });
@@ -8528,17 +8733,19 @@ impl Render for Shell {
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 let root = this.shortcut_focus.clone();
+                let unfocused = this.unfocused.clone();
                 let preferred = this.composer.focus_handle(cx);
                 window.on_next_frame(move |window, cx| {
-                    restore_mounted_focus(&root, &preferred, window, cx);
+                    restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
                 });
                 cx.notify();
             }));
         }
         let shortcut_focus = self.shortcut_focus.clone();
+        let unfocused = self.unfocused.clone();
         let preferred_focus = self.composer.focus_handle(cx);
         window.defer(cx, move |window, cx| {
-            restore_mounted_focus(&shortcut_focus, &preferred_focus, window, cx);
+            restore_mounted_focus(&shortcut_focus, &preferred_focus, &unfocused, window, cx);
         });
 
         // Modifier events follow focus too. Reconcile from the window's input
@@ -8553,6 +8760,9 @@ impl Render for Shell {
 
         let root = presentation::root(Theme::of(cx))
             .track_focus(&self.shortcut_focus)
+            .child(div().track_focus(&self.unfocused))
+            .capture_key_down(cx.listener(Self::on_key_down_capture))
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
@@ -8727,7 +8937,7 @@ impl Render for Shell {
                     )
                     // A forgiving transparent hit target centered on the
                     // seam; the panel's 1px border remains the visual divider.
-                    .left(px(-6.0))
+                    .left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
                 });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
@@ -8777,12 +8987,16 @@ impl Render for Shell {
                 // Keep the right resize target outside the pane's
                 // overflow-hidden width container. This mirrors the sidebar
                 // seam and lets the target straddle both adjacent panes.
+                // Paint it after the page so page input cannot occlude the
+                // inner half. A deferred draw would capture all native input.
                 let right_seam: AnyElement = if let Some(handle) = right_handle {
                     div()
                         .w(px(0.0))
                         .h_full()
                         .flex_none()
-                        .relative()
+                        .absolute()
+                        .left_0()
+                        .top_0()
                         .child(handle)
                         .into_any_element()
                 } else {
@@ -8814,8 +9028,14 @@ impl Render for Shell {
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
-                            .child(right_seam)
-                            .child(right),
+                            .child(
+                                div()
+                                    .h_full()
+                                    .flex_none()
+                                    .relative()
+                                    .child(right)
+                                    .child(right_seam),
+                            ),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
@@ -8952,6 +9172,111 @@ mod tests {
     fn right_pane_takeover_consumes_the_chat_column() {
         assert_eq!(right_pane_takeover_width(1200.0, 256.0), 944.0);
         assert_eq!(1200.0 - 256.0 - 944.0, 0.0);
+    }
+
+    #[test]
+    fn escape_interrupts_only_the_active_live_chat() {
+        assert_eq!(
+            resolve_shell_escape(
+                "escape",
+                false,
+                true,
+                Route::Chat,
+                Some("chat-a"),
+                Indicator::Working,
+                false,
+            ),
+            ShellEscapeOutcome::InterruptChat("chat-a".to_owned())
+        );
+        assert_eq!(
+            resolve_shell_escape(
+                "escape",
+                false,
+                true,
+                Route::Chat,
+                Some("chat-b"),
+                Indicator::AwaitingInput,
+                false,
+            ),
+            ShellEscapeOutcome::InterruptChat("chat-b".to_owned())
+        );
+    }
+
+    #[test]
+    fn escape_ignores_non_live_or_ineligible_views() {
+        assert_eq!(
+            resolve_shell_escape(
+                "escape",
+                true,
+                true,
+                Route::Chat,
+                Some("chat-a"),
+                Indicator::Working,
+                false,
+            ),
+            ShellEscapeOutcome::Blocked
+        );
+        for (route, selected, indicator, interrupting) in [
+            (Route::Chat, Some("chat-a"), Indicator::None, false),
+            (Route::Chat, None, Indicator::Working, false),
+            (Route::Chat, Some("chat-a"), Indicator::Working, true),
+            (
+                Route::Settings(SettingsSection::Devices),
+                Some("chat-a"),
+                Indicator::Working,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                resolve_shell_escape(
+                    "escape",
+                    false,
+                    true,
+                    route,
+                    selected,
+                    indicator,
+                    interrupting,
+                ),
+                ShellEscapeOutcome::Ignored
+            );
+        }
+        assert_eq!(
+            resolve_shell_escape(
+                "enter",
+                true,
+                true,
+                Route::Chat,
+                Some("chat-a"),
+                Indicator::Working,
+                false,
+            ),
+            ShellEscapeOutcome::OtherKey
+        );
+    }
+
+    #[test]
+    fn escape_interrupt_is_opt_in() {
+        assert_eq!(
+            resolve_shell_escape(
+                "escape",
+                false,
+                false,
+                Route::Chat,
+                Some("chat-a"),
+                Indicator::Working,
+                false,
+            ),
+            ShellEscapeOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn only_visible_sync_steps_block_escape() {
+        assert!(!SyncFlow::Idle.has_visible_overlay());
+        assert!(!SyncFlow::SwitchOffer { notice_open: false }.has_visible_overlay());
+        assert!(SyncFlow::SwitchOffer { notice_open: true }.has_visible_overlay());
+        assert!(SyncFlow::Importing { done: 1, total: 3 }.has_visible_overlay());
+        assert!(SyncFlow::SignOutConfirm.has_visible_overlay());
     }
 
     #[test]
@@ -9774,6 +10099,162 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn opening_terminals_focuses_the_terminal_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let mut drawer_window = None;
+        for embedded in [false, false, true] {
+            let panel = window
+                .update(cx, |shell, window, cx| {
+                    shell.open_chat("terminal-session".into(), cx);
+                    shell.active_chat = "terminal-session".into();
+                    let panel = if embedded {
+                        shell.add_terminal_surface(cx);
+                        shell.right_terminal.clone().unwrap()
+                    } else {
+                        shell.toggle_terminal(window, cx);
+                        shell.terminal.clone().unwrap()
+                    };
+                    assert!(!shell.composer.read(cx).focus_pending);
+                    panel
+                })
+                .unwrap();
+            let terminal_window = if !embedded && drawer_window.is_some() {
+                drawer_window.unwrap()
+            } else {
+                let handle = cx.update(|cx| {
+                    cx.open_window(gpui::WindowOptions::default(), |_, _| panel.clone())
+                        .unwrap()
+                });
+                if !embedded {
+                    drawer_window = Some(handle);
+                }
+                handle
+            };
+            cx.update_window(terminal_window.into(), |_, window, cx| {
+                window.draw(cx).clear();
+                assert!(
+                    panel.read(cx).focus_handle().is_focused(window),
+                    "embedded: {embedded}"
+                );
+                // Ordinary redraws must not steal focus from another control.
+                let other_input = cx.focus_handle();
+                window.focus(&other_input, cx);
+                window.draw(cx).clear();
+                assert!(other_input.is_focused(window));
+            })
+            .unwrap();
+            if !embedded {
+                window
+                    .update(cx, |shell, window, cx| {
+                        shell.toggle_terminal(window, cx);
+                        assert!(shell.composer.focus_handle(cx).is_focused(window));
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn session_navigation_focuses_composer_once(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        // Render the real composer in its own window to exercise mounting
+        // without the shell's boot/connection gate hiding the destination.
+        let composer_window = cx.update(|cx| {
+            let composer = window.read(cx).unwrap().composer.clone();
+            cx.open_window(gpui::WindowOptions::default(), |_, _| composer)
+                .unwrap()
+        });
+        for destination in ["initial", "chat", "chat", "new", "new", "back", "settings"] {
+            window
+                .update(cx, |shell, _, cx| match destination {
+                    "chat" => shell.open_chat("existing-session".into(), cx),
+                    "new" => shell.open_new_session(cx),
+                    "back" => shell.apply_nav(NavEntry::Chat("existing-session".into()), cx),
+                    "settings" => {
+                        shell.open_settings(SettingsSection::Devices, cx);
+                        shell.close_settings(cx);
+                    }
+                    _ => {}
+                })
+                .unwrap();
+            cx.update_window(composer_window.into(), |composer, window, cx| {
+                window.draw(cx).clear();
+                assert!(
+                    composer
+                        .downcast::<Composer>()
+                        .unwrap()
+                        .focus_handle(cx)
+                        .is_focused(window),
+                    "{destination}"
+                );
+                // Subsequent renders after a click-away must not reclaim it.
+                window.blur();
+                window.draw(cx).clear();
+                assert!(window.focused(cx).is_none(), "{destination}");
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn projectless_new_session_restores_opt_out_and_clears_sidebar_filter(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         crate::settings::composer::ComposerDefaults {
@@ -9930,6 +10411,68 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn cmd_w_closes_the_active_right_pane_surface_before_the_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.active_chat = "session".into();
+                shell.toggle_right_pane(cx);
+                assert!(shell.right_pane_open(cx));
+
+                shell.add_browser_surface(None, window, cx);
+                let first = shell.browser_seq;
+                shell.add_browser_surface(None, window, cx);
+                let second = shell.browser_seq;
+                assert_eq!(
+                    shell.resolved_right_active(cx),
+                    RightSurface::Browser(second)
+                );
+
+                // ⌘W closes the active tab, not the window.
+                assert!(shell.close_active_surface(window, cx));
+                assert_eq!(
+                    shell.resolved_right_active(cx),
+                    RightSurface::Browser(first)
+                );
+
+                // …and again for the last tab.
+                assert!(shell.close_active_surface(window, cx));
+                assert_eq!(shell.resolved_right_active(cx), RightSurface::Picker);
+
+                // An open pane with nothing left to close falls through to the
+                // window-close rung instead of being consumed.
+                assert!(!shell.close_active_surface(window, cx));
+
+                // So does an already-closed pane.
+                shell.toggle_right_pane(cx);
+                assert!(!shell.right_pane_open(cx));
+                assert!(!shell.close_active_surface(window, cx));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn lifecycle_actions_keep_pending_and_failed_file_saves_alive(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
@@ -10073,6 +10616,7 @@ mod shortcut_focus_regressions {
 
     struct ShortcutHost {
         root: FocusHandle,
+        unfocused: FocusHandle,
         editor: FocusHandle,
         show_editor: bool,
         jumps: usize,
@@ -10081,13 +10625,15 @@ mod shortcut_focus_regressions {
     impl Render for ShortcutHost {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let root = self.root.clone();
+            let unfocused = self.unfocused.clone();
             let preferred = self.editor.clone();
             window.defer(cx, move |window, cx| {
-                restore_mounted_focus(&root, &preferred, window, cx);
+                restore_mounted_focus(&root, &preferred, &unfocused, window, cx);
             });
             div()
                 .size_full()
                 .track_focus(&self.root)
+                .child(div().track_focus(&self.unfocused))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -10110,6 +10656,30 @@ mod shortcut_focus_regressions {
     }
 
     #[gpui::test]
+    fn explicit_blur_does_not_refocus_a_mounted_input(cx: &mut TestAppContext) {
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+        });
+        cx.run_until_parked();
+        cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        host.update(cx, |host, window, cx| {
+            window.focus(&host.editor, cx);
+            window.blur();
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+            // Subsequent renders must keep the neutral shortcut focus too.
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
     fn shortcuts_recover_from_retained_editor_focus(cx: &mut TestAppContext) {
         cx.update(|cx| {
             cx.bind_keys([KeyBinding::new(
@@ -10120,6 +10690,7 @@ mod shortcut_focus_regressions {
         });
         let host = cx.add_window(|_, cx| ShortcutHost {
             root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
@@ -10136,7 +10707,7 @@ mod shortcut_focus_regressions {
             cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
                 .unwrap();
             host.update(cx, |host, window, cx| {
-                restore_mounted_focus(&host.root, &host.editor, window, cx);
+                restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
                 assert!(host.root.contains_focused(window, cx));
                 assert_eq!(host.editor.is_focused(window), show_editor);
             })
@@ -10146,8 +10717,8 @@ mod shortcut_focus_regressions {
         host.update(cx, |host, window, cx| {
             assert_eq!(host.jumps, 4);
             window.blur();
-            restore_mounted_focus(&host.root, &host.editor, window, cx);
-            assert!(host.root.is_focused(window));
+            restore_mounted_focus(&host.root, &host.editor, &host.unfocused, window, cx);
+            assert!(host.unfocused.is_focused(window));
         })
         .unwrap();
     }
@@ -10163,6 +10734,7 @@ mod shortcut_focus_regressions {
         });
         let host = cx.add_window(|_, cx| ShortcutHost {
             root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,

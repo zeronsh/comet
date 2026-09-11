@@ -30,7 +30,7 @@ static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.wav");
 /// Which notification chime to play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sound {
-    /// A run finished (Working → Idle).
+    /// An agent turn completed successfully.
     Done,
     /// The agent is waiting on a question (→ AwaitingInput).
     Request,
@@ -161,22 +161,50 @@ fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> 
 }
 
 // ---------------------------------------------------------------------------
-// Transition mapping (pure — herdr's notification_sound_for_state_change)
+// Notification decision (shared by sound and desktop banners)
 // ---------------------------------------------------------------------------
 
-use zeron_proto::SessionStatus;
+use zeron_proto::{
+    Session,
+    view::{Indicator, effective_indicator},
+};
 
-/// Which chime (if any) a session-status transition deserves. Same-state
-/// updates never chime; a question always chimes; a completion chimes on the
-/// Working→Idle edge.
-pub fn sound_for_transition(prev: SessionStatus, new: SessionStatus) -> Option<Sound> {
-    if prev == new {
-        return None;
+/// Notification baseline is separate from the visual activity indicator:
+/// going idle can mean cancellation, expiry, or an internal handoff.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionNotificationState {
+    indicator: Indicator,
+    last_completed_turn: Option<String>,
+    fresh: bool,
+}
+
+impl SessionNotificationState {
+    pub(crate) fn new(session: &Session, now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            indicator: effective_indicator(Some(session), now),
+            last_completed_turn: session.last_completed_turn.clone(),
+            fresh: now
+                .signed_duration_since(session.updated_at)
+                .num_milliseconds()
+                <= zeron_proto::view::SESSION_STALE_MS,
+        }
     }
-    match new {
-        SessionStatus::AwaitingInput => Some(Sound::Request),
-        SessionStatus::Idle if prev == SessionStatus::Working => Some(Sound::Done),
-        _ => None,
+
+    /// Call after saving the new baseline, including when delivery is pending
+    /// or outputs are disabled. Suppressed pings must never be replayed later.
+    pub(crate) fn sound_since(&self, prev: &Self, send_pending: bool) -> Option<Sound> {
+        if self.indicator == Indicator::AwaitingInput && prev.indicator != Indicator::AwaitingInput
+        {
+            return Some(Sound::Request);
+        }
+        if !send_pending
+            && self.fresh
+            && self.last_completed_turn.is_some()
+            && self.last_completed_turn != prev.last_completed_turn
+        {
+            return Some(Sound::Done);
+        }
+        None
     }
 }
 
@@ -184,26 +212,60 @@ pub fn sound_for_transition(prev: SessionStatus, new: SessionStatus) -> Option<S
 mod tests {
     use super::*;
 
+    fn baseline(indicator: Indicator, turn: Option<&str>) -> SessionNotificationState {
+        SessionNotificationState {
+            indicator,
+            last_completed_turn: turn.map(str::to_owned),
+            fresh: true,
+        }
+    }
+
     #[test]
-    fn transition_mapping_matches_herdr_semantics() {
-        use SessionStatus::*;
-        // A question always chimes, wherever it came from.
+    fn interrupted_and_expired_activity_never_chime() {
+        let working = baseline(Indicator::Working, Some("old"));
+        let idle = baseline(Indicator::None, Some("old"));
+        assert_eq!(idle.sound_since(&working, false), None);
         assert_eq!(
-            sound_for_transition(Working, AwaitingInput),
-            Some(Sound::Request)
+            baseline(Indicator::Errored, Some("old")).sound_since(&working, false),
+            None
         );
+        // An older host without explicit completion metadata is silent too.
         assert_eq!(
-            sound_for_transition(Idle, AwaitingInput),
-            Some(Sound::Request)
+            baseline(Indicator::None, None).sound_since(&baseline(Indicator::Working, None), false),
+            None
         );
-        // Completion = the Working→Idle edge only.
-        assert_eq!(sound_for_transition(Working, Idle), Some(Sound::Done));
-        assert_eq!(sound_for_transition(AwaitingInput, Idle), None);
-        assert_eq!(sound_for_transition(Errored, Idle), None);
-        // Same state / other edges stay silent.
-        assert_eq!(sound_for_transition(Working, Working), None);
-        assert_eq!(sound_for_transition(Idle, Working), None);
-        assert_eq!(sound_for_transition(Working, Errored), None);
+    }
+
+    #[test]
+    fn ordinary_queue_completions_survive_coalesced_working_states() {
+        let first = baseline(Indicator::Working, None);
+        let second = baseline(Indicator::Working, Some("first"));
+        assert_eq!(second.sound_since(&first, false), Some(Sound::Done));
+        assert_eq!(second.sound_since(&second, false), None);
+        let last = baseline(Indicator::None, Some("second"));
+        assert_eq!(last.sound_since(&second, false), Some(Sound::Done));
+        assert_eq!(last.sound_since(&last, false), None);
+    }
+
+    #[test]
+    fn pending_send_consumes_completion_but_preserves_input_requests() {
+        let before = baseline(Indicator::Working, None);
+        let settled = baseline(Indicator::None, Some("first"));
+        assert_eq!(settled.sound_since(&before, true), None);
+        assert_eq!(settled.sound_since(&settled, false), None);
+        let question = baseline(Indicator::AwaitingInput, Some("first"));
+        assert_eq!(question.sound_since(&settled, true), Some(Sound::Request));
+        assert_eq!(question.sound_since(&question, false), None);
+    }
+
+    #[test]
+    fn stale_completion_is_consumed_without_replaying_on_a_heartbeat() {
+        let before = baseline(Indicator::Working, None);
+        let mut stale = baseline(Indicator::None, Some("old"));
+        stale.fresh = false;
+        assert_eq!(stale.sound_since(&before, false), None);
+        let refreshed = baseline(Indicator::Working, Some("old"));
+        assert_eq!(refreshed.sound_since(&stale, false), None);
     }
 
     #[test]

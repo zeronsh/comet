@@ -40,6 +40,14 @@ pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
 }
 
 impl Shell {
+    /// Navigation requests focus once the destination composer renders.
+    pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.focus_pending = true;
+            cx.notify();
+        });
+    }
+
     /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
     /// the order it is drawn. Selection is immediate (no MRU overlay held open
     /// on the modifier) — one press, one session.
@@ -78,6 +86,7 @@ impl Shell {
                 .map(|(_, c)| c.id.clone())
         };
         if let Some(first) = first {
+            self.focus_composer(cx);
             self.state
                 .update(cx, |s, cx| s.select_chat(Some(first), cx));
         }
@@ -86,6 +95,7 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.focus_composer(cx);
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -96,6 +106,7 @@ impl Shell {
     /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.focus_composer(cx);
         let target = {
             let state = self.state.read(cx);
             self.settings

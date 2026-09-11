@@ -15,12 +15,24 @@ cleanup() {
 }
 trap cleanup EXIT
 Xvfb -displayfd 3 -screen 0 1280x800x24 -ac -nolisten tcp 3>"$runtime/display" >"$output/xvfb.log" 2>&1 &
-processes+=("$!")
-for _ in $(seq 1 100); do
-  [ -s "$runtime/display" ] && break
+xvfb_pid=$!
+processes+=("$xvfb_pid")
+display_number=
+for _ in $(seq 1 300); do
+  if IFS= read -r display_number <"$runtime/display"; then break; fi
+  if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+    echo "Xvfb exited before publishing a display" >&2
+    cat "$output/xvfb.log" >&2
+    exit 1
+  fi
   sleep .1
 done
-export DISPLAY=":$(cat "$runtime/display")"
+if [[ ! "$display_number" =~ ^[0-9]+$ ]]; then
+  echo "Xvfb did not publish a valid display within 30 seconds" >&2
+  cat "$output/xvfb.log" >&2
+  exit 1
+fi
+export DISPLAY=":$display_number"
 export XDG_RUNTIME_DIR="$runtime"
 export ZERON_BROWSER_NATIVE_POINTER=1
 openbox >"$output/openbox.log" 2>&1 &
