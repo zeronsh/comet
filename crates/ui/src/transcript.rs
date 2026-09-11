@@ -360,6 +360,15 @@ fn tool_group_collapses(tools: &[ToolItem]) -> bool {
     tools.iter().any(|t| !is_agent_tool(t))
 }
 
+fn tool_group_open(
+    collapses: bool,
+    user_open: Option<bool>,
+    auto_open: bool,
+    expand_active_task: bool,
+) -> bool {
+    !collapses || user_open.unwrap_or(auto_open && expand_active_task)
+}
+
 /// Column budget for soft-wrapping thought text into detail lines. The
 /// detail body is preformatted (no element wrapping), so the wrap happens
 /// here — conservative enough to fit the card at typical transcript widths.
@@ -5311,7 +5320,12 @@ impl Transcript {
         // Agent/spawn chips never fold: they are their own row, always open,
         // no "Called N tools" header — a running subagent stays visible.
         let collapses = tool_group_collapses(tools);
-        let open = !collapses || fold.open.unwrap_or(auto_open);
+        let open = tool_group_open(
+            collapses,
+            fold.open,
+            auto_open,
+            crate::settings::current(cx).expand_active_task,
+        );
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -6926,6 +6940,17 @@ mod tests {
             selection_scroll_step(bounds, gpui::point(px(20.0), px(220.0)))
                 > selection_scroll_step(bounds, gpui::point(px(20.0), px(200.0)))
         );
+    }
+
+    #[test]
+    fn active_tool_group_auto_open_honors_setting() {
+        assert!(tool_group_open(true, None, true, true));
+        assert!(!tool_group_open(true, None, true, false));
+        // A manual choice still wins over the automatic default.
+        assert!(tool_group_open(true, Some(true), true, false));
+        assert!(!tool_group_open(true, Some(false), true, true));
+        // Agent chips that never collapse stay open regardless of the toggle.
+        assert!(tool_group_open(false, None, true, false));
     }
 
     // ---- streaming parse wiring (the transcript side, not the parser) ----

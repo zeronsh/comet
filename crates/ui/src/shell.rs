@@ -36,7 +36,7 @@ use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
-use crate::settings::appearance::AppearancePage;
+use crate::settings::appearance::{AppearanceEvent, AppearancePage};
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
@@ -1172,7 +1172,7 @@ pub struct Shell {
     /// the transcript's bottom clearance, and the jump pill's anchor (the
     /// same one-frame lag every fade here rides).
     bottom_stack: std::rc::Rc<std::cell::Cell<f32>>,
-    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
+    /// The sidebar's archived accordion (t3code Sidebar): CLOSED by default
     /// (user request), session-transient. `archived_shown` pages the
     /// expanded list ("Show more" reveals another page).
     pub(super) archived_open: bool,
@@ -1250,6 +1250,7 @@ pub struct Shell {
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
+    appearance_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
@@ -1548,7 +1549,7 @@ impl Shell {
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
-            archived_open: true,
+            archived_open: false,
             archived_shown: 0,
             archived_hover: None,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
@@ -1591,6 +1592,7 @@ impl Shell {
             harnesses_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
+            appearance_sub: None,
             files_settings_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
@@ -3267,7 +3269,18 @@ impl Shell {
             }
             SettingsSection::Appearance => {
                 if self.appearance_page.is_none() {
-                    self.appearance_page = Some(cx.new(AppearancePage::new));
+                    let page =
+                        cx.new(|cx| AppearancePage::new(self.settings.expand_active_task, cx));
+                    self.appearance_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &AppearanceEvent, cx| {
+                            let AppearanceEvent::ExpandActiveTaskChanged(enabled) = *event;
+                            this.settings.expand_active_task = enabled;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.appearance_page = Some(page);
                 }
                 match &self.appearance_page {
                     Some(page) => page.clone().into_any_element(),

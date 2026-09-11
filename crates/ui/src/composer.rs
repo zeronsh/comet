@@ -222,6 +222,8 @@ fn input_scroll_offset_for_cursor(
 enum PressIntent {
     /// Take the whole field.
     SelectAll,
+    /// Select the word under the pointer.
+    SelectWord,
     /// Grow the current selection to the pressed position.
     ExtendSelection,
     /// Put the caret at the pressed position.
@@ -232,20 +234,18 @@ impl PressIntent {
     /// Whether the press starts a drag selection. A select-all must not, or
     /// the next mouse move shrinks it back to a drag from the press position.
     fn arms_drag(self) -> bool {
-        !matches!(self, Self::SelectAll)
+        !matches!(self, Self::SelectAll | Self::SelectWord)
     }
 }
 
-/// Read the intent from the press. Two clicks or more take the whole field,
-/// and every further click keeps it, so holding the button through a third
-/// click does not change what is selected.
+/// Read the intent from the press. A double click selects a word; a third
+/// click keeps the existing whole-field behavior.
 fn press_intent(click_count: usize, shift: bool) -> PressIntent {
-    if click_count >= 2 {
-        PressIntent::SelectAll
-    } else if shift {
-        PressIntent::ExtendSelection
-    } else {
-        PressIntent::PlaceCaret
+    match click_count {
+        2 => PressIntent::SelectWord,
+        3.. => PressIntent::SelectAll,
+        _ if shift => PressIntent::ExtendSelection,
+        _ => PressIntent::PlaceCaret,
     }
 }
 
@@ -2246,6 +2246,17 @@ impl ComposerInput {
             .unwrap_or(self.content.len())
     }
 
+    fn word_range_at(&self, offset: usize) -> Range<usize> {
+        let offset = self.projection.normalize_range(offset..offset).start;
+        if let Some(start) = self.projection.previous_boundary(offset) {
+            return start..offset;
+        }
+        if let Some(end) = self.projection.next_boundary(offset) {
+            return offset..end;
+        }
+        crate::markdown::selection::word_range(&self.content, offset)
+    }
+
     /// Byte range of the logical line containing `offset`.
     fn line_range_at(&self, offset: usize) -> Range<usize> {
         let start = self.content[..offset]
@@ -2706,6 +2717,11 @@ impl ComposerInput {
             PressIntent::SelectAll => {
                 self.move_to(0, cx);
                 self.select_to(self.content.len(), cx);
+            }
+            PressIntent::SelectWord => {
+                let range = self.word_range_at(self.index_for_mouse_position(event.position));
+                self.move_to(range.start, cx);
+                self.select_to(range.end, cx);
             }
             PressIntent::ExtendSelection => {
                 let index = self.index_for_mouse_position(event.position);
@@ -7525,21 +7541,31 @@ mod tests {
     /// multi-click leaves the drag disarmed is invisible until a selection
     /// collapses under the pointer.
     #[test]
-    fn a_press_of_two_or_more_clicks_takes_the_whole_field_and_leaves_the_drag_disarmed() {
+    fn multi_click_intent_matches_macos_selection_granularity() {
         assert_eq!(press_intent(1, false), PressIntent::PlaceCaret);
         assert_eq!(press_intent(1, true), PressIntent::ExtendSelection);
-        assert_eq!(press_intent(2, false), PressIntent::SelectAll);
-        // A triple click keeps the whole field, so holding the button down
-        // through a third click does not change what is selected.
+        assert_eq!(press_intent(2, false), PressIntent::SelectWord);
+        assert_eq!(press_intent(2, true), PressIntent::SelectWord);
+        // A triple click keeps the whole field.
         assert_eq!(press_intent(3, false), PressIntent::SelectAll);
-        // The whole field wins over the shift modifier: shift has nothing
-        // left to extend once everything is selected.
-        assert_eq!(press_intent(2, true), PressIntent::SelectAll);
-        // Only a caret press arms the drag. A select-all that armed it would
-        // collapse to a drag selection on the next mouse move.
+        // Multi-click selection must not arm drag, or the next mouse move
+        // would collapse it back to a drag from the press position.
         assert!(press_intent(1, false).arms_drag());
         assert!(press_intent(1, true).arms_drag());
         assert!(!press_intent(2, false).arms_drag());
+        assert!(!press_intent(3, false).arms_drag());
+    }
+
+    #[gpui::test]
+    fn double_click_selects_the_word_at_the_pointer(cx: &mut gpui::TestAppContext) {
+        let input = cx.new(|cx| ComposerInput::new("Composer", cx));
+        input.update(cx, |input, cx| input.set_text("one héllo, = world", cx));
+        input.read_with(cx, |input, _| {
+            assert_eq!(input.word_range_at(6), 4..10);
+            assert_eq!(input.word_range_at(10), 4..10);
+            assert_eq!(input.word_range_at(11), 11..11);
+            assert_eq!(input.word_range_at(12), 12..13);
+        });
     }
 
     #[test]

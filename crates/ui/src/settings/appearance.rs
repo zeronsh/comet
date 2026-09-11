@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent, Render,
-    SharedString, Subscription, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement,
+    KeyDownEvent, Render, SharedString, Subscription, Window, div, prelude::*, px,
 };
 use zeron_theme::vscode::{ImportReport, SourceCompilation};
 use zeron_theme::{
@@ -36,6 +36,7 @@ struct ImportDialog {
 }
 
 pub struct AppearancePage {
+    expand_active_task: bool,
     selected_font: UiFontFamily,
     selected_size: UiFontSize,
     font_focus: FocusHandle,
@@ -51,9 +52,17 @@ pub struct AppearancePage {
     library_error: Option<SharedString>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum AppearanceEvent {
+    ExpandActiveTaskChanged(bool),
+}
+
+impl EventEmitter<AppearanceEvent> for AppearancePage {}
+
 impl AppearancePage {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(expand_active_task: bool, cx: &mut Context<Self>) -> Self {
         Self {
+            expand_active_task,
             selected_font: typography::effective(cx),
             selected_size: typography::font_size(cx),
             font_focus: cx.focus_handle(),
@@ -2058,6 +2067,41 @@ impl Render for AppearancePage {
         let modal = self
             .render_import_dialog(window.viewport_size(), &theme, window, cx)
             .or_else(|| self.render_review_dialog(window.viewport_size(), &theme, cx));
+        let expand_active_task = self.expand_active_task;
+        let chat_behavior = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, false)
+                .child(widgets::row_tile(&theme, icons::EXPAND_ARROWS))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(&theme, "Expand active task"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![
+                                div()
+                                    .child(SharedString::from(
+                                        "Automatically open the active task accordion while an agent is working.",
+                                    ))
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(
+                    widgets::toggle_switch(&theme, expand_active_task)
+                        .id("appearance-expand-active-task-toggle")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.expand_active_task = !this.expand_active_task;
+                            cx.emit(AppearanceEvent::ExpandActiveTaskChanged(
+                                this.expand_active_task,
+                            ));
+                            cx.notify();
+                        })),
+                ),
+        );
 
         let font_rows: Vec<AnyElement> = availability
             .choices()
@@ -2327,7 +2371,16 @@ impl Render for AppearancePage {
                                 .text_color(theme.warning)
                                 .child(warning),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .mt(px(36.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.0))
+                            .child(widgets::field_label(&theme, "Chat behavior"))
+                            .child(chat_behavior),
+                    ),
             )
             .children(modal)
     }

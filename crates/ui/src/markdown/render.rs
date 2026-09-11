@@ -1117,12 +1117,22 @@ pub(crate) fn paint_text_selection(
     layout: &gpui::TextLayout,
     theme: &Theme,
 ) {
+    paint_text_selection_with_wash(window, key, text, layout, selection_wash(theme));
+}
+
+fn paint_text_selection_with_wash(
+    window: &mut Window,
+    key: &std::sync::Arc<str>,
+    text: &SharedString,
+    layout: &gpui::TextLayout,
+    wash: Hsla,
+) {
     if let Some(range) = super::selection::wash_range(key) {
         for rect in range_rects(layout, &range, 0.0, 0.0) {
             window.paint_quad(quad(
                 rect,
                 px(0.0),
-                selection_wash(theme),
+                wash,
                 px(0.0),
                 gpui::transparent_black(),
                 BorderStyle::default(),
@@ -1137,6 +1147,33 @@ pub(crate) fn paint_text_selection(
         })
     });
     register_selection_listeners(window, key, text, layout);
+}
+
+fn selectable_text_element(
+    key: std::sync::Arc<str>,
+    text: SharedString,
+    runs: Vec<TextRun>,
+    wash: Hsla,
+) -> AnyElement {
+    let styled = StyledText::new(text.clone()).with_runs(runs);
+    let layout = styled.layout().clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection_with_wash(window, &key, &text, &layout, wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
+}
+
+fn code_line_selection_key(row_key: &str, code_ix: usize, line_ix: usize) -> std::sync::Arc<str> {
+    format!("{row_key}-code{code_ix}-line{line_ix}").into()
 }
 
 /// One painted text element, registered per frame in document order — the
@@ -1782,6 +1819,7 @@ fn render_code_block_source_with_actions(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
+    let sel_wash = selection_wash(theme);
     let code_ui = opts.code.as_ref().and_then(|code| code.get(&ix)).cloned();
     let fit_content = code_ui.as_ref().is_some_and(|ui| ui.fit_content);
 
@@ -1857,6 +1895,7 @@ fn render_code_block_source_with_actions(
             *off = start + line.len() + 1; // +1 for the '\n'
             let local = slice_spans(&veil_spans, start, start + line.len());
             let runs = apply_veil(runs.clone(), &local);
+            let key = code_line_selection_key(&opts.row_key, ix, li);
             Some(
                 div()
                     .map(|el| {
@@ -1866,7 +1905,7 @@ fn render_code_block_source_with_actions(
                             el.h(px(CODE_LINE_HEIGHT)).flex_none()
                         }
                     })
-                    .child(StyledText::new(line.clone()).with_runs(runs)),
+                    .child(selectable_text_element(key, line.clone(), runs, sel_wash)),
             )
         }));
 
@@ -2046,6 +2085,44 @@ pub fn runs_for_syntax_line_with_plain(
 mod tests {
     use super::*;
     use crate::markdown::parser::{InlineStyle, parse_full};
+    use gpui::TestAppContext;
+
+    struct CodeSelectionHarness;
+
+    impl Render for CodeSelectionHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::of(cx).clone();
+            let opts = RenderOptions::settled("code-test".into());
+            div().size_full().child(render_code_block_source(
+                None, "word", 0, 0, &opts, &theme, None,
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn code_block_lines_support_native_word_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (_, cx) = cx.add_window_view(|_, _| CodeSelectionHarness);
+        cx.simulate_resize(size(px(640.0), px(240.0)));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        let key = "code-test-code0-line0";
+        let bounds = selection_test_bounds(key);
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: bounds.origin + point(px(5.0), px(9.0)),
+            click_count: 2,
+            ..Default::default()
+        });
+        assert_eq!(
+            super::super::selection::selected_text().as_deref(),
+            Some("word")
+        );
+        super::super::selection::clear_if_owner(key);
+    }
 
     #[test]
     fn code_block_indices_include_nested_quotes_and_lists() {

@@ -426,6 +426,8 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
+    /// Automatically expand the active tool group while an agent is working.
+    pub expand_active_task: bool,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -483,6 +485,7 @@ impl Default for UiSettings {
             diff_split: false,
             diff_wrap: false,
             code_fences_fit_content: false,
+            expand_active_task: true,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -1071,6 +1074,7 @@ mod tests {
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
+        assert!(loaded.expand_active_task);
     }
 
     #[test]
@@ -1148,6 +1152,7 @@ mod tests {
             diff_split: true,
             diff_wrap: true,
             code_fences_fit_content: true,
+            expand_active_task: false,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
@@ -1461,6 +1466,7 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert!(!d.escape_stops_active_agent);
+        assert!(d.expand_active_task);
     }
 
     #[test]
