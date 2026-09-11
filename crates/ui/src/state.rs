@@ -597,6 +597,10 @@ pub struct AppState {
     /// Live edge posture (WatchConnectivity): drives the connection pill,
     /// composer honesty ("will queue"), and the Queued send badges.
     pub connectivity: zeron_proto::Connectivity,
+    /// Whether this runtime's connectivity watch has delivered its first
+    /// frame. The default `Disabled` value is only a placeholder and must not
+    /// seed notification decisions before the watch is authoritative.
+    pub(crate) connectivity_observed: bool,
     /// Sorted (see [`sort_spaces`]).
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
@@ -714,6 +718,7 @@ impl AppState {
             device_presentation: None,
             session_presence_presentation: Vec::new(),
             connectivity: zeron_proto::Connectivity::default(),
+            connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
@@ -925,6 +930,7 @@ impl AppState {
 
     pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
         self.connectivity = connectivity;
+        self.connectivity_observed = true;
     }
 
     /// Is this chat's delivery path degraded — will a send QUEUE rather than
@@ -1649,6 +1655,10 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        // The attachment notification precedes the first connectivity frame.
+        // Make that bootstrap gap explicit so the shell resets its alert
+        // baseline instead of comparing the new runtime with the old one.
+        self.connectivity_observed = false;
         let engine_info = handle.engine_info();
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());

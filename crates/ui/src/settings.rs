@@ -380,9 +380,15 @@ pub struct UiSettings {
     /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
-    /// Session notification chimes (done / awaiting-input). `ZERON_DISABLE_SOUND`
-    /// overrides.
+    /// Master switch for session notification chimes. `ZERON_DISABLE_SOUND`
+    /// overrides every per-event preference below.
     pub sound_enabled: bool,
+    /// Chime when an agent run completes successfully.
+    pub sound_completion_enabled: bool,
+    /// Chime when an agent is waiting for user input.
+    pub sound_input_enabled: bool,
+    /// Chime when a run fails or the durable connection state degrades.
+    pub sound_attention_enabled: bool,
     /// Desktop banner notifications on the same transitions.
     /// `ZERON_DISABLE_NOTIFICATIONS` overrides.
     pub notifications_enabled: bool,
@@ -463,6 +469,9 @@ impl Default for UiSettings {
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
+            sound_completion_enabled: true,
+            sound_input_enabled: true,
+            sound_attention_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
@@ -903,6 +912,17 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
 }
 
 impl UiSettings {
+    /// Whether this session event may produce audio. Appshot capture has its
+    /// own feature-local preference once the Appshots contribution lands.
+    pub fn session_sound_enabled(&self, sound: crate::sound::Sound) -> bool {
+        self.sound_enabled
+            && match sound {
+                crate::sound::Sound::Done => self.sound_completion_enabled,
+                crate::sound::Sound::Request => self.sound_input_enabled,
+                crate::sound::Sound::Attention => self.sound_attention_enabled,
+            }
+    }
+
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
         if self.sidebar_organization == SidebarOrganization::ByProject {
@@ -1071,6 +1091,13 @@ mod tests {
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
+        for sound in [
+            crate::sound::Sound::Done,
+            crate::sound::Sound::Request,
+            crate::sound::Sound::Attention,
+        ] {
+            assert!(!loaded.session_sound_enabled(sound));
+        }
     }
 
     #[test]
@@ -1110,6 +1137,9 @@ mod tests {
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sound_enabled: false,
+            sound_completion_enabled: false,
+            sound_input_enabled: true,
+            sound_attention_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
             right_pane_width: 700.0,
@@ -1252,6 +1282,9 @@ mod tests {
         assert_eq!(loaded.surface, zeron_theme::SurfacePreference::ThemeDefault);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert!(loaded.sound_completion_enabled);
+        assert!(loaded.sound_input_enabled);
+        assert!(loaded.sound_attention_enabled);
         assert_eq!(
             loaded.files_autosave_delay_ms,
             FILES_AUTOSAVE_DELAY_DEFAULT_MS
@@ -1295,6 +1328,30 @@ mod tests {
             GitHistoryAuthorDisplay::Avatar,
             "pre-author-display files default to avatars"
         );
+    }
+
+    #[test]
+    fn session_sound_preferences_round_trip_and_gate_each_event() {
+        let settings = UiSettings {
+            sound_enabled: true,
+            sound_completion_enabled: false,
+            sound_input_enabled: true,
+            sound_attention_enabled: false,
+            ..Default::default()
+        };
+        assert!(!settings.session_sound_enabled(crate::sound::Sound::Done));
+        assert!(settings.session_sound_enabled(crate::sound::Sound::Request));
+        assert!(!settings.session_sound_enabled(crate::sound::Sound::Attention));
+
+        let value = serde_json::to_value(&settings).unwrap();
+        let restored: UiSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, settings);
+
+        let muted = UiSettings {
+            sound_enabled: false,
+            ..settings
+        };
+        assert!(!muted.session_sound_enabled(crate::sound::Sound::Request));
     }
 
     #[test]

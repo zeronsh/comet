@@ -1,0 +1,72 @@
+[
+  {
+    "file": "01-send.wav",
+    "name": "Send accepted",
+    "description": "One compact click with a tiny muted note.",
+    "duration": 0.3,
+    "peak_dbfs": -19.2
+  },
+  {
+    "file": "02-queued.wav",
+    "name": "Added to queue",
+    "description": "Three diminishing taps, ending with a low warm hint.",
+    "duration": 0.48,
+    "peak_dbfs": -19.2
+  },
+  {
+    "file": "03-upload-ready.wav",
+    "name": "Upload ready",
+    "description": "Two clicks open a small ascending three-note flourish.",
+    "duration": 0.74,
+    "peak_dbfs": -19.2
+  },
+  {
+    "file": "04-complete.wav",
+    "name": "Completion \u2014 resolve",
+    "description": "A round pair with a descending, settled chime.",
+    "duration": 0.73,
+    "peak_dbfs": -18.7
+  },
+  {
+    "file": "05-question.wav",
+    "name": "Question \u2014 open interval",
+    "description": "A patient pair followed by two gently rising notes.",
+    "duration": 0.79,
+    "peak_dbfs": -19.2
+  },
+  {
+    "file": "06-attention.wav",
+    "name": "Needs attention",
+    "description": "Two broader taps and a restrained downward step.",
+    "duration": 0.65,
+    "peak_dbfs": -19.6
+  },
+  {
+    "file": "07-mic-on.wav",
+    "name": "Microphone on",
+    "description": "A light opening pair with a quick upward fifth.",
+    "duration": 0.55,
+    "peak_dbfs": -20.1
+  },
+  {
+    "file": "08-mic-off.wav",
+    "name": "Microphone off",
+    "description": "The closing counterpart: broader click and downward fifth.",
+    "duration": 0.55,
+    "peak_dbfs": -20.1
+  },
+  {
+    "file": "09-reconnected.wav",
+    "name": "Connection restored",
+    "description": "Three growing taps land on a soft two-note harmony.",
+    "duration": 0.76,
+    "peak_dbfs": -19.2
+  },
+  {
+    "file": "10-undo.wav",
+    "name": "Undo / restore",
+    "description": "Two reversed-weight clicks with a brief falling chime.",
+    "duration": 0.49,
+    "peak_dbfs": -19.2
+  }
+]
