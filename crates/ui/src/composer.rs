@@ -4770,14 +4770,19 @@ impl Composer {
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    crate::icons::icon(if result.is_dir {
-                                        crate::icons::FOLDER
-                                    } else {
-                                        crate::icons::DOCUMENT
-                                    })
+                                    crate::file_icons::icon(
+                                        if result.is_dir {
+                                            crate::file_icons::FileIconIdentity::directory(
+                                                &result.path,
+                                                false,
+                                            )
+                                        } else {
+                                            crate::file_icons::FileIconIdentity::file(&result.path)
+                                        },
+                                        theme.appearance,
+                                    )
                                     .size(px(14.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
+                                    .flex_none(),
                                 )
                                 .child(
                                     div()

@@ -2157,6 +2157,14 @@ impl FilesSurface {
             .tooltip_show_delay(Duration::from_millis(350));
         toolbar(theme)
             .pr(px(crate::surface_chrome::CONTROL_GAP))
+            .child(
+                crate::file_icons::icon(
+                    crate::file_icons::FileIconIdentity::file(path),
+                    theme.appearance,
+                )
+                .size(px(14.0))
+                .flex_none(),
+            )
             .child(crumbs)
             .when(markdown, |element| {
                 element.child(

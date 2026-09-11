@@ -23,6 +23,13 @@ Zeron also uses the following editor foundations from the pinned `zeronsh/gpui-c
 
 Zeron's own source code is licensed under the terms in `LICENSE`. Bundled third-party components retain their respective licenses and notices.
 
+## Symbols
+
+Zeron bundles the SVG icon set and filename/folder associations from
+[Symbols](https://github.com/miguelsolorio/vscode-symbols/tree/296ef1b62287fb2315cb5651e552e09e8c8e1de8).
+Symbols is MIT licensed. The complete upstream license and copyright notice is
+retained at `crates/ui/assets/file-icons/LICENSE.symbols`.
+
 ## Bundled theme palette adaptations
 
 Zeron includes manually curated palette adaptations derived from the projects

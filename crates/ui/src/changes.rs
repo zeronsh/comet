@@ -3383,6 +3383,14 @@ impl Changes {
             }))
             .child(chevron)
             .child(
+                crate::file_icons::icon(
+                    crate::file_icons::FileIconIdentity::file(&file.path),
+                    theme.appearance,
+                )
+                .size(px(14.0))
+                .flex_none(),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_w_0()

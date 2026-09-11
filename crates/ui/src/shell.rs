@@ -7458,6 +7458,7 @@ impl Shell {
             }));
         for (ix, (surface, title, dirty, detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
+            let file_identity_path = detail.as_ref().cloned().unwrap_or_else(|| title.clone());
             let icon_path = match surface {
                 RightSurface::Files => icons::FOLDER_WITH_FILES,
                 RightSurface::File(_) => icons::DOCUMENT,
@@ -7612,6 +7613,16 @@ impl Shell {
                                     .into_any_element()
                                 } else if let Some(favicon) = browser_favicon {
                                     gpui::img(favicon).size(px(12.0)).into_any_element()
+                                } else if matches!(surface, RightSurface::File(_)) {
+                                    crate::file_icons::icon(
+                                        crate::file_icons::FileIconIdentity::file(
+                                            file_identity_path.as_ref(),
+                                        ),
+                                        theme.appearance,
+                                    )
+                                    .size(px(14.0))
+                                    .when(!is_active, |icon| icon.opacity(0.78))
+                                    .into_any_element()
                                 } else {
                                     icon(icon_path)
                                         .size(px(12.0))

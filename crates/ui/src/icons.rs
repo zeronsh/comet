@@ -22,10 +22,10 @@ macro_rules! icon_assets {
     ($(($const_name:ident, $path:literal)),+ $(,)?) => {
         $(pub const $const_name: &str = concat!("icons/", $path, ".svg");)+
 
-        /// Serves the embedded icons to gpui's SVG renderer.
-        pub struct Assets;
+        /// Serves the embedded control icons to gpui's SVG renderer.
+        struct ControlAssets;
 
-        impl AssetSource for Assets {
+        impl AssetSource for ControlAssets {
             fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
                 Ok(match path {
                     $(concat!("icons/", $path, ".svg") => Some(Cow::Borrowed(
@@ -199,6 +199,25 @@ icon_assets![
     (OPENCODE_MARK, "opencode-mark"),
 ];
 
+/// Serves both the compact control-icon set and the complete file-identity
+/// icon theme through the single asset source registered at app startup.
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(asset) = ControlAssets.load(path)? {
+            return Ok(Some(asset));
+        }
+        crate::file_icons::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut assets = ControlAssets.list(path)?;
+        assets.extend(crate::file_icons::Assets.list(path)?);
+        Ok(assets)
+    }
+}
+
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {
@@ -212,64 +231,9 @@ pub fn icon(path: &'static str) -> Svg {
     svg().path(path).flex_none()
 }
 
-/// File badges use the basename so dotted directories cannot affect the icon.
-/// Accept either path separator: transcripts can come from a different OS.
-pub fn for_file(path: &str) -> &'static str {
-    let name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase();
-    match name.as_str() {
-        "dockerfile" | "makefile" | "justfile" | ".bashrc" | ".zshrc" => return TERMINAL,
-        ".gitignore" | ".gitattributes" | ".editorconfig" | ".env" => return SETTINGS_MINIMALISTIC,
-        "readme" | "license" | "changelog" => return FILE_MARKDOWN,
-        _ if name.starts_with(".env.") => return SETTINGS_MINIMALISTIC,
-        _ => {}
-    }
-    match name.rsplit_once('.').map(|(_, extension)| extension) {
-        Some("css" | "scss" | "sass" | "less") => FILE_STYLE,
-        Some("json" | "jsonc" | "jsonl" | "csv" | "tsv" | "sql") => FILE_DATA,
-        Some("toml" | "yaml" | "yml" | "ini" | "conf" | "config" | "properties") => {
-            SETTINGS_MINIMALISTIC
-        }
-        Some("md" | "mdx" | "markdown" | "rst") => FILE_MARKDOWN,
-        Some("svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "avif" | "bmp" | "tiff") => {
-            FILE_IMAGE
-        }
-        Some("sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd") => TERMINAL,
-        Some("zip" | "gz" | "tar" | "tgz" | "7z" | "rar" | "bz2" | "xz") => ARCHIVE_MINIMALISTIC,
-        Some(
-            "rs" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "py" | "pyi"
-            | "go" | "rb" | "java" | "kt" | "kts" | "swift" | "c" | "h" | "cc" | "cpp" | "hpp"
-            | "cs" | "fs" | "php" | "lua" | "ex" | "exs" | "erl" | "hs" | "scala" | "dart" | "vue"
-            | "svelte" | "html" | "htm" | "xml" | "graphql" | "gql" | "proto" | "zig",
-        ) => FILE_CODE,
-        _ => DOCUMENT,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn file_icons_handle_paths_case_and_special_names() {
-        for (path, expected) in [
-            ("src/styles/globals.css", FILE_STYLE),
-            ("C:\\project\\README.MD", FILE_MARKDOWN),
-            ("src/component.test.tsx", FILE_CODE),
-            ("config/.env.local", SETTINGS_MINIMALISTIC),
-            ("Dockerfile", TERMINAL),
-            ("assets/LOGO.SVG", FILE_IMAGE),
-            ("package.json", FILE_DATA),
-            ("folder.css/unknown", DOCUMENT),
-            ("file.unrecognized", DOCUMENT),
-            ("", DOCUMENT),
-        ] {
-            assert_eq!(for_file(path), expected, "{path}");
-        }
-    }
 
     #[test]
     fn every_registered_icon_loads_and_parses() {

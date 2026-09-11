@@ -87,6 +87,10 @@ pub struct RenderOptions {
     /// Optional owner-provided routing for links that belong inside the app.
     /// Returning true prevents the ordinary external URL opener from running.
     pub link: Option<LinkUi>,
+    /// Root used to distinguish a direct workspace-file link from an ordinary
+    /// web link. Transcript surfaces provide it; generic Markdown previews do
+    /// not acquire workspace-specific decoration.
+    pub workspace_root: Option<SharedString>,
     /// Agent-transcript-only fence layout controls and tracked horizontal
     /// scroll state, keyed by the same element discriminator passed to
     /// [`render_block`]. `None` keeps non-chat Markdown surfaces unchanged.
@@ -312,6 +316,7 @@ impl RenderOptions {
             now: Instant::now(),
             copy: None,
             link: None,
+            workspace_root: None,
             code: None,
         }
     }
@@ -1491,6 +1496,32 @@ fn text_element(
                 .into_any_element();
         }
     }
+    if let Some(lines) = opts
+        .workspace_root
+        .as_deref()
+        .and_then(|root| plain_file_reference_lines(runs, root))
+    {
+        let style = runs[0].style.clone();
+        return div()
+            .flex()
+            .flex_col()
+            .children(lines.into_iter().enumerate().map(|(line_ix, text)| {
+                text_element(
+                    &[InlineRun {
+                        text,
+                        style: style.clone(),
+                    }],
+                    size,
+                    line_height,
+                    bold_default,
+                    top_ix,
+                    ix.wrapping_mul(4099).wrapping_add(line_ix + 2000),
+                    opts,
+                    theme,
+                )
+            }))
+            .into_any_element();
+    }
     let weight = if bold_default {
         FontWeight::SEMIBOLD
     } else {
@@ -1498,11 +1529,127 @@ fn text_element(
     };
     let flat = flatten_cached(runs, weight, top_ix, ix, opts, theme);
     let inner = flat_text_element(&flat, ix, opts, theme);
+    let direct_file = opts
+        .workspace_root
+        .as_deref()
+        .and_then(|root| sole_file_reference(runs, root));
+    let content = if let Some(path) = direct_file {
+        div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .size(px(20.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .bg(crate::file_icons::well_bg(theme))
+                    .child(
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::file(&path),
+                            theme.appearance,
+                        )
+                        .size(px(14.0)),
+                    ),
+            )
+            .child(div().min_w_0().flex_1().child(inner))
+            .into_any_element()
+    } else {
+        inner
+    };
     div()
         .text_size(crate::typography::ui_rems(size))
         .line_height(crate::typography::ui_rems(line_height))
-        .child(inner)
+        .child(content)
         .into_any_element()
+}
+
+/// A file icon belongs beside a link only when the whole visible paragraph is
+/// one safe workspace-file target. Mixed prose and external links retain the
+/// ordinary inline Markdown layout.
+fn sole_workspace_file_link(runs: &[InlineRun], workspace_root: &str) -> Option<String> {
+    let mut target = None;
+    for run in runs.iter().filter(|run| !run.text.is_empty()) {
+        if run.style.image.is_some() || run.style.task.is_some() {
+            return None;
+        }
+        let link = run.style.link.as_deref()?;
+        if link == super::mend::PENDING_LINK_URL {
+            return None;
+        }
+        match target {
+            Some(previous) if previous != link => return None,
+            None => target = Some(link),
+            _ => {}
+        }
+    }
+    crate::workspace_links::resolve_workspace_file_link(target?, workspace_root)
+        .map(|link| link.path)
+}
+
+/// A model sometimes emits a bare filename after being asked for a file list
+/// instead of preserving the workspace link it would normally author. Treat a
+/// whole paragraph as a decorative file identity only when the token resolves
+/// safely within the workspace and the icon theme recognizes it. The stricter
+/// mapping check keeps version numbers, domains, and unknown dotted prose from
+/// acquiring file affordances; unlike a real link, this stays non-interactive.
+fn sole_plain_file_reference(runs: &[InlineRun], workspace_root: &str) -> Option<String> {
+    let mut text = String::new();
+    for run in runs.iter().filter(|run| !run.text.is_empty()) {
+        if run.style.link.is_some()
+            || run.style.image.is_some()
+            || run.style.task.is_some()
+            || run.style.code
+        {
+            return None;
+        }
+        text.push_str(&run.text);
+    }
+    let candidate = text.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let path = crate::workspace_links::resolve_workspace_file_link(candidate, workspace_root)?.path;
+    crate::file_icons::has_specific_file_icon(&path).then_some(path)
+}
+
+/// Preserve hard-break file lists as one compact paragraph while giving each
+/// line its own icon. Limiting this path to one uniformly styled run avoids
+/// rewriting mixed inline formatting or ordinary wrapped prose.
+fn plain_file_reference_lines(runs: &[InlineRun], workspace_root: &str) -> Option<Vec<String>> {
+    let [run] = runs else { return None };
+    if run.style.link.is_some()
+        || run.style.image.is_some()
+        || run.style.task.is_some()
+        || run.style.code
+        || !run.text.contains('\n')
+    {
+        return None;
+    }
+    let lines = run
+        .text
+        .lines()
+        .map(str::trim)
+        .map(|candidate| {
+            if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let path =
+                crate::workspace_links::resolve_workspace_file_link(candidate, workspace_root)?
+                    .path;
+            crate::file_icons::has_specific_file_icon(&path).then(|| candidate.to_owned())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (lines.len() > 1).then_some(lines)
+}
+
+fn sole_file_reference(runs: &[InlineRun], workspace_root: &str) -> Option<String> {
+    sole_workspace_file_link(runs, workspace_root)
+        .or_else(|| sole_plain_file_reference(runs, workspace_root))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2057,6 +2204,123 @@ mod tests {
 
         let top_level = parse_full("paragraph\n\n```text\nvalue\n```\n");
         assert_eq!(code_block_indices(&top_level.blocks[1].block, 1), vec![1]);
+    }
+
+    #[test]
+    fn sole_workspace_link_gets_a_file_path() {
+        let runs = vec![InlineRun {
+            text: "slides.ts".into(),
+            style: InlineStyle {
+                link: Some("src/slides.ts#L12".into()),
+                ..Default::default()
+            },
+        }];
+        assert_eq!(
+            sole_workspace_file_link(&runs, "/work/comet"),
+            Some("src/slides.ts".into())
+        );
+    }
+
+    #[test]
+    fn direct_file_decoration_excludes_mixed_and_external_links() {
+        let linked = InlineRun {
+            text: "slides.ts".into(),
+            style: InlineStyle {
+                link: Some("src/slides.ts".into()),
+                ..Default::default()
+            },
+        };
+        let mixed = vec![
+            InlineRun {
+                text: "See ".into(),
+                style: InlineStyle::default(),
+            },
+            linked,
+        ];
+        assert_eq!(sole_workspace_file_link(&mixed, "/work/comet"), None);
+
+        let external = vec![InlineRun {
+            text: "website".into(),
+            style: InlineStyle {
+                link: Some("https://example.com/slides.ts".into()),
+                ..Default::default()
+            },
+        }];
+        assert_eq!(sole_workspace_file_link(&external, "/work/comet"), None);
+    }
+
+    #[test]
+    fn standalone_recognized_filename_gets_a_decorative_identity() {
+        let plain = vec![InlineRun {
+            text: "AudienceView.tsx".into(),
+            style: InlineStyle::default(),
+        }];
+        assert_eq!(
+            sole_file_reference(&plain, "/work/comet"),
+            Some("AudienceView.tsx".into())
+        );
+
+        let linked_unknown = vec![InlineRun {
+            text: "artifact.unknown".into(),
+            style: InlineStyle {
+                link: Some("build/artifact.unknown".into()),
+                ..Default::default()
+            },
+        }];
+        assert_eq!(
+            sole_file_reference(&linked_unknown, "/work/comet"),
+            Some("build/artifact.unknown".into())
+        );
+    }
+
+    #[test]
+    fn plain_file_decoration_rejects_prose_code_and_unknown_dotted_tokens() {
+        let plain = |text: &str| {
+            vec![InlineRun {
+                text: text.into(),
+                style: InlineStyle::default(),
+            }]
+        };
+        assert_eq!(
+            sole_file_reference(&plain("version 1.2"), "/work/comet"),
+            None
+        );
+        assert_eq!(
+            sole_file_reference(&plain("example.invalid"), "/work/comet"),
+            None
+        );
+
+        let code = vec![InlineRun {
+            text: "slides.ts".into(),
+            style: InlineStyle {
+                code: true,
+                ..Default::default()
+            },
+        }];
+        assert_eq!(sole_file_reference(&code, "/work/comet"), None);
+    }
+
+    #[test]
+    fn hard_break_file_list_resolves_every_recognized_line() {
+        let runs = vec![InlineRun {
+            text: "slides.ts\ncourseDecks.ts\nAudienceView.tsx\nglobals.css".into(),
+            style: InlineStyle::default(),
+        }];
+        assert_eq!(
+            plain_file_reference_lines(&runs, "/work/comet"),
+            Some(vec![
+                "slides.ts".into(),
+                "courseDecks.ts".into(),
+                "AudienceView.tsx".into(),
+                "globals.css".into(),
+            ])
+        );
+
+        let mixed = vec![InlineRun {
+            text: "slides.ts\nnot a file".into(),
+            style: InlineStyle::default(),
+        }];
+        assert_eq!(plain_file_reference_lines(&mixed, "/work/comet"), None);
     }
 
     /// Model GPUI's upstream affinity at a soft-wrap boundary: byte 5 is

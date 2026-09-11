@@ -9,6 +9,7 @@ use super::{
     workspace_path_drag_ghost,
 };
 use crate::{
+    file_icons::{self, FileIconIdentity},
     icons::{self, icon},
     theme::Theme,
 };
@@ -118,9 +119,12 @@ impl FilesSurface {
                 } else {
                     theme.text_muted
                 };
-                let file_icon = match node.entry.kind {
-                    WorkspaceEntryKind::Directory => icons::FOLDER,
-                    WorkspaceEntryKind::File | WorkspaceEntryKind::Symlink => icons::DOCUMENT,
+                let file_identity = match node.entry.kind {
+                    WorkspaceEntryKind::Directory => {
+                        FileIconIdentity::directory(&node.entry.name, expanded)
+                    }
+                    WorkspaceEntryKind::File => FileIconIdentity::file(&node.entry.name),
+                    WorkspaceEntryKind::Symlink => FileIconIdentity::symlink(&node.entry.name),
                 };
                 div()
                     .id(gpui::SharedString::from(format!(
@@ -175,14 +179,9 @@ impl FilesSurface {
                             }),
                     )
                     .child(
-                        icon(file_icon)
-                            .size(px(13.0))
-                            .flex_none()
-                            .text_color(if is_directory {
-                                theme.text_muted
-                            } else {
-                                text_color
-                            }),
+                        file_icons::icon(file_identity, theme.appearance)
+                            .size(px(14.0))
+                            .flex_none(),
                     )
                     .child(
                         div()

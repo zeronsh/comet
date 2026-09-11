@@ -113,16 +113,16 @@ impl Render for WorkspacePathDragGhost {
             .text_size(px(11.5))
             .text_color(theme.text)
             .opacity(0.85)
-            .child(
-                crate::icons::icon(if self.payload.is_directory {
-                    crate::icons::FOLDER
+            .child({
+                let identity = if self.payload.is_directory {
+                    crate::file_icons::FileIconIdentity::directory(&self.payload.path, false)
                 } else {
-                    crate::icons::DOCUMENT
-                })
-                .size(px(12.0))
-                .flex_none()
-                .text_color(theme.text_muted),
-            )
+                    crate::file_icons::FileIconIdentity::file(&self.payload.path)
+                };
+                crate::file_icons::icon(identity, theme.appearance)
+                    .size(px(14.0))
+                    .flex_none()
+            })
             .child(div().min_w_0().truncate().child(self.payload.title()))
     }
 }
