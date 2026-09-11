@@ -1,3 +1,5 @@
+#![cfg(feature = "highlighting")]
+
 use std::time::Instant;
 
 use zeron_syntax::{HighlightKind, HighlightRequest, HighlightedDocument, highlight};

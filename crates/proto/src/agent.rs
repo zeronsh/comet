@@ -57,6 +57,41 @@ pub enum SteeringMode {
     TurnBoundary,
 }
 
+/// What `ListHarnesses` reports per harness. This wire DTO belongs with the
+/// rest of the protocol so UI consumers do not need the native registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessDescriptor {
+    pub id: HarnessId,
+    pub name: String,
+    pub supports_steering: bool,
+    pub steering_mode: SteeringMode,
+    pub reasoning_levels: Vec<ReasoningLevel>,
+    /// Whether the agent CLI is present on the listed device.
+    #[serde(default = "default_harness_installed")]
+    pub installed: bool,
+    /// `None` represents catalogs emitted before per-device enablement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl HarnessDescriptor {
+    pub fn steers_mid_turn(&self) -> bool {
+        self.supports_steering && self.steering_mode == SteeringMode::StepBoundary
+    }
+}
+
+fn default_harness_installed() -> bool {
+    true
+}
+
+/// The effective enablement used by both engine and UI for older catalogs.
+pub fn descriptor_enabled(descriptor: &HarnessDescriptor) -> bool {
+    descriptor
+        .enabled
+        .unwrap_or(descriptor.installed && descriptor.id != HarnessId::Mock)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
@@ -558,6 +593,27 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+    }
+
+    #[test]
+    fn harness_descriptor_defaults_and_effective_enablement_round_trip() {
+        let descriptor: HarnessDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "claude-code",
+            "name": "Claude Code",
+            "supportsSteering": true,
+            "steeringMode": "step-boundary",
+            "reasoningLevels": ["high"]
+        }))
+        .unwrap();
+        assert!(descriptor.installed);
+        assert!(descriptor_enabled(&descriptor));
+        assert!(descriptor.steers_mid_turn());
+
+        let unavailable = HarnessDescriptor {
+            installed: false,
+            ..descriptor
+        };
+        assert!(!descriptor_enabled(&unavailable));
     }
 }
 

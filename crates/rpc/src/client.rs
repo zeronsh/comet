@@ -1,14 +1,21 @@
 //! Client side: request/stream multiplexing over string frames + the WebSocket dialer.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+#[cfg(feature = "native")]
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+#[cfg(feature = "native")]
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{ClientFrame, RpcError, ServerFrame};
+
+mod task;
+#[cfg(all(test, feature = "native"))]
+mod tests;
 
 /// Per-stream queue depth. Bounded: route_frame awaits a full queue, pausing
 /// the connection reader — transport backpressure instead of unbounded growth
@@ -27,89 +34,145 @@ enum Pending {
 
 struct Shared {
     pending: Mutex<HashMap<u64, Pending>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Pending>> {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn cancel(&self, id: u64, sent: bool, out: &mpsc::Sender<String>) {
+        if self.lock().remove(&id).is_none() || !sent {
+            return;
+        }
+        let frame = serde_json::to_string(&ClientFrame {
+            id,
+            method: None,
+            params: serde_json::Value::Null,
+            cancel: true,
+        })
+        .expect("cancel envelope is serializable");
+        if out.try_send(frame).is_err() {
+            // No detached send tasks/unbounded cancellation backlog. If the
+            // bounded writer cannot accept cancellation, close this transport;
+            // dropping its outbound channel cancels all server-side requests.
+            self.shutdown.send_replace(true);
+        }
+    }
 }
 
-/// A multiplexing RPC client over any string-frame duplex ([`crate::memory_client`] or
-/// [`connect_ws`]). Cheap to clone-by-Arc internally; use one per connection.
+/// Owns a pending entry from insertion (including while send is blocked) until
+/// reply/stream completion or cancellation. Cancellation never retries a call,
+/// nor does it prove a mutation was not applied before the cancel arrived.
+struct PendingGuard {
+    id: Option<u64>,
+    sent: bool,
+    out: mpsc::Sender<String>,
+    shared: Arc<Shared>,
+}
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.shared.cancel(id, self.sent, &self.out);
+        }
+    }
+}
+
+/// A multiplexing RPC client over string frames. One bounded writer owns the
+/// actual transport sender, so overload can close both memory and WS transports.
 pub struct RpcClient {
     out: mpsc::Sender<String>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
-    reader: tokio::task::JoinHandle<()>,
+    reader: task::Task,
+    writer: task::Task,
+    transport: Option<task::Task>,
 }
 
 /// Checked stream receiver whose drop immediately cancels the server task.
 pub struct RpcSubscription {
-    id: u64,
     items: mpsc::Receiver<serde_json::Value>,
-    out: mpsc::Sender<String>,
-    shared: Arc<Shared>,
+    _pending: PendingGuard,
 }
-
 impl RpcSubscription {
     pub async fn recv(&mut self) -> Option<serde_json::Value> {
         self.items.recv().await
     }
 }
 
-impl Drop for RpcSubscription {
-    fn drop(&mut self) {
-        if self.shared.lock().remove(&self.id).is_none() {
-            return;
-        }
-        let Ok(frame) = serde_json::to_string(&ClientFrame {
-            id: self.id,
-            method: None,
-            params: serde_json::Value::Null,
-            cancel: true,
-        }) else {
-            return;
-        };
-        match self.out.try_send(frame) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(frame)) => {
-                let out = self.out.clone();
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        let _ = out.send(frame).await;
-                    });
-                }
-            }
-        }
-    }
-}
-
 impl RpcClient {
+    /// Close this viewport's transport and fail pending work. No remote engine
+    /// command is sent, and no call is retried. Idempotent across shared handles.
+    pub fn close(&self) {
+        self.shared.shutdown.send_replace(true);
+    }
+
+    /// Subscribe to closure of this viewport's transport. The notification is
+    /// edge-triggered for callers that need to replace their application state;
+    /// it carries no retry or delivery guarantee for in-flight mutations.
+    pub fn watch_closed(&self) -> watch::Receiver<bool> {
+        self.shared.shutdown.subscribe()
+    }
+
     /// Wrap an existing duplex: `out` carries client frames, `inbound` server frames.
-    pub fn new(out: mpsc::Sender<String>, mut inbound: mpsc::Receiver<String>) -> Self {
+    pub fn new(transport_out: mpsc::Sender<String>, mut inbound: mpsc::Receiver<String>) -> Self {
+        let (shutdown, _) = watch::channel(false);
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
+            shutdown,
+        });
+        let (out, mut outgoing) = mpsc::channel::<String>(STREAM_QUEUE_CAP);
+        let writer_shared = shared.clone();
+        let mut writer_closed = shared.shutdown.subscribe();
+        let writer = task::spawn(async move {
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = writer_closed.wait_for(|closed| *closed) => break,
+                    _ = transport_out.closed() => break,
+                    frame = outgoing.recv() => match frame { Some(frame) => frame, None => break },
+                };
+                tokio::select! {
+                    biased;
+                    _ = writer_closed.wait_for(|closed| *closed) => break,
+                    sent = transport_out.send(frame) => if sent.is_err() { break; },
+                }
+            }
+            writer_shared.shutdown.send_replace(true);
+            // transport_out drops here, closing the actual transport even if
+            // callers still hold clones of the bounded local out sender.
         });
         let reader_shared = shared.clone();
         let reader_out = out.clone();
-        let reader = tokio::spawn(async move {
-            while let Some(payload) = inbound.recv().await {
+        let mut reader_closed = shared.shutdown.subscribe();
+        let reader = task::spawn(async move {
+            'read: loop {
+                let payload = tokio::select! {
+                    biased;
+                    _ = reader_closed.wait_for(|closed| *closed) => break,
+                    payload = inbound.recv() => match payload { Some(payload) => payload, None => break },
+                };
                 for line in payload.lines() {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
                     }
-                    let frame: ServerFrame = match serde_json::from_str(line) {
+                    let frame = match crate::decode_server_frame(line) {
                         Ok(frame) => frame,
                         Err(err) => {
                             tracing::warn!(error = %err, "rpc: dropping malformed server frame");
                             continue;
                         }
                     };
-                    route_frame(&reader_shared, &reader_out, frame).await;
+                    tokio::select! {
+                        biased;
+                        _ = reader_closed.wait_for(|closed| *closed) => break 'read,
+                        _ = route_frame(&reader_shared, &reader_out, frame) => {},
+                    }
                 }
             }
+            reader_shared.shutdown.send_replace(true);
             // Connection closed: fail everything still pending.
             let drained: Vec<Pending> = {
                 let mut pending = reader_shared.lock();
@@ -135,7 +198,60 @@ impl RpcClient {
             shared,
             next_id: AtomicU64::new(1),
             reader,
+            writer,
+            transport: None,
         }
+    }
+
+    /// Wrap a duplex and retain a caller-provided transport pump for the
+    /// client's lifetime. Browser adapters use this to keep WebSocket callbacks
+    /// alive after handing the typed client to application state.
+    ///
+    /// The pump must stop when `transport_out` is dropped and must drop its
+    /// inbound sender when the underlying transport closes. Neither condition
+    /// retries calls or buffers writes for a later connection.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_with_transport<F>(
+        transport_out: mpsc::Sender<String>,
+        inbound: mpsc::Receiver<String>,
+        transport: F,
+    ) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut client = Self::new(transport_out, inbound);
+        let mut closed = client.shared.shutdown.subscribe();
+        client.transport = Some(task::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => {},
+                _ = transport => {},
+            }
+        }));
+        client
+    }
+
+    /// WASM transport pumps run on the browser's local executor and therefore
+    /// intentionally do not require `Send`.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new_with_transport<F>(
+        transport_out: mpsc::Sender<String>,
+        inbound: mpsc::Receiver<String>,
+        transport: F,
+    ) -> Self
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        let mut client = Self::new(transport_out, inbound);
+        let mut closed = client.shared.shutdown.subscribe();
+        client.transport = Some(task::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = closed.wait_for(|closed| *closed) => {},
+                _ = transport => {},
+            }
+        }));
+        client
     }
 
     /// Unary request.
@@ -147,6 +263,7 @@ impl RpcClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.shared.lock().insert(id, Pending::Call(tx));
+        let mut pending = self.pending_guard(id);
         self.send(ClientFrame {
             id,
             method: Some(method.into()),
@@ -157,6 +274,7 @@ impl RpcClient {
         .inspect_err(|_| {
             self.shared.lock().remove(&id);
         })?;
+        pending.sent = true;
         rx.await.map_err(|_| RpcError::Closed)?
     }
 
@@ -181,6 +299,7 @@ impl RpcClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
         self.shared.lock().insert(id, Pending::Stream(tx));
+        let mut pending = self.pending_guard(id);
         self.send(ClientFrame {
             id,
             method: Some(method.into()),
@@ -191,6 +310,8 @@ impl RpcClient {
         .inspect_err(|_| {
             self.shared.lock().remove(&id);
         })?;
+        // Legacy receiver cancellation stays reader-driven after setup.
+        pending.id = None;
         Ok(rx)
     }
 
@@ -213,6 +334,7 @@ impl RpcClient {
                 ready: Some(ready_tx),
             },
         );
+        let mut pending = self.pending_guard(id);
         self.send(ClientFrame {
             id,
             method: Some(method.into()),
@@ -223,25 +345,43 @@ impl RpcClient {
         .inspect_err(|_| {
             self.shared.lock().remove(&id);
         })?;
+        pending.sent = true;
         let subscription = RpcSubscription {
-            id,
             items: items_rx,
-            out: self.out.clone(),
-            shared: self.shared.clone(),
+            _pending: pending,
         };
         ready_rx.await.map_err(|_| RpcError::Closed)??;
         Ok(subscription)
     }
 
+    fn pending_guard(&self, id: u64) -> PendingGuard {
+        PendingGuard {
+            id: Some(id),
+            sent: false,
+            out: self.out.clone(),
+            shared: self.shared.clone(),
+        }
+    }
+
     async fn send(&self, frame: ClientFrame) -> Result<(), RpcError> {
         let json = serde_json::to_string(&frame)
             .map_err(|e| RpcError::Transport(format!("serialize frame: {e}")))?;
-        self.out.send(json).await.map_err(|_| RpcError::Closed)
+        let mut closed = self.shared.shutdown.subscribe();
+        tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => Err(RpcError::Closed),
+            result = self.out.send(json) => result.map_err(|_| RpcError::Closed),
+        }
     }
 }
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
+        self.shared.shutdown.send_replace(true);
+        self.writer.abort();
+        if let Some(transport) = &self.transport {
+            transport.abort();
+        }
         self.reader.abort();
     }
 }
@@ -334,9 +474,11 @@ fn wire_error(error: String) -> RpcError {
 /// *any* other process holding the port accepts the TCP connection and then
 /// never completes the WebSocket handshake, and the caller waits forever — a
 /// stranger on port 27654 would hang the app at boot rather than degrade it.
+#[cfg(feature = "native")]
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Dial a WebSocket RPC server (`ws://127.0.0.1:{ipc_port}`).
+#[cfg(feature = "native")]
 pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
         .await
@@ -345,31 +487,43 @@ pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
     let (mut sink, mut stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                frame = out_rx.recv() => match frame {
-                    Some(text) => {
-                        if sink.send(WsMessage::Text(text)).await.is_err() {
+    let mut client = RpcClient::new(out_tx, in_rx);
+    let mut closed = client.shared.shutdown.subscribe();
+    client.transport = Some(task::spawn(async move {
+        let pump = async move {
+            loop {
+                tokio::select! {
+                    frame = out_rx.recv() => match frame {
+                        Some(text) => {
+                            if sink.send(WsMessage::Text(text)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            let _ = sink.send(WsMessage::Close(None)).await;
                             break;
                         }
-                    }
-                    None => {
-                        let _ = sink.send(WsMessage::Close(None)).await;
-                        break;
-                    }
-                },
-                message = stream.next() => match message {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        if in_tx.send(text).await.is_err() {
-                            break;
+                    },
+                    message = stream.next() => match message {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            if in_tx.send(text).await.is_err() {
+                                break;
+                            }
                         }
-                    }
-                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
-                },
+                        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => {}
+                    },
+                }
             }
+        };
+        // Race the entire pump, not only its outer receive loop: sink.send,
+        // close-frame flushing and inbound channel backpressure can all wait
+        // indefinitely. Shutdown must drop the actual socket from any await.
+        tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => {},
+            _ = pump => {},
         }
-    });
-    Ok(RpcClient::new(out_tx, in_rx))
+    }));
+    Ok(client)
 }

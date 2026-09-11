@@ -1,7 +1,7 @@
 //! Device-local interface typography: bundled font registration, the persisted
 //! catalog choice, and the effective family installed into [`crate::theme::Theme`].
 
-use std::{borrow::Cow, collections::BTreeSet};
+use std::collections::BTreeSet;
 
 use gpui::{App, Global, Rems, SharedString, Window, px, rems};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -200,37 +200,11 @@ pub struct TypographyState {
 
 impl Global for TypographyState {}
 
-const GEIST: [&[u8]; 8] = [
-    include_bytes!("../assets/fonts/Geist.ttf"),
-    include_bytes!("../assets/fonts/Geist-Italic.ttf"),
-    include_bytes!("../assets/fonts/Geist-Medium.ttf"),
-    include_bytes!("../assets/fonts/Geist-MediumItalic.ttf"),
-    include_bytes!("../assets/fonts/Geist-SemiBold.ttf"),
-    include_bytes!("../assets/fonts/Geist-SemiBoldItalic.ttf"),
-    include_bytes!("../assets/fonts/Geist-Bold.ttf"),
-    include_bytes!("../assets/fonts/Geist-BoldItalic.ttf"),
-];
-
-const GEIST_MONO: [&[u8]; 8] = [
-    include_bytes!("../assets/fonts/GeistMono.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-Italic.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-Medium.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-MediumItalic.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-SemiBold.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-SemiBoldItalic.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-Bold.ttf"),
-    include_bytes!("../assets/fonts/GeistMono-BoldItalic.ttf"),
-];
+pub(crate) mod bundled;
+use bundled::{GEIST, GEIST_MONO};
 
 fn register_family(cx: &App, family: &UiFontFamily, faces: &'static [&'static [u8]]) -> bool {
-    let fonts = faces.iter().map(|face| Cow::Borrowed(*face)).collect();
-    match cx.text_system().add_fonts(fonts) {
-        Ok(()) => true,
-        Err(err) => {
-            tracing::warn!(font_family = family.label(), error = %err, "failed to register bundled font family");
-            false
-        }
-    }
+    bundled::register(cx, family.label(), faces)
 }
 
 /// Families that contain the Latin glyph GPUI relies on for text metrics.

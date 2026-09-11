@@ -4,6 +4,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsCast as _, closure::Closure};
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent, Render,
     SharedString, Subscription, Window, div, prelude::*, px,
@@ -42,8 +51,8 @@ pub struct AppearancePage {
     size_focus: FocusHandle,
     font_menu: Popup<()>,
     size_menu: Popup<()>,
-    font_menu_dismissed_at: Option<std::time::Instant>,
-    size_menu_dismissed_at: Option<std::time::Instant>,
+    font_menu_dismissed_at: Option<Instant>,
+    size_menu_dismissed_at: Option<Instant>,
     light_theme_menu: Popup<()>,
     dark_theme_menu: Popup<()>,
     import_dialog: Option<ImportDialog>,
@@ -99,12 +108,12 @@ impl AppearancePage {
     }
 
     fn dismiss_font_menu(&mut self, cx: &mut Context<Self>) {
-        self.font_menu_dismissed_at = Some(std::time::Instant::now());
+        self.font_menu_dismissed_at = Some(Instant::now());
         self.close_font_menu(cx);
     }
 
     fn dismiss_size_menu(&mut self, cx: &mut Context<Self>) {
-        self.size_menu_dismissed_at = Some(std::time::Instant::now());
+        self.size_menu_dismissed_at = Some(Instant::now());
         self.close_size_menu(cx);
     }
 
@@ -305,6 +314,7 @@ impl AppearancePage {
         cx.notify();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn compile_import(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = self.import_dialog.as_mut() else {
             return;
@@ -319,24 +329,38 @@ impl AppearancePage {
         let family_name = source_name(&path);
         let family_id = format!("custom-{}", slug(&family_name));
         match theme_library::compile(&path, &family_id, &family_name) {
-            Ok(compilation) => {
-                dialog.selected = compilation
-                    .family
-                    .variants
-                    .iter()
-                    .map(|variant| variant.id.clone())
-                    .collect();
-                // Mapping diagnostics are useful, but they are an advanced
-                // inspection surface rather than part of the happy path.
-                dialog.review_variant = None;
-                dialog.compilation = Some(compilation);
-                dialog.error = None;
+            Ok(compilation) => self.set_import_compilation(compilation, cx),
+            Err(error) => {
+                dialog.error = Some(error.to_string().into());
+                cx.notify();
             }
-            Err(error) => dialog.error = Some(error.to_string().into()),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn compile_import(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.import_dialog.as_mut() {
+            dialog.error = Some("Choose a theme JSON file with Browse….".into());
         }
         cx.notify();
     }
 
+    fn set_import_compilation(&mut self, compilation: SourceCompilation, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.import_dialog.as_mut() {
+            dialog.selected = compilation
+                .family
+                .variants
+                .iter()
+                .map(|variant| variant.id.clone())
+                .collect();
+            dialog.review_variant = None;
+            dialog.compilation = Some(compilation);
+            dialog.error = None;
+        }
+        cx.notify();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn choose_import_source(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
@@ -359,6 +383,41 @@ impl AppearancePage {
                     });
                 }
                 page.compile_import(cx);
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn choose_import_source(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let selected = pick_browser_theme_file().await;
+            let _ = this.update(cx, |page, cx| match selected {
+                Ok(Some((name, bytes))) => {
+                    if let Some(dialog) = page.import_dialog.as_mut() {
+                        dialog
+                            .input
+                            .update(cx, |input, cx| input.set_text(name.clone(), cx));
+                    }
+                    let family_name = source_name(Path::new(&name));
+                    let family_id = format!("custom-{}", slug(&family_name));
+                    match theme_library::compile_bytes(&name, &bytes, &family_id, &family_name) {
+                        Ok(compilation) => page.set_import_compilation(compilation, cx),
+                        Err(error) => {
+                            if let Some(dialog) = page.import_dialog.as_mut() {
+                                dialog.error = Some(error.to_string().into());
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(dialog) = page.import_dialog.as_mut() {
+                        dialog.error = Some(error.into());
+                    }
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -420,6 +479,70 @@ fn slug(value: &str) -> String {
     } else {
         result
     }
+}
+
+/// Open a browser file input and return the selected theme's actual bytes.
+/// Browser `File` objects are not host paths, so imported themes are always
+/// snapshots rather than reloadable links.
+#[cfg(target_arch = "wasm32")]
+async fn pick_browser_theme_file() -> Result<Option<(String, Vec<u8>)>, String> {
+    let window = web_sys::window().ok_or_else(|| "Browser window is unavailable.".to_string())?;
+    let document = window
+        .document()
+        .ok_or_else(|| "Browser document is unavailable.".to_string())?;
+    let body = document
+        .body()
+        .ok_or_else(|| "Browser document body is unavailable.".to_string())?;
+    let input: web_sys::HtmlInputElement = document
+        .create_element("input")
+        .map_err(|error| format!("Could not open the theme picker: {error:?}"))?
+        .dyn_into()
+        .map_err(|_| "Could not create the theme picker.".to_string())?;
+    input.set_type("file");
+    input.set_accept(".json,.jsonc,.code-theme");
+    input.set_hidden(true);
+    body.append_child(&input)
+        .map_err(|error| format!("Could not open the theme picker: {error:?}"))?;
+
+    let (sender, receiver) =
+        futures::channel::oneshot::channel::<Result<Option<web_sys::File>, String>>();
+    let sender = std::rc::Rc::new(RefCell::new(Some(sender)));
+    let change_sender = sender.clone();
+    let change_input = input.clone();
+    let change = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if let Some(sender) = change_sender.borrow_mut().take() {
+            let _ = sender.send(Ok(change_input.files().and_then(|files| files.item(0))));
+        }
+    }) as Box<dyn FnMut(_)>);
+    let cancel = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+        if let Some(sender) = sender.borrow_mut().take() {
+            let _ = sender.send(Ok(None));
+        }
+    }) as Box<dyn FnMut(_)>);
+    let change_callback = change.as_ref().unchecked_ref();
+    let cancel_callback = cancel.as_ref().unchecked_ref();
+    input
+        .add_event_listener_with_callback("change", change_callback)
+        .map_err(|error| format!("Could not open the theme picker: {error:?}"))?;
+    input
+        .add_event_listener_with_callback("cancel", cancel_callback)
+        .map_err(|error| format!("Could not open the theme picker: {error:?}"))?;
+    input.click();
+
+    let selected = receiver
+        .await
+        .map_err(|_| "The theme picker closed unexpectedly.".to_string())?;
+    let _ = input.remove_event_listener_with_callback("change", change_callback);
+    let _ = input.remove_event_listener_with_callback("cancel", cancel_callback);
+    let _ = body.remove_child(&input);
+    let Some(file) = selected? else {
+        return Ok(None);
+    };
+    let name = file.name();
+    let bytes = wasm_bindgen_futures::JsFuture::from(file.array_buffer())
+        .await
+        .map_err(|_| format!("{name} could not be read."))?;
+    Ok(Some((name, js_sys::Uint8Array::new(&bytes).to_vec())))
 }
 
 fn step_font(
@@ -1133,6 +1256,7 @@ impl AppearancePage {
         let dialog = self.import_dialog.as_ref()?;
         let input = dialog.input.clone();
         let focus = dialog.focus.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let mode = dialog.mode;
         let compilation = dialog.compilation.clone();
         let selected = dialog.selected.clone();
@@ -1141,6 +1265,7 @@ impl AppearancePage {
         let ready = compilation.is_some() && !selected.is_empty();
         let hairline = crate::theme::hairline(0.08);
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mode_control = |label: &'static str, description: &'static str, value: InstallMode| {
             let active = mode == value;
             div()
@@ -1248,8 +1373,11 @@ impl AppearancePage {
                             .flex_none()
                             .on_click(cx.listener(|this, _, _, cx| this.choose_import_source(cx))),
                     ),
-            )
-            .child(
+            );
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            main = main.child(
                 div()
                     .mt(px(16.0))
                     .child(section_label("Keep it up to date"))
@@ -1269,6 +1397,19 @@ impl AppearancePage {
                             )),
                     ),
             );
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            main = main.child(
+                div()
+                    .mt(px(16.0))
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .line_height(px(16.0))
+                    .text_color(theme.text_muted.opacity(0.72))
+                    .child("Browser imports are saved as independent copies."),
+            );
+        }
 
         if let Some(ref compilation) = compilation {
             main = main.child(

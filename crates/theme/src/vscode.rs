@@ -89,6 +89,8 @@ struct NormalizedTheme {
     token_colors: Vec<TokenRule>,
     semantic_token_colors: BTreeMap<String, SemanticStyle>,
     files: Vec<PathBuf>,
+    /// Browser imports receive one selected file rather than filesystem paths.
+    inline_source: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,6 +161,102 @@ pub fn compile_source(path: &Path, options: CompileOptions) -> Result<SourceComp
         return compile_package(&path, &package_json, options);
     }
     compile_single_file(path, options)
+}
+
+/// Compile one browser-selected VS Code JSON/JSONC theme. Browser file inputs
+/// expose bytes, not a filesystem tree, so source includes and external token
+/// files cannot be resolved here.
+pub fn compile_bytes(
+    file_name: &str,
+    bytes: &[u8],
+    options: CompileOptions,
+) -> Result<SourceCompilation> {
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        bail!("theme source {file_name} exceeds the {MAX_SOURCE_BYTES}-byte limit");
+    }
+    let source = std::str::from_utf8(bytes)
+        .with_context(|| format!("could not read theme source {file_name} as UTF-8"))?;
+    let value: Value = json5::from_str(source)
+        .with_context(|| format!("could not parse JSONC theme {file_name}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{file_name} is not a JSON object"))?;
+    if object.contains_key("include") {
+        bail!("{file_name} uses an included theme file, which browser imports cannot read");
+    }
+    if matches!(object.get("tokenColors"), Some(Value::String(_))) {
+        bail!("{file_name} uses an external token file, which browser imports cannot read");
+    }
+
+    let mut normalized = NormalizedTheme {
+        files: vec![PathBuf::from(file_name)],
+        inline_source: Some(bytes.to_vec()),
+        ..Default::default()
+    };
+    if let Some(colors) = object.get("colors").and_then(Value::as_object) {
+        for (key, value) in colors {
+            if let Some(value) = value.as_str() {
+                normalized.colors.insert(key.clone(), value.into());
+            }
+        }
+    }
+    if let Some(Value::Array(rules)) = object.get("tokenColors") {
+        normalized.token_colors.extend(parse_token_rules(rules));
+    }
+    if let Some(semantic) = object.get("semanticTokenColors").and_then(Value::as_object) {
+        for (selector, style) in semantic {
+            normalized
+                .semantic_token_colors
+                .insert(selector.clone(), parse_semantic_style(style));
+        }
+    }
+
+    let appearance = match object.get("type").and_then(Value::as_str) {
+        Some(kind) if kind.eq_ignore_ascii_case("light") => Appearance::Light,
+        Some(kind) if kind.eq_ignore_ascii_case("dark") => Appearance::Dark,
+        _ => normalized
+            .colors
+            .get("editor.background")
+            .and_then(|value| value.parse::<Color>().ok())
+            .map(|background| {
+                if Color::BLACK.contrast(background) > Color::WHITE.contrast(background) {
+                    Appearance::Light
+                } else {
+                    Appearance::Dark
+                }
+            })
+            .unwrap_or(Appearance::Dark),
+    };
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&options.family_name)
+        .to_owned();
+    let imported = convert(
+        normalized,
+        ImportOptions {
+            id: options.family_id.clone(),
+            family_id: options.family_id.clone(),
+            name,
+            appearance,
+            source_url: options.source_url,
+            revision: options.revision,
+            license: options.license,
+        },
+    )?;
+    let reports = BTreeMap::from([(imported.theme.id.clone(), imported.report)]);
+    Ok(SourceCompilation {
+        path: PathBuf::from(file_name),
+        source_kind: DetectedThemeSource::File,
+        family: ThemeFamily {
+            id: options.family_id,
+            name: options.family_name,
+            variants: vec![imported.theme],
+        },
+        reports,
+        failures: Vec::new(),
+    })
 }
 
 fn compile_single_file(path: PathBuf, options: CompileOptions) -> Result<SourceCompilation> {
@@ -885,8 +983,12 @@ fn convert(theme: NormalizedTheme, options: ImportOptions) -> Result<ImportResul
     map_syntax(&theme, &mut output, &mut report);
     harden_variant(&theme, &mut output, fallback_background, &mut report);
     let mut hasher = Sha256::new();
-    for path in &theme.files {
-        hasher.update(read_bounded(path, "theme source while hashing")?.as_bytes());
+    if let Some(source) = &theme.inline_source {
+        hasher.update(source);
+    } else {
+        for path in &theme.files {
+            hasher.update(read_bounded(path, "theme source while hashing")?.as_bytes());
+        }
     }
     report.source_hash = format!("sha256:{:x}", hasher.finalize());
     output.source = ThemeSource {
@@ -1695,5 +1797,47 @@ mod tests {
         assert_eq!(compiled.source_kind, DetectedThemeSource::File);
         assert_eq!(compiled.family.variants[0].name, "Paper");
         assert_eq!(compiled.family.variants[0].appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn browser_bytes_compile_a_standalone_theme_without_filesystem_access() {
+        let compiled = compile_bytes(
+            "paper.json",
+            br##"{
+              "name": "Paper",
+              "type": "light",
+              "colors": { "editor.background": "#fafafa", "foreground": "#222222" }
+            }"##,
+            CompileOptions {
+                family_id: "paper".into(),
+                family_name: "Paper fallback".into(),
+                source_url: "browser-file:paper.json".into(),
+                revision: "local".into(),
+                license: "User supplied".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(compiled.source_kind, DetectedThemeSource::File);
+        assert_eq!(compiled.family.name, "Paper fallback");
+        assert_eq!(compiled.family.variants[0].name, "Paper");
+        assert_eq!(compiled.family.variants[0].appearance, Appearance::Light);
+        assert!(compiled.reports["paper"].source_hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn browser_bytes_reject_sources_that_need_neighboring_files() {
+        let options = CompileOptions {
+            family_id: "theme".into(),
+            family_name: "Theme".into(),
+            source_url: "browser-file:theme.json".into(),
+            revision: "local".into(),
+            license: "User supplied".into(),
+        };
+        let include = compile_bytes("theme.json", br#"{"include":"base.json"}"#, options.clone())
+            .unwrap_err();
+        assert!(include.to_string().contains("included theme file"));
+        let tokens =
+            compile_bytes("theme.json", br#"{"tokenColors":"tokens.json"}"#, options).unwrap_err();
+        assert!(tokens.to_string().contains("external token file"));
     }
 }

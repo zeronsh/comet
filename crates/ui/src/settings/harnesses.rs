@@ -24,8 +24,7 @@ use gpui::{
     px,
 };
 
-use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
-use zeron_proto::HarnessId;
+use zeron_proto::{HarnessDescriptor, HarnessId, descriptor_enabled};
 use zeron_rpc::methods;
 
 use crate::pickers::visible_harnesses;

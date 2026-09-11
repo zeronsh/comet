@@ -12,13 +12,19 @@
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(not(target_arch = "wasm32"))]
 const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
+#[cfg(not(target_arch = "wasm32"))]
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(not(target_arch = "wasm32"))]
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
+#[cfg(not(target_arch = "wasm32"))]
 static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.wav");
 
 /// Which notification chime to play.
@@ -32,6 +38,7 @@ pub enum Sound {
 
 /// Play a chime on a background thread. Silently a no-op when disabled or no
 /// player is available.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn play(sound: Sound) {
     if std::env::var_os(DISABLE_ENV).is_some() {
         return;
@@ -47,6 +54,13 @@ pub fn play(sound: Sound) {
     });
 }
 
+/// Browser builds deliberately have no host audio/player effect. A session
+/// transition must still render, but it must never spawn a thread, write a
+/// temporary file, or launch a native process.
+#[cfg(target_arch = "wasm32")]
+pub fn play(_sound: Sound) {}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn play_bytes(data: &[u8]) -> Result<(), String> {
     // The system players want a file path; write the embedded bytes out.
     let tmp = temp_path();
@@ -56,6 +70,7 @@ fn play_bytes(data: &[u8]) -> Result<(), String> {
     result
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn temp_path() -> PathBuf {
     let id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("zeron-sound-{}-{id}.wav", std::process::id()))
@@ -91,7 +106,7 @@ fn run_player(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(all(not(target_arch = "wasm32"), not(any(windows, target_os = "macos"))))]
 fn run_player(path: &Path) -> Result<(), String> {
     // WAV everywhere, so even bare ALSA aplay decodes it (herdr must exclude
     // aplay because it ships mp3s).
@@ -112,6 +127,7 @@ fn run_player(path: &Path) -> Result<(), String> {
     Err(format!("no audio player available: {}", errors.join("; ")))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> {
     // Bounded wait: a wedged audio daemon must not accumulate zombie threads.
     let mut child = std::process::Command::new(program)
@@ -164,7 +180,7 @@ pub fn sound_for_transition(prev: SessionStatus, new: SessionStatus) -> Option<S
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

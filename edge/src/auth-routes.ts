@@ -14,6 +14,8 @@
  * body 400, missing bearer 401, WorkOS-off 501, rejected exchange/refresh 401.
  */
 import { bearerFromRequest, verifyToken } from "./auth";
+
+import { handleBrowserAuthRoute } from "./browser-auth";
 import type { Env } from "./env";
 import { WorkOsAuthFailed, createOrg, exchange, listOrgs, refresh } from "./workos";
 
@@ -44,6 +46,8 @@ export const handleAuthRoute = async (
 ): Promise<Response | undefined> => {
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts[0] !== "auth") return undefined;
+
+  if (parts[1] === "browser") return handleBrowserAuthRoute(request, env, url);
   const apiKey = env.WORKOS_API_KEY;
 
   if (parts[1] === "exchange" && parts.length === 2 && request.method === "POST") {
@@ -67,16 +71,7 @@ export const handleAuthRoute = async (
     try {
       return json(await refresh(env, apiKey, body.refreshToken, body.organizationId));
     } catch (e) {
-      // Identify repeat offenders: a client with a rotated-out session
-      // retries every 30s forever and is otherwise anonymous in the tail
-      // (the Worker outcome is "ok" — only the 401 body says it failed).
-      // The token fingerprint is safe: single-use, and this one is dead.
-      console.warn(
-        "auth/refresh failed",
-        request.headers.get("cf-connecting-ip") ?? "unknown-ip",
-        `token:${body.refreshToken.slice(0, 6)}…len${body.refreshToken.length}`,
-        e instanceof WorkOsAuthFailed ? e.message : String(e)
-      );
+      // Never log refresh credentials or derived fingerprints.
       return authFailed(e);
     }
   }

@@ -116,22 +116,29 @@ impl CustomThemeLibrary {
                 return Err(error).with_context(|| format!("could not read {}", path.display()));
             }
         };
-        let library: Self = serde_json::from_str(&source)
-            .with_context(|| format!("could not parse {}", load_path.display()))?;
+        Self::from_json(&source).with_context(|| format!("could not parse {}", load_path.display()))
+    }
+
+    pub fn from_json(source: &str) -> Result<Self> {
+        let library: Self = serde_json::from_str(source)?;
         library.validate_capacity()?;
         Ok(library)
     }
 
-    pub fn save(&self, data_dir: &Path) -> Result<()> {
+    pub fn to_json(&self) -> Result<String> {
         self.validate_capacity()?;
-        fs::create_dir_all(data_dir)
-            .with_context(|| format!("could not create {}", data_dir.display()))?;
-        let path = Self::path(data_dir);
-        let encoded = serde_json::to_vec_pretty(self)?;
+        let encoded = serde_json::to_string_pretty(self)?;
         if encoded.len() as u64 > MAX_LIBRARY_BYTES {
             bail!("custom theme library exceeds the {MAX_LIBRARY_BYTES}-byte limit");
         }
-        replace_file_recoverably(&path, &encoded)
+        Ok(encoded)
+    }
+
+    pub fn save(&self, data_dir: &Path) -> Result<()> {
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("could not create {}", data_dir.display()))?;
+        let path = Self::path(data_dir);
+        replace_file_recoverably(&path, self.to_json()?.as_bytes())
     }
 
     pub fn install_runtime(&self) {
@@ -154,6 +161,25 @@ impl CustomThemeLibrary {
                 family_id: family_id.into(),
                 family_name: family_name.into(),
                 source_url: path.display().to_string(),
+                revision: "local".into(),
+                license: "User supplied".into(),
+            },
+        )
+    }
+
+    pub fn compile_bytes(
+        file_name: &str,
+        bytes: &[u8],
+        family_id: &str,
+        family_name: &str,
+    ) -> Result<SourceCompilation> {
+        crate::vscode::compile_bytes(
+            file_name,
+            bytes,
+            CompileOptions {
+                family_id: family_id.into(),
+                family_name: family_name.into(),
+                source_url: format!("browser-file:{file_name}"),
                 revision: "local".into(),
                 license: "User supplied".into(),
             },

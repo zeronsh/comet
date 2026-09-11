@@ -3,8 +3,11 @@
 //! This crate intentionally has no UI, RPC, or engine dependencies. Public
 //! ranges are byte offsets relative to one UTF-8 source line.
 
-use std::{collections::BTreeSet, ops::Range, path::Path, sync::atomic::AtomicUsize};
+#[cfg(feature = "highlighting")]
+use std::sync::atomic::AtomicUsize;
+use std::{collections::BTreeSet, ops::Range, path::Path};
 
+#[cfg(feature = "highlighting")]
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 1024 * 1024;
@@ -298,15 +301,31 @@ fn line_starts(source: &str) -> Vec<usize> {
 /// Whether this build contains a parser and compatible highlight queries.
 pub const fn supports_language(language: LanguageId) -> bool {
     let _ = language;
-    true
+    cfg!(feature = "highlighting")
+}
+
+
+/// Keep presentation callers portable when tree-sitter is intentionally absent.
+/// The shared UI falls back to unstyled source while retaining its actual route.
+#[cfg(not(feature = "highlighting"))]
+pub fn highlight(request: HighlightRequest<'_>) -> Result<HighlightedDocument, HighlightError> {
+    let language = detect_language(
+        request.path,
+        request.fence_tag,
+        request.source.lines().next(),
+    )
+    .ok_or(HighlightError::UnknownLanguage)?;
+    Err(HighlightError::GrammarUnavailable(language))
 }
 
 /// Highlight a complete document with the default resource limits.
+#[cfg(feature = "highlighting")]
 pub fn highlight(request: HighlightRequest<'_>) -> Result<HighlightedDocument, HighlightError> {
     highlight_with_limits(request, HighlightLimits::default(), None)
 }
 
 /// Highlight a complete document with explicit limits and cooperative cancellation.
+#[cfg(feature = "highlighting")]
 pub fn highlight_with_limits(
     request: HighlightRequest<'_>,
     limits: HighlightLimits,
@@ -375,6 +394,7 @@ pub fn highlight_with_limits(
     HighlightedDocument::from_absolute_spans(language, request.source, spans)
 }
 
+#[cfg(feature = "highlighting")]
 fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
     use LanguageId::*;
     match parent {
@@ -393,6 +413,7 @@ fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
 /// for every fence or eagerly compiling all 27 Markdown injection targets.
 /// Each grammar has its own cell: concurrent requests compile it only once,
 /// while unrelated languages never wait on a global compilation lock.
+#[cfg(feature = "highlighting")]
 fn cached_configuration(
     language: LanguageId,
 ) -> Result<&'static HighlightConfiguration, HighlightError> {
@@ -418,6 +439,7 @@ fn cached_configuration(
     )
 }
 
+#[cfg(feature = "highlighting")]
 fn cached_markdown_inline_configuration() -> Result<&'static HighlightConfiguration, HighlightError>
 {
     static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> =
@@ -432,6 +454,7 @@ fn cached_markdown_inline_configuration() -> Result<&'static HighlightConfigurat
         .map_err(Clone::clone)
 }
 
+#[cfg(feature = "highlighting")]
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
     // The upstream Rust query groups numbers and booleans as
     // `constant.builtin`. Zeron preserves those structural roles separately.
@@ -458,6 +481,7 @@ fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
     .map_err(|error| HighlightError::Parser(error.to_string()))
 }
 
+#[cfg(feature = "highlighting")]
 fn markdown_configuration() -> Result<HighlightConfiguration, HighlightError> {
     // tree-sitter-highlight excludes child ranges from injections by default.
     // The Markdown block grammar's `inline` node owns anonymous children that
@@ -475,6 +499,7 @@ fn markdown_configuration() -> Result<HighlightConfiguration, HighlightError> {
     )
 }
 
+#[cfg(feature = "highlighting")]
 fn markdown_inline_configuration() -> Result<HighlightConfiguration, HighlightError> {
     make_configuration(
         tree_sitter_md::INLINE_LANGUAGE.into(),
@@ -485,6 +510,7 @@ fn markdown_inline_configuration() -> Result<HighlightConfiguration, HighlightEr
     )
 }
 
+#[cfg(feature = "highlighting")]
 fn make_configuration(
     language: tree_sitter::Language,
     name: &str,
@@ -496,6 +522,7 @@ fn make_configuration(
         .map_err(|error| HighlightError::Parser(error.to_string()))
 }
 
+#[cfg(feature = "highlighting")]
 fn javascript_family_highlights(language: LanguageId) -> String {
     use LanguageId::*;
 
@@ -519,6 +546,7 @@ fn javascript_family_highlights(language: LanguageId) -> String {
     queries.join("\n")
 }
 
+#[cfg(feature = "highlighting")]
 fn javascript_family_configuration(
     language: LanguageId,
 ) -> Result<HighlightConfiguration, HighlightError> {
@@ -555,6 +583,7 @@ fn javascript_family_configuration(
     make_configuration(grammar, name, &highlights, injections, locals)
 }
 
+#[cfg(feature = "highlighting")]
 fn configuration(language: LanguageId) -> Result<HighlightConfiguration, HighlightError> {
     use LanguageId::*;
     match language {
@@ -717,6 +746,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
 
 // Ordered from generic to specific. `HighlightConfiguration::configure`
 // resolves dotted captures to the best recognized name in this table.
+#[cfg(feature = "highlighting")]
 const CAPTURE_NAMES: &[&str] = &[
     "comment",
     "keyword",
@@ -751,6 +781,7 @@ const CAPTURE_NAMES: &[&str] = &[
     "error",
 ];
 
+#[cfg(feature = "highlighting")]
 const CAPTURE_KINDS: &[HighlightKind] = &[
     HighlightKind::Comment,
     HighlightKind::Keyword,
@@ -865,7 +896,7 @@ fn language_for_shebang(line: &str) -> Option<LanguageId> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "highlighting"))]
 mod tests {
     #[test]
     fn compiled_queries_are_shared_across_concurrent_documents() {

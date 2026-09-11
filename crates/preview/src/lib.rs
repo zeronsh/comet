@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod mux;
 pub mod peer;
 pub mod proxy;
+pub mod remote;
 pub mod signaling;
 
 pub mod service;

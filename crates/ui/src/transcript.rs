@@ -30,7 +30,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
+#[path = "transcript/source.rs"]
+pub mod source;
+use source::TranscriptSource;
 
 use gpui::{
     AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
@@ -700,7 +708,7 @@ pub enum ToolDetail {
     /// context, dual line numbers, and (for recognized languages) syntax
     /// tokens — rendered by `changes::render_file_body`.
     Diff {
-        file: Arc<crate::changes::FileDiff>,
+        file: Arc<crate::changes::presentation::FileDiff>,
         old_text: Option<Arc<str>>,
         new_text: Option<Arc<str>>,
     },
@@ -721,7 +729,7 @@ pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
 pub const DIFF_DETAIL_MAX_LINES: usize = 600;
 
 /// Per-line height of an output detail block (diff blocks use the changes
-/// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
+/// pane's own [`crate::changes::presentation::DIFF_LINE_HEIGHT`]).
 pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
 
 /// Vertical padding of an output detail body (py(6) × 2).
@@ -747,7 +755,7 @@ pub fn tool_detail(
         // cap it so a whole-file rewrite (or fetched full-diff blob) can't
         // build tens of thousands of elements per frame. The changes pane
         // has no such cap; it virtualizes per line.
-        crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
+        crate::changes::presentation::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
         return Some(ToolDetail::Diff {
             file: Arc::new(file),
             old_text: diff.old_text.as_deref().map(Arc::from),
@@ -864,10 +872,10 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
 }
 
 /// Reduce an inline [`zeron_proto::ToolDiff`] to the changes pane's
-/// [`crate::changes::FileDiff`]: hunks grouped with 3 context lines, dual
+/// [`crate::changes::presentation::FileDiff`]: hunks grouped with 3 context lines, dual
 /// 1-based line numbers, unified-diff hunk headers, and add/del counts.
-pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
-    use crate::changes::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::presentation::FileDiff {
+    use crate::changes::presentation::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     let old = diff.old_text.as_deref().unwrap_or("");
     let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
     let mut hunks = Vec::new();
@@ -1694,7 +1702,7 @@ pub fn chips_height(count: usize) -> f32 {
 
 /// Analytic height an open detail adds to its chip's card (separator + body)
 /// — output blocks by line count, diff blocks via the changes pane's own
-/// [`crate::changes::body_height`]. The chip's own [`CHIP_HEIGHT`] is already
+/// [`crate::changes::presentation::body_height`]. The chip's own [`CHIP_HEIGHT`] is already
 /// counted by [`chips_height`].
 pub fn detail_height(detail: &ToolDetail) -> f32 {
     let body = match detail {
@@ -1712,7 +1720,7 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
             let rows = lines.len() + usize::from(*truncated_by > 0);
             rows as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
         }
-        ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
+        ToolDetail::Diff { file, .. } => crate::changes::presentation::body_height(file),
         ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
     };
     DETAIL_SEPARATOR + body
@@ -1845,6 +1853,195 @@ struct HighlightEntry {
     _task: Option<Task<()>>,
 }
 
+/// Browser-safe lexical highlighting for fenced code. It deliberately covers
+/// only paint roles the renderer already understands and has no worker, engine,
+/// or native parser dependency.
+#[cfg(any(target_arch = "wasm32", test))]
+fn portable_highlight_document(language: Lang, source: &str) -> zeron_syntax::HighlightedDocument {
+    zeron_syntax::HighlightedDocument {
+        language,
+        lines: source
+            .split('\n')
+            .map(|line| portable_highlight_line(language, line))
+            .collect(),
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn portable_highlight_line(language: Lang, line: &str) -> Vec<zeron_syntax::HighlightSpan> {
+    use zeron_syntax::{HighlightKind, HighlightSpan};
+
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while at < line.len() {
+        let rest = &line[at..];
+        let comment = match language {
+            Lang::Bash | Lang::Python | Lang::Yaml | Lang::Toml => rest.starts_with('#'),
+            Lang::Sql => rest.starts_with("--"),
+            _ => rest.starts_with("//"),
+        };
+        if comment {
+            spans.push(HighlightSpan {
+                range: at..line.len(),
+                kind: HighlightKind::Comment,
+            });
+            break;
+        }
+        let byte = rest.as_bytes()[0];
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            let quote = byte;
+            let mut end = at + 1;
+            let mut escaped = false;
+            while end < line.len() {
+                let current = line.as_bytes()[end];
+                end += 1;
+                if current == quote && !escaped {
+                    break;
+                }
+                escaped = current == b'\\' && !escaped;
+                if current != b'\\' {
+                    escaped = false;
+                }
+            }
+            spans.push(HighlightSpan {
+                range: at..end,
+                kind: HighlightKind::String,
+            });
+            at = end;
+            continue;
+        }
+        if byte.is_ascii_digit() {
+            let end = at
+                + rest
+                    .bytes()
+                    .take_while(|byte| {
+                        byte.is_ascii_alphanumeric() || *byte == b'.' || *byte == b'_'
+                    })
+                    .count();
+            spans.push(HighlightSpan {
+                range: at..end,
+                kind: HighlightKind::Number,
+            });
+            at = end;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let end = at
+                + rest
+                    .bytes()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    .count();
+            if portable_keyword(&line[at..end]) {
+                spans.push(HighlightSpan {
+                    range: at..end,
+                    kind: HighlightKind::Keyword,
+                });
+            }
+            at = end;
+            continue;
+        }
+        at += 1;
+    }
+    spans
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn portable_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "const"
+            | "continue"
+            | "def"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "from"
+            | "function"
+            | "if"
+            | "impl"
+            | "import"
+            | "in"
+            | "interface"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "mut"
+            | "new"
+            | "null"
+            | "package"
+            | "pub"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "trait"
+            | "true"
+            | "try"
+            | "type"
+            | "use"
+            | "var"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_highlight_document(
+    language: Lang,
+    source: &str,
+) -> Option<zeron_syntax::HighlightedDocument> {
+    zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+        source,
+        path: None,
+        fence_tag: Some(match language {
+            Lang::Rust => "rust",
+            Lang::JavaScript => "javascript",
+            Lang::Jsx => "jsx",
+            Lang::TypeScript => "typescript",
+            Lang::Tsx => "tsx",
+            Lang::Python => "python",
+            Lang::Go => "go",
+            Lang::Json => "json",
+            Lang::Jsonc => "jsonc",
+            Lang::Bash => "bash",
+            Lang::Toml => "toml",
+            Lang::Markdown => "markdown",
+            Lang::Html => "html",
+            Lang::Css => "css",
+            Lang::Yaml => "yaml",
+            Lang::C => "c",
+            Lang::Cpp => "cpp",
+            Lang::CSharp => "csharp",
+            Lang::Java => "java",
+            Lang::Kotlin => "kotlin",
+            Lang::Swift => "swift",
+            Lang::Ruby => "ruby",
+            Lang::Php => "php",
+            Lang::Sql => "sql",
+            Lang::Lua => "lua",
+            Lang::Dockerfile => "dockerfile",
+            Lang::Nix => "nix",
+            Lang::Make => "make",
+        }),
+    })
+    .ok()
+}
+
 /// Cache of tokenized code blocks keyed by `(row id, block ix)`. Tokenization
 /// runs on the background executor, time-sliced; results apply as paint-only
 /// run colors when they land.
@@ -1855,7 +2052,55 @@ struct HighlightStore {
 }
 
 impl HighlightStore {
+    /// The browser has no native syntax worker. Tokenize synchronously through
+    /// the portable lexer; the resulting roles use the same renderer and cache
+    /// as native Tree-sitter documents.
+    #[cfg(target_arch = "wasm32")]
+    fn request(
+        &mut self,
+        row_id: SharedString,
+        block_ix: usize,
+        lang: Lang,
+        code: &str,
+        _cx: &mut Context<Transcript>,
+    ) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
+        let slot_key = (row_id, block_ix);
+        let document_key = DocumentHighlightKey::new(lang, code);
+        if let Some(document) = self
+            .entries
+            .get(&slot_key)
+            .filter(|entry| entry.key == document_key)
+            .and_then(|entry| entry.document.as_ref())
+            .and_then(Weak::upgrade)
+        {
+            return Some(document);
+        }
+        if let Some(document) = self.cache.get(&document_key) {
+            self.entries.insert(
+                slot_key,
+                HighlightEntry {
+                    key: document_key,
+                    document: Some(Arc::downgrade(&document)),
+                    _task: None,
+                },
+            );
+            return Some(document);
+        }
+        let document = Arc::new(portable_highlight_document(lang, code));
+        let retained = self.cache.insert(document_key, document.clone());
+        self.entries.insert(
+            slot_key,
+            HighlightEntry {
+                key: document_key,
+                document: retained.then(|| Arc::downgrade(&document)),
+                _task: None,
+            },
+        );
+        retained.then_some(document)
+    }
+
     /// Current tokens if ready; kicks a background tokenize when stale/missing.
+    #[cfg(not(target_arch = "wasm32"))]
     fn request(
         &mut self,
         row_id: SharedString,
@@ -1891,43 +2136,7 @@ impl HighlightStore {
             let started = Instant::now();
             let document = cx
                 .background_executor()
-                .spawn(async move {
-                    zeron_syntax::highlight(zeron_syntax::HighlightRequest {
-                        source: &code,
-                        path: None,
-                        fence_tag: Some(match lang {
-                            Lang::Rust => "rust",
-                            Lang::JavaScript => "javascript",
-                            Lang::Jsx => "jsx",
-                            Lang::TypeScript => "typescript",
-                            Lang::Tsx => "tsx",
-                            Lang::Python => "python",
-                            Lang::Go => "go",
-                            Lang::Json => "json",
-                            Lang::Jsonc => "jsonc",
-                            Lang::Bash => "bash",
-                            Lang::Toml => "toml",
-                            Lang::Markdown => "markdown",
-                            Lang::Html => "html",
-                            Lang::Css => "css",
-                            Lang::Yaml => "yaml",
-                            Lang::C => "c",
-                            Lang::Cpp => "cpp",
-                            Lang::CSharp => "csharp",
-                            Lang::Java => "java",
-                            Lang::Kotlin => "kotlin",
-                            Lang::Swift => "swift",
-                            Lang::Ruby => "ruby",
-                            Lang::Php => "php",
-                            Lang::Sql => "sql",
-                            Lang::Lua => "lua",
-                            Lang::Dockerfile => "dockerfile",
-                            Lang::Nix => "nix",
-                            Lang::Make => "make",
-                        }),
-                    })
-                    .ok()
-                })
+                .spawn(async move { native_highlight_document(lang, &code) })
                 .await;
             this.update(cx, |transcript, cx| {
                 if let Some(document) = document {
@@ -2294,7 +2503,7 @@ impl SavedViewportCache {
 }
 
 pub struct Transcript {
-    state: Entity<AppState>,
+    source: TranscriptSource,
     list: ListState,
     rows: Vec<Row>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
@@ -2474,7 +2683,7 @@ pub struct Transcript {
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
     _observe: Subscription,
-    _text_changes: Subscription,
+    _text_changes: Option<Subscription>,
 }
 
 /// One sidecar blob fetch's lifecycle.
@@ -2507,7 +2716,7 @@ impl Transcript {
         self.workspace_link = Some(handler);
     }
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        Self::build(state, None, true, cx)
+        Self::build(TranscriptSource::Native(state), None, true, cx)
     }
 
     /// A read-only transcript over one SUBAGENT doc (right-pane tab). The
@@ -2522,11 +2731,27 @@ impl Transcript {
         follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(state, Some(doc_id), follow, cx)
+        Self::build(TranscriptSource::Native(state), Some(doc_id), follow, cx)
+    }
+
+    /// Render an already-replayed document without engine services. The same
+    /// rows, caches, list, selection and rendering are used on both platforms.
+    pub fn from_document(
+        document: Entity<source::TranscriptDocument>,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let doc_id = document.read(cx).doc_id().to_owned();
+        Self::build(
+            TranscriptSource::Document(document),
+            Some(doc_id),
+            follow,
+            cx,
+        )
     }
 
     fn build(
-        state: Entity<AppState>,
+        source: TranscriptSource,
         doc_override: Option<String>,
         follow: bool,
         cx: &mut Context<Self>,
@@ -2557,19 +2782,28 @@ impl Transcript {
             })
             .ok();
         });
-        let observe = cx.observe(&state, |this: &mut Self, _, cx| this.sync(cx));
-        let text_changes = cx.subscribe(
-            &state,
-            |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
-                let doc_id = this
-                    .doc_override
-                    .as_deref()
-                    .or_else(|| state.read(cx).selected_chat.as_deref());
-                if doc_id == Some(event.doc_id.as_str()) {
-                    this.sync(cx);
-                }
-            },
-        );
+        let (observe, text_changes) = match &source {
+            TranscriptSource::Native(state) => {
+                let observe = cx.observe(state, |this: &mut Self, _, cx| this.sync(cx));
+                let text_changes = cx.subscribe(
+                    state,
+                    |this: &mut Self, state, event: &crate::state::TranscriptTextChanged, cx| {
+                        let doc_id = this
+                            .doc_override
+                            .as_deref()
+                            .or_else(|| state.read(cx).selected_chat.as_deref());
+                        if doc_id == Some(event.doc_id.as_str()) {
+                            this.sync(cx);
+                        }
+                    },
+                );
+                (observe, Some(text_changes))
+            }
+            TranscriptSource::Document(document) => (
+                cx.observe(document, |this: &mut Self, _, cx| this.sync(cx)),
+                None,
+            ),
+        };
         // The rail is sized for the conversation column; a narrow right-pane
         // tab has no width gate driving it, so override instances skip it.
         let rail_enabled = doc_override.is_none();
@@ -2581,7 +2815,7 @@ impl Transcript {
         // wheel-up, and resticks/jumps exactly like the main transcript.
         let pinned = follow;
         let mut this = Self {
-            state,
+            source,
             list,
             rows: Vec::new(),
             last_source: None,
@@ -2790,8 +3024,13 @@ impl Transcript {
         }
     }
 
-    pub(crate) fn state_entity(&self) -> &Entity<AppState> {
-        &self.state
+    pub(crate) fn with_entries<R>(
+        &self,
+        cx: &gpui::App,
+        read: impl FnOnce(&[SessionMessageEntry], &[SessionMessageEntry]) -> R,
+    ) -> R {
+        let snapshot = self.source.snapshot(self.doc_override.as_deref(), cx);
+        read(snapshot.entries, snapshot.echoes)
     }
 
     /// Hand viewport ownership to explicit rail/navigation input before its
@@ -3614,33 +3853,22 @@ impl Transcript {
         }
     }
 
-    /// Rebuild rows from app state; splice minimal ranges into the list.
+    /// Rebuild rows from a borrowed source; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (selected, replay) = {
-            let s = self.state.read(cx);
-            match &self.doc_override {
-                // Pinned to a subagent doc: `selected` equals `chat_id` by
-                // construction, so the attach/reset branch below never fires,
-                // and echoes stay empty (nothing is ever sent from here).
-                Some(doc_id) => (Some(doc_id.clone()), TranscriptReplayState::Populated),
-                None => {
-                    let replay = if !s.transcript_replayed {
-                        TranscriptReplayState::Pending
-                    } else if s.transcript.is_empty() {
-                        TranscriptReplayState::Empty
-                    } else {
-                        TranscriptReplayState::Populated
-                    };
-                    (s.selected_chat.clone(), replay)
-                }
-            }
+        let (selected, replay, revision) = {
+            let snapshot = self.source.snapshot(self.doc_override.as_deref(), cx);
+            (
+                snapshot.doc_id.map(str::to_owned),
+                snapshot.replay,
+                snapshot.revision,
+            )
         };
-
-        let source = (
-            selected.clone(),
-            replay,
-            self.state.read(cx).transcript_revision,
-        );
+        // Document feeds may replace their identity; keep read-only policy while
+        // letting the normal attach path invalidate rows and restore viewport.
+        if self.source.is_document() {
+            self.doc_override = selected.clone();
+        }
+        let source = (selected.clone(), replay, revision);
         if self.last_source.as_ref() == Some(&source) {
             return;
         }
@@ -3710,7 +3938,10 @@ impl Transcript {
             } else {
                 // New chats and chats that were following their tail retain
                 // the existing open-at-bottom behavior.
-                self.pinned = true;
+                self.pinned = !self.source.is_document() || self.doc_live;
+                if self.source.is_document() {
+                    self.land_end_pending = !self.doc_live;
+                }
                 self.last_scroll_distance = 0.0;
                 self.show_jump_button = false;
             }
@@ -3727,19 +3958,15 @@ impl Transcript {
         // handle lets rows_for mutate our caches without copying every text
         // and tool payload on each app-state notification.
         let (entries_empty, tail_streaming) = {
-            let state = self.state.clone();
-            let state = state.read(cx);
-            let entries = match &self.doc_override {
-                Some(doc_id) => state.sub_transcript(doc_id),
-                None => state.transcript.as_slice(),
-            };
+            let source = self.source.clone();
+            let doc_override = self.doc_override.clone();
+            let snapshot = source.snapshot(doc_override.as_deref(), cx);
+            let entries = snapshot.entries;
             for entry in entries {
                 new_rows.extend(self.rows_for(entry, false));
             }
-            if self.doc_override.is_none() {
-                for echo in state.pending_echoes() {
-                    new_rows.extend(self.rows_for(echo, true));
-                }
+            for echo in snapshot.echoes {
+                new_rows.extend(self.rows_for(echo, true));
             }
             (
                 entries.is_empty(),
@@ -3954,6 +4181,7 @@ impl Transcript {
     /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
     /// [`ToolDetail`] once, off the render path. Re-entry while Loading/Ready
     /// is a no-op; Failed re-arms as a retry (the affordance label says so).
+    #[cfg(not(target_arch = "wasm32"))]
     fn spawn_blob_fetch(&mut self, blob_ref: SharedString, cx: &mut Context<Self>) {
         // Rank BEFORE the already-fetched guard: clicking a Ready ref is the
         // "show me this one again" toggle (recency bump + repaint, no
@@ -3970,7 +4198,12 @@ impl Transcript {
             Some(BlobFetch::Loading(_)) => return,
             Some(BlobFetch::Failed) | None => {}
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self
+            .source
+            .native()
+            .and_then(|state| state.read(cx).engine())
+            .cloned()
+        else {
             return;
         };
         let is_diff = blob_ref.ends_with(".diff");
@@ -4188,23 +4421,29 @@ impl Transcript {
     /// device (uploads targeted it) plus this device (zeron's
     /// `uniqueIds([attachmentDeviceId, m.device_id])`).
     fn attachment_device_ids(&self, cx: &Context<Self>) -> Vec<String> {
-        // `selected_chat_row` belongs to the PRIMARY transcript's chat — an
-        // override instance has no chat row, so it claims no devices (its
-        // thumbnails degrade to placeholders instead of guessing).
-        if self.doc_override.is_some() {
-            return Vec::new();
+        if self.source.is_document() {
+            // Document fixtures may seed the real cache; no host reads are made.
+            return self.chat_id.iter().cloned().collect();
         }
-        let state = self.state.read(cx);
-        let mut ids = Vec::new();
-        if let Some(chat) = state.selected_chat_row() {
-            ids.push(chat.device_id.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(state) = self.source.native() {
+            // A native override must not guess the primary chat's device.
+            if self.doc_override.is_some() {
+                return Vec::new();
+            }
+            let state = state.read(cx);
+            let mut ids = Vec::new();
+            if let Some(chat) = state.selected_chat_row() {
+                ids.push(chat.device_id.clone());
+            }
+            if let Some(local) = state.local_device_id.clone()
+                && !ids.contains(&local)
+            {
+                ids.push(local);
+            }
+            return ids;
         }
-        if let Some(local) = state.local_device_id.clone()
-            && !ids.contains(&local)
-        {
-            ids.push(local);
-        }
-        ids
+        Vec::new()
     }
 
     /// Effective load state for one attachment across its candidate devices:
@@ -4222,10 +4461,18 @@ impl Transcript {
                 return AttachmentSnapshot::Loaded(image);
             }
         }
+        // An unavailable host cannot claim a load or schedule a retry. Cached
+        // images above still work, while missing images remain explicitly absent.
+        if self.source.is_document() {
+            return AttachmentSnapshot::Error {
+                retry_in: Duration::MAX,
+            };
+        }
         let mut any_loading = false;
         let mut min_retry: Option<Duration> = None;
         for dev in device_ids {
             if begin_load(dev, path) {
+                #[cfg(not(target_arch = "wasm32"))]
                 self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
             }
             match attachment_snapshot(dev, path) {
@@ -4253,13 +4500,17 @@ impl Transcript {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn spawn_attachment_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
         use crate::attachments::{read_attachment_image, store_error, store_loaded};
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(state) = self.source.native() else {
+            return;
+        };
+        let Some(engine) = state.read(cx).engine().cloned() else {
             store_error(&device_id, &path);
             return;
         };
-        let local = self.state.read(cx).local_device_id.clone();
+        let local = state.read(cx).local_device_id.clone();
         // Relay-forward only for a genuinely remote owner; the local device's
         // files are served directly.
         let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
@@ -4552,19 +4803,22 @@ impl Transcript {
             // that isn't a real transfer position (2026-08-20 report: the
             // staging-only percent blinked out in ~100ms and lied about the
             // slow part).
-            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let sending = !self.source.is_document()
+                && (att.path.starts_with("pending://") || att.path.starts_with("pending/"));
             let upload_id = att
                 .path
                 .strip_prefix("pending://")
                 .and_then(|rest| rest.split_once('/'))
                 .map(|(id, _)| id);
-            let uploading = upload_id
-                .and_then(|id| self.state.read(cx).transfer_percent(id))
-                .or_else(|| {
-                    sending
-                        .then(|| self.state.read(cx).upload_progress_percent())
-                        .flatten()
-                });
+            #[cfg(not(target_arch = "wasm32"))]
+            let uploading = self.source.native().and_then(|state| {
+                let state = state.read(cx);
+                upload_id
+                    .and_then(|id| state.transfer_percent(id))
+                    .or_else(|| sending.then(|| state.upload_progress_percent()).flatten())
+            });
+            #[cfg(target_arch = "wasm32")]
+            let uploading: Option<u8> = None;
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -4682,8 +4936,11 @@ impl Transcript {
         let Some(chat_id) = self.chat_id.clone() else {
             return;
         };
-        let engine = self.state.read(cx).engine().cloned();
-        self.state.update(cx, |s, cx| {
+        let Some(state) = self.source.native() else {
+            return;
+        };
+        let engine = state.read(cx).engine().cloned();
+        state.update(cx, |s, cx| {
             s.retry_pending_send(&chat_id, chrono::Utc::now());
             cx.notify();
         });
@@ -4714,62 +4971,65 @@ impl Transcript {
             if !self.doc_live {
                 return None;
             }
-            let state = self.state.read(cx);
-            let last = state.sub_transcript(doc_id).last()?;
-            let live =
-                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
+            let snapshot = self.source.snapshot(Some(doc_id), cx);
+            let last = snapshot.entries.last()?;
+            let live = last.status == Some(MessageStatus::Streaming)
+                || (!self.source.is_document() && last.role == MessageRole::User);
             if !live {
                 return None;
             }
             let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
             (false, false, elapsed, flavour_seed(doc_id))
         } else {
-            let chat_id = self.chat_id.clone()?;
-            // Failed-send state first: past the grace window the trailer IS
-            // the retry affordance, whatever the indicator fell back to.
-            if self.state.read(cx).send_undelivered(&chat_id, now) {
-                let theme = Theme::of(cx).clone();
-                return Some(
-                    div()
-                        .id("undelivered-retry")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(Theme::SPACE_SM))
-                        .pt(px(Theme::SPACE_LG))
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.danger)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
-                        .child(SharedString::from("Not delivered — click to retry"))
-                        .into_any_element(),
-                );
-            }
-            let (sending, queued, elapsed) = {
-                let state = self.state.read(cx);
-                if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
-                    return None;
+            {
+                let native = self.source.native()?;
+                let chat_id = self.chat_id.clone()?;
+                // Failed-send state first: past the grace window the trailer IS
+                // the retry affordance, whatever the indicator fell back to.
+                if native.read(cx).send_undelivered(&chat_id, now) {
+                    let theme = Theme::of(cx).clone();
+                    return Some(
+                        div()
+                            .id("undelivered-retry")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .pt(px(Theme::SPACE_LG))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.danger)
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
+                            .child(SharedString::from("Not delivered — click to retry"))
+                            .into_any_element(),
+                    );
                 }
-                // During the send→turn window the session row's `started_at`
-                // still belongs to the PREVIOUS turn — a timer based on the
-                // send counted the round-trip and then restarted when the
-                // turn actually began (user report). Bridge it as "Sending…"
-                // with no timer instead; the word + timer start with the
-                // turn.
-                let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-                let sending =
-                    sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
-                // Degraded delivery path: the send is a durable local write
-                // waiting on connectivity — say so instead of faking
-                // progress. (The overlay holds while degraded, so this line
-                // owns the surface until the ack or the failed state.)
-                let queued = sending && state.chat_delivery_degraded(&chat_id);
-                let elapsed = turn_started
-                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-                    .unwrap_or(0);
-                (sending, queued, elapsed)
-            };
-            (sending, queued, elapsed, flavour_seed(&chat_id))
+                let (sending, queued, elapsed) = {
+                    let state = native.read(cx);
+                    if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+                        return None;
+                    }
+                    // During the send→turn window the session row's `started_at`
+                    // still belongs to the PREVIOUS turn — a timer based on the
+                    // send counted the round-trip and then restarted when the
+                    // turn actually began (user report). Bridge it as "Sending…"
+                    // with no timer instead; the word + timer start with the
+                    // turn.
+                    let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
+                    let sending =
+                        sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+                    // Degraded delivery path: the send is a durable local write
+                    // waiting on connectivity — say so instead of faking
+                    // progress. (The overlay holds while degraded, so this line
+                    // owns the surface until the ack or the failed state.)
+                    let queued = sending && state.chat_delivery_degraded(&chat_id);
+                    let elapsed = turn_started
+                        .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                        .unwrap_or(0);
+                    (sending, queued, elapsed)
+                };
+                (sending, queued, elapsed, flavour_seed(&chat_id))
+            }
         };
         let word = if queued {
             "Queued — will send automatically"
@@ -5377,7 +5637,7 @@ impl Transcript {
         tool_ix: usize,
         detail: &ToolDetail,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<crate::changes::DiffHighlights>> {
+    ) -> Option<Arc<crate::changes::presentation::DiffHighlights>> {
         let ToolDetail::Diff {
             file,
             old_text,
@@ -5405,7 +5665,10 @@ impl Transcript {
             }
             None => None,
         };
-        Some(Arc::new(crate::changes::DiffHighlights { old, new }))
+        Some(Arc::new(crate::changes::presentation::DiffHighlights {
+            old,
+            new,
+        }))
     }
 
     fn render_tool_group(
@@ -5463,6 +5726,9 @@ impl Transcript {
         let affordances: Vec<Option<ChipAffordance>> = tools
             .iter()
             .map(|tool| {
+                if self.source.is_document() {
+                    return None;
+                }
                 // The currently-displayed ref (same recency rule as
                 // `details` above): its affordance is spent; any OTHER
                 // Ready ref stays offered as a no-fetch toggle.
@@ -5537,16 +5803,17 @@ impl Transcript {
                 (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(default_open)
             })
             .collect();
-        let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
-            .iter()
-            .enumerate()
-            .map(|(ix, detail)| {
-                detail
-                    .as_deref()
-                    .filter(|_| detail_opens[ix])
-                    .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
-            })
-            .collect();
+        let detail_highlights: Vec<Option<Arc<crate::changes::presentation::DiffHighlights>>> =
+            details
+                .iter()
+                .enumerate()
+                .map(|(ix, detail)| {
+                    detail
+                        .as_deref()
+                        .filter(|_| detail_opens[ix])
+                        .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
+                })
+                .collect();
         let open_height = chips_height(tools.len())
             + details
                 .iter()
@@ -5629,7 +5896,11 @@ impl Transcript {
                 // Spawn chips are LINKS, not accordions: the click opens the
                 // subagent's transcript as a right-pane tab (the shell hosts
                 // the surface — the chip only announces which doc it indexes).
-                if let Some(doc_id) = tool.subagent_ref.clone().filter(|_| is_spawn_link(tool)) {
+                if let Some(doc_id) = tool
+                    .subagent_ref
+                    .clone()
+                    .filter(|_| is_spawn_link(tool) && !self.source.is_document())
+                {
                     let chat_id = self.chat_id.clone().unwrap_or_default();
                     let title = subagent_tab_title(&tool.call);
                     let frozen = matches!(
@@ -5793,6 +6064,7 @@ impl Transcript {
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme.text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    #[cfg(not(target_arch = "wasm32"))]
                                     this.spawn_blob_fetch(blob_ref.clone(), cx);
                                     cx.notify();
                                 }));
@@ -6129,7 +6401,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// lines, indentation intact, counted-tail truncation.
 fn detail_body(
     detail: &ToolDetail,
-    diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    diff_highlights: Option<Arc<crate::changes::presentation::DiffHighlights>>,
     theme: &Theme,
 ) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
@@ -6137,7 +6409,7 @@ fn detail_body(
         // No comment layer: an inline tool diff is a record of what the
         // agent already did, not a review surface.
         ToolDetail::Diff { file, .. } => body
-            .child(crate::changes::render_file_body_with_syntax(
+            .child(crate::changes::presentation::render_file_body_with_syntax(
                 file,
                 diff_highlights,
                 theme,
@@ -7017,6 +7289,134 @@ impl Render for Transcript {
 mod tests {
     use super::*;
     use zeron_doc::MessagePart;
+
+    #[test]
+    fn portable_highlighter_marks_fence_roles_without_tree_sitter() {
+        use zeron_syntax::HighlightKind;
+
+        let document = portable_highlight_document(
+            Lang::Rust,
+            "fn main() { let answer = 42; let label = \"ok\"; // note }",
+        );
+        let kinds = document.lines[0]
+            .iter()
+            .map(|span| span.kind)
+            .collect::<Vec<_>>();
+        for kind in [
+            HighlightKind::Keyword,
+            HighlightKind::Number,
+            HighlightKind::String,
+            HighlightKind::Comment,
+        ] {
+            assert!(kinds.contains(&kind), "missing {kind:?}: {kinds:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn document_notifications_update_rows_and_reset_identity(cx: &mut gpui::TestAppContext) {
+        let document = cx.new(|_| {
+            source::TranscriptDocument::new(
+                "first",
+                vec![assistant(
+                    "reply",
+                    MessageStatus::Streaming,
+                    vec![text_part("text", "Hello")],
+                )],
+            )
+        });
+        let transcript = cx.new(|cx| Transcript::from_document(document.clone(), true, cx));
+        let original_version = cx.read_entity(&transcript, |view, cx| {
+            assert_eq!(view.chat_id.as_deref(), Some("first"));
+            assert!(view.is_pinned());
+            assert!(!view.rows.is_empty());
+            view.with_entries(cx, |entries, echoes| {
+                assert!(echoes.is_empty());
+                assert_eq!(entries.as_ptr(), document.read(cx).entries().as_ptr());
+            });
+            view.rows[0].version
+        });
+        document.update(cx, |doc, cx| {
+            doc.update_entries(
+                |entries| {
+                    entries[0] = assistant(
+                        "reply",
+                        MessageStatus::Complete,
+                        vec![text_part("text", "Hello world")],
+                    );
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.read_entity(&transcript, |view, _| {
+            assert_ne!(view.rows[0].version, original_version);
+            assert_eq!(view.last_source.as_ref().unwrap().2, 1);
+        });
+        document.update(cx, |doc, cx| doc.replace("second", Vec::new(), cx));
+        cx.run_until_parked();
+        cx.read_entity(&transcript, |view, _| {
+            assert_eq!(view.chat_id.as_deref(), Some("second"));
+            assert_eq!(view.doc_override.as_deref(), Some("second"));
+            assert!(view.rows.is_empty());
+            assert!(view.row_cache.is_empty());
+            assert!(view.live_parsers.is_empty());
+            assert_eq!(view.last_source.as_ref().unwrap().2, 2);
+        });
+        document.update(cx, |doc, cx| {
+            doc.update_entries(
+                |entries| {
+                    entries.push(assistant(
+                        "new",
+                        MessageStatus::Complete,
+                        vec![text_part("text", "New doc")],
+                    ));
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.read_entity(&transcript, |view, _| {
+            assert!(!view.rows.is_empty());
+            assert!(view.rows.iter().all(|row| row.entry_id.as_ref() == "new"));
+            assert_eq!(view.last_source.as_ref().unwrap().2, 3);
+        });
+    }
+
+    #[gpui::test]
+    fn frozen_document_switch_does_not_start_following(cx: &mut gpui::TestAppContext) {
+        let document = cx.new(|_| source::TranscriptDocument::new("first", Vec::new()));
+        let transcript = cx.new(|cx| Transcript::from_document(document.clone(), false, cx));
+        document.update(cx, |doc, cx| doc.replace("second", Vec::new(), cx));
+        cx.run_until_parked();
+        cx.read_entity(&transcript, |view, _| {
+            assert!(!view.is_pinned());
+            assert!(view.land_end_pending);
+            assert!(!view.doc_live);
+        });
+    }
+
+    #[gpui::test]
+    fn document_missing_host_services_do_not_start_work(cx: &mut gpui::TestAppContext) {
+        let mut user = assistant(
+            "prompt",
+            MessageStatus::Complete,
+            vec![text_part("text", "hello")],
+        );
+        user.role = MessageRole::User;
+        user.status = None;
+        let document = cx.new(|_| source::TranscriptDocument::new("offline-doc", vec![user]));
+        let transcript = cx.new(|cx| Transcript::from_document(document, true, cx));
+        transcript.update(cx, |view, cx| {
+            assert!(view.render_working_trailer(cx).is_none(), "a local user row is not an in-flight send");
+            let devices = view.attachment_device_ids(cx);
+            assert_eq!(devices, ["offline-doc"]);
+            assert!(matches!(view.attachment_state(&devices, "/missing.png", cx),
+                crate::attachments::AttachmentSnapshot::Error { retry_in } if retry_in == Duration::MAX));
+            assert!(view.attachment_loads.is_empty());
+            assert!(view.attachment_retries.is_empty());
+            assert!(view.blob_details.is_empty());
+        });
+    }
 
     #[test]
     fn selection_scroll_ramps_at_viewport_edges() {
@@ -8285,12 +8685,15 @@ mod tests {
             entries: Vec<SessionMessageEntry>,
             cx: &mut Context<Transcript>,
         ) {
-            this.state.update(cx, |state, _| {
-                state.selected_chat = Some("chat".into());
-                state.transcript_replayed = true;
-                state.transcript = entries;
-                state.transcript_revision += 1;
-            });
+            this.source
+                .native()
+                .expect("native test source")
+                .update(cx, |state, _| {
+                    state.selected_chat = Some("chat".into());
+                    state.transcript_replayed = true;
+                    state.transcript = entries;
+                    state.transcript_revision += 1;
+                });
             this.sync(cx);
         }
 
@@ -8416,15 +8819,18 @@ mod tests {
                 transcript.update(cx, |this, cx| {
                     feed(this, vec![prompt("prompt")], cx);
                     this.rail_enabled = false;
-                    this.state.update(cx, |state, _| {
-                        state.sessions.push(zeron_proto::Session {
-                            chat_id: "chat".into(),
-                            device_id: "test".into(),
-                            status: zeron_proto::SessionStatus::Working,
-                            started_at: Some(chrono::Utc::now()),
-                            updated_at: chrono::Utc::now(),
-                        })
-                    });
+                    this.source
+                        .native()
+                        .expect("native test source")
+                        .update(cx, |state, _| {
+                            state.sessions.push(zeron_proto::Session {
+                                chat_id: "chat".into(),
+                                device_id: "test".into(),
+                                status: zeron_proto::SessionStatus::Working,
+                                started_at: Some(chrono::Utc::now()),
+                                updated_at: chrono::Utc::now(),
+                            })
+                        });
                     this.on_own_send("chat".into(), "prompt".into(), cx);
                 });
                 let entries = |status, text: &str| {
@@ -8826,7 +9232,13 @@ mod tests {
                 assert!(!transcript.read(cx).own_turn.as_ref().unwrap().held);
                 let before = transcript.read(cx).list.logical_scroll_top();
                 transcript.update(cx, |this, cx| {
-                    let mut entries = this.state.read(cx).transcript.clone();
+                    let mut entries = this
+                        .source
+                        .native()
+                        .expect("native test source")
+                        .read(cx)
+                        .transcript
+                        .clone();
                     entries.push(assistant(
                         "reply",
                         MessageStatus::Streaming,
@@ -9036,7 +9448,13 @@ mod tests {
                         assert!(!transcript.read(cx).pinned);
                         let before = transcript.read(cx).list.logical_scroll_top();
                         transcript.update(cx, |this, cx| {
-                            let mut entries = this.state.read(cx).transcript.clone();
+                            let mut entries = this
+                                .source
+                                .native()
+                                .expect("native test source")
+                                .read(cx)
+                                .transcript
+                                .clone();
                             entries.push(assistant(
                                 "reply",
                                 MessageStatus::Streaming,
@@ -9640,7 +10058,7 @@ mod tests {
 
     #[test]
     fn tool_diff_builds_real_hunks_with_context_and_numbers() {
-        use crate::changes::LineKind;
+        use crate::changes::presentation::LineKind;
         let old = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let mut new = old.clone();
         new[9] = "LINE 10".into();
@@ -9694,7 +10112,7 @@ mod tests {
         else {
             panic!("expected diff detail");
         };
-        assert_eq!(file.status, crate::changes::FileStatus::Added);
+        assert_eq!(file.status, crate::changes::presentation::FileStatus::Added);
         assert!(old_text.is_none());
         assert_eq!(new_text.as_deref(), Some("only\n"));
 

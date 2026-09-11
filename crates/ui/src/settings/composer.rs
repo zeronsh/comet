@@ -65,43 +65,62 @@ pub struct ComposerDefaults {
 impl ComposerDefaults {
     /// Load from `{data_dir}/composer-defaults.json`; defaults on any failure.
     pub fn load(data_dir: &Path) -> Self {
-        match std::fs::read_to_string(Self::path(data_dir)) {
-            Ok(text) => match serde_json::from_str::<ComposerDefaults>(&text) {
+        let stored = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                crate::settings::browser_storage::load(data_dir, FILE_NAME)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::fs::read_to_string(Self::path(data_dir)).map(Some)
+            }
+        };
+        match stored {
+            Ok(Some(text)) => match serde_json::from_str::<ComposerDefaults>(&text) {
                 Ok(defaults) => defaults,
                 Err(err) => {
                     tracing::warn!(error = %err, "composer-defaults corrupt; using defaults");
                     Self::default()
                 }
             },
-            Err(_) => Self::default(),
+            Ok(None) | Err(_) => Self::default(),
         }
     }
 
     /// Write atomically (temp file + rename) so a crash mid-write never corrupts.
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(data_dir)?;
-        let path = Self::path(data_dir);
-        // Each writer owns its temporary file; overlapping windows must not
-        // truncate or rename one another's in-progress writes.
-        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-        let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            #[cfg(unix)]
-            std::fs::File::open(data_dir)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let json = serde_json::to_string_pretty(self)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            return crate::settings::browser_storage::save(data_dir, FILE_NAME, &json);
         }
-        result
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::fs::create_dir_all(data_dir)?;
+            let path = Self::path(data_dir);
+            // Each writer owns its temporary file; overlapping windows must not
+            // truncate or rename one another's in-progress writes.
+            let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+            let json = serde_json::to_vec_pretty(self)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let result = (|| {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)?;
+                file.write_all(&json)?;
+                file.sync_all()?;
+                std::fs::rename(&tmp, &path)?;
+                #[cfg(unix)]
+                std::fs::File::open(data_dir)?.sync_all()?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            result
+        }
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {

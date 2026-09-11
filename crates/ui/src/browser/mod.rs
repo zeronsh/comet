@@ -3,10 +3,14 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_arch = "wasm32")]
+mod web;
 #[cfg(target_os = "linux")]
 use linux as native;
 #[cfg(target_os = "macos")]
 use macos as native;
+#[cfg(target_arch = "wasm32")]
+use web as native;
 pub mod model;
 mod view;
 
@@ -91,7 +95,7 @@ pub struct BrowserSurface {
     fixture_preview_open: std::rc::Rc<std::cell::Cell<Option<gpui::Point<gpui::Pixels>>>>,
     presentation: Presentation,
     _input_sub: Subscription,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_arch = "wasm32"))]
     native: Option<native::NativePage>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     native_tx: tokio::sync::mpsc::Sender<native::NativeEvent>,
@@ -164,7 +168,7 @@ impl BrowserSurface {
             fixture_preview_open: Default::default(),
             presentation: Presentation::Hidden,
             _input_sub: input_sub,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_arch = "wasm32"))]
             native: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             native_tx,
@@ -182,6 +186,46 @@ impl BrowserSurface {
     }
     pub fn set_remote(&mut self, remote: bool) {
         self.remote = remote;
+    }
+
+    fn preview_address(&self, service: &zeron_proto::PreviewService) -> Option<String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            native::preview_url(&service.device_id, &service.id)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Some(service.url(self.previews.proxy_port))
+        }
+    }
+
+    fn navigate_preview(
+        &mut self,
+        service: &zeron_proto::PreviewService,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(url) = self.preview_address(service) else {
+            self.validation = Some("This preview has an invalid route.".into());
+            cx.notify();
+            return;
+        };
+        self.navigate(&url, window, cx);
+    }
+
+    fn embeds_page(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.native.is_some()
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
+        {
+            false
+        }
     }
     pub fn set_shortcuts(&mut self, keymap: &crate::settings::KeymapConfig) {
         #[cfg(target_os = "macos")]
@@ -212,7 +256,7 @@ impl BrowserSurface {
             return;
         }
         self.presentation = presentation;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_arch = "wasm32"))]
         if let Some(native) = &mut self.native {
             native.present(presentation);
         }
@@ -327,7 +371,29 @@ impl BrowserSurface {
             }
             window.focus(&self.focus, cx);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if native::is_preview_url(&url) {
+                let result = if let Some(native) = &self.native {
+                    native.load(&url)
+                } else {
+                    native::NativePage::new(&url).map(|native| {
+                        native.present(self.presentation);
+                        self.native = Some(native);
+                    })
+                };
+                self.page.loading = false;
+                if let Err(error) = result {
+                    self.page.error = Some(format!("Could not open this preview: {error}"));
+                }
+            } else {
+                self.native = None;
+                cx.open_url(&url);
+            }
+            let _ = window;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
         {
             let _ = window;
             cx.open_url(&url);
@@ -353,7 +419,15 @@ impl BrowserSurface {
             }
             self.page.error = None;
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+
+        #[cfg(target_arch = "wasm32")]
+        if let Some(native) = &self.native {
+            native.reload();
+            self.page.error = None;
+        } else {
+            self.open_external(cx);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_arch = "wasm32")))]
         self.open_external(cx);
         cx.notify();
     }
@@ -385,6 +459,11 @@ impl BrowserSurface {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn clear_web_page(&mut self) {
+        self.native = None;
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.set_presentation(Presentation::Hidden, cx);
         self.clear_favicon(cx);
@@ -404,6 +483,9 @@ impl BrowserSurface {
                 self.favicon_generation += 1;
             }
         }
+
+        #[cfg(target_arch = "wasm32")]
+        self.clear_web_page();
     }
 }
 

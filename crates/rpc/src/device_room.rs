@@ -22,19 +22,20 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
+use tokio::task::{AbortHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+pub use crate::device_frame::{
+    DeviceFrameHeader, ECHO_KIND, RELAY_KIND, RPC_KIND, decode_device_frame, encode_device_frame,
+    relay_error_code,
+};
+use crate::device_frame::{ECHO_DEADLINE_MS, PING_INTERVAL_MS, PING_TEXT, SILENCE_LEASE_MS};
 use crate::{RpcClient, RpcError, RpcService, serve_connection};
 
-/// Relay-emitted control frames. MUST byte-match the DO's `RELAY_KIND` (yes, it has a
-/// leading space — clients compare with equality; a mismatch makes host_offline invisible).
-pub const RELAY_KIND: &str = " relay";
 /// Durable command nudge frames (§7 cold-chat delivery): payload `{chatId}`.
 pub const NUDGE_KIND: &str = "nudge";
-/// The RPC stream over the relay: both `s` (stream id) and `k` (kind) are `"rpc"`.
-pub const RPC_KIND: &str = "rpc";
 
 /// Relay error codes (payload `{"error": code}` on [`RELAY_KIND`] frames).
 pub const HOST_OFFLINE: &str = "host_offline";
@@ -46,37 +47,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Text `"ping"` keepalive — answered by the DO's hibernation-safe auto-response
-/// pair (`edge/src/device-room.ts`) without waking it.
-///
-/// 10s, not 30: a laptop's uplink (corporate proxy, VPN split-tunnel extension,
-/// consumer NAT) can reap an idle flow well inside a minute, and a keepalive
-/// that races the reaper loses. The frame is 4 bytes and never wakes the DO, so
-/// the only cost of shortening the interval is that the host stays reachable —
-/// and a tight interval is what lets the silence lease below stay short.
-const PING_INTERVAL: Duration = Duration::from_secs(10);
-/// Silence lease: every ping elicits an auto-pong, so a healthy socket sees
-/// inbound traffic at least once per `PING_INTERVAL`. No inbound frame for a
-/// couple of intervals plus grace = dead socket (half-open TCP after NAT
-/// timeout or sleep/wake) — drop it and reconnect instead of waiting on a TCP
-/// write error. 25s tolerates one lost pong (pings at +10/+20) before ruling
-/// the socket dead; the old 40s left sends wedged for most of a minute after
-/// an unnoticed drop. Must stay well under the relay's own host-liveness
-/// window (`HOST_LIVENESS_MS`, edge/src/device-room.ts) so a host replaces
-/// its dead socket before the relay gives up on the device.
-const SILENCE_LEASE: Duration = Duration::from_secs(25);
-/// App-level end-to-end liveness for the CLIENT link. The transport lease
-/// above proves only the client↔edge leg — the DO's auto-pong answers from
-/// the edge, so a link whose edge↔host leg is dead still looks healthy and
-/// retries frames into the void indefinitely (2026-08-19 incident: a peer
-/// link sat dead for 6 minutes until an unrelated token refresh cycled the
-/// host session). The client rides an `echo` frame on every keepalive; the
-/// HOST echoes it back. Silence past this deadline on a link that HAS echoed
-/// before = zombie relay path → drop and redial. Feature-detected: a link
-/// that never echoed (old host) keeps the transport-lease-only behavior, and
-/// inbound RPC frames count as echoes (end-to-end proof either way).
-const ECHO_KIND: &str = "echo";
-const ECHO_DEADLINE: Duration = Duration::from_secs(20);
+/// Native duration forms of the portable DeviceRoom liveness protocol constants.
+const PING_INTERVAL: Duration = Duration::from_millis(PING_INTERVAL_MS as u64);
+const SILENCE_LEASE: Duration = Duration::from_millis(SILENCE_LEASE_MS as u64);
+const ECHO_DEADLINE: Duration = Duration::from_millis(ECHO_DEADLINE_MS as u64);
 
 // Test seam: the consts above stay the production truth; integration tests
 // compress the client-link clocks so the zombie-path regression runs in
@@ -102,107 +76,6 @@ fn client_echo_deadline() -> Duration {
         0 => ECHO_DEADLINE,
         ms => Duration::from_millis(ms),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Frame codec
-// ---------------------------------------------------------------------------
-
-/// The JSON frame header. Field order matters for byte-parity with the TS encoder
-/// (`JSON.stringify` of `{s, k, to?, from?}`); absent routing keys are omitted, not null.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceFrameHeader {
-    /// Stream id, unique per (connId, logical stream).
-    pub s: String,
-    /// Stream kind: `"rpc"` | `"term"` | … — opaque to the relay.
-    pub k: String,
-    /// Routing: host → client target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    /// Routing: client → host origin (stamped by the relay).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from: Option<String>,
-}
-
-impl DeviceFrameHeader {
-    pub fn new(s: impl Into<String>, k: impl Into<String>) -> Self {
-        Self {
-            s: s.into(),
-            k: k.into(),
-            to: None,
-            from: None,
-        }
-    }
-
-    pub fn with_to(mut self, conn_id: impl Into<String>) -> Self {
-        self.to = Some(conn_id.into());
-        self
-    }
-}
-
-/// Encode `uleb128(header_len) ‖ header JSON ‖ payload`.
-pub fn encode_device_frame(
-    header: &DeviceFrameHeader,
-    payload: &[u8],
-) -> Result<Vec<u8>, RpcError> {
-    let json = serde_json::to_vec(header)
-        .map_err(|e| RpcError::Transport(format!("encode frame header: {e}")))?;
-    let mut out = Vec::with_capacity(json.len() + payload.len() + 5);
-    let mut n = json.len();
-    loop {
-        let mut byte = (n & 0x7f) as u8;
-        n >>= 7;
-        if n != 0 {
-            byte |= 0x80;
-        }
-        out.push(byte);
-        if n == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&json);
-    out.extend_from_slice(payload);
-    Ok(out)
-}
-
-/// Decode a device frame; the payload is the remainder after the JSON header.
-pub fn decode_device_frame(bytes: &[u8]) -> Result<(DeviceFrameHeader, Vec<u8>), RpcError> {
-    let bad = |m: &str| RpcError::Transport(format!("device frame: {m}"));
-    let mut offset = 0usize;
-    let mut len: usize = 0;
-    let mut shift = 0u32;
-    loop {
-        let byte = *bytes.get(offset).ok_or_else(|| bad("truncated uleb128"))?;
-        offset += 1;
-        if shift >= 32 {
-            return Err(bad("uleb128 overflow"));
-        }
-        len |= ((byte & 0x7f) as usize) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    let header_end = offset
-        .checked_add(len)
-        .ok_or_else(|| bad("header length overflow"))?;
-    let header_bytes = bytes
-        .get(offset..header_end)
-        .ok_or_else(|| bad("truncated header"))?;
-    let header: DeviceFrameHeader =
-        serde_json::from_slice(header_bytes).map_err(|e| bad(&format!("bad header JSON: {e}")))?;
-    Ok((header, bytes[header_end..].to_vec()))
-}
-
-/// Extract the error code from a relay control payload (`{"error": code}`).
-pub fn relay_error_code(payload: &[u8]) -> Option<String> {
-    #[derive(Deserialize)]
-    struct RelayError {
-        error: String,
-    }
-    serde_json::from_slice::<RelayError>(payload)
-        .ok()
-        .map(|e| e.error)
 }
 
 /// Build the device-room WebSocket URL from the http(s) edge base URL.
@@ -263,10 +136,18 @@ impl TokenSource for StaticToken {
 /// open it and drain"); the engine warms/opens the chat doc.
 pub type NudgeHandler = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Handles a non-RPC device frame and returns its response payload. The relay
+/// always routes a returned payload only to the originating client.
+pub type FrameHandler = Arc<
+    dyn Fn(String, Vec<u8>) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> + Send + Sync,
+>;
+
 pub struct HostRelayConfig {
     /// Edge base URL (`http(s)://…`; rewritten to `ws(s)` for the socket).
     pub edge_url: String,
     pub device_id: String,
+    /// Optional owner-visible label registered with the browser device directory.
+    pub device_name: Option<String>,
     pub token: Arc<dyn TokenSource>,
     /// Reconnect delay after a session ends (a small jitter is added).
     pub retry: Duration,
@@ -281,10 +162,29 @@ impl HostRelayConfig {
         Self {
             edge_url: edge_url.into(),
             device_id: device_id.into(),
+            device_name: None,
             token,
             retry: Duration::from_secs(5),
         }
     }
+
+    pub fn with_device_name(mut self, name: impl Into<String>) -> Self {
+        self.device_name = Some(name.into());
+        self
+    }
+}
+
+
+fn query_component(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut encoded, byte| {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(encoded, "%{byte:02X}").expect("writing a string cannot fail");
+        }
+        encoded
+    })
 }
 
 /// The host end of the relay: one outbound WebSocket to our own DeviceRoom DO, serving
@@ -302,6 +202,15 @@ impl HostRelay {
         service: Arc<dyn RpcService>,
         on_nudge: NudgeHandler,
     ) -> Self {
+        Self::spawn_with_frame(config, service, on_nudge, None)
+    }
+
+    pub fn spawn_with_frame(
+        config: HostRelayConfig,
+        service: Arc<dyn RpcService>,
+        on_nudge: NudgeHandler,
+        on_frame: Option<FrameHandler>,
+    ) -> Self {
         let task = tokio::spawn(async move {
             let mut wake = zeron_sync::wake::subscribe();
             let mut online = zeron_sync::wake::subscribe_online();
@@ -315,16 +224,20 @@ impl HostRelay {
             let mut delay = HOST_REJOIN_MIN;
             loop {
                 if let Some(token) = config.token.token().await {
-                    let url = device_room_ws_url(
+                    let mut url = device_room_ws_url(
                         &config.edge_url,
                         &config.device_id,
                         "host",
                         None,
                         &token,
                     );
+                    if let Some(name) = config.device_name.as_deref() {
+                        url.push_str("&name=");
+                        url.push_str(&query_component(name));
+                    }
                     let started = tokio::time::Instant::now();
                     let outcome = {
-                        let session = host_session(&url, &service, &on_nudge);
+                        let session = host_session(&url, &service, &on_nudge, &on_frame);
                         tokio::pin!(session);
                         loop {
                             tokio::select! {
@@ -441,11 +354,64 @@ fn make_virtual_conn(
     VirtualConn { in_tx }
 }
 
+/// Preview relay work is owned by the browser client that started it. The
+/// WebSocket's `client_closed` control frame aborts only that client's requests;
+/// ending the host session aborts and joins every remaining request.
+struct PreviewTasks {
+    tasks: JoinSet<u64>,
+    active: HashMap<u64, (String, AbortHandle)>,
+    next: u64,
+}
+
+impl PreviewTasks {
+    fn spawn<F>(&mut self, client: String, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if self
+            .active
+            .values()
+            .filter(|(owner, _)| owner == &client)
+            .count()
+            >= 16
+        {
+            tracing::warn!(%client, "device-room: preview request limit reached");
+            return;
+        }
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        let handle = self.tasks.spawn(async move {
+            future.await;
+            id
+        });
+        self.active.insert(id, (client, handle));
+    }
+
+    fn abort_client(&mut self, client: &str) {
+        for (owner, handle) in self.active.values() {
+            if owner == client {
+                handle.abort();
+            }
+        }
+    }
+
+    fn reap(&mut self) {
+        self.active.retain(|_, (_, handle)| !handle.is_finished());
+    }
+
+    async fn shutdown(&mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        self.active.clear();
+    }
+}
+
 /// One relay session: connect as host, serve RPC per client conn, until the socket drops.
 async fn host_session(
     url: &str,
     service: &Arc<dyn RpcService>,
     on_nudge: &NudgeHandler,
+    on_frame: &Option<FrameHandler>,
 ) -> Result<(), RpcError> {
     let ws = zeron_sync::dial::connect_ws(url)
         .await
@@ -455,6 +421,12 @@ async fn host_session(
     // All writers (per-conn pumps) funnel through one outbound queue → one socket writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
     let mut conns: HashMap<String, VirtualConn> = HashMap::new();
+
+    let mut preview_tasks = PreviewTasks {
+        tasks: JoinSet::new(),
+        active: HashMap::new(),
+        next: 0,
+    };
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
@@ -473,7 +445,7 @@ async fn host_session(
             message = stream.next() => match message {
                 Some(Ok(WsMessage::Binary(bytes))) => {
                     last_rx = tokio::time::Instant::now();
-                    handle_host_frame(&bytes, &mut conns, service, &out_tx, on_nudge).await;
+                    handle_host_frame(&bytes, &mut conns, &mut preview_tasks, service, &out_tx, on_nudge, on_frame).await;
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
                     if let Some(frame) = frame {
@@ -486,6 +458,11 @@ async fn host_session(
                 // Text "pong" / control frames: proof of life for the lease.
                 Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
             },
+            joined = preview_tasks.tasks.join_next(), if !preview_tasks.tasks.is_empty() => {
+                let _ = joined;
+                preview_tasks.reap();
+            }
+
             _ = ping.tick() => {
                 if let Err(err) = sink.send(WsMessage::Text("ping".into())).await {
                     // The usual way a silently-reaped uplink surfaces: reads
@@ -502,15 +479,20 @@ async fn host_session(
     }
     // Dropping the conns aborts every per-client dispatch loop (terminals etc. reaped).
     conns.clear();
+    preview_tasks.shutdown().await;
     Ok(())
 }
 
 async fn handle_host_frame(
     bytes: &[u8],
     conns: &mut HashMap<String, VirtualConn>,
+
+    preview_tasks: &mut PreviewTasks,
     service: &Arc<dyn RpcService>,
     out_tx: &mpsc::Sender<Vec<u8>>,
     on_nudge: &NudgeHandler,
+
+    on_frame: &Option<FrameHandler>,
 ) {
     let (header, payload) = match decode_device_frame(bytes) {
         Ok(frame) => frame,
@@ -526,6 +508,8 @@ async fn handle_host_frame(
         if let Some(conn_id) = header.from.as_deref().or(header.to.as_deref()) {
             tracing::debug!(conn = %conn_id, %code, "device-room: client conn torn down");
             conns.remove(conn_id);
+
+            preview_tasks.abort_client(conn_id);
         }
         return;
     }
@@ -559,6 +543,24 @@ async fn handle_host_frame(
         }
         return;
     }
+    if header.k == "preview"
+        && let (Some(from), Some(handler)) = (header.from.clone(), on_frame)
+    {
+        let kind = header.k;
+        let stream = header.s;
+        let out = out_tx.clone();
+        let handler = handler.clone();
+        preview_tasks.spawn(from.clone(), async move {
+            if let Some(payload) = handler(kind.clone(), payload).await {
+                let reply = DeviceFrameHeader::new(stream, kind).with_to(from);
+                if let Ok(frame) = encode_device_frame(&reply, &payload) {
+                    let _ = out.send(frame).await;
+                }
+            }
+        });
+        return;
+    }
+
     if header.k != RPC_KIND {
         return; // future stream kinds (term, tunnel)
     }
@@ -674,7 +676,7 @@ impl DeviceLink {
                         Some(Ok(_)) => last_rx = tokio::time::Instant::now(),
                     },
                     _ = ping.tick() => {
-                        if sink.send(WsMessage::Text("ping".into())).await.is_err() {
+                        if sink.send(WsMessage::Text(PING_TEXT.into())).await.is_err() {
                             break "connection lost".to_string();
                         }
                         if !echo_frame.is_empty()
@@ -1168,5 +1170,7 @@ mod tests {
         );
         let host = device_room_ws_url("http://localhost:26640", "d", "host", None, "t");
         assert_eq!(host, "ws://localhost:26640/device/d/ws?role=host&token=t");
+
+        assert_eq!(query_component("Studio Mac/2"), "Studio%20Mac%2F2");
     }
 }

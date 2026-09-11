@@ -49,13 +49,18 @@ pub mod transcript;
 pub mod typography;
 mod workspace_links;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 use futures::StreamExt as _;
+#[cfg(not(target_arch = "wasm32"))]
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
+
+#[cfg(not(target_arch = "wasm32"))]
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).
@@ -80,6 +85,8 @@ pub struct UiConfig {
     pub initial_url: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+
 impl UiConfig {
     fn boot(&self) -> EngineBootConfig {
         EngineBootConfig {
@@ -94,6 +101,8 @@ impl UiConfig {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+
 /// What a dock-icon reopen needs to rebuild the main window after ⌘W closed it
 /// (macOS keeps the process alive with just the menu bar, like zed).
 struct ReopenState {
@@ -101,7 +110,11 @@ struct ReopenState {
     boot: EngineBootConfig,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+
 impl gpui::Global for ReopenState {}
+
+#[cfg(not(target_arch = "wasm32"))]
 
 /// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
@@ -208,6 +221,8 @@ pub fn run_app(config: UiConfig) {
         cx.activate(true);
     });
 }
+
+#[cfg(not(target_arch = "wasm32"))]
 
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is

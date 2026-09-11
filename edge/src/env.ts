@@ -1,6 +1,8 @@
 export interface Env {
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
+  /** Single durable authority for browser login transactions and sessions. */
+  BROWSER_SESSIONS: DurableObjectNamespace;
   PREVIEW_ROOMS: DurableObjectNamespace;
   /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
    * replacement for the Loro workspace doc (docs/registry-sync.md). */
@@ -22,6 +24,23 @@ export interface Env {
    * routes (code exchange, refresh, orgs). Unset ⇒ those routes answer 501,
    * matching the old apps/server dev-mode behavior. */
   WORKOS_API_KEY?: string;
+  /** Browser BFF deployment inputs; unset makes only browser auth unavailable. */
+  WORKOS_BROWSER_ORIGIN?: string;
+  WORKOS_BROWSER_OWNER_SUBJECT?: string;
+  /** Dedicated secret used to encrypt recoverable provider refresh credentials. */
+  BROWSER_SESSION_KEY?: string;
+
+  /** Dedicated origin that serves untrusted remote preview bytes, never the app BFF. */
+  BROWSER_PREVIEW_ORIGIN?: string;
+  /** Explicit loopback-only owner for local browser/engine integration tests. */
+  BROWSER_DEV_OWNER_SUBJECT?: string;
+  BROWSER_DEV_ORGANIZATION_ID?: string;
+
+  /** Fixed loopback origin accepted by the local browser proxy. */
+  BROWSER_DEV_ORIGIN?: string;
+
+  /** Ephemeral capability shared only by the loopback development proxy and worker. */
+  BROWSER_DEV_PROXY_KEY?: string;
 }
 
 /** Header the Worker stamps on requests it forwards into DOs after verifying

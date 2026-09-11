@@ -13,9 +13,17 @@ import type { Env } from "./env";
 
 const API = "https://api.workos.com";
 
-/** Thrown for rejected WorkOS calls; routes map it to 401 (same as the old
- * server's WorkOsAuthFailed). */
-export class WorkOsAuthFailed extends Error {}
+/** A classified WorkOS failure. Native routes preserve their legacy 401 mapping;
+ * browser routes expose only the classification, never provider error text. */
+export class WorkOsAuthFailed extends Error {
+  constructor(
+    message = "authentication failed",
+    readonly kind: "invalid" | "rate_limited" | "unavailable" = "invalid",
+    readonly retryAfterSeconds?: number
+  ) {
+    super(message);
+  }
+}
 
 export interface ExchangeResult {
   readonly user: {
@@ -66,7 +74,11 @@ const failed = async (res: Response): Promise<never> => {
   } catch {
     /* non-JSON error body */
   }
-  throw new WorkOsAuthFailed(message);
+  const retryAfter = Number(res.headers.get("retry-after"));
+  const retryAfterSeconds =
+    Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(Math.ceil(retryAfter), 60) : undefined;
+  const kind = res.status === 429 ? "rate_limited" : res.status >= 500 ? "unavailable" : "invalid";
+  throw new WorkOsAuthFailed(message, kind, retryAfterSeconds);
 };
 
 const post = async (apiKey: string, path: string, body: unknown): Promise<Response> =>
@@ -105,6 +117,40 @@ export const exchange = async (env: Env, apiKey: string, code: string): Promise<
   };
 };
 
+
+/** Browser-only code exchange. Native code-only sign-in intentionally remains
+ * on `exchange`; callers must supply an RFC 7636 S256 verifier here. */
+export const exchangeWithVerifier = async (
+  env: Env,
+  apiKey: string,
+  code: string,
+  codeVerifier: string
+): Promise<ExchangeResult> => {
+  const res = await fetch(`${API}/user_management/authenticate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id: env.WORKOS_CLIENT_ID,
+      client_secret: apiKey,
+      grant_type: "authorization_code",
+      code,
+      code_verifier: codeVerifier
+    })
+  });
+  if (!res.ok) return failed(res);
+  const r = (await res.json()) as WireAuthResponse;
+  return {
+    user: {
+      id: r.user.id,
+      email: r.user.email,
+      firstName: r.user.first_name,
+      lastName: r.user.last_name
+    },
+    accessToken: r.access_token,
+    refreshToken: r.refresh_token
+  };
+};
+
 /** `authenticateWithRefreshToken`; passing `organizationId` scopes the session
  * to that org (the next access token carries `org_id`). */
 export const refresh = async (
@@ -127,6 +173,14 @@ export const refresh = async (
   if (!res.ok) return failed(res);
   const r = (await res.json()) as WireAuthResponse;
   return { accessToken: r.access_token, refreshToken: r.refresh_token };
+};
+
+
+/** End one provider session. Browser routes never accept an arbitrary session
+ * id; their caller must present a broker-issued grant bound to this value. */
+export const revokeSession = async (apiKey: string, sessionId: string): Promise<void> => {
+  const res = await post(apiKey, "/user_management/sessions/revoke", { session_id: sessionId });
+  if (!res.ok) return failed(res);
 };
 
 /** The user's active organization memberships. */

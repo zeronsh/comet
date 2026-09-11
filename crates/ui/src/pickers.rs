@@ -14,15 +14,19 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
     Subscription, Task, Window, div, prelude::*, px,
 };
 
-use zeron_engine::registry::HarnessDescriptor;
 use zeron_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
+    ChatConfig, FolderListing, HarnessDescriptor, HarnessId, Model, ReasoningLevel, RepoRef,
+    SandboxLevel, Space, descriptor_enabled,
 };
 use zeron_rpc::methods;
 
@@ -2174,39 +2178,7 @@ impl Pickers {
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
-        div()
-            .id(id)
-            .h(px(32.0))
-            .max_w(px(248.0))
-            // Shrinkable under row pressure — four footer chips share one
-            // line; without min_w_0 they overflowed and painted overlapped.
-            .min_w_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .rounded(px(8.0))
-            .text_size(crate::typography::ui_rems(12.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            // zeron composer/styles.tsx `pill`: `transition-colors` — the wash
-            // and text brighten fade over 150ms.
-            .text_color(motion::hover_blend(
-                id,
-                if set {
-                    theme.text.opacity(0.9)
-                } else {
-                    theme.text_muted
-                },
-                theme.text,
-            ))
-            .bg(if open {
-                theme.element_hover
-            } else {
-                motion::hover_blend(id, gpui::transparent_black(), theme.element_hover)
-            })
-            .on_hover(motion::hover_listener(id))
-            .cursor_pointer()
+        presentation::trigger_chip(id, set, open, theme)
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, _, _, _| {
@@ -3062,16 +3034,7 @@ impl Pickers {
         //    viewed tab wears a 2px accent bar sitting on the row's bottom
         //    hairline. Tabs never hide: a live search only filters the
         //    viewed tab's list, so switching tabs re-scopes the same query.
-        let mut tabs = div()
-            .flex_none()
-            .h(px(40.0))
-            .px(px(6.0))
-            .border_b_1()
-            .border_color(crate::theme::hairline(0.08))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(2.0));
+        let mut tabs = presentation::models::tabs();
         tabs = tabs.child(
             div()
                 .id("model-tab-favorites")
@@ -3111,65 +3074,26 @@ impl Pickers {
             let harness = descriptor.id;
             let is_viewed = !favorites_view && effective == Some(harness);
             let is_disabled = locked && effective != Some(harness);
-            let (icon_path, tint) = harness_brand_icon(harness);
-            tabs =
-                tabs.child(
-                    div()
-                        .id(("harness-tab", ix))
-                        .relative()
-                        .w(px(32.0))
-                        .h(px(32.0))
-                        .rounded(px(8.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .when(is_disabled, |el| el.opacity(0.35))
-                        .when(!is_disabled, |el| el.cursor_pointer())
-                        .when(!is_disabled && !is_viewed, |el| {
-                            el.hover(|s| s.bg(crate::theme::ink(0.06)))
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.model_rail = ModelRail::Harness;
-                            this.pick_harness(harness, cx);
-                            cx.notify();
-                        }))
-                        .child(crate::icons::icon(icon_path).size(px(16.0)).text_color(
-                            tint.unwrap_or(if is_viewed {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            }),
-                        ))
-                        .when(is_viewed, |el| el.child(tab_indicator(theme.accent))),
-                );
+            tabs = tabs.child(
+                presentation::models::harness_tab(
+                    ("harness-tab", ix),
+                    harness,
+                    is_viewed,
+                    is_disabled,
+                    &theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.model_rail = ModelRail::Harness;
+                    this.pick_harness(harness, cx);
+                    cx.notify();
+                })),
+            );
         }
 
         // ── search row: icon + borderless input over a full-bleed hairline.
         //    The placeholder names the scope — the query never leaves the
         //    viewed tab (user request; the old global search hid the rail).
-        let search_row = div()
-            .flex_none()
-            .h(px(40.0))
-            .px(px(10.0))
-            .border_b_1()
-            .border_color(crate::theme::hairline(0.08))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(
-                crate::icons::icon(crate::icons::MAGNIFER)
-                    .size(px(14.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.7)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .child(self.search.clone()),
-            );
+        let search_row = presentation::models::search_row(self.search.clone(), &theme);
 
         // ── model rows: a VIRTUALIZED uniform list — only the visible slice
         //    renders, so a 7k-model catalog scrolls as smoothly as seven
@@ -3235,15 +3159,7 @@ impl Pickers {
         };
 
         let model_scrollbar = self.render_model_scrollbar(&theme, cx);
-        let list_host = div()
-            .id("model-list-scroll-host")
-            .relative()
-            .flex_none()
-            .h(px(LIST_HEIGHT))
-            .py(px(6.0))
-            // A whisper of wash keeps the scrolling band readable between
-            // the pinned chrome above and the traits tray below.
-            .bg(crate::theme::ink(0.02))
+        let list_host = presentation::models::list_host()
             .on_hover(cx.listener(Self::on_model_list_hover))
             .child(match model_list {
                 Some(list) => list,
@@ -3286,12 +3202,7 @@ impl Pickers {
                 .into_any_element()
         });
 
-        div()
-            .flex()
-            .flex_col()
-            .child(tabs)
-            .child(search_row)
-            .child(list_host)
+        presentation::models::content(tabs, search_row, list_host)
             .children(tray)
             .into_any_element()
     }
@@ -3331,27 +3242,7 @@ impl Pickers {
             .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(harness_name.as_ref()))
             .map(|d| SharedString::from(d.to_owned()));
         let compact = self.model_rail == ModelRail::Harness;
-        let mut el = div()
-            .id(("model-row", ix))
-            .px(px(8.0))
-            .py(px(if compact { 5.0 } else { 6.0 }))
-            .rounded(px(6.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(10.0))
-            .cursor_pointer();
-        // ONE moving highlight (t3/Base-UI combobox): hovering moves the
-        // keyboard cursor instead of painting its own wash, so hover + arrow
-        // cursor can never wear two washes at once. Selection is the
-        // distinct stronger treatment (wash + ring).
-        if is_selected {
-            el = el
-                .bg(crate::theme::card_selected_bg())
-                .shadow(crate::theme::card_selected_shadows());
-        } else if is_active {
-            el = el.bg(crate::theme::ink(0.05));
-        }
+        let mut el = presentation::models::row(ix, compact, is_selected, is_active);
         el = el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && this.active != ix {
                 this.active = ix;
@@ -3365,34 +3256,7 @@ impl Pickers {
         // visible). The favorites tab mixes harnesses and keeps the
         // two-line layout with the brand subline.
         let body: AnyElement = if compact {
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .max_w_full()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(12.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(label),
-                )
-                .when_some(attribution, |el, attribution| {
-                    el.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(theme.text_muted.opacity(0.7))
-                            .child(attribution),
-                    )
-                })
-                .into_any_element()
+            presentation::models::compact_body(label, attribution, &theme)
         } else {
             div()
                 .flex_1()
@@ -3674,17 +3538,7 @@ fn scoped_model_rows<'a>(
                 if !in_scope(descriptor, model) {
                     continue;
                 }
-                let by_label = popover::match_rank(query, &model.label);
-                let by_description = popover::match_rank(
-                    query,
-                    &format!(
-                        "{} {}",
-                        model.description.as_deref().unwrap_or(""),
-                        model.label
-                    ),
-                )
-                .map(|rank| rank + 2);
-                if let Some(rank) = by_label.into_iter().chain(by_description).min() {
+                if let Some(rank) = presentation::models::match_rank(query, model) {
                     let starred = !is_favorite(descriptor.id, &model.id);
                     ranked.push((rank, starred as usize, input_ix, row(descriptor, model)));
                 }
@@ -3728,17 +3582,7 @@ fn scoped_model_rows<'a>(
     }
 }
 
-/// Centered muted note filling an empty model list ("No models found").
-fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
-    div()
-        .px(px(8.0))
-        .py(px(24.0))
-        .text_size(crate::typography::ui_rems(12.0))
-        .text_color(theme.text_muted.opacity(0.6))
-        .text_center()
-        .child(SharedString::from(copy.to_string()))
-        .into_any_element()
-}
+use presentation::models::empty_list_note;
 
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
 /// fold (`models_from_session`) for catalogs served by OLDER engines (the
@@ -3759,8 +3603,11 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             .collect::<String>()
             .to_ascii_lowercase()
     }
-    let catalog = match harness {
+    let catalog: Vec<Model> = match harness {
+        #[cfg(not(target_arch = "wasm32"))]
         HarnessId::ClaudeCode => zeron_harness::claude::catalog::static_models(),
+        #[cfg(target_arch = "wasm32")]
+        HarnessId::ClaudeCode => Vec::new(),
         _ => Vec::new(),
     };
     // Curated label for an id: exact normalized match, else — for bare
@@ -3826,25 +3673,8 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
         .collect()
 }
 
-pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gpui::Hsla>) {
-    match harness {
-        HarnessId::ClaudeCode | HarnessId::Mock => (
-            crate::icons::CLAUDE_MARK,
-            Some(crate::icons::claude_brand()),
-        ),
-        HarnessId::Codex => (crate::icons::OPENAI_MARK, None),
-        HarnessId::Cursor => (crate::icons::CURSOR_MARK, None),
-        // Cognition's mark (the Devin product icon), monochrome.
-        HarnessId::Devin => (crate::icons::DEVIN_MARK, None),
-        // Monochrome mark, tinted by the surface like OpenAI's.
-        HarnessId::Grok => (crate::icons::GROK_MARK, None),
-        // Nous Research's mark (the Hermes product icon), monochrome.
-        HarnessId::Hermes => (crate::icons::HERMES_MARK, None),
-        HarnessId::Pi => (crate::icons::PI_MARK, None),
-        // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
-        HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
-    }
-}
+pub(crate) mod presentation;
+pub(crate) use presentation::harness_brand_icon;
 
 /// `ZERON_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
@@ -3894,9 +3724,7 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
     visible_harnesses_impl(list, allow_mock)
         .into_iter()
         .filter(|d| {
-            d.installed
-                && (zeron_engine::registry::descriptor_enabled(d)
-                    || (allow_mock && d.id == HarnessId::Mock))
+            d.installed && (descriptor_enabled(d) || (allow_mock && d.id == HarnessId::Mock))
         })
         .collect()
 }
@@ -3907,7 +3735,7 @@ fn attach_overlay(
     overlay: &mut Option<(PickerKind, AnyElement)>,
     kind: PickerKind,
     id: &'static str,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> gpui::Stateful<gpui::Div> {
     if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
         && let Some((_, element)) = overlay.take()
@@ -3924,7 +3752,7 @@ fn attach_overlay_end(
     overlay: &mut Option<(PickerKind, AnyElement)>,
     kind: PickerKind,
     id: &'static str,
-    closing: Option<std::time::Instant>,
+    closing: Option<Instant>,
 ) -> gpui::Stateful<gpui::Div> {
     if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
         && let Some((_, element)) = overlay.take()
