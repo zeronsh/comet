@@ -111,6 +111,10 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     #[cfg(windows)]
+    if cli.command.is_none() {
+        detach_desktop_console();
+    }
+    #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
     }
@@ -227,6 +231,20 @@ fn main() -> anyhow::Result<()> {
                 initial_url: cli.open_url,
             });
             Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn detach_desktop_console() {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+
+    // Explorer creates a console for this combined desktop/CLI executable.
+    // Detach only if we own it alone; preserve a terminal used to launch us.
+    let mut process = 0;
+    unsafe {
+        if GetConsoleProcessList(&mut process, 1) == 1 {
+            FreeConsole();
         }
     }
 }
