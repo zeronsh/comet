@@ -965,7 +965,10 @@ fn comment_state_key(
     comments: &[ReviewComment],
     draft: Option<&(String, CommentSide, u32)>,
 ) -> u64 {
-    let mut parts: Vec<String> = comments.iter().map(|comment| comment.id.clone()).collect();
+    let mut parts: Vec<String> = comments
+        .iter()
+        .flat_map(|comment| [comment.id.clone(), comment.body.clone()])
+        .collect();
     if let Some((path, side, line)) = draft {
         parts.push(format!("draft:{path}:{}:{line}", side.tag()));
     }
@@ -1530,6 +1533,7 @@ struct HoverRow {
 }
 
 struct CommentDraft {
+    editing_id: Option<String>,
     /// Composer the note will stage onto, captured when the card opened. A
     /// draft belongs to the checkout it was written over, so it must not
     /// follow the user onto whatever chat is selected by commit time.
@@ -2573,7 +2577,17 @@ impl Changes {
     /// Cloned because rendering borrows `self` mutably a moment later.
     fn staged_comments(&self, cx: &App) -> Vec<ReviewComment> {
         let state = self.state.read(cx);
-        state.review_comments(&state.composer_key()).to_vec()
+        state
+            .review_comments(&state.composer_key())
+            .iter()
+            .filter(|comment| {
+                self.draft
+                    .as_ref()
+                    .and_then(|draft| draft.editing_id.as_ref())
+                    != Some(&comment.id)
+            })
+            .cloned()
+            .collect()
     }
 
     fn comments_for(&self, path: &str, cx: &App) -> Vec<ReviewComment> {
@@ -2717,6 +2731,7 @@ impl Changes {
         let key = self.state.read(cx).composer_key();
         let old_path = self.old_path_of(&path);
         self.draft = Some(CommentDraft {
+            editing_id: None,
             key,
             path,
             old_path,
@@ -2726,6 +2741,32 @@ impl Changes {
             _events: events,
         });
         window.focus(&handle, cx);
+        self.sync_comment_rows(cx);
+        cx.notify();
+    }
+
+    fn edit_comment(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(comment) = state
+            .review_comments(&state.composer_key())
+            .iter()
+            .find(|comment| comment.id == id && !comment.is_file())
+            .cloned()
+        else {
+            return;
+        };
+        let Some((side, line)) = comment.diff_anchor() else {
+            return;
+        };
+        self.open_draft(comment.path.clone(), side, line, window, cx);
+        let draft = self.draft.as_mut().unwrap();
+        draft.editing_id = Some(comment.id);
+        if let comments::CommentSource::Diff { old_path, .. } = comment.source {
+            draft.old_path = old_path;
+        }
+        draft
+            .input
+            .update(cx, |input, cx| input.set_text(comment.body, cx));
         self.sync_comment_rows(cx);
         cx.notify();
     }
@@ -2746,13 +2787,18 @@ impl Changes {
             cx.notify();
             return;
         }
-        let comment = ReviewComment::new(draft.path, draft.side, draft.line, body)
-            .renamed_from(draft.old_path);
+
         // `draft.key`, not the live one: the note stages onto the composer it
         // was written against even if the selection moved under it.
         let key = draft.key;
         self.state.update(cx, |state, cx| {
-            state.add_review_comment(&key, comment);
+            if let Some(id) = draft.editing_id {
+                state.update_review_comment_body(&key, &id, body);
+            } else {
+                let comment = ReviewComment::new(draft.path, draft.side, draft.line, body)
+                    .renamed_from(draft.old_path);
+                state.add_review_comment(&key, comment);
+            }
             cx.notify();
         });
         self.sync_comment_rows(cx);
@@ -3222,6 +3268,7 @@ impl Changes {
                         comment,
                         &theme,
                         cx,
+                        Self::edit_comment,
                         Self::remove_comment,
                     ),
                     None => gpui::Empty.into_any_element(),
@@ -3242,6 +3289,7 @@ impl Changes {
                         draft_cite_path(draft),
                         draft.line,
                         draft.input.clone(),
+                        draft.editing_id.is_some(),
                         &theme,
                         cx,
                         Self::cancel_draft,
@@ -4866,6 +4914,74 @@ impl Render for Changes {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[gpui::test]
+    fn editing_staged_diff_comments_preserves_identity_and_cancellation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Changes::new(state, cx)
+        });
+        window
+            .update(cx, |changes, window, cx| {
+                for side in [CommentSide::Old, CommentSide::New] {
+                    let original =
+                        ReviewComment::new("new.rs", side, 7, "Original 🦀\nSecond line")
+                            .renamed_from(Some("old.rs"));
+                    changes.state.update(cx, |state, _| {
+                        state.add_review_comment("", original.clone())
+                    });
+                    changes.edit_comment(&original.id, window, cx);
+                    let draft = changes.draft.as_ref().unwrap();
+                    assert_eq!(draft.input.read(cx).text(), original.body);
+                    assert_eq!(draft_cite_path(draft), original.cite_path());
+                    assert!(draft.input.read(cx).focus_handle(cx).is_focused(window));
+                    let input = draft.input.clone();
+                    input.update(cx, |input, cx| input.set_text("Cancelled", cx));
+                    assert_eq!(changes.state.read(cx).review_comments("")[0], original);
+                    changes.cancel_draft(cx);
+                    assert_eq!(
+                        changes.state.read(cx).review_comments(""),
+                        &[original.clone()]
+                    );
+
+                    changes.edit_comment(&original.id, window, cx);
+                    changes
+                        .draft
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .clone()
+                        .update(cx, |input, cx| {
+                            input.set_text("  Revised\nMore detail  ", cx)
+                        });
+                    changes.commit_draft(cx);
+                    let mut expected = original.clone();
+                    expected.body = "Revised\nMore detail".into();
+                    assert_eq!(
+                        changes.state.read(cx).review_comments(""),
+                        &[expected.clone()]
+                    );
+                    assert_ne!(
+                        comment_state_key(&[original], None),
+                        comment_state_key(&[expected.clone()], None)
+                    );
+                    changes.edit_comment(&expected.id, window, cx);
+                    let sent = changes
+                        .state
+                        .update(cx, |state, _| state.take_review_comments(""));
+                    assert!(comments::with_comments("", &sent).contains("Revised\n  More detail"));
+                    changes.commit_draft(cx);
+                    assert!(changes.state.read(cx).review_comments("").is_empty());
+                }
+            })
+            .unwrap();
+    }
 
     const PATCH: &str = "\
 diff --git a/src/main.rs b/src/main.rs

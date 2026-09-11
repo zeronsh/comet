@@ -121,7 +121,7 @@ pub(super) struct MarkdownPreview {
     block_lines: Vec<u32>,
     comment_owner: Option<gpui::WeakEntity<super::FilesSurface>>,
     comments: Vec<crate::comments::ReviewComment>,
-    comment_draft: Option<(u32, gpui::Entity<crate::composer::ComposerInput>)>,
+    comment_draft: Option<(u32, gpui::Entity<crate::composer::ComposerInput>, bool)>,
     pub editor: Option<gpui::WeakEntity<super::editor::FileEditorState>>,
     list: ListState,
     cache: Rc<RefCell<RenderCache>>,
@@ -232,7 +232,7 @@ impl MarkdownPreview {
         &mut self,
         owner: gpui::WeakEntity<super::FilesSurface>,
         comments: Vec<crate::comments::ReviewComment>,
-        draft: Option<(u32, gpui::Entity<crate::composer::ComposerInput>)>,
+        draft: Option<(u32, gpui::Entity<crate::composer::ComposerInput>, bool)>,
         cx: &mut Context<Self>,
     ) {
         self.comment_owner = Some(owner);
@@ -273,6 +273,12 @@ impl MarkdownPreview {
         }
     }
 
+    fn edit_comment(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(owner) = &self.comment_owner {
+            let _ = owner.update(cx, |owner, cx| owner.edit_editor_comment(id, window, cx));
+        }
+    }
+
     fn remove_comment(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(owner) = &self.comment_owner {
             let _ = owner.update(cx, |owner, cx| owner.remove_editor_comment(id, cx));
@@ -285,15 +291,22 @@ impl MarkdownPreview {
             .iter()
             .filter(|comment| comment_block(&self.block_lines, comment.line) == Some(ix))
             .map(|comment| {
-                crate::comment_ui::render_comment_card(comment, theme, cx, Self::remove_comment)
+                crate::comment_ui::render_comment_card(
+                    comment,
+                    theme,
+                    cx,
+                    Self::edit_comment,
+                    Self::remove_comment,
+                )
             })
             .collect();
-        if let Some((line, input)) = &self.comment_draft {
+        if let Some((line, input, editing)) = &self.comment_draft {
             if comment_block(&self.block_lines, *line) == Some(ix) {
                 elements.push(crate::comment_ui::render_comment_draft(
                     &self.path,
                     *line,
                     input.clone(),
+                    *editing,
                     theme,
                     cx,
                     Self::cancel_comment,

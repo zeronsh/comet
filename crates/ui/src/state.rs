@@ -784,6 +784,18 @@ impl AppState {
         }
     }
 
+    /// Update only a staged comment's body. A stale editor must never recreate
+    /// a comment that has already been removed or sent to the agent.
+    pub fn update_review_comment_body(&mut self, key: &str, id: &str, body: String) {
+        if let Some(comment) = self
+            .review_comments
+            .get_mut(key)
+            .and_then(|comments| comments.iter_mut().find(|comment| comment.id == id))
+        {
+            comment.body = body;
+        }
+    }
+
     pub fn update_review_comment_line(&mut self, key: &str, id: &str, line: u32) {
         if let Some(comment) = self
             .review_comments
@@ -3950,6 +3962,30 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn review_comment_body_updates_are_scoped_and_keep_current_metadata() {
+        let mut state = AppState::new();
+        let original = ReviewComment::file("a.rs", 2, "Original");
+        state.add_review_comment("chat-1", original.clone());
+        state.add_review_comment("chat-2", original.clone());
+        state.begin_review_comment_flush("chat-1", 1);
+        state.update_review_comment_line("chat-1", &original.id, 9);
+        state.rename_review_comment_path("chat-1", "a.rs", "renamed.rs");
+        state.update_review_comment_body("chat-1", &original.id, "Revised".into());
+        let mut expected = original.clone();
+        expected.path = "renamed.rs".into();
+        expected.line = 9;
+        expected.body = "Revised".into();
+        assert_eq!(state.review_comments("chat-1"), &[expected]);
+        assert_eq!(state.review_comments("chat-2"), &[original.clone()]);
+        assert!(state.review_comment_flush_pending("chat-1"));
+        state.remove_review_comment("chat-1", &original.id);
+        state.update_review_comment_body("chat-1", &original.id, "Stale".into());
+        state.update_review_comment_body("missing-chat", &original.id, "Stale".into());
+        assert!(state.review_comments("chat-1").is_empty());
+        assert!(state.review_comments("missing-chat").is_empty());
     }
 
     #[test]
