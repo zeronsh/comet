@@ -118,6 +118,21 @@ pub enum RowImportOutcome {
 /// every method persists doc content AND the room cursor in one transaction
 /// (`DocsStore::save_snapshot_with_cursor`) so they can never diverge.
 pub trait ChatDocSink: Send + Sync + 'static {
+    /// Durable publication hooks. In-memory/test sinks may use the defaults.
+    fn pending_updates(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        Ok(Vec::new())
+    }
+    fn persist_update(&self, _batch_id: &str, _bytes: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+    fn acknowledge_update(&self, _batch_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Keep permanently rejected operations durable until checkpointed.
+    fn reject_update(&self, _batch_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Import one remote update row with a proposed contiguous cursor. A
     /// pending import must not persist that cursor; the client repairs it.
     fn apply_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome;
@@ -280,9 +295,11 @@ async fn pump(
 
 // ── shared client state ─────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct PendingPush {
     batch_id: String,
     bytes: Vec<u8>,
+    durable: bool,
 }
 
 #[derive(Default)]
@@ -313,6 +330,35 @@ struct Shared {
     needs_checkpoint: bool,
     /// Prevent an overlapping HTTP/socket catch-up from clearing a newer gap.
     causal_gap_generation: u64,
+}
+
+// Retry failed writes before network admission. Do not reinsert already-ACKed
+// batches when the HTTP and socket paths race using cloned pending lists.
+fn ensure_durable(shared: &Mutex<Shared>, sink: &dyn ChatDocSink, push: &PendingPush) -> bool {
+    if push.durable {
+        return true;
+    }
+    let mut shared = lock(shared);
+    let Some(pending) = shared
+        .pending
+        .iter_mut()
+        .find(|p| p.batch_id == push.batch_id)
+    else {
+        return true;
+    };
+    if pending.durable {
+        return true;
+    }
+    match sink.persist_update(&pending.batch_id, &pending.bytes) {
+        Ok(()) => {
+            pending.durable = true;
+            true
+        }
+        Err(err) => {
+            tracing::error!(%err, "chat2: outbox retry failed");
+            false
+        }
+    }
 }
 
 fn apply_remote_row(shared: &Mutex<Shared>, sink: &dyn ChatDocSink, bytes: &[u8], seq: u64) {
@@ -378,6 +424,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A live chat2-room membership for one chat doc.
 pub struct ChatClient {
+    sink: Arc<dyn ChatDocSink>,
     shared: Arc<Mutex<Shared>>,
     events: broadcast::Sender<ChatEvent>,
     shutdown: watch::Sender<bool>,
@@ -508,13 +555,23 @@ impl ChatClient {
         let (presence_tx, presence_rx) = mpsc::channel(4);
         let shared = Arc::new(Mutex::new(Shared {
             cursor: initial_cursor,
+            pending: sink
+                .pending_updates()
+                .map_err(SyncError::Protocol)?
+                .into_iter()
+                .map(|(batch_id, bytes)| PendingPush {
+                    batch_id,
+                    bytes,
+                    durable: true,
+                })
+                .collect(),
             ..Shared::default()
         }));
         let flags = Arc::new(Flags::default());
 
         let actor = Actor {
             shared: shared.clone(),
-            sink,
+            sink: sink.clone(),
             fetcher,
             device_id: device_id.to_string(),
             connector,
@@ -535,6 +592,7 @@ impl ChatClient {
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
+                sink,
                 shared,
                 events,
                 shutdown: shutdown_tx,
@@ -568,6 +626,18 @@ impl ChatClient {
     /// on every reconnect — the exact wedge class chat2 replaces. The ops
     /// stay in the local doc and reach peers via the next checkpoint.
     pub fn enqueue_update(&self, bytes: Vec<u8>) {
+        self.enqueue_batch(uuid::Uuid::new_v4().to_string(), bytes);
+    }
+
+    /// Queue an already-journaled batch without changing its deduplication ID.
+    pub fn enqueue_batch(&self, batch_id: String, bytes: Vec<u8>) {
+        let durable = match self.sink.persist_update(&batch_id, &bytes) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::error!(%err, "chat2: outbox write failed; retaining batch for retry");
+                false
+            }
+        };
         if bytes.len() > MAX_PUSH_BYTES {
             use std::sync::atomic::Ordering::Relaxed;
             tracing::error!(
@@ -576,15 +646,19 @@ impl ChatClient {
                  updates are KB-scale — this is an upstream bug)"
             );
             self.flags.rejected.fetch_add(1, Relaxed);
+            let _ = self.sink.reject_update(&batch_id);
             let _ = self.events.send(ChatEvent::PushRejected);
             return;
         }
         {
             let mut shared = lock(&self.shared);
-            shared.pending.push_back(PendingPush {
-                batch_id: uuid::Uuid::new_v4().to_string(),
-                bytes,
-            });
+            if !shared.pending.iter().any(|p| p.batch_id == batch_id) {
+                shared.pending.push_back(PendingPush {
+                    batch_id,
+                    bytes,
+                    durable,
+                });
+            }
         }
         let _ = self.nudge.try_send(());
     }
@@ -1212,22 +1286,19 @@ impl Actor {
 
     /// Send only the queue's head batch — the quota-probe path.
     async fn push_head(&self, pipe: &mut BinPipe) -> bool {
-        let frame = {
-            let shared = lock(&self.shared);
-            shared.pending.front().map(|push| {
-                wire::encode(
-                    frame_type::PUSH,
-                    &wire::PushHeader {
-                        batch_id: &push.batch_id,
-                    },
-                    &push.bytes,
-                )
-            })
-        };
-        match frame {
-            Some(frame) => pipe.tx.send(frame).await.is_ok(),
-            None => true,
+        let push = lock(&self.shared).pending.front().cloned();
+        let Some(push) = push else { return true };
+        if !ensure_durable(&self.shared, self.sink.as_ref(), &push) {
+            return false;
         }
+        let frame = wire::encode(
+            frame_type::PUSH,
+            &wire::PushHeader {
+                batch_id: &push.batch_id,
+            },
+            &push.bytes,
+        );
+        pipe.tx.send(frame).await.is_ok()
     }
 
     /// One HTTPS sync cycle off the critical path: flush pending batches
@@ -1249,19 +1320,20 @@ impl Actor {
         let events = self.events.clone();
         let busy = self.sync_busy.clone();
         tokio::spawn(async move {
-            let batches: Vec<(String, Vec<u8>)> = lock(&shared)
-                .pending
-                .iter()
-                .map(|p| (p.batch_id.clone(), p.bytes.clone()))
-                .collect();
-            for (batch_id, bytes) in batches {
-                match transport.push(batch_id, bytes).await {
+            let batches: Vec<PendingPush> = lock(&shared).pending.iter().cloned().collect();
+            for push in batches {
+                if !ensure_durable(&shared, sink.as_ref(), &push) {
+                    break;
+                }
+                match transport.push(push.batch_id, push.bytes).await {
                     Ok(ack) => {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ack) {
                             if let (Some(b), Some(seq)) = (v["batchId"].as_str(), v["seq"].as_u64())
                             {
                                 let mut sh = lock(&shared);
-                                sh.pending.retain(|p| p.batch_id != b);
+                                if sink.acknowledge_update(b).is_ok() {
+                                    sh.pending.retain(|p| p.batch_id != b);
+                                }
                                 // Contiguity rule (see handle_frame ACK): an
                                 // own-push ack proves the server has rows up
                                 // to `seq`, not that WE have the interleaved
@@ -1427,21 +1499,18 @@ impl Actor {
     }
 
     async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
-        // Clone rather than drain: batches stay queued until their ack.
-        let frames: Vec<Vec<u8>> = lock(&self.shared)
-            .pending
-            .iter()
-            .map(|push| {
-                wire::encode(
-                    frame_type::PUSH,
-                    &wire::PushHeader {
-                        batch_id: &push.batch_id,
-                    },
-                    &push.bytes,
-                )
-            })
-            .collect();
-        for frame in frames {
+        let batches: Vec<PendingPush> = lock(&self.shared).pending.iter().cloned().collect();
+        for push in batches {
+            if !ensure_durable(&self.shared, self.sink.as_ref(), &push) {
+                return false;
+            }
+            let frame = wire::encode(
+                frame_type::PUSH,
+                &wire::PushHeader {
+                    batch_id: &push.batch_id,
+                },
+                &push.bytes,
+            );
             if pipe.tx.send(frame).await.is_err() {
                 return false;
             }
@@ -1473,7 +1542,11 @@ impl Actor {
                     return false;
                 };
                 let mut shared = lock(&self.shared);
-                shared.pending.retain(|p| p.batch_id != ack.batch_id);
+                if self.sink.acknowledge_update(&ack.batch_id).is_ok() {
+                    shared.pending.retain(|p| p.batch_id != ack.batch_id);
+                } else {
+                    shared.retry_at = Some(tokio::time::Instant::now() + QUOTA_RETRY);
+                }
                 // Same contiguity rule as ROW: our own batch landing at
                 // `seq` proves rows up to seq exist server-side, not that we
                 // HAVE the interleaved ones from other devices.
@@ -1528,6 +1601,10 @@ impl Actor {
                     // wedge class this design exists to kill. The ops stay
                     // in the local doc and travel with the next checkpoint.
                     "too_large" | "empty" | "bad_push" if !batch_id.is_empty() => {
+                        if let Err(err) = self.sink.reject_update(batch_id) {
+                            tracing::error!(%err, "chat2: cannot persist checkpoint obligation");
+                            return false;
+                        }
                         let mut shared = lock(&self.shared);
                         let before = shared.pending.len();
                         shared.pending.retain(|p| p.batch_id != batch_id);

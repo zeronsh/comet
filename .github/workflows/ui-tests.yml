@@ -34,6 +34,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  session-sync-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Durable session publication and recovery
+        run: |
+          cargo test --locked -p zeron-sync --lib
+          cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
+
   ui-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

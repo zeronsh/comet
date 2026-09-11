@@ -74,6 +74,43 @@ impl EngineChatSink {
 }
 
 impl ChatDocSink for EngineChatSink {
+    fn pending_updates(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let rejected = self
+            .store
+            .rejected_chat_updates(&self.chat_id)
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .store
+            .pending_chat_updates(&self.chat_id)
+            .map_err(|e| e.to_string())?;
+        let mut updates = Vec::new();
+        for (id, bytes) in pending {
+            if bytes.len() > zeron_sync::chat_client::MAX_PUSH_BYTES {
+                self.store
+                    .reject_chat_update(&self.chat_id, &id)
+                    .map_err(|e| e.to_string())?;
+            } else if !rejected.iter().any(|(r, _)| r == &id) {
+                updates.push((id, bytes));
+            }
+        }
+        Ok(updates)
+    }
+    fn reject_update(&self, batch_id: &str) -> Result<(), String> {
+        self.store
+            .reject_chat_update(&self.chat_id, batch_id)
+            .map_err(|e| e.to_string())
+    }
+    fn persist_update(&self, batch_id: &str, bytes: &[u8]) -> Result<(), String> {
+        self.store
+            .enqueue_chat_update(&self.chat_id, batch_id, bytes)
+            .map_err(|e| e.to_string())
+    }
+    fn acknowledge_update(&self, batch_id: &str) -> Result<(), String> {
+        self.store
+            .acknowledge_chat_update(&self.chat_id, batch_id)
+            .map_err(|e| e.to_string())
+    }
+
     fn apply_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome {
         let Some(doc) = self.doc.upgrade() else {
             return RowImportOutcome::Applied;
@@ -454,4 +491,41 @@ mod tests {
                 .is_none()
         );
     }
+}
+
+/// Replay a legacy document in bounded rows. Splitting by operation range
+/// preserves IDs; Loro safely parks cross-peer dependencies until replay completes.
+pub(crate) fn publication_updates(doc: &loro::LoroDoc) -> Result<Vec<Vec<u8>>, String> {
+    fn split(
+        doc: &loro::LoroDoc,
+        peer: u64,
+        start: i32,
+        end: i32,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        let bytes = doc
+            .export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(
+                peer, start, end,
+            )]))
+            .map_err(|e| e.to_string())?;
+        if bytes.len() <= zeron_sync::chat_client::MAX_PUSH_BYTES || end - start <= 1 {
+            // An indivisible oversized op remains durable until checkpointed.
+            out.push(bytes);
+        } else {
+            let middle = start + (end - start) / 2;
+            split(doc, peer, start, middle, out)?;
+            split(doc, peer, middle, end, out)?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let vv = doc.oplog_vv();
+    let mut peers: Vec<_> = vv.iter().collect();
+    peers.sort_by_key(|(peer, _)| **peer);
+    for (&peer, &end) in peers {
+        if end > 0 {
+            split(doc, peer, 0, end, &mut out)?;
+        }
+    }
+    Ok(out)
 }
