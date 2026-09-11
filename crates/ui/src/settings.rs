@@ -1271,6 +1271,7 @@ mod tests {
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
         );
+        assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
         assert!(
             !loaded.escape_stops_active_agent,
             "preference files default Escape stopping off"
@@ -1460,6 +1461,7 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert_eq!(d.composer_send_behavior, ComposerSendBehavior::Enter);
         assert!(!d.escape_stops_active_agent);
     }
 
