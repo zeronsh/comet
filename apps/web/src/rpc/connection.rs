@@ -1,9 +1,7 @@
 //! Browser-only bridge from the authenticated same-origin socket to `RpcClient`.
 //!
-//! This is intentionally not mounted by the preserved `SessionController` app.
-//! A future actual `AppState` owner obtains an auth epoch, calls
-//! [`connect_client`], rejects stale epochs around
-//! `EngineHandle::from_connected_client`, and observes `RpcClient::watch_closed`.
+//! The browser session owns authentication epochs and uses this bridge to
+//! attach the shared UI state to one remote DeviceRoom connection.
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
