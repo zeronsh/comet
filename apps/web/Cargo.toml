@@ -13,8 +13,8 @@ debug = 0
 zeron-ui = { path = "../../crates/ui" }
 zeron-proto = { path = "../../crates/proto" }
 zeron-rpc = { path = "../../crates/rpc", default-features = false, features = ["client"] }
-gpui = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
-gpui_platform = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
+gpui = { path = "../../../zui/crates/gpui" }
+gpui_platform = { path = "../../../zui/crates/gpui_platform" }
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Node", "HtmlElement", "Location", "WebSocket", "BinaryType", "MessageEvent", "Event", "CloseEvent", "ErrorEvent", "Request", "RequestInit", "RequestCredentials", "Response", "Headers", "AbortController", "AbortSignal"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
@@ -24,7 +24,7 @@ serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [patch."https://github.com/zeronsh/zui"]
-gpui = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
-gpui_macros = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
-gpui_platform = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
-gpui_web = { git = "https://github.com/Gratenes/zui", rev = "53f49068b7aa2b796360e640b2635dbabba9c032" }
+gpui = { path = "../../../zui/crates/gpui" }
+gpui_macros = { path = "../../../zui/crates/gpui_macros" }
+gpui_platform = { path = "../../../zui/crates/gpui_platform" }
+gpui_web = { path = "../../../zui/crates/gpui_web" }
