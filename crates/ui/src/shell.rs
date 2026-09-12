@@ -1885,6 +1885,7 @@ impl Shell {
         // snap, no tween — the panels belong to the destination chat).
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if selected != self.active_chat {
+            self.suspend_file_images(cx);
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
@@ -2021,6 +2022,7 @@ impl Shell {
         let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
         if !open {
+            self.suspend_file_images(cx);
             // Closing always leaves takeover mode — reopening at full bleed
             // with the conversation gone read as a broken chat.
             self.right_pane_expanded = false;
@@ -2201,7 +2203,16 @@ impl Shell {
         }
     }
 
+    fn suspend_file_images(&mut self, cx: &mut Context<Self>) {
+        for files in self.files.values().chain(self.file_surfaces.values()) {
+            files.update(cx, |files, cx| files.suspend_images(cx));
+        }
+    }
+
     fn set_right_active(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        if self.resolved_right_active(cx) != surface {
+            self.suspend_file_images(cx);
+        }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
         match surface {
@@ -3209,6 +3220,7 @@ impl Shell {
     /// points at `entry` (back/forward moved the index); the selection change
     /// this triggers dedups against `current()` in [`Self::on_state_changed`].
     fn apply_nav(&mut self, entry: NavEntry, cx: &mut Context<Self>) {
+        self.suspend_file_images(cx);
         match entry {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;
@@ -7081,6 +7093,11 @@ impl Shell {
         let content: AnyElement = if self.right_pane_open(cx) || self.tween_active(self.right_tween)
         {
             match self.resolved_right_active(cx) {
+                // Rendering a Files surface activates its image. Keep it unmounted
+                // throughout the closing animation after suspending its resources.
+                RightSurface::Files | RightSurface::File(_) if !self.right_pane_open(cx) => {
+                    gpui::Empty.into_any_element()
+                }
                 RightSurface::Files => {
                     let key = self.panel_key(cx);
                     if let Some(files) = self.files.get(&key).cloned() {
@@ -10041,6 +10058,36 @@ mod exit_regressions {
                     shell.right_tween.unwrap().from,
                     width,
                     "reversing must not restart from zero"
+                );
+                let files = cx.new(|cx| {
+                    FilesSurface::new(
+                        shell.state.clone(),
+                        "preview".into(),
+                        false,
+                        1000,
+                        13.0,
+                        false,
+                        false,
+                        cx,
+                    )
+                });
+                let key = shell.panel_key(cx);
+                shell.files.insert(key.clone(), files.clone());
+                shell
+                    .panels
+                    .update(&key, |panel| panel.right_active = RightSurface::Files);
+                assert!(files.read(cx).test_images_visible());
+                shell.toggle_right_pane(cx);
+                assert!(!shell.right_pane_open(cx));
+                assert!(shell.tween_active(shell.right_tween));
+                assert!(
+                    !files.read(cx).test_images_visible(),
+                    "closing suspends image resources immediately"
+                );
+                let _ = shell.render_right_pane(cx);
+                assert!(
+                    !files.read(cx).test_images_visible(),
+                    "closing animation must not reactivate images"
                 );
                 shell.settings.sidebar_collapsed = true;
                 shell.sidebar_tween = tween;

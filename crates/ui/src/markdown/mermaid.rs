@@ -146,11 +146,9 @@ mod tests {
                 assert!(!svg.contains("<foreignObject"));
                 let raster = renderer.render_single_frame(svg.as_bytes(), 1.0).unwrap();
                 assert!(raster.size(0).width.0 > 0);
-                let prepared = crate::files::markdown_media::decode_image(
-                    "image/svg+xml",
-                    svg.as_bytes().to_vec(),
-                )
-                .unwrap();
+                let prepared =
+                    crate::image_media::decode_image("image/svg+xml", svg.as_bytes().to_vec())
+                        .unwrap();
                 let prepared_raster = prepared
                     .image
                     .to_image_data(gpui::SvgRenderer::new(std::sync::Arc::new(

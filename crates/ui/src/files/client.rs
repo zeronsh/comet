@@ -75,7 +75,7 @@ pub struct WorkspaceFilesClient {
 }
 
 #[async_trait]
-trait WorkspaceFilesTransport: Send + Sync {
+pub(super) trait WorkspaceFilesTransport: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError>;
     async fn subscribe(
         &self,
@@ -110,7 +110,7 @@ impl WorkspaceFilesClient {
     }
 
     #[cfg(test)]
-    fn with_transport(
+    pub(super) fn with_transport(
         transport: Arc<dyn WorkspaceFilesTransport>,
         context: FilesRequestContext,
     ) -> Self {
@@ -183,6 +183,11 @@ impl WorkspaceFilesClient {
     ) -> Result<(String, Vec<u8>), FilesClientError> {
         use base64::Engine as _;
         use zeron_proto::{MAX_WORKSPACE_IMAGE_BYTES, WORKSPACE_IMAGE_CHUNK_BYTES};
+        if checkout_id.is_empty() {
+            return Err(FilesClientError::Decode(
+                "Workspace checkout identity unavailable".into(),
+            ));
+        }
         let mut request = zeron_proto::ReadWorkspaceImageRequest {
             target: self.context.target.clone(),
             path,
@@ -197,6 +202,7 @@ impl WorkspaceFilesClient {
             let chunk: zeron_proto::WorkspaceImageChunk =
                 self.call(methods::READ_WORKSPACE_IMAGE, &request).await?;
             if chunk.checkout_id != request.expected_checkout_id
+                || chunk.content_hash.is_empty()
                 || chunk.size > MAX_WORKSPACE_IMAGE_BYTES
                 || chunk.data.len() > WORKSPACE_IMAGE_CHUNK_BYTES.div_ceil(3) * 4
                 || request
@@ -823,5 +829,57 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn image_reads_reject_malformed_repeated_and_oversized_chunks() {
+        use zeron_proto::{MAX_WORKSPACE_IMAGE_BYTES, WORKSPACE_IMAGE_CHUNK_BYTES};
+        let cases = [
+            ("data", serde_json::json!("%%%")),
+            (
+                "data",
+                serde_json::json!("A".repeat(WORKSPACE_IMAGE_CHUNK_BYTES.div_ceil(3) * 4 + 4)),
+            ),
+            ("size", serde_json::json!(MAX_WORKSPACE_IMAGE_BYTES + 1)),
+            ("contentHash", serde_json::json!("")),
+            ("checkoutId", serde_json::json!("wrong-checkout")),
+            ("nextOffset", serde_json::json!(usize::MAX)),
+        ];
+        for (field, value) in cases {
+            let mut chunk = image_chunk(b"abcd", 4, true);
+            chunk[field] = value;
+            let (client, _) = image_client(vec![Ok(chunk)]);
+            assert!(
+                client
+                    .read_image("a.png".into(), "checkout".into())
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let first = image_chunk(b"ab", 2, false);
+        let (client, _) = image_client(vec![Ok(first.clone()), Ok(first)]);
+        assert!(
+            client
+                .read_image("a.png".into(), "checkout".into())
+                .await
+                .is_err()
+        );
+        let mut last = image_chunk(b"cd", 4, false);
+        last["size"] = 5.into();
+        let (client, _) = image_client(vec![Ok(image_chunk(b"ab", 2, false)), Ok(last)]);
+        assert!(
+            client
+                .read_image("a.png".into(), "checkout".into())
+                .await
+                .is_err()
+        );
+        let (client, transport) = image_client(Vec::new());
+        assert!(
+            client
+                .read_image("a.png".into(), String::new())
+                .await
+                .is_err()
+        );
+        assert!(transport.calls.lock().unwrap().is_empty());
     }
 }

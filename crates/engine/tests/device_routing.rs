@@ -953,6 +953,77 @@ async fn workspace_file_surface_proxies_over_the_relay() {
         "expectedCheckoutId": "wrong-checkout", "offset": 0,
     })).await.is_err());
 
+    // The caller has no workspace for this chat: only the owner can read it.
+    assert!(
+        client
+            .call(
+                methods::READ_WORKSPACE_IMAGE,
+                serde_json::json!({
+                    "chatId": "chat-files", "path": "remote-image.svg",
+                    "expectedCheckoutId": read["checkoutId"], "offset": 0,
+                })
+            )
+            .await
+            .is_err()
+    );
+
+    let large_svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><!--{}--><rect width="20" height="20" fill="red"/></svg>"#,
+        " ".repeat(zeron_proto::WORKSPACE_IMAGE_CHUNK_BYTES)
+    );
+    std::fs::write(repo_b.join("remote-image.svg"), &large_svg).unwrap();
+    let image_request = serde_json::json!({
+        "chatId": "chat-files", "path": "remote-image.svg", "targetDeviceId": "device-b",
+        "expectedCheckoutId": read["checkoutId"], "offset": 0,
+    });
+    let first = client
+        .call(methods::READ_WORKSPACE_IMAGE, image_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["checkoutId"], read["checkoutId"]);
+    assert_eq!(first["done"], false);
+    let mut continuation = image_request;
+    continuation["offset"] = first["nextOffset"].clone();
+    continuation["expectedContentHash"] = first["contentHash"].clone();
+    let last = client
+        .call(methods::READ_WORKSPACE_IMAGE, continuation.clone())
+        .await
+        .unwrap();
+    assert_eq!(last["contentHash"], first["contentHash"]);
+    assert_eq!(last["done"], true);
+    {
+        use base64::Engine as _;
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(first["data"].as_str().unwrap())
+            .unwrap();
+        bytes.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(last["data"].as_str().unwrap())
+                .unwrap(),
+        );
+        assert_eq!(bytes, large_svg.as_bytes());
+    }
+    // Same length, different content: a continuation from the old generation
+    // must fail on the owning device, even though the routing is still valid.
+    std::fs::write(
+        repo_b.join("remote-image.svg"),
+        large_svg.replace("red", "tan"),
+    )
+    .unwrap();
+    assert!(
+        client
+            .call(methods::READ_WORKSPACE_IMAGE, continuation.clone())
+            .await
+            .is_err()
+    );
+    continuation["expectedCheckoutId"] = "obsolete-checkout".into();
+    assert!(
+        client
+            .call(methods::READ_WORKSPACE_IMAGE, continuation)
+            .await
+            .is_err()
+    );
+
     let written = client
         .call(
             methods::WRITE_WORKSPACE_FILE,

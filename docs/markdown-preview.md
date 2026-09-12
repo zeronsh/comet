@@ -8,7 +8,7 @@ Task lists use the existing GPUI base checkbox with Zeron theme colors and icons
 
 Hovering a Markdown block exposes the same add-comment button used in diffs. The shared inline draft and comment cards appear below the block, with its original file and line reference. Comments use the existing file-review staging, removal and editor anchors; they join the composer without modifying the Markdown. A paragraph, list, table or fence is one comment target, cited at its first source line. Existing notes on inner lines appear below their containing block. Cancel or Escape dismisses the draft. Truncated and non-editable previews cannot start comments, and stale preview offsets are rejected.
 
-Workspace-relative images are loaded from the device owning the checkout. HTTP(S) images remain links. HTML and MDX are not executed. Images and diagrams open in the existing centered lightbox; wheel zoom and pan are not included. Mermaid in chat is not enabled by this change.
+Workspace-relative images are loaded from the device owning the checkout. HTTP(S) images remain links. HTML and MDX are not executed. Images and diagrams open in the shared centered lightbox with trackpad pinch, Ctrl + wheel zoom and pan; see [image preview and zoom](image-preview.md). Mermaid in chat is not enabled by this change.
 
 Mermaid diagrams use the same fence frame, header metrics, border, background and code actions as ordinary fenced code blocks. Switching between diagram and source replaces the body inside that single frame.
 
