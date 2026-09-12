@@ -26,6 +26,7 @@ pub mod local_import;
 pub mod profile;
 pub mod registry;
 pub mod repos;
+pub mod rift;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;

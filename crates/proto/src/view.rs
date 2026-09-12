@@ -606,6 +606,7 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: None,
+            isolation: crate::CheckoutIsolation::Git,
         }
     }
 
@@ -614,6 +615,7 @@ mod checkout_tests {
             name: name.into(),
             current: false,
             worktree_path: Some(path.into()),
+            isolation: crate::CheckoutIsolation::Git,
         }
     }
 
