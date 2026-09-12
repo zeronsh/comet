@@ -2580,32 +2580,34 @@ impl Pickers {
 
     fn popover_frame(&self, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        popover::popover_card(&theme)
-            .w(px(width))
-            // zeron caps its tallest picker at min(640px, 75vh).
-            .max_h(px(640.0))
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.on_key_down(event, window, cx)
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    if this.is_open() && !this.focus.contains_focused(window, cx) {
-                        window.focus(&this.focus, cx);
+        popover::viewport_menu(
+            popover::popover_card(&theme)
+                .w(px(width))
+                // zeron caps its tallest picker at min(640px, 75vh).
+                .max_h(px(640.0))
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.on_key_down(event, window, cx)
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        if this.is_open() && !this.focus.contains_focused(window, cx) {
+                            window.focus(&this.focus, cx);
+                        }
+                    }),
+                )
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    this.dismiss(cx);
+                    if this.focus.contains_focused(window, cx) {
+                        window.blur();
                     }
-                }),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.dismiss(cx);
-                if this.focus.contains_focused(window, cx) {
-                    window.blur();
-                }
-            }))
-            .flex()
-            .flex_col()
-            .child(content)
-            .into_any_element()
+                }))
+                .flex()
+                .flex_col()
+                .child(div().flex_none().min_w_0().child(content)),
+        )
+        .into_any_element()
     }
 
     /// [`Self::popover_frame`] without the p-1 inset — the harness/model
@@ -2618,30 +2620,32 @@ impl Pickers {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        popover::popover_card_flush(&theme)
-            .w(px(width))
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.on_key_down(event, window, cx)
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    if this.is_open() && !this.focus.contains_focused(window, cx) {
-                        window.focus(&this.focus, cx);
+        popover::viewport_menu(
+            popover::popover_card_flush(&theme)
+                .w(px(width))
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.on_key_down(event, window, cx)
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        if this.is_open() && !this.focus.contains_focused(window, cx) {
+                            window.focus(&this.focus, cx);
+                        }
+                    }),
+                )
+                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                    this.dismiss(cx);
+                    if this.focus.contains_focused(window, cx) {
+                        window.blur();
                     }
-                }),
-            )
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.dismiss(cx);
-                if this.focus.contains_focused(window, cx) {
-                    window.blur();
-                }
-            }))
-            .flex()
-            .flex_col()
-            .child(content)
-            .into_any_element()
+                }))
+                .flex()
+                .flex_col()
+                .child(div().flex_none().min_w_0().child(content)),
+        )
+        .into_any_element()
     }
 
     fn search_box(&self, theme: &Theme) -> AnyElement {

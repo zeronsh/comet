@@ -679,30 +679,32 @@ impl Shell {
         let sort_rows = rows.split_off(2);
         let organization_rows = rows;
 
-        popover::popover_card(theme)
-            .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
-            .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.sidebar_view_menu_key(event, cx)
-            }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_sidebar_view_menu(cx)))
-            .flex()
-            .flex_col()
-            .child(popover::menu_heading(theme, "Organize"))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(organization_rows),
-            )
-            .child(popover::menu_separator())
-            .child(popover::menu_heading(theme, "Sort"))
-            .child(div().flex().flex_col().gap(px(2.0)).children(sort_rows))
-            .child(popover::menu_separator())
-            .child(popover::menu_heading(theme, "Show"))
-            .child(div().flex().flex_col().gap(px(2.0)).children(show_rows))
-            .into_any_element()
+        popover::viewport_menu(
+            popover::popover_card(theme)
+                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+                .track_focus(&focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    this.sidebar_view_menu_key(event, cx)
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_sidebar_view_menu(cx)))
+                .flex()
+                .flex_col()
+                .child(popover::menu_heading(theme, "Organize"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .children(organization_rows),
+                )
+                .child(popover::menu_separator())
+                .child(popover::menu_heading(theme, "Sort"))
+                .child(div().flex().flex_col().gap(px(2.0)).children(sort_rows))
+                .child(popover::menu_separator())
+                .child(popover::menu_heading(theme, "Show"))
+                .child(div().flex().flex_col().gap(px(2.0)).children(show_rows)),
+        )
+        .into_any_element()
     }
 
     /// The sidebar's space-filter row: current filter ("All projects" or the
@@ -1006,25 +1008,27 @@ impl Shell {
                     },
                 ));
 
-        popover::popover_card(theme)
-            // Match the trigger row as the sidebar is resized. Both live
-            // inside the same SPACE_SM horizontal gutters.
-            .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
-            .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.spaces_menu_key(event, cx)
-            }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.close_spaces_menu(cx);
-            }))
-            .flex()
-            .flex_col()
-            .child(popover::search_input_frame(
-                theme,
-                search.into_any_element(),
-            ))
-            .child(list)
-            .into_any_element()
+        popover::viewport_menu(
+            popover::popover_card(theme)
+                // Match the trigger row as the sidebar is resized. Both live
+                // inside the same SPACE_SM horizontal gutters.
+                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+                .track_focus(&focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    this.spaces_menu_key(event, cx)
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.close_spaces_menu(cx);
+                }))
+                .flex()
+                .flex_col()
+                .child(popover::search_input_frame(
+                    theme,
+                    search.into_any_element(),
+                ))
+                .child(list),
+        )
+        .into_any_element()
     }
 
     /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
@@ -2213,6 +2217,7 @@ impl Shell {
         // Header and footer sit a shade DEEPER than the body (the shared
         // recessed-band tone) — the bands frame the folder list, which stays
         // on the brighter tint.
+        let card_width = (f32::from(viewport.width) - 24.0).clamp(0.0, 680.0);
         let card_radius = 14.0;
         let band = popover::band();
         let input_row = div()
@@ -2552,7 +2557,7 @@ impl Shell {
             .unwrap_or_default();
         let rail = div()
             .id("add-space-rail")
-            .w(px(196.0))
+            .w(px(196.0_f32.min(card_width * 0.36)))
             .flex_none()
             .border_l_1()
             .border_color(hairline)
@@ -2744,6 +2749,7 @@ impl Shell {
             .py(px(8.0))
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
             .gap(px(12.0))
             .child(popover::key_hint_pair(
@@ -2767,7 +2773,7 @@ impl Shell {
             });
 
         let card =
-            popover::palette_card(&theme, px(680.0), card_radius)
+            popover::palette_card(&theme, px(card_width), card_radius)
                 .id("add-space-palette")
                 // On the keyboard dispatch path (see `AddSpaceFlow::focus`) — the
                 // pickers' proven structure for frame-level keys with a focused

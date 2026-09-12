@@ -310,6 +310,27 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 /// blur to the same value, so the two must agree.
 pub const CARD_RADIUS: f32 = 12.0;
 
+/// Resolve picker limits at layout time, including keyboard-driven resizes.
+#[derive(IntoElement)]
+pub struct ViewportMenu {
+    card: Div,
+}
+
+pub fn viewport_menu(card: Div) -> ViewportMenu {
+    ViewportMenu { card }
+}
+
+impl gpui::RenderOnce for ViewportMenu {
+    fn render(self, window: &mut Window, _cx: &mut gpui::App) -> impl IntoElement {
+        let viewport = window.viewport_size();
+        self.card
+            .max_w((viewport.width - px(24.0)).max(px(0.0)))
+            .max_h((viewport.height - px(24.0)).max(px(0.0)))
+            .id("viewport-menu-scroll")
+            .overflow_y_scroll()
+    }
+}
+
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
