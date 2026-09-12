@@ -94,8 +94,9 @@ impl Shell {
 
     /// Open a session from the sidebar: select it, the main area follows.
     pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
+        self.nav.push(NavEntry::Chat(chat_id.clone()));
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -105,8 +106,9 @@ impl Shell {
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
+        self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
+        self.nav.push(NavEntry::Chat(String::new()));
         let target = {
             let state = self.state.read(cx);
             self.settings
