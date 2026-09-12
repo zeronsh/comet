@@ -239,7 +239,7 @@ impl AccountsPage {
         }
     }
 
-    fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+    pub(crate) fn set_target_device(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         self.close_device_menu(cx);
         if self.target_device == target {
             cx.notify();

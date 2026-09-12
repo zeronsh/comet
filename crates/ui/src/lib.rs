@@ -33,6 +33,7 @@ pub mod loaders;
 pub mod markdown;
 pub mod motion;
 pub mod notify;
+pub mod onboarding;
 pub mod pickers;
 pub mod popover;
 pub mod queue;
@@ -135,7 +136,22 @@ pub fn run_app(config: UiConfig) {
         gpui_tokio::init(cx);
         gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();
-        let ui_settings = settings::UiSettings::load(&data_dir);
+        let mut ui_settings = settings::UiSettings::load(&data_dir);
+        let fresh_profile = settings::is_fresh_profile(&data_dir);
+        if fresh_profile {
+            ui_settings.onboarding = onboarding::OnboardingState::fresh();
+            // Publish the first-run marker before engine bootstrap creates its
+            // own durable profile files. A crash on the welcome screen must
+            // resume onboarding rather than look like an established install.
+            if let Err(error) = ui_settings.save(&data_dir) {
+                tracing::warn!(%error, "failed to persist initial onboarding state");
+            }
+        } else if ui_settings.onboarding.disposition == onboarding::OnboardingDisposition::Deferred
+        {
+            // "Continue later" dismisses the current window only. A new app
+            // launch resumes the saved step without disturbing its choices.
+            ui_settings.onboarding.disposition = onboarding::OnboardingDisposition::InProgress;
+        }
         settings::init(ui_settings.clone(), data_dir.clone(), cx);
         let font_availability = typography::register_fonts(cx);
         // Typography first: theme installation reads the effective family, so

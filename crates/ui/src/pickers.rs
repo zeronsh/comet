@@ -1387,6 +1387,45 @@ impl Pickers {
         cx.notify();
     }
 
+    /// Apply first-run choices through the same draft/default state used by
+    /// the real composer. `None` keeps the corresponding Automatic behavior.
+    pub(crate) fn apply_onboarding_defaults(
+        &mut self,
+        harness: HarnessId,
+        model: Option<String>,
+        reasoning: Option<ReasoningLevel>,
+        cx: &mut Context<Self>,
+    ) {
+        let harness_locked = self.harness_locked(cx);
+        if !harness_locked {
+            if self.config.harness != Some(harness) {
+                self.config.model_options.clear();
+            }
+            self.config.harness = Some(harness);
+            self.config.model = model.clone();
+            self.config.reasoning = reasoning;
+        }
+        self.defaults.harness = Some(harness);
+        if let Some(model_id) = model {
+            let label = self
+                .models
+                .get(&harness)
+                .and_then(|slot| slot.ready())
+                .and_then(|models| models.iter().find(|candidate| candidate.id == model_id))
+                .map(|model| model.label.clone())
+                .unwrap_or_else(|| model_id.clone());
+            self.defaults.remember_model(harness, model_id, label);
+        } else {
+            self.defaults.model_by_harness.remove(&harness);
+        }
+        self.defaults.reasoning = reasoning;
+        self.save_defaults();
+        if !harness_locked {
+            self.ensure_models(harness, false, cx);
+        }
+        cx.notify();
+    }
+
     fn pick_option(
         &mut self,
         option_id: String,
@@ -1785,7 +1824,7 @@ impl Pickers {
             s.auto_selected = true;
             s.select_space(Some(space_id), cx);
         });
-        self.remember_target(cx);
+        let _ = self.remember_target(cx);
         self.close(cx);
     }
 
@@ -1796,20 +1835,20 @@ impl Pickers {
             s.auto_selected = true;
             s.select_space(None, cx);
         });
-        self.remember_target(cx);
+        let _ = self.remember_target(cx);
         self.close(cx);
     }
 
     fn pick_device(&mut self, device_id: String, cx: &mut Context<Self>) {
         self.state
             .update(cx, |s, cx| s.select_device(device_id, cx));
-        self.remember_target(cx);
+        let _ = self.remember_target(cx);
         self.close(cx);
     }
 
     /// Persist the device/project picks — the "last selected" defaults the
     /// next boot's canvas restores.
-    fn remember_target(&mut self, cx: &App) {
+    pub(crate) fn remember_target(&mut self, cx: &App) -> std::io::Result<()> {
         {
             let state = self.state.read(cx);
             self.defaults.device = state
@@ -1820,10 +1859,13 @@ impl Pickers {
             self.defaults.no_project = state.no_project;
         }
         if let Some(dir) = &self.data_dir {
-            if let Err(err) = self.defaults.save(dir) {
+            let result = self.defaults.save(dir);
+            if let Err(err) = &result {
                 tracing::warn!(error = %err, "composer-defaults save failed");
             }
+            result?;
         }
+        Ok(())
     }
 
     /// Devices in picker order: this device first, then by name.
@@ -4294,6 +4336,40 @@ mod tests {
             assert_eq!(pickers.selected_space_index(cx), 0); // empty device
             assert!(pickers.target_generation >= 2);
         });
+    }
+
+    #[gpui::test]
+    fn remembered_projectless_target_survives_later_catalog_saves(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.data_dir = Some(dir.path().to_path_buf());
+            state.local_device_id = Some("local".into());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+
+        state.update(cx, |state, cx| {
+            state.auto_selected = true;
+            state.select_space(None, cx);
+            state.select_chat(None, cx);
+        });
+        pickers.update(cx, |pickers, cx| {
+            pickers.remember_target(cx).unwrap();
+            assert!(pickers.defaults.no_project);
+            assert_eq!(pickers.defaults.device.as_deref(), Some("local"));
+
+            pickers
+                .defaults
+                .remember_labels([("new-model", "New model")].into_iter());
+            pickers.save_defaults();
+        });
+
+        let saved = ComposerDefaults::load(dir.path());
+        assert!(saved.no_project);
+        assert!(saved.project.is_none());
+        assert_eq!(saved.device.as_deref(), Some("local"));
+        assert_eq!(saved.label_for("new-model"), Some("New model"));
     }
 
     fn bare_model(id: &str, label: &str) -> Model {

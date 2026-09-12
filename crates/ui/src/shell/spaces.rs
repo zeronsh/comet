@@ -401,6 +401,10 @@ impl Shell {
             s.select_chat(None, cx);
         });
         self.schedule_save(cx);
+        if self.onboarding.active() {
+            self.onboarding.error = None;
+            self.onboarding_remember_target(cx);
+        }
         cx.notify();
     }
 

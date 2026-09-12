@@ -342,6 +342,9 @@ pub enum SidebarSort {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    /// Device-local first-run journey. Established profiles deserialize a
+    /// missing field as completed; only a genuinely empty profile opts in.
+    pub onboarding: crate::onboarding::OnboardingState,
     /// Submit using Enter or the platform modifier plus Enter.
     pub composer_send_behavior: ComposerSendBehavior,
     pub sidebar_width: f32,
@@ -449,6 +452,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            onboarding: crate::onboarding::OnboardingState::default(),
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
@@ -1038,6 +1042,29 @@ impl UiSettings {
     }
 }
 
+/// A missing settings file alone does not mean a profile is new: users may
+/// remove it while retaining sessions, authentication, or agent preferences.
+/// Automatic onboarding is reserved for a data directory with no durable user
+/// state at all. Explicit `ZERON_OPEN_ROUTE=onboarding[/…]` remains available
+/// for manual runs and deterministic captures.
+pub fn is_fresh_profile(data_dir: &Path) -> bool {
+    if UiSettings::path(data_dir).exists() {
+        return false;
+    }
+    [
+        "docs.sqlite3",
+        "profiles/local/docs.sqlite3",
+        "session.json",
+        "harness-prefs.json",
+        "composer-defaults.json",
+        "repos.json",
+        "agent-accounts",
+        "orgs",
+    ]
+    .into_iter()
+    .all(|name| !data_dir.join(name).exists())
+}
+
 fn clamp_or(value: f32, min: f32, max: f32, default: f32) -> f32 {
     if value.is_finite() {
         value.clamp(min, max)
@@ -1093,6 +1120,7 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            onboarding: crate::onboarding::OnboardingState::fresh(),
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,
@@ -1368,6 +1396,48 @@ mod tests {
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
         std::fs::write(UiSettings::path(dir.path()), "{not json").unwrap();
         assert_eq!(UiSettings::load(dir.path()), UiSettings::default());
+    }
+
+    #[test]
+    fn established_settings_without_onboarding_stay_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.onboarding.disposition,
+            crate::onboarding::OnboardingDisposition::Completed
+        );
+    }
+
+    #[test]
+    fn only_an_empty_profile_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_fresh_profile(dir.path()));
+
+        for durable_file in [
+            "docs.sqlite3",
+            "profiles/local/docs.sqlite3",
+            "session.json",
+            "harness-prefs.json",
+            "composer-defaults.json",
+            "repos.json",
+            "agent-accounts/account.json",
+            "orgs/acme/user/docs.sqlite3",
+        ] {
+            let profile = tempfile::tempdir().unwrap();
+            let path = profile.path().join(durable_file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, []).unwrap();
+            assert!(!is_fresh_profile(profile.path()), "{durable_file}");
+        }
+
+        std::fs::write(UiSettings::path(dir.path()), "{}").unwrap();
+        assert!(!is_fresh_profile(dir.path()));
     }
 
     #[test]
